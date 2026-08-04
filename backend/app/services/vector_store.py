@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 COLLECTION = "news_docs"
 
 
+def _payload_ts(published_at: str) -> int:
+    """新闻发布时间 → 秒时间戳（供保留期清理过滤）；无法解析返回 0（不参与清理）"""
+    import datetime
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(datetime.datetime.strptime(str(published_at).strip()[:19], fmt).timestamp())
+        except ValueError:
+            continue
+    return 0
+
+
 class VectorStore:
     def __init__(self) -> None:
         self._client = None
@@ -41,15 +53,30 @@ class VectorStore:
             self._client = None
 
     def _ensure_collection(self) -> None:
-        from qdrant_client.models import Distance, VectorParams
+        from qdrant_client.models import (Distance, QuantizationType, ScalarQuantization,
+                                          ScalarQuantizationConfig, VectorParams)
 
         collections = [c.name for c in self._client.get_collections().collections]
         if COLLECTION not in collections:
             # bge-m3 为 1024 维；本地 bge-small-zh 为 512 维，按首个写入向量定维
-            self._client.create_collection(
-                collection_name=COLLECTION,
-                vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
-            )
+            # 本地文件模式默认启用 INT8 标量量化压缩（qdrant_compression=true），减少磁盘占用；
+            # 旧版 qdrant-client 不支持 compression 参数时自动降级重试
+            compression = None
+            if settings.qdrant_compression:
+                compression = ScalarQuantization(
+                    scalar=ScalarQuantizationConfig(type=QuantizationType.INT8,
+                                                    always_ram=True, quantile=0.99))
+            try:
+                self._client.create_collection(
+                    collection_name=COLLECTION,
+                    vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+                    compression=compression,
+                )
+            except TypeError:  # 旧版本无 compression 参数
+                self._client.create_collection(
+                    collection_name=COLLECTION,
+                    vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+                )
 
     # ---------------- 索引 ----------------
     def index_news(self, code: str, articles: list[dict[str, Any]]) -> None:
@@ -70,12 +97,33 @@ class VectorStore:
                     vector=vec,
                     payload={"code": code, "title": article.get("title", ""),
                              "published_at": article.get("published_at", ""),
-                             "emb_model": emb_model},
+                             "emb_model": emb_model,
+                             "ts": _payload_ts(article.get("published_at", ""))},
                 ))
             self._client.upsert(collection_name=COLLECTION, points=points)
             logger.info("已索引 %s 条新闻: %s", len(points), code)
         except Exception as exc:  # noqa: BLE001
             logger.warning("新闻索引失败（不影响主链路）: %s", exc)
+
+    def cleanup_old_news(self, before_ts: float) -> int:
+        """删除索引时间早于 before_ts（秒时间戳）的新闻索引（与 news_article 保留期同步）；
+        Qdrant 不可用或调用失败时返回 0，不阻塞主链路"""
+        if self._client is None:
+            return 0
+        try:
+            from qdrant_client.models import FieldCondition, Filter, Range
+
+            self._client.delete(
+                collection_name=COLLECTION,
+                points_selector=Filter(
+                    must=[FieldCondition(key="ts", range=Range(gt=0, lt=before_ts))]
+                ),
+            )
+            logger.info("已清理 %s 前的新闻索引", int(before_ts))
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("新闻索引清理失败（不影响主链路）: %s", exc)
+            return 0
 
     # ---------------- 检索 ----------------
     def search_related(self, code: str, query: str, top_k: int = 5) -> list[dict[str, Any]]:

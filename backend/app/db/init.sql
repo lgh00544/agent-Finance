@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS stock_candidate (
     snapshot JSON NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_candidate_code_date (stock_code, trade_date),
-    KEY idx_candidate_date (trade_date)
+    KEY idx_candidate_date (trade_date),
+    KEY ix_candidate_date_rank (trade_date, rank)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS stock_score (
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS holding (
     note TEXT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    KEY idx_holding_code (stock_code)
+    KEY idx_holding_code (stock_code),
+    KEY ix_holding_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS trade_record (
@@ -106,7 +108,8 @@ CREATE TABLE IF NOT EXISTS review_result (
     lesson TEXT NULL,
     feedback JSON NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    KEY idx_review_code (stock_code)
+    KEY idx_review_code (stock_code),
+    KEY ix_review_exit_status (exit_date, suggest_status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS news_article (
@@ -135,4 +138,21 @@ CREATE TABLE IF NOT EXISTS sys_trade_profile (
     version INT NOT NULL DEFAULT 1,
     content JSON NULL,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS agent_suggestion (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    review_id INT NOT NULL,
+    target_agent VARCHAR(16) NOT NULL,
+    target_kind VARCHAR(16) NOT NULL DEFAULT 'profile',
+    rule_name VARCHAR(128) NOT NULL,
+    current_value TEXT NULL,
+    suggested_value TEXT NULL,
+    reason TEXT NULL,
+    evidence TEXT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_suggestion_review (review_id),
+    KEY idx_suggestion_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

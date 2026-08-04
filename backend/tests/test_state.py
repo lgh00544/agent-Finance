@@ -6,7 +6,8 @@ from app.graph.graphs import get_graph
 from app.graph.state import StockAgentState
 
 _EXPECTED_NODES = {
-    "discover": {"hard_filter", "llm_shortlist", "enrich_news", "llm_final"},
+    "discover": {"market_condition", "hard_filter", "llm_shortlist",
+                 "enrich_news", "enrich_data", "llm_final"},
     "score": {"collect_data", "llm_score"},
     "position": {"collect_plan_input", "llm_plan"},
     "monitor": {"collect_quote", "llm_signal", "push_alert_node"},

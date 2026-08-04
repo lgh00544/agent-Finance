@@ -7,12 +7,13 @@ MonitorAgent 持仓监控 - LangGraph 节点（每持仓执行一次）
 import logging
 import time
 
-from app.agents.common import agent_call
+from app.agents.common import ModelLevel, agent_call
 from agent_prompts import monitor_prompt
 from app.agents.schemas import MonitorOutput
 from app.cache import cache
 from app.core.config import settings
-from app.datasource.akshare_source import AkshareSource
+from app.datasource.base import DataSource, to_float
+from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.db.models import Holding
 from app.graph.state import StockAgentState
@@ -23,13 +24,21 @@ logger = logging.getLogger(__name__)
 
 
 def collect_quote(state: StockAgentState) -> StockAgentState:
-    """节点1：拉取持仓实时行情与最新新闻【刚性代码逻辑】"""
+    """节点1：拉取持仓实时行情（30s 缓存，禁止用过期缓存）与最新新闻【刚性代码逻辑】
+
+    实时价失败时用日K最新收盘兜底并标注「数据暂未更新」；
+    止损/止盈距离、盈亏比例、市值基于当次最新价纯数学计算，注入 LLM 上下文。
+    """
     code = state["stock_code"]
-    source = AkshareSource()
+    source = get_datasource()
     today = state.get("trade_date") or time.strftime("%Y-%m-%d")
 
     kline = source.fetch_daily_kline(code, _days_ago(30), today)
     indicators = compute_indicators(kline)
+
+    quote, stale = _fetch_realtime_quote(source, code, indicators)
+    state["real_time"] = quote
+    state["quote_stale"] = stale
 
     news_rows: list[dict] = []
     try:
@@ -47,8 +56,44 @@ def collect_quote(state: StockAgentState) -> StockAgentState:
 
     state["tech_index"] = indicators
     state["news_report"] = news_rows
-    state["trace"] = [*state.get("trace", []), f"行情聚合: {indicators.get('latest_date')}"]
+    state["trace"] = [*state.get("trace", []),
+                      f"行情聚合: {indicators.get('latest_date')}"
+                      + ("（实时价不可用，用日K收盘兜底）" if stale else "")]
     return state
+
+
+def _fetch_realtime_quote(source: DataSource, code: str, indicators: dict) -> tuple[dict, bool]:
+    """拉取单股实时行情（TTL 30s）；失败用日K最新收盘兜底（上一次有效数据）并返回 stale 标记"""
+    try:
+        quote = source.fetch_spot_quote(code)
+    except Exception as exc:  # noqa: BLE001 实时行情失败不阻塞监控
+        logger.warning("实时行情获取失败 %s: %s", code, exc)
+        quote = {}
+    if quote.get("price") is None:
+        # 兜底：日K最新收盘（上一次有效数据，标注「数据暂未更新」）
+        kl = indicators.get("recent_klines") or []
+        price = float(kl[-1].get("close")) if kl else None
+        quote = {"code": code, "name": quote.get("name", ""), "price": price,
+                 "change_pct": quote.get("change_pct"), "time": quote.get("time", "")}
+        return quote, price is not None
+    return quote, False
+
+
+def _trade_math(price: float | None, holding: Holding | None) -> dict:
+    """基于当次最新价程序计算止损/止盈距离、盈亏比例、市值【刚性数学计算，零判断】"""
+    if price is None:
+        return {"stop_loss_distance_pct": None, "take_profit_distance_pct": None,
+                "pnl_pct": None, "market_value": None}
+    stop_loss = to_float(holding.stop_loss if holding else 0.0, 0.0)
+    take_profit = to_float(holding.take_profit if holding else 0.0, 0.0)
+    entry_price = to_float(holding.entry_price if holding else 0.0, 0.0)
+    shares = to_float(holding.shares if holding else 0.0, 0.0)
+    return {
+        "stop_loss_distance_pct": round((stop_loss - price) / price * 100, 2) if stop_loss > 0 else None,
+        "take_profit_distance_pct": round((take_profit - price) / price * 100, 2) if take_profit > 0 else None,
+        "pnl_pct": round((price - entry_price) / entry_price * 100, 2) if entry_price > 0 else None,
+        "market_value": round(price * shares, 2),
+    }
 
 
 def llm_signal(state: StockAgentState) -> StockAgentState:
@@ -68,14 +113,22 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         f"参考止损: {holding.stop_loss} | 参考止盈: {holding.take_profit} | 目标仓位: {holding.target_pct}%"
     )
     indicators = state.get("tech_index") or {}
+    real_time = state.get("real_time") or {}
+    stale = bool(state.get("quote_stale"))
+    math = _trade_math(real_time.get("price"), holding)
+    real_time_block = {
+        **real_time, **math,
+        "数据状态": "实时（TTL 30s 内缓存）" if not stale else "数据暂未更新（实时源不可用，以下为最近一次有效数据）",
+    }
     quote_data = {
+        "实时行情": real_time_block,
         "最新指标": {k: v for k, v in indicators.items() if k != "recent_klines"},
         "近期K线": indicators.get("recent_klines", [])[-15:],
     }
     news_context = "\n".join(
         f"{n.get('published_at')} {n.get('title')}" for n in (state.get("news_report") or [])) or "（无）"
 
-    # 盘中监控 LLM 调用节流（短 TTL 缓存）
+    # 盘中监控 LLM 调用节流（短 TTL 缓存，与监控频率同节奏）
     cache_key = f"{code}:{today}:{time.strftime('%H')}"
     output = agent_call(
         agent="monitor",
@@ -85,6 +138,7 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
             holding_info, _compact(quote_data), news_context),
         schema=MonitorOutput,
         ttl_seconds=max(60, settings.monitor_llm_cache_minutes * 60),
+        model_level=ModelLevel.LIGHT,
     )
 
     state["holding_signal"] = output.model_dump()
@@ -112,6 +166,16 @@ def push_alert_node(state: StockAgentState) -> StockAgentState:
             pushed = push_alert(name, code, signal.get("alert_type", "监控"),
                                 signal.get("severity", "info"),
                                 signal.get("message", ""), signal.get("action", "hold"))
+            cache.set(f"alert:last:{code}:{today}",
+                      f"{signal.get('action')}|{signal.get('severity')}", 86400)
+        elif _severity_changed(code, today, signal):
+            # 同日同类告警但风险等级/建议发生变化 → 重新推送（30 分钟冷却，防 LLM 波动震荡）
+            logger.info("告警等级变化，重新推送: %s %s", code, signal.get("alert_type"))
+            pushed = push_alert(name, code, signal.get("alert_type", "监控"),
+                                signal.get("severity", "info"),
+                                signal.get("message", ""), signal.get("action", "hold"))
+            cache.set(f"alert:last:{code}:{today}",
+                      f"{signal.get('action')}|{signal.get('severity')}", 86400)
         else:
             logger.info("告警去重命中，跳过推送: %s", dedup_key)
 
@@ -119,6 +183,15 @@ def push_alert_node(state: StockAgentState) -> StockAgentState:
                       signal.get("severity", "info"), signal.get("message", ""),
                       signal.get("action", "hold"), signal, pushed)
     return state
+
+
+def _severity_changed(code: str, today: str, signal: dict) -> bool:
+    """同日同类告警是否风险等级变化：与当日已推信号比较，且 30 分钟冷却（防震荡）"""
+    last = cache.get(f"alert:last:{code}:{today}")
+    cur = f"{signal.get('action')}|{signal.get('severity')}"
+    if not last or last == cur:
+        return False
+    return not cache.alert_deduplicated(f"{code}:sevchange:{today}", ttl_seconds=1800)
 
 
 def _compact(data) -> str:

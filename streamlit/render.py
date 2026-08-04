@@ -75,3 +75,248 @@ def time_text(label: str, time_str: str | None, highlight: bool = False) -> None
     st.markdown(
         f'<span style="color:{color};font-size:0.85em">{label}：{str(time_str)[:16]}</span>',
         unsafe_allow_html=True)
+
+
+@st.fragment(run_every="3s")
+def task_status_area() -> None:
+    """页面顶部统一后台任务状态区：每 3 秒轮询最近任务，任务全部结束自动消失
+
+    - pending/running：琥珀色「后台任务执行中」明细 + 可切换页面继续操作提示；
+    - failed：红色提示 + 一键重试（复用原任务ID重新入队）；
+    - 任务完成/失败瞬间弹一次性 toast（session_state 标记，不重复弹）；
+    - 无未完成任务时本区域不渲染任何内容。
+    """
+    from api_client import recent_tasks, retry_task
+
+    try:
+        tasks = recent_tasks(limit=8) or []
+    except Exception:  # noqa: BLE001 后端暂不可达时静默跳过，页面主体照常
+        return
+    active = [t for t in tasks if t["status"] in ("pending", "running")]
+    failed = [t for t in tasks if t["status"] == "failed"]
+
+    # 完成/失败一次性 toast（仅状态从进行中变为终态时弹一次）
+    seen = st.session_state.setdefault("_task_seen", {})
+    for t in tasks:
+        prev = seen.get(t["task_id"])
+        seen[t["task_id"]] = t["status"]
+        if prev in ("pending", "running") and t["status"] == "done":
+            st.toast(f"任务完成：{t['label']}")
+        elif prev in ("pending", "running") and t["status"] == "failed":
+            st.toast(f"任务失败：{t['label']}，可点击重试", icon="⚠️")
+    if len(seen) > 60:  # 只保留最近标记，防无限增长
+        st.session_state["_task_seen"] = {k: v for k, v in list(seen.items())[-40:]}
+
+    if not active and not failed:
+        return
+    if active:
+        st.markdown(
+            f'<span style="color:{_TIME_HIGHLIGHT}">⏳ 后台任务执行中（{len(active)} 个）</span>'
+            f'<span style="color:{_TIME_COLOR};font-size:0.85em">　任务已提交后台，'
+            f'可切换页面继续操作</span>',
+            unsafe_allow_html=True)
+        for t in active:
+            st.markdown(f"- **{t['label']}**（提交于 {str(t['submitted_at'])[:16]}）")
+    if failed:
+        st.error(f"有 {len(failed)} 个后台任务执行失败：")
+        for t in failed:
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(f"**{t['label']}**　`{t['task_id']}`\n\n{t['error']}")
+            if c2.button("重试", key=f"retry_{t['task_id']}"):
+                retry_task(t["task_id"])
+
+
+# ================= 全局顶部常驻状态栏 =================
+# 固定于原生顶部栏（stHeader，z-index 1000）之下、z-index 998，不随页面滚动消失；
+# 状态栏条目较多时允许换行（≤2 行 ≈3rem）：主内容区与侧边栏同步预留 3.6rem
+# 顶部内边距，保证首屏标题与核心内容不被固定栏遮挡；栏本体保持紧凑单行风格
+_TOP_BAR_CSS = """
+<style>
+[data-testid="stMain"] { padding-top: 3.6rem; }
+[data-testid="stSidebarContent"] { padding-top: 3.6rem; }
+.top-status-bar {
+  position: fixed; top: 2.95rem; left: 0; right: 0; z-index: 998;
+  display: flex; align-items: center; flex-wrap: wrap;
+  column-gap: 1rem; row-gap: 0.15rem;
+  padding: 0.28rem 1rem; font-size: 0.8rem; line-height: 1.4;
+  background: rgba(11, 13, 19, 0.98); border-bottom: 1px solid #2C2F36;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+}
+.top-status-bar .bar-label { color: #9CA3AF; font-size: 0.78em; margin-right: 0.25rem; }
+.top-status-bar .up { color: #F87171; font-weight: 600; }
+.top-status-bar .down { color: #4ADE80; font-weight: 600; }
+.top-status-bar .flat { color: #9CA3AF; }
+.top-status-bar .stale { color: #F59E0B; font-size: 0.8em; }
+</style>
+"""
+_COLOR_UP = "up"
+_COLOR_DOWN = "down"
+_COLOR_FLAT = "flat"
+
+
+def _bar_money(value) -> str:
+    """金额千分位（None 显示 —）"""
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _bar_pct(value) -> str:
+    """百分比显示（None 显示 —）"""
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _bar_sign(value) -> str:
+    """正红负绿（A 股习惯）：>0 → up，<0 → down，其余 flat"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return _COLOR_FLAT
+    return _COLOR_UP if v > 0 else (_COLOR_DOWN if v < 0 else _COLOR_FLAT)
+
+
+def _bar_stale_fetch(state_key: str, fn):
+    """接口失败时返回上次成功缓存值（标注「上次数据」）；无缓存返回 (None, 错误标记) 显示「数据加载中」"""
+    try:
+        data = fn()
+        st.session_state[state_key] = data
+        return data, ""
+    except Exception as exc:  # noqa: BLE001 后端暂不可达时降级展示，不向页面抛原始报错
+        return st.session_state.get(state_key), f"更新失败（{type(exc).__name__}）"
+
+
+@st.fragment(run_every="60s")
+def top_status_bar() -> None:
+    """全局顶部常驻状态栏（所有页面固定显示，不随滚动消失）
+
+    左=北京时间（每分钟自动刷新）；中=账户核心资产 5 项（双数据路径：有 OCR 账户基准
+    用券商真实值，否则按总资金设定估算并标注「估算」；盈亏正红负绿）；
+    右=三大指数（名称+点位+涨跌幅+更新时间）。
+    「账户明细 / 指数详情」可点击展开查看详细数据；接口失败显示「数据加载中」或
+    上次缓存值并标注，不向页面抛原始报错。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import api_client as api
+
+    st.markdown(_TOP_BAR_CSS, unsafe_allow_html=True)
+
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    acc, acc_err = _bar_stale_fetch("_bar_account", api.account_summary)
+    idx, idx_err = _bar_stale_fetch("_bar_indices", api.market_indices)
+
+    parts = [f'<span class="bar-label">北京时间</span><b>{now}</b>']
+
+    # ---------- 中：账户核心资产 ----------
+    if acc:
+        total = acc.get("total_asset")
+        estimate_tag = ('<span class="stale">估算</span>'
+                        if (acc.get("source") == "estimate" and total is not None) else "")
+        parts.append(f'<span class="bar-label">总资产</span><b>{_bar_money(total)}{estimate_tag}</b>')
+        parts.append(f'<span class="bar-label">总持仓成本</span><b>{_bar_money(acc.get("total_cost"))}</b>')
+        pnl = acc.get("pnl_amount")
+        if pnl is not None:
+            parts.append(f'<span class="bar-label">总盈亏</span>'
+                         f'<b class="{_bar_sign(pnl)}">{_bar_money(pnl)}（{_bar_pct(acc.get("pnl_pct"))}）</b>')
+        else:
+            parts.append(f'<span class="bar-label">总盈亏</span><b>—</b>')
+        parts.append(f'<span class="bar-label">整体仓位</span><b>{_bar_pct(acc.get("position_pct"))}</b>')
+        parts.append(f'<span class="bar-label">可用资金</span><b>{_bar_money(acc.get("available_cash"))}</b>')
+        if acc_err:
+            parts.append(f'<span class="stale">账户数据{acc_err}，显示上次数据</span>')
+    else:
+        hint = "数据加载中" if acc_err else "—"
+        parts.append(f'<span class="bar-label">总资产</span><b>{hint}</b>')
+        parts.append(f'<span class="bar-label">可用资金</span><b>{hint}</b>')
+        parts.append(f'<span class="bar-label">整体仓位</span><b>{hint}</b>')
+
+    # ---------- 右：三大指数 ----------
+    if idx:
+        for it in idx.get("indices") or []:
+            label = it.get("name") or it.get("code") or ""
+            pct = it.get("change_pct")
+            if pct is None:
+                parts.append(f'<span class="bar-label">{label}</span><b>—</b>')
+            else:
+                parts.append(f'<span class="bar-label">{label}</span>'
+                             f'<b class="{_bar_sign(pct)}">{_bar_money(it.get("price"))} {pct:+.2f}%</b>')
+        if idx.get("updated_at"):
+            parts.append(f'<span class="bar-label">指数更新时间</span>'
+                         f'<span class="stale">{idx["updated_at"]}</span>')
+        if idx_err:
+            parts.append(f'<span class="stale">指数{idx_err}，显示上次数据</span>')
+    else:
+        parts.append(f'<span class="bar-label">指数</span><b>{"数据加载中" if idx_err else "—"}</b>')
+
+    st.markdown(f'<div class="top-status-bar">{"".join(parts)}</div>', unsafe_allow_html=True)
+
+    # ---------- 展开详情（默认收起，点击展开查看详细数据） ----------
+    show_acc = st.session_state.setdefault("_bar_show_acc", False)
+    show_idx = st.session_state.setdefault("_bar_show_idx", False)
+    c1, c2, c3 = st.columns([1.2, 1.2, 6])
+    with c1:
+        if st.button("账户明细 ▼" if not show_acc else "账户明细 ▲",
+                     key="bar_toggle_acc", use_container_width=True):
+            st.session_state["_bar_show_acc"] = not show_acc
+            st.rerun()
+    with c2:
+        if st.button("指数详情 ▼" if not show_idx else "指数详情 ▲",
+                     key="bar_toggle_idx", use_container_width=True):
+            st.session_state["_bar_show_idx"] = not show_idx
+            st.rerun()
+
+    if show_acc and acc:
+        st.markdown("**账户明细**")
+        if acc.get("source") == "estimate":
+            st.caption("暂无券商账户基准：总资产/可用资金/整体仓位按「总资金设定 + 持仓实时盈亏」估算。"
+                       "上传持仓截图 OCR 识别并经人工确认保存账户基准后，自动切换为券商真实值。")
+        else:
+            b = acc.get("baseline") or {}
+            st.caption(f"账户基准来自券商持仓截图（人工确认，{b.get('trade_date', '')} 保存）；"
+                       f"总盈亏/总持仓成本随持仓与实时行情自动计算。")
+        pnl_sign = _bar_sign(acc.get("pnl_amount"))
+        for label, value, colored in [
+            ("总资产", _bar_money(acc.get("total_asset")), False),
+            ("总持仓成本", _bar_money(acc.get("total_cost")), False),
+            ("持仓市值", _bar_money(acc.get("market_value")), False),
+            ("总盈亏", _bar_money(acc.get("pnl_amount")), True),
+            ("总盈亏比例", _bar_pct(acc.get("pnl_pct")), True),
+            ("整体仓位占比", _bar_pct(acc.get("position_pct")), False),
+            ("可用资金", _bar_money(acc.get("available_cash")), False),
+        ]:
+            if colored:
+                st.markdown(f'- {label}：**<span class="{pnl_sign}">{value}</span>**',
+                            unsafe_allow_html=True)
+            else:
+                st.markdown(f"- {label}：**{value}**")
+        if acc.get("quote_error"):
+            st.caption(f"⚠️ 行情刷新失败：{acc['quote_error']}（市价相关数值可能不准确）")
+
+    if show_idx and idx:
+        st.markdown("**指数详情**")
+        for it in idx.get("indices") or []:
+            pct = it.get("change_pct")
+            cls = _bar_sign(pct)
+            if pct is None:
+                st.markdown(f"- **{it.get('name', it.get('code', ''))}**："
+                            f"{_bar_money(it.get('price'))}（—）")
+            elif pct > 0:
+                mark = "涨"
+            elif pct < 0:
+                mark = "跌"
+            else:
+                mark = "平"
+            if pct is not None:
+                st.markdown(f"- **{it.get('name', it.get('code', ''))}**：{_bar_money(it.get('price'))} "
+                            f"（<span class='{cls}'>{mark} {pct:+.2f}%</span>）", unsafe_allow_html=True)
+        st.caption(f"指数数据更新时间：{idx.get('updated_at', '—')}")
+        if idx_err:
+            st.caption(f"⚠️ 指数行情更新失败：{idx_err}（显示上次缓存值）")

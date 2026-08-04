@@ -8,10 +8,11 @@ import json
 import logging
 import time
 
-from app.agents.common import agent_call
+from app.agents.common import ModelLevel, agent_call
 from agent_prompts import sell_prompt
 from app.agents.schemas import SellOutput
-from app.datasource.akshare_source import AkshareSource
+from app.datasource.base import DataSource
+from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
 from app.services.indicator import compute_indicators
@@ -31,7 +32,7 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
     state["stock_code"] = code
     state["stock_name"] = holding.stock_name
 
-    source = AkshareSource()
+    source = get_datasource()
     today = state.get("trade_date") or time.strftime("%Y-%m-%d")
     kline = source.fetch_daily_kline(code, _days_ago(_KLINE_DAYS), today)
     indicators = compute_indicators(kline)
@@ -114,6 +115,7 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
             holding_info, signals_text, plan_info, json.dumps(quote_pack, ensure_ascii=False, default=str)),
         schema=SellOutput,
         ttl_seconds=86400,
+        model_level=ModelLevel.DEEP,
     )
 
     repo.insert_sell_decision(state["holding_id"], code, name, output.model_dump())

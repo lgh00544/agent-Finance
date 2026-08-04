@@ -21,7 +21,17 @@ from agent_prompts.common import ROLE_BASE, TRADE_STYLE, json_requirement
 SCHEMA_DESC = """{
   "market_summary": "当日市场环境一句话简述",
   "candidates": [
-    {"stock_code": "600519", "stock_name": "贵州茅台", "reason": "候选理由...", "risk_notice": "风险初判..."}
+    {
+      "stock_code": "600519", "stock_name": "贵州茅台",
+      "reason": "候选理由...", "risk_notice": "风险初判...",
+      "confidence_tier": "建议关注", "confidence_pct": 72,
+      "macro_view": "宏观维度核心判断", "meso_view": "中观维度核心判断", "micro_view": "微观维度核心判断",
+      "volume_analysis": "量能判定（资金结构/主力动向结论）",
+      "risks": ["风险点1", "风险点2"], "focus_type": "低吸",
+      "tech_view": "技术面研判（标注至少两套体系及支撑依据）",
+      "price_levels": "关键价位（支撑/压力/建议关注区间）",
+      "position_hint": "操作建议（低吸/突破/观望 + 参考仓位）"
+    }
   ]
 }"""
 
@@ -36,12 +46,34 @@ SYSTEM_PROMPT = f"""{ROLE_BASE}
 4. 行业热度：所属行业板块当前处于资金关注方向；
 5. 风险控制：剔除明显高位、放量滞涨、估值严重脱离基本面、异动频繁的标的。
 
+【v2.0 执行标准（必须执行）】
+1. 技术研判覆盖度：必须覆盖威科夫5阶段定位、量价7条核心规则、6大基础K线形态、
+   4大谐波形态，且至少两套体系交叉验证，单一信号不构成最终依据；
+2. 估值参考：PE/PB/PEG/市值需对照所属行业均值评估，显著高估的标的必须提示风险；
+3. 板块共振优先：先验证所属板块的共振强度（板块涨幅位置、板块内联动家数），
+   板块整体偏弱或纯个股独立脉冲行情须谨慎，不得把纯个股独立行情当作候选逻辑。
+
+【输出格式强制要求（v2.0）】
+每只标的必须输出：股票代码+股票全称（成对出现）、K202 信心度档位（谨慎观察/建议关注/强烈推荐）
+与百分比参考、宏观/中观/微观三维分析结论、量能判定（资金结构/主力动向）、
+技术面研判（必须标注所用技术体系名称及其支撑依据，至少两套体系交叉验证）、
+关键价位（支撑位/压力位/建议关注区间）、操作建议（低吸/突破/观望 + 参考仓位建议）、
+核心风险（至少 2 项）、关注类型（低吸/突破/观察）；禁止仅输出代码与理由。
+【输出长度纪律（必须遵守，防止截断）】全部字段精炼表达：每个字段 1-2 句话（中文 40-80 字），
+技术面研判只标注体系名称 + 一句支撑依据；候选 5-10 只、宁缺毋滥；整份 JSON 总长度控制在
+4000 tokens 以内，超长会导致输出被截断而校验失败。
+
 {json_requirement(SCHEMA_DESC)}"""
 
 
-def build_user_prompt(stock_table: str, market_context: str) -> str:
-    """stock_table: 初筛后的数据表（紧凑表格）；market_context: 大盘与行业板块行情摘要"""
-    return f"""【市场环境与行业板块行情】
+def build_user_prompt(stock_table: str, market_context: str, market_note: str = "") -> str:
+    """stock_table: 初筛后的数据表（紧凑表格）；market_context: 大盘与行业板块行情摘要；
+    market_note: 当日市况评分与候选池上限（v2.0 前置步骤结果）"""
+    note_section = f"""【今日市况评分与候选池规模约束】
+{market_note}
+
+""" if market_note else ""
+    return f"""{note_section}【市场环境与行业板块行情】
 {market_context}
 
 【全市场初筛数据表】（已完成刚性过滤：剔除 ST/退市/停牌/成交额过低标的；
@@ -51,12 +83,19 @@ def build_user_prompt(stock_table: str, market_context: str) -> str:
 请从上述数据表中挑选波段潜力标的并给出候选理由与风险初判。"""
 
 
-def build_final_prompt(stock_table: str, news_context: str) -> str:
-    """news_context: 候选股新闻/公告检索结果，供最终确认"""
-    return f"""{stock_table}
+def build_final_prompt(stock_table: str, news_context: str, cap: int | None = None,
+                       market_note: str = "") -> str:
+    """news_context: 候选股新闻/公告检索结果；cap: 当日候选池上限（v2.0 市况档位）"""
+    cap_section = ""
+    if cap is not None:
+        cap_section = f"\n【当日候选池规模上限】今日候选池不得超过 {cap} 只，按优先级排序，宁缺毋滥。"
+    note_section = f"\n{market_note}" if market_note else ""
+    return f"""{stock_table}{cap_section}{note_section}
 
 【候选股新闻/公告检索结果】（向量检索相关资讯，用于核实基本面与风险）
 {news_context}
 
-请基于新闻资讯对初步候选做最后确认：剔除存在明确利空（立案/减持/质押/业绩暴雷等）
-或与基本面严重矛盾的标的，输出最终候选列表。"""
+请基于新闻资讯与增量数据对初步候选做最后确认：剔除存在明确利空（立案/减持/质押/业绩暴雷等）、
+与基本面严重矛盾、或触发硬性规则（人工硬性锁定规则）的标的，输出最终候选列表。
+每只标的必须完整输出 v2.0 强制字段（信心度档位/三维分析/量能判定/技术面研判含体系标注/
+关键价位/操作建议/核心风险≥2项/关注类型）。"""

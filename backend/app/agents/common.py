@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Type, TypeVar
 
 from app.db import repo
-from app.llm.structured import call_llm_cached
+from app.llm.structured import ModelLevel, call_llm_cached
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,16 @@ def _global_base_version() -> str:
 #   - 禁止推荐/买入 ST、*ST、退市整理期及立案调查中的股票；
 #   - 单只标的从成本价回撤超过 8% 必须触发减仓/清仓信号，不得以任何理由放宽；
 #   - 商誉占净资产比例超过 50% 的公司一律回避。
-HARD_RULES: list[str] = []
+HARD_RULES: list[str] = [
+    # ===== 每日候选池 v2.0 强制底线（2026-08-04 人工设定，全 Agent 生效） =====
+    "板块权限硬约束：创业板（300 开头）标的仅做分析、不推荐买入，"
+    "若因分析价值保留在候选池，必须在风险中显著标注『仅限分析，不推荐买入』且信心度档位不得高于『谨慎观察』；"
+    "科创板（688 开头）、北交所（8/4 开头）标的不纳入候选池，一律不得入选，也不得推荐买入。",
+    "派发期一票否决：同时满足『5日涨幅≥15% + 主力资金净流出 + 换手率≥12% + 距52周高点≤10%』的标的，"
+    "直接排除，不得进入候选池。",
+    "一日游避雷：板块内共振上涨个股不足3只、或盘中涨幅收窄≥0.5% 的纯脉冲题材，不得纳入正式候选池。",
+    "超买否决：单只标的 5 日累计涨幅≥15% 时，不得作为建仓推荐标的。",
+]
 
 
 def hard_rules_section() -> str:
@@ -115,31 +124,44 @@ def _knowledge_version() -> str:
 
 def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
                schema: Type[T], ttl_seconds: int = 86400,
-               with_profile: bool = True, with_knowledge: bool = True) -> T:
-    """统一 LLM 调用：全局基线 → 专属Prompt → 硬性规则 → 偏好 → 知识库，版本指纹入缓存键"""
+               with_profile: bool = True, with_knowledge: bool = True,
+               model_level: ModelLevel = ModelLevel.DEEP) -> T:
+    """统一 LLM 调用：固定段序拼接 + 版本指纹入缓存键。
+
+    system prompt 段序（永久固定，利于服务端前缀缓存命中）：
+    全局通用知识库基线 → 硬性规则 HARD_RULES → 个人交易偏好档案 → 私有知识库检索结果
+    → Agent 专属 Prompt（动态数据一律在 user 段，前置段同版本内 100% 重复）。
+
+    model_level 声明场景等级：LIGHT=高频轻量（初筛/巡检），DEEP=深度复杂（默认）。"""
+    sections: list[str] = []
     # 拼接位0 · 全局通用知识库基线（最先加载，所有 Agent 统一生效）
     base = global_base_prompt()
-    sys_prompt = f"{base}\n\n{system_prompt}" if base else system_prompt
-    # ↑ 拼接位1 · 插槽1：分职能Agent专项规则 = 各 Agent 专属 Prompt 文件内容（独立存放、可单独修改）
-
+    if base:
+        sections.append(base)
+    # 拼接位1 · 人工硬性锁定规则（统一调教接口·底线）
     rules_section = hard_rules_section()
     if rules_section:
-        sys_prompt += "\n\n" + rules_section
+        sections.append(rules_section)
+    # 拼接位2 · 个性化交易体系 = 个人交易偏好档案（动态配置）
     if with_profile:
         section = profile_section()
         if section:
-            # 拼接位2 · 插槽2：个性化交易体系 = 个人交易偏好档案（动态配置）
-            sys_prompt += (
-                "\n\n【用户个人交易偏好档案】（你的研判必须尊重用户这些偏好，"
+            sections.append(
+                "【用户个人交易偏好档案】（你的研判必须尊重用户这些偏好，"
                 "如有冲突需在输出中说明）\n" + section
             )
+    # 拼接位3 · 私有知识库检索结果注入
     if with_knowledge:
         section = knowledge_section(agent)
         if section:
-            # 拼接位3 · 插槽3（预留扩展）：私有知识库检索结果注入
-            sys_prompt += "\n\n" + section
+            sections.append(section)
+    # 拼接位4 · 分职能 Agent 专属 Prompt（独立存放、可单独修改）
+    if system_prompt:
+        sections.append(system_prompt)
+    sys_prompt = "\n\n".join(sections)
 
     version = repo.get_trade_profile().version
     return call_llm_cached(agent,
                            f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}",
-                           sys_prompt, user_prompt, schema, ttl_seconds=ttl_seconds)
+                           sys_prompt, user_prompt, schema, ttl_seconds=ttl_seconds,
+                           model_level=model_level)

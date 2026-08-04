@@ -16,14 +16,18 @@ _graphs: dict[str, object] = {}
 
 def _build_discover() -> StateGraph:
     g = StateGraph(StockAgentState)
+    g.add_node("market_condition", discover.market_condition)
     g.add_node("hard_filter", discover.hard_filter)
     g.add_node("llm_shortlist", discover.llm_shortlist)
     g.add_node("enrich_news", discover.enrich_news)
+    g.add_node("enrich_data", discover.enrich_data)
     g.add_node("llm_final", discover.llm_final)
-    g.add_edge(START, "hard_filter")
+    g.add_edge(START, "market_condition")
+    g.add_edge("market_condition", "hard_filter")
     g.add_edge("hard_filter", "llm_shortlist")
     g.add_edge("llm_shortlist", "enrich_news")
-    g.add_edge("enrich_news", "llm_final")
+    g.add_edge("enrich_news", "enrich_data")
+    g.add_edge("enrich_data", "llm_final")
     g.add_edge("llm_final", END)
     return g
 

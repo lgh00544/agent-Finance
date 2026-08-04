@@ -6,6 +6,10 @@ import api_client as api
 import render
 
 st.set_page_config(page_title="告警日志", layout="wide")
+
+# 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
+render.top_status_bar()
+
 st.title("告警日志（MonitorAgent）")
 
 SEVERITY_MAP = {"info": "一般", "warning": "警告", "critical": "严重"}
@@ -14,7 +18,7 @@ ACTION_MAP = {"hold": "持有", "reduce": "减仓", "exit": "清仓"}
 try:
     rows = api.alerts()
     if not rows:
-        st.info("暂无告警记录。持仓监控在交易时段每 5 分钟自动运行。")
+        st.info("暂无告警记录。持仓监控在交易时段每 3 分钟自动运行。")
     else:
         render.time_text("告警统计时间范围",
                          f"{rows[0]['created_at'][:16]} ~ {rows[-1]['created_at'][:16]}")

@@ -12,10 +12,13 @@ from app.db.models import Base
 
 
 def _sqlite_pragmas(dbapi_connection, connection_record):
-    """SQLite 打开外键与 WAL，便于多线程读写"""
+    """SQLite 性能/并发调优：WAL 读写不互斥 + 异步刷盘 + 内存缓存 + 忙等待"""
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA journal_mode=WAL")     # 写前日志：读不阻塞写、写不阻塞读
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA synchronous=NORMAL")   # WAL 下崩溃安全且大幅降低 fsync 次数
+    cursor.execute("PRAGMA cache_size=-20000")    # 页缓存 20MB，降低磁盘 IO
+    cursor.execute("PRAGMA busy_timeout=5000")    # 写锁竞争时等待而非立即报错
     cursor.close()
 
 
@@ -53,6 +56,41 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _ensure_review_result_columns()
+    _ensure_stock_candidate_detail()
+    _ensure_indexes()
+
+
+def _ensure_indexes() -> None:
+    """幂等补建高频查询索引（create_all 只对新表建索引，已存在的表需单独补建）。
+    SQLite 支持 IF NOT EXISTS；MySQL 走 init.sql（容器初始化 DDL）。"""
+    if engine.dialect.name != "sqlite":
+        return
+    statements = [
+        "CREATE INDEX IF NOT EXISTS ix_candidate_date_rank "
+        "ON stock_candidate (trade_date, rank)",
+        "CREATE INDEX IF NOT EXISTS ix_holding_status ON holding (status)",
+        "CREATE INDEX IF NOT EXISTS ix_review_exit_status "
+        "ON review_result (exit_date, suggest_status)",
+        "CREATE INDEX IF NOT EXISTS ix_suggestion_status ON agent_suggestion (status)",
+    ]
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.exec_driver_sql(stmt)
+
+
+def _ensure_stock_candidate_detail(eng=None) -> None:
+    """幂等补齐 stock_candidate.detail 列（v2.0 输出详情；仅增量加列，不重建表不丢数据）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(stock_candidate)")}
+            if "detail" not in existing:
+                conn.exec_driver_sql("ALTER TABLE stock_candidate ADD COLUMN detail JSON")
+        else:
+            try:
+                conn.exec_driver_sql("ALTER TABLE stock_candidate ADD COLUMN detail JSON")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
 
 
 def _ensure_review_result_columns(eng=None) -> None:

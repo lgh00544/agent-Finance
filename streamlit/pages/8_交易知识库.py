@@ -6,9 +6,17 @@ import pandas as pd
 import streamlit as st
 
 import api_client as api
+import render
 
 st.set_page_config(page_title="交易知识库", layout="wide")
+
+# 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
+render.top_status_bar()
+
 st.title("交易知识库（统一调教·私有战法）")
+
+# 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
+render.task_status_area()
 
 st.caption("这里存放你的私有交易经验、战法、心得。六个 Agent（挖掘/评分/建仓/监控/卖出/复盘）"
            "每次启动任务都会自动检索对应标签的知识注入研判上下文；"
@@ -34,6 +42,41 @@ with st.form("add_knowledge"):
         else:
             result = api.add_knowledge(title.strip(), content.strip(), agent_tag)
             st.success(f"已保存（ID={result['id']}），对应 Agent 下次任务自动注入。")
+
+st.divider()
+
+# ================= 批量导入（异步提交） =================
+st.subheader("批量导入知识")
+with st.form("batch_knowledge"):
+    batch_tag = st.selectbox("批量适用 Agent", AGENTS, key="batch_tag",
+                             help="全部条目统一应用此标签，导入后可在列表里逐条修改")
+    batch_text = st.text_area(
+        "粘贴文本（空行分隔多条；每条第一行为标题，其余行为正文）",
+        height=160,
+        placeholder=("例如：\n"
+                     "放量突破战法确认条件\n"
+                     "①换手率 5%-15% ②突破前缩量整理 ③板块共振\n"
+                     "\n"
+                     "止损纪律\n"
+                     "买入后跌破关键支撑位无条件离场，不补仓摊薄成本"))
+    batch_submitted = st.form_submit_button("批量导入（异步执行）")
+    if batch_submitted:
+        items = []
+        for block in (batch_text or "").splitlines():
+            block = block.strip()
+            if not block:
+                continue
+            lines = block.splitlines()
+            title = lines[0].strip()
+            content = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+            if title and content:
+                items.append({"title": title, "content": content, "agent_tag": batch_tag})
+        if not items:
+            st.error("未解析出有效条目：每条需至少包含标题行 + 正文行，且以空行分隔")
+        else:
+            result = api.batch_import_knowledge(items)
+            st.success(f"已提交 {len(items)} 条知识批量导入任务（{result.get('task_id')}），"
+                       "完成后顶部任务状态区会提示，无需等待本页刷新")
 
 st.divider()
 

@@ -7,8 +7,13 @@ import json
 import streamlit as st
 
 import api_client as api
+import render
 
 st.set_page_config(page_title="个人交易偏好", layout="wide")
+
+# 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
+render.top_status_bar()
+
 st.title("个人交易偏好档案（sys_trade_profile）")
 
 st.caption("偏好会在所有 Agent 调用 LLM 时自动注入研判上下文。保存立即生效，无需重启。"

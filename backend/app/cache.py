@@ -26,7 +26,9 @@ class CacheBackend(ABC):
     @abstractmethod
     def delete(self, key: str) -> None: ...
 
-    # ---------- LLM 结果缓存 ----------
+    @abstractmethod
+    def delete_prefix(self, prefix: str) -> None:
+        """删除指定前缀的全部 key（高频读结果缓存按表命名空间批量失效用）"""
     def get_llm_json(self, agent: str, key: str, ttl_seconds: int) -> dict | None:
         raw = self.get(f"llm:{agent}:{key}")
         if raw is None:
@@ -82,6 +84,11 @@ class MemoryCache(CacheBackend):
         with self._lock:
             self._store.pop(key, None)
 
+    def delete_prefix(self, prefix: str) -> None:
+        with self._lock:
+            for k in [k for k in self._store if k.startswith(prefix)]:
+                self._store.pop(k, None)
+
     def acquire_lock(self, lock_name: str, ttl_seconds: int = 3600) -> bool:
         # 内存锁：同进程内防止调度重叠
         key = f"lock:{lock_name}"
@@ -111,6 +118,15 @@ class RedisCache(CacheBackend):
 
     def delete(self, key: str) -> None:
         self._client.delete(key)
+
+    def delete_prefix(self, prefix: str) -> None:
+        cursor = 0
+        while True:
+            cursor, keys = self._client.scan(cursor, match=f"{prefix}*", count=200)
+            if keys:
+                self._client.delete(*keys)
+            if cursor == 0:
+                break
 
     def acquire_lock(self, lock_name: str, ttl_seconds: int = 3600) -> bool:
         return bool(self._client.set(f"lock:{lock_name}", "1", nx=True, ex=ttl_seconds))

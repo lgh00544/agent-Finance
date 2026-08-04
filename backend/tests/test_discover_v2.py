@@ -1,0 +1,234 @@
+"""每日候选池 v2.0 补强测试：
+市况档位映射 / v2 输出 Schema 校验 / 增量数据纯数学计算 / 富化表结构 / 市况落库闭环
+（不触网、不测任何主观结论；LLM 层只测结构校验）"""
+import pandas as pd
+import pytest
+from pydantic import ValidationError
+
+from app.agents.discover import (_enrich_candidate_data, _final_table_text,
+                                 _fmt_money, _market_note)
+from app.agents.schemas import DiscoverCandidate, MarketConditionOutput
+from app.core.config import market_band_info
+from app.db import repo
+from app.db.session import init_db
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _db_ready():
+    init_db()
+
+
+# ==================== 市况档位映射（人工映射表，纯规则） ====================
+
+def test_market_band_info_boundaries():
+    assert market_band_info(0) == (5, "防御期")
+    assert market_band_info(20) == (5, "防御期")
+    assert market_band_info(21) == (10, "过渡期")
+    assert market_band_info(35) == (10, "过渡期")
+    assert market_band_info(36) == (15, "温和期")
+    assert market_band_info(45) == (15, "温和期")
+    assert market_band_info(46) == (20, "强势期")
+    assert market_band_info(50) == (20, "强势期")
+    assert market_band_info(999) == (20, "强势期")  # 越界兜底取最末档
+
+
+# ==================== v2.0 输出 Schema（强制字段） ====================
+
+def _valid_candidate() -> dict:
+    return {
+        "stock_code": "600519", "stock_name": "贵州茅台", "reason": "量价健康",
+        "risk_notice": "估值偏高",
+        "confidence_tier": "建议关注", "confidence_pct": 72.0,
+        "macro_view": "宏观判断", "meso_view": "中观判断", "micro_view": "微观判断",
+        "volume_analysis": "主力小幅流入", "risks": ["风险A", "风险B"],
+        "focus_type": "低吸",
+    }
+
+
+def test_discover_candidate_v2_valid():
+    c = DiscoverCandidate(**_valid_candidate())
+    assert c.confidence_tier in ("谨慎观察", "建议关注", "强烈推荐")
+    assert c.focus_type in ("低吸", "突破", "观察")
+
+
+def test_discover_candidate_requires_two_risks():
+    data = _valid_candidate()
+    data["risks"] = ["仅一个风险"]
+    with pytest.raises(ValidationError):
+        DiscoverCandidate(**data)
+
+
+def test_discover_candidate_rejects_bad_enums():
+    data = _valid_candidate()
+    data["confidence_tier"] = "强烈看多"
+    with pytest.raises(ValidationError):
+        DiscoverCandidate(**data)
+    data = _valid_candidate()
+    data["focus_type"] = "追高"
+    with pytest.raises(ValidationError):
+        DiscoverCandidate(**data)
+
+
+def test_market_condition_output_validation():
+    out = MarketConditionOutput(dim_index=6, dim_sector=5, dim_money=4,
+                                dim_sentiment=6, dim_risk=7, summary="温和")
+    assert out.dim_index + out.dim_risk <= 20
+    with pytest.raises(ValidationError):
+        MarketConditionOutput(dim_index=11, dim_sector=5, dim_money=4,
+                              dim_sentiment=6, dim_risk=7, summary="超界")
+
+
+# ==================== 金额格式化（纯展示） ====================
+
+def test_fmt_money():
+    assert _fmt_money(120000000.0) == "1.20亿"
+    assert _fmt_money(-50000000.0) == "-5000.0万"
+    assert _fmt_money(20000000.0) == "2000.0万"
+    assert _fmt_money(5000.0) == "5000"
+    assert _fmt_money(None) == ""
+    assert _fmt_money(float("nan")) == ""
+
+
+# ==================== 增量数据纯数学计算（v2.0 富化） ====================
+
+class _FakeSource:
+    """模拟数据源：只返回固定原始数据，验证计算正确性"""
+
+    def __init__(self, kline, flow, info=None, gdhs=None):
+        self._kline = kline
+        self._flow = flow
+        self._info = info
+        self._gdhs = gdhs
+
+    def fetch_stock_info(self, code):
+        return self._info if self._info is not None else {"行业": "白酒"}
+
+    def fetch_daily_kline(self, code, start_date, end_date, adjust="qfq"):
+        return self._kline
+
+    def fetch_fund_flow(self, code):
+        return self._flow
+
+    def fetch_shareholder_detail(self, code):
+        return self._gdhs if self._gdhs is not None else {"holder_change_pct": -3.2}
+
+
+def _make_kline():
+    """8 个交易日：收盘 10→12，高点 12.3，用于验证 5日涨幅/52周区间/收窄幅度"""
+    dates = pd.date_range("2026-07-24", periods=8).strftime("%Y-%m-%d")
+    return pd.DataFrame({
+        "date": dates,
+        "close": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 11.0, 12.0],
+        "high": [10.2, 10.2, 10.2, 10.2, 10.2, 10.2, 11.2, 12.3],
+        "low": [9.8] * 8,
+    })
+
+
+def _make_flow():
+    """10 日资金流：主力累计 3/5/10 日可精确验证"""
+    dates = pd.date_range("2026-07-20", periods=10).strftime("%Y-%m-%d")
+    mains = [1e7, 2e7, 3e7, 4e7, 5e7, 6e7, 7e7, 8e7, 9e7, -5e7]
+    return pd.DataFrame({
+        "date": dates,
+        "main_net_inflow": mains,
+        "super_large_net": [-5e7] * 10,
+        "large_net": [2e7] * 10,
+        "medium_net": [-1e7] * 10,
+        "small_net": [-1e7] * 10,
+    })
+
+
+def test_enrich_candidate_data_pure_math():
+    source = _FakeSource(_make_kline(), _make_flow())
+    out = _enrich_candidate_data(source, {"600519": {"float_pct": 12.5}},
+                                 "600519", "贵州茅台")
+
+    assert out["industry"] == "白酒"
+    # 5日涨幅 = (12.0/10.0-1)*100
+    assert out["pct_change_5d"] == pytest.approx(20.0)
+    # 52周区间与距高点
+    assert out["high_52w"] == 12.3
+    assert out["low_52w"] == 9.8
+    assert out["dist_52w_high_pct"] == pytest.approx(-2.44)
+    # 盘中涨幅收窄 = (当日最高-收盘)/昨收*100
+    assert out["intraday_narrow_pct"] == pytest.approx((12.3 - 12.0) / 11.0 * 100, abs=0.01)
+    # 资金结构（当日）
+    assert out["super_large_net"] == -5e7
+    assert out["large_net"] == 2e7
+    # 阶段主力累计：3/5/10 日（尾部 3/5/10 行求和）
+    assert out["main_net_3d"] == 1.2e8       # 8e7+9e7-5e7
+    assert out["main_net_5d"] == 2.5e8       # 6e7+7e7+8e7+9e7-5e7
+    assert out["main_net_10d"] == 4.0e8      # 全部 10 日求和
+    # 股东面与机构持股
+    assert out["holder_change_pct"] == -3.2
+    assert out["inst_hold_pct"] == 12.5
+
+
+def test_enrich_candidate_data_missing_fields():
+    """数据缺失时字段为 None/空，不抛异常（单项失败降级）"""
+    source = _FakeSource(pd.DataFrame(), pd.DataFrame(), info={}, gdhs={})
+    out = _enrich_candidate_data(source, {}, "600519", "贵州茅台")
+    assert out == {"industry": ""}
+
+
+def test_final_table_text_includes_v2_columns():
+    shortlist = [{"code": "600519", "name": "贵州茅台", "price": 1500.0, "change_pct": 1.2,
+                  "amount": 5e8, "volume_ratio": 1.5, "turnover_rate": 2.0,
+                  "pe_dynamic": 30.0, "pb": 8.0, "total_mv": 1.8e12, "circ_mv": 1.8e12,
+                  "pct_change_60d": 8.0, "pct_change_ytd": 5.0}]
+    enrichment = {"600519": {"industry": "白酒", "pct_change_5d": 20.0,
+                             "dist_52w_high_pct": -2.44, "intraday_narrow_pct": 2.73,
+                             "super_large_net": -5e7, "large_net": 2e7,
+                             "main_net_3d": 1.2e8, "main_net_5d": 3e8,
+                             "holder_change_pct": -3.2, "inst_hold_pct": 12.5}}
+    text = _final_table_text(shortlist, enrichment)
+    lines = text.splitlines()
+    header = lines[0]
+    assert "industry" in header and "pct_change_5d" in header
+    assert "dist_52w_high_pct" in header and "intraday_narrow_pct" in header
+    assert "main_net_3d" in header and "inst_hold_pct" in header
+    body = lines[1]
+    assert "白酒" in body and "-5000.0万" in body and "1.20亿" in body
+    assert "600519" in body
+
+
+# ==================== 市况摘要注入文本 ====================
+
+def test_market_note_text():
+    state = {"market_condition": {"total_score": 42, "band": "温和期", "cap": 15,
+                                  "summary": "板块轮动正常"}, "market_cap": 15}
+    note = _market_note(state)
+    assert "42" in note and "温和期" in note and "15" in note
+    state2 = {"market_condition": None, "market_cap": 20}
+    assert "默认上限 20" in _market_note(state2)
+
+
+# ==================== 市况落库闭环 ====================
+
+def test_market_condition_upsert_and_read():
+    repo.upsert_market_condition("2026-08-04", 42,
+                                 {"index": 9, "sector": 8, "money": 8,
+                                  "sentiment": 9, "risk": 8}, 15, "板块轮动正常")
+    mc = repo.get_latest_market_condition()
+    assert mc is not None
+    assert mc["total_score"] == 42
+    assert mc["band"] == "温和期"
+    assert mc["cap"] == 15
+    assert mc["dims"]["money"] == 8
+    assert "2026-08-04" in mc["created_at"]
+
+    repo.upsert_market_condition("2026-08-04", 10, {"index": 2, "sector": 2, "money": 2,
+                                                    "sentiment": 2, "risk": 2}, 5, "弱势")
+    mc2 = repo.get_latest_market_condition()
+    assert mc2["total_score"] == 10 and mc2["cap"] == 5 and mc2["band"] == "防御期"
+
+
+# ==================== 硬性规则注入（HARD_RULES 已生效） ====================
+
+def test_hard_rules_contains_v2_rules():
+    from app.agents.common import HARD_RULES
+
+    joined = "\n".join(HARD_RULES)
+    for keyword in ("板块权限硬约束", "派发期一票否决", "一日游避雷", "超买否决",
+                    "科创板", "北交所", "52周高点", "换手率"):
+        assert keyword in joined, f"HARD_RULES 缺少: {keyword}"

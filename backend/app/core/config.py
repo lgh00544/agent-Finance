@@ -9,6 +9,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[2]  # backend/
@@ -29,6 +30,9 @@ class Settings(BaseSettings):
     db_backend: str = "sqlite"     # sqlite（默认，单文件 data/dev.db）/ mysql
     cache_backend: str = "memory"  # memory（默认，进程内）/ redis
     qdrant_mode: str = "local"     # local（默认，本地文件模式，存 data/qdrant_storage）/ server
+    # 高频读接口结果缓存（秒）：候选/评分/建仓/持仓/告警/复盘列表短缓存，
+    # 写操作自动失效保证一致；设为 0 关闭（数据变更需即时可见的场景可关）
+    db_query_cache_ttl: int = 60
 
     # ---------- MySQL（DB_BACKEND=mysql 时生效）----------
     mysql_host: str = "127.0.0.1"
@@ -46,11 +50,17 @@ class Settings(BaseSettings):
     qdrant_host: str = "127.0.0.1"
     qdrant_port: int = 6333
 
-    # ---------- DeepSeek LLM ----------
+    # ---------- DeepSeek LLM（双模型分场景路由）----------
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-chat"
-    llm_max_tokens: int = 8192  # 留足空间防大表输出 JSON 截断
+    # 轻量默认模型：高频轻量场景（Discover 初筛 / Monitor 盘中巡检 / 告警生成等），速度与成本优先
+    deepseek_default_model: str = "deepseek-v4-flash"
+    # 深度推理模型：复杂研判场景（市况评分 / 最终候选确认 / 五维打分 / 建仓方案 / 卖出决策 / 复盘与重思考）
+    deepseek_reasoning_model: str = "deepseek-chat"
+    # flash 输出上限：轻量场景足够，防止大 token 浪费（flash 不支持内部思考，无需预留思考预算）
+    deepseek_flash_max_tokens: int = 8192
+    llm_max_tokens: int = 32768  # 深度推理模型输出上限（留足空间防大表输出 JSON 截断，推理思考也计入输出）
+    reasoning_effort: str = "low"  # 推理强度（仅深度推理模型生效，flash 不传推理参数）
 
     # ---------- Embedding ----------
     embedding_provider: str = "siliconflow"  # siliconflow / local
@@ -66,26 +76,67 @@ class Settings(BaseSettings):
     total_capital: float = 100000.0
     max_single_position_pct: float = 40.0
     trade_style: str = "波段趋势交易，中线持有，分批建仓，严格执行止损"
+    # 持仓参考风控比例（%）：持仓未手动设置止损/止盈且无关联建仓计划时，
+    # 用于按持仓成本计算展示用参考价（仅展示，不落库、不触发任何判断）
+    default_stop_loss_pct: float = 8.0
+    default_take_profit_pct: float = 15.0
 
     # ---------- Discover 刚性过滤参数（客观条件，非主观判断）----------
     discover_top_n: int = 300   # 按成交额客观排序后送入 LLM 的股票数量
     min_amount: float = 1e8     # 最低成交额（元）：流动性刚性过滤
 
+    # ---------- 市况评分 → 候选池上限档位（v2.0 前置步骤）----------
+    # 每档 [最低分, 最高分, 候选池上限, 档位名]；.env 可用 JSON 覆盖 MARKET_CAP_BANDS
+    market_cap_bands: list[list] = Field(
+        default=[[0, 20, 5, "防御期"], [21, 35, 10, "过渡期"],
+                 [36, 45, 15, "温和期"], [46, 50, 20, "强势期"]],
+        description="市况评分（0-50）档位映射：分数区间 → 候选池上限 → 档位名")
+
     # ---------- 调度 ----------
     discover_hour: int = 16
     discover_minute: int = 10
-    monitor_interval_minutes: int = 5
-    monitor_llm_cache_minutes: int = 15
+    monitor_interval_minutes: int = 3  # 交易时段持仓监控间隔（分钟）
+    monitor_llm_cache_minutes: int = 3  # 监控 LLM 结果缓存（与监控频率同节奏，保证信号时效）
 
     # ---------- OCR 持仓截图识别 ----------
     ocr_enable: bool = False  # true=启用 PaddleOCR 本地识别；false=关闭
     ocr_device: str = "cpu"   # cpu / gpu（gpu 需安装 paddlepaddle-gpu 与 CUDA）
+    ocr_model_level: str = "light"  # light=轻量模型（默认，体积小）；full=完整模型（精度略高，体积更大）
 
-    # ---------- 日志 ----------
+    # ---------- MiniMax M3 可选多模态能力（默认关闭，零开销）----------
+    # MiniMax M3 仅承担持仓截图 OCR 等视觉专项任务（预留 K 线图/财报截图等扩展场景），
+    # 不参与五 Agent 选股/建仓/监控等核心业务研判（主模型仍为 DeepSeek）。
+    # 默认关闭时系统行为与原版本完全一致：不加载任何依赖、不发起任何请求。
+    minimax_enable: bool = False  # 多模态能力总开关（开启后 OCR 默认优先云端）
+    minimax_api_key: str = ""     # MiniMax API 密钥（仅环境变量管理，禁止硬编码到业务代码）
+    minimax_base_url: str = "https://api.minimax.chat/v1"  # 官方 OpenAI 兼容端点（国际站 api.minimaxi.com/v1）
+    minimax_model: str = "MiniMax-M3"  # 模型 ID（官方文档 ID 含连字符）
+    minimax_ocr_enable: bool = True    # true=默认优先 MiniMax 云端识别持仓截图，失败自动回退本地；false=强制仅用本地 PaddleOCR
+
+    # ---------- 日志（自动轮转，防无限增长）----------
     log_level: str = "INFO"
+    log_max_bytes_mb: int = 10   # 单个日志文件上限（MB）
+    log_backup_count: int = 5    # 轮转保留份数（单文件×份数≈日志总占用上限）
 
     # ---------- 数据源 ----------
     datasource_timeout: int = 15  # akshare 请求超时秒数
+
+    # ---------- 麦蕊智数增强数据源（可选，默认关闭）----------
+    # 麦蕊（mairui.club）作为 akshare 的补充数据源：仅用于 v2.0 选股机制的高级资金面/股东面字段，
+    # 基础行情数据仍优先走 akshare（东财→新浪双通道），减少配额消耗。默认关闭时行为与之前完全一致。
+    mairui_enable: bool = False
+    mairui_licence: str = "519B8996-416A-4358-AEDC-87CD2A54023F"  # 证书密钥（仅环境变量管理，禁止硬编码到业务代码）
+    mairui_base_url: str = "https://api.mairuiapi.com"
+
+    # ---------- 存储空间维护（低频自动清理，防无限堆积）----------
+    news_retention_days: int = 90        # 新闻/公告保留周期（天），超期自动清理（关键分析数据不清理）
+    db_maintenance_enabled: bool = True  # 定时空间维护总开关（SQLite VACUUM + 超期数据清理）
+    db_maintenance_day_of_week: int = 6  # 每周执行日（0=周一 … 6=周日），默认周日凌晨
+    db_maintenance_hour: int = 5
+    db_maintenance_minute: int = 30
+
+    # ---------- 向量库 ----------
+    qdrant_compression: bool = True  # 本地文件模式默认启用标量量化压缩，减少向量库磁盘占用
 
     # ---------- 派生路径 ----------
     @property
@@ -116,3 +167,12 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def market_band_info(score: float) -> tuple[int, str]:
+    """市况评分 → (当日候选池上限, 档位名)。档位为人工设定映射，非市场判断。"""
+    for low, high, cap, name in settings.market_cap_bands:
+        if low <= score <= high:
+            return int(cap), str(name)
+    last = settings.market_cap_bands[-1]
+    return int(last[2]), str(last[3])

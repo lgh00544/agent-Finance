@@ -7,7 +7,14 @@ import api_client as api
 import render
 
 st.set_page_config(page_title="交易复盘", layout="wide")
+
+# 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
+render.top_status_bar()
+
 st.title("交易复盘（ReviewAgent）")
+
+# 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
+render.task_status_area()
 
 # ================= 策略闭环·Agent 优化建议（人工审核后生效） =================
 st.subheader("策略闭环 · Agent 优化建议（待审核）")
@@ -119,11 +126,9 @@ try:
                                     if not reason.strip():
                                         st.error("驳回原因不能为空，请填写后再提交")
                                     else:
-                                        with st.spinner("AI 重新思考中，请稍候..."):
-                                            res = api.reject_review(r["id"], reason.strip())
-                                        st.success(f"已驳回。AI 已生成第 {res.get('new_iteration')} 版新建议，"
-                                                   f"请审核。")
+                                        res = api.reject_review(r["id"], reason.strip())
+                                        st.success("已驳回，AI 重思考任务已提交后台"
+                                                   f"（{res.get('task_id')}），完成后顶部任务状态区会提示。")
                                         st.session_state.pop(f"show_reject_{r['id']}", None)
-                                        st.rerun()
 except Exception as exc:
     st.error(f"复盘获取失败: {exc}")

@@ -30,7 +30,15 @@ class DataSource(ABC):
     def fetch_index_daily(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         """大盘指数日线（列：date/open/close/high/low/volume）"""
 
+    @abstractmethod
+    def fetch_index_spot(self) -> pd.DataFrame:
+        """三大指数实时行情（列：code/name/price/change_pct；sh000001/sz399001/sz399006）"""
+
     # ---------- 个股 ----------
+    @abstractmethod
+    def fetch_spot_quote(self, code: str) -> dict:
+        """单股实时行情（TTL 30s；返回 code/name/price/change_pct/time，全部失败返回 {}）"""
+
     @abstractmethod
     def fetch_daily_kline(self, code: str, start_date: str, end_date: str, adjust: str = "qfq") -> pd.DataFrame:
         """个股日 K（列：date/open/close/high/low/volume/amount/change_pct/turnover_rate）"""

@@ -27,6 +27,9 @@ class StockAgentState(TypedDict, total=False):
     universe: Optional[List[Dict]]        # 刚性过滤后的全市场表（Discover）
     shortlist: Optional[List[Dict]]       # LLM 初选候选（Discover）
     enrichment: Optional[Dict]            # code -> 新闻检索结果（Discover）
+    data_enrichment: Optional[Dict]       # code -> 增量数据（资金/股东/52周，v2.0）
+    market_condition: Optional[Dict]      # 市况评分结果（v2.0 前置步骤）
+    market_cap: Optional[int]             # 当日候选池上限（市况档位映射）
     candidates: Optional[List[Dict]]      # 最终候选（Discover）
     holding_id: Optional[int]             # 持仓 ID（Monitor/Review）
     error: Optional[str]                  # 节点错误信息（容错流转）

@@ -1,18 +1,19 @@
 """
 DiscoverAgent 潜力发掘 - LangGraph 节点
-【刚性代码逻辑】硬过滤（ST/退市/停牌/流动性，客观事实）、指标计算、新闻检索、落库
-【交由模型推理的业务逻辑】波段潜力判断、候选理由、风险初判（全部在 LLM）
-流转：hard_filter → llm_shortlist → enrich_news → llm_final → 落库
+【刚性代码逻辑】硬过滤（ST/退市/停牌/流动性，客观事实）、指标计算、新闻检索、增量数据采集、落库
+【交由模型推理的业务逻辑】市况评分、波段潜力判断、候选理由、风险初判（全部在 LLM）
+流转：market_condition → hard_filter → llm_shortlist → enrich_news → enrich_data → llm_final → 落库
 """
 import logging
 
 import pandas as pd
 
-from app.agents.common import agent_call
-from agent_prompts import discover_prompt
-from app.agents.schemas import DiscoverCandidate, DiscoverOutput
-from app.core.config import settings
-from app.datasource.akshare_source import AkshareSource
+from app.agents.common import ModelLevel, agent_call
+from agent_prompts import discover_prompt, market_prompt
+from app.agents.schemas import DiscoverCandidate, DiscoverOutput, MarketConditionOutput
+from app.core.config import market_band_info, settings
+from app.datasource.base import DataSource
+from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
 from app.services.vector_store import get_vector_store
@@ -21,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 _TABLE_COLS = ["code", "name", "price", "change_pct", "amount", "volume_ratio", "turnover_rate",
                "pe_dynamic", "pb", "total_mv", "circ_mv", "pct_change_60d", "pct_change_ytd"]
+# v2.0 增量数据列（候选富化后追加在初筛 13 列之后，随原始数据交给 LLM 研判）
+_ENRICH_COLS = ["industry", "pct_change_5d", "dist_52w_high_pct", "intraday_narrow_pct",
+                "super_large_net", "large_net", "medium_net", "small_net",
+                "main_net_3d", "main_net_5d", "main_net_10d",
+                "holder_change_pct", "inst_hold_pct"]
+_MONEY_COLS = {"super_large_net", "large_net", "medium_net", "small_net",
+               "main_net_3d", "main_net_5d", "main_net_10d"}
 
 
 def apply_hard_filter(spot: pd.DataFrame, suspended_codes: set[str],
@@ -55,7 +63,7 @@ def apply_hard_filter(spot: pd.DataFrame, suspended_codes: set[str],
 
 def hard_filter(state: StockAgentState) -> StockAgentState:
     """节点1：刚性硬过滤 + 客观排序【刚性代码逻辑】"""
-    source = AkshareSource()
+    source = get_datasource()
     spot = source.fetch_spot_universe()
     if spot is None or spot.empty:
         state["error"] = "全市场快照拉取失败"
@@ -77,7 +85,108 @@ def hard_filter(state: StockAgentState) -> StockAgentState:
     return state
 
 
-def _market_context(source: AkshareSource) -> str:
+# ==================== 市况评分（v2.0 前置步骤） ====================
+
+def _market_condition_raw() -> str:
+    """市况评分输入原始数据：指数位置/板块结构/资金方向/情绪指标/风险维度
+    【刚性代码逻辑】只打包客观数据，五维打分全部由 LLM 完成"""
+    source = get_datasource()
+    lines = []
+    today = _today()
+    try:
+        idx = source.fetch_index_daily("sh000001", _days_ago(90), today)
+        if idx is not None and not idx.empty:
+            idx = idx.dropna(subset=["close"]).reset_index(drop=True)
+            close = float(idx.iloc[-1]["close"])
+            win = idx["close"].tail(60)
+            hi60, lo60 = float(win.max()), float(win.min())
+            pos = (close - lo60) / (hi60 - lo60) * 100 if hi60 > lo60 else None
+            pos_txt = f"{pos:.0f}%" if pos is not None else "（数据不足）"
+            lines.append(f"上证指数: 收盘 {close:.2f}，近60日区间位置 {pos_txt}"
+                         f"（区间最高 {hi60:.2f} / 最低 {lo60:.2f}）")
+            lines.append("上证指数近5日: " + str(idx.tail(5)[["date", "close"]].to_dict(orient="records")))
+    except Exception as exc:  # noqa: BLE001 单数据源失败不阻塞
+        logger.warning("市况-指数数据失败: %s", exc)
+    try:
+        board = source.fetch_industry_spot()
+        if board is not None and not board.empty and "change_pct" in board.columns:
+            board = board.dropna(subset=["change_pct"])
+            up_n = int((board["change_pct"] > 0).sum())
+            down_n = int((board["change_pct"] < 0).sum())
+            lines.append(f"行业板块结构: 共 {len(board)} 个板块，上涨 {up_n} / 下跌 {down_n}")
+            lines.append("板块涨幅前5: " + str(board.nlargest(5, "change_pct")[["board_name", "change_pct"]].to_dict(orient="records")))
+            lines.append("板块跌幅前5: " + str(board.nsmallest(5, "change_pct")[["board_name", "change_pct"]].to_dict(orient="records")))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("市况-板块数据失败: %s", exc)
+    try:
+        mf = source.fetch_market_fund_flow()
+        if mf:
+            lines.append("大盘资金流: " + str(mf))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("市况-大盘资金流失败: %s", exc)
+    try:
+        spot = source.fetch_spot_universe()
+        if spot is not None and not spot.empty and "change_pct" in spot.columns:
+            chg = spot["change_pct"].dropna()
+            up_n = int((chg > 0).sum())
+            down_n = int((chg < 0).sum())
+            flat_n = int((chg == 0).sum())
+            lines.append(f"全市场涨跌分布: 上涨 {up_n} / 平盘 {flat_n} / 下跌 {down_n}"
+                         f"（涨幅≥9.5% 约 {int((chg >= 9.5).sum())} 家，跌幅≤-9.5% 约 {int((chg <= -9.5).sum())} 家）")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("市况-情绪数据失败: %s", exc)
+    return "\n".join(lines) if lines else "（市况数据暂不可用）"
+
+
+def market_condition(state: StockAgentState) -> StockAgentState:
+    """节点0：市况评分前置步骤（v2.0）
+    【刚性代码逻辑】打包原始数据 → LLM 五维打分 → 代码仅求和（0-50）并按人工档位映射候选池上限 → 落库"""
+    date_key = state.get("trade_date", _today())
+    total: int | None = None
+    try:
+        output = agent_call(
+            agent="market_condition",
+            cache_key=f"market:v2:{date_key}",
+            system_prompt=market_prompt.SYSTEM_PROMPT,
+            user_prompt=market_prompt.build_user_prompt(_market_condition_raw()),
+            schema=MarketConditionOutput,
+            ttl_seconds=86400,
+            model_level=ModelLevel.DEEP,
+        )
+        total = output.dim_index + output.dim_sector + output.dim_money \
+            + output.dim_sentiment + output.dim_risk
+        cap, band = market_band_info(total)
+        dims = {"index": output.dim_index, "sector": output.dim_sector,
+                "money": output.dim_money, "sentiment": output.dim_sentiment,
+                "risk": output.dim_risk}
+        state["market_condition"] = {
+            "trade_date": date_key, "total_score": total, "band": band, "cap": cap,
+            "dims": dims, "summary": output.summary,
+        }
+        state["market_cap"] = cap
+        repo.upsert_market_condition(date_key, total, dims, cap, output.summary)
+        logger.info("市况评分 %s 分（%s），候选池上限 %s 只", total, band, cap)
+    except Exception as exc:  # noqa: BLE001 市况失败不阻塞主链路，按默认上限继续
+        logger.warning("市况评分失败，按默认档位继续: %s", exc)
+        cap, band = market_band_info(999)
+        state["market_condition"] = None
+        state["market_cap"] = cap
+    score_txt = f"{total}分" if total is not None else "失败"
+    state["trace"] = [*state.get("trace", []),
+                      f"市况评分: {score_txt}（候选池上限 {cap} 只）"]
+    return state
+
+
+def _market_note(state: StockAgentState) -> str:
+    """市况摘要文本（注入 LLM 提示，告知当日候选池规模约束）"""
+    mc = state.get("market_condition")
+    if not mc:
+        return f"今日市况评分暂不可用，候选池按默认上限 {state.get('market_cap') or 20} 只执行。"
+    return (f"今日市况评分 {mc['total_score']} 分（{mc['band']}），"
+            f"当日候选池上限 {mc['cap']} 只，市况综述：{mc['summary']}")
+
+
+def _market_context(source: DataSource) -> str:
     """大盘 + 行业板块行情摘要（原始数据打包）"""
     lines = []
     try:
@@ -121,16 +230,17 @@ def llm_shortlist(state: StockAgentState) -> StockAgentState:
     if not universe:
         return state
 
-    source = AkshareSource()
+    source = get_datasource()
     date_key = state.get("trade_date", _today())
     output = agent_call(
         agent="discover",
-        cache_key=f"shortlist:{date_key}",
+        cache_key=f"shortlist:v2:{date_key}",
         system_prompt=discover_prompt.SYSTEM_PROMPT,
         user_prompt=discover_prompt.build_user_prompt(
-            _table_text(universe), _market_context(source)),
+            _table_text(universe), _market_context(source), _market_note(state)),
         schema=DiscoverOutput,
         ttl_seconds=86400,
+        model_level=ModelLevel.LIGHT,
     )
     shortlist = [c.model_dump() for c in output.candidates]
     state["shortlist"] = shortlist
@@ -142,7 +252,7 @@ def llm_shortlist(state: StockAgentState) -> StockAgentState:
 
 def enrich_news(state: StockAgentState) -> StockAgentState:
     """节点3：候选股新闻检索（落库 + 向量索引 + 语义检索）【刚性代码逻辑】"""
-    source = AkshareSource()
+    source = get_datasource()
     vector_store = get_vector_store()
     enrichment: dict[str, list[dict]] = {}
     for cand in state.get("shortlist") or []:
@@ -175,14 +285,137 @@ def enrich_news(state: StockAgentState) -> StockAgentState:
     return state
 
 
+# ==================== 候选增量数据采集（v2.0） ====================
+
+def _num(value) -> float | None:
+    """宽松数值转换（None/NaN/非法值 → None），纯类型处理"""
+    try:
+        f = float(value)
+        return None if f != f else f  # noqa: PLR0124 NaN 判定
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_money(value: float | None) -> str:
+    """金额友好格式（元 → 亿/万），纯展示格式化，不含任何判断"""
+    v = _num(value)
+    if v is None:
+        return ""
+    if abs(v) >= 1e8:
+        return f"{v / 1e8:.2f}亿"
+    if abs(v) >= 1e4:
+        return f"{v / 1e4:.1f}万"
+    return f"{v:.0f}"
+
+
+def _enrich_candidate_data(source: DataSource, inst_map: dict,
+                           code: str, name: str) -> dict:
+    """候选股增量数据（v2.0）：资金结构/阶段主力动向/股东面/52周区间/盘中涨幅收窄
+    【刚性代码逻辑】只做客观数据采集与纯数学计算（累计求和/区间极值/百分比），零判断"""
+    out: dict = {}
+    try:
+        info = source.fetch_stock_info(code)
+        out["industry"] = str(info.get("行业") or "") if info else ""
+    except Exception as exc:  # noqa: BLE001 单项失败不影响其余字段
+        logger.warning("候选 %s 基本信息失败: %s", code, exc)
+    try:
+        kline = source.fetch_daily_kline(code, _days_ago(400), _today())
+        if kline is not None and not kline.empty:
+            kline = kline.dropna(subset=["close", "high", "low"]).reset_index(drop=True)
+            if len(kline) >= 2:
+                close, prev_close = float(kline.iloc[-1]["close"]), float(kline.iloc[-2]["close"])
+                high52, low52 = float(kline["high"].max()), float(kline["low"].min())
+                out["high_52w"] = round(high52, 2)
+                out["low_52w"] = round(low52, 2)
+                out["dist_52w_high_pct"] = round((close / high52 - 1) * 100, 2) if high52 else None
+                if len(kline) >= 6:
+                    out["pct_change_5d"] = round((close / float(kline.iloc[-6]["close"]) - 1) * 100, 2)
+                # 盘中涨幅收窄 = 当日最高涨幅 - 收盘涨幅（纯数学，供 LLM 判定脉冲题材）
+                out["intraday_narrow_pct"] = round((float(kline.iloc[-1]["high"]) - close) / prev_close * 100, 2)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("候选 %s 日K增量失败: %s", code, exc)
+    try:
+        flow = source.fetch_fund_flow(code)
+        if flow is not None and not flow.empty:
+            today = flow.iloc[-1]
+            for col, key in [("super_large_net", "super_large_net"), ("large_net", "large_net"),
+                             ("medium_net", "medium_net"), ("small_net", "small_net")]:
+                if col in flow.columns:
+                    out[key] = _num(today[col])
+            if "main_net_inflow" in flow.columns:
+                vals = flow["main_net_inflow"].dropna().astype(float)
+                out["main_net_3d"] = round(float(vals.tail(3).sum()), 2)
+                out["main_net_5d"] = round(float(vals.tail(5).sum()), 2)
+                out["main_net_10d"] = round(float(vals.tail(10).sum()), 2)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("候选 %s 资金流增量失败: %s", code, exc)
+    try:
+        inst = inst_map.get(code) or {}
+        if inst:
+            out["inst_hold_pct"] = _num(inst.get("float_pct"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("候选 %s 机构持股失败: %s", code, exc)
+    try:
+        gdhs = source.fetch_shareholder_detail(code)
+        if gdhs.get("holder_change_pct") is not None:
+            out["holder_change_pct"] = _num(gdhs.get("holder_change_pct"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("候选 %s 股东户数失败: %s", code, exc)
+    return out
+
+
+def _final_table_text(shortlist: list[dict], data_enrichment: dict) -> str:
+    """初选表（13 列）+ 候选增量数据（v2.0 列）合并为一个紧凑文本表"""
+    if not shortlist:
+        return "（无数据）"
+    cols = [*_TABLE_COLS, *_ENRICH_COLS]
+    rows = []
+    for r in shortlist:
+        extra = data_enrichment.get(r.get("code")) or {}
+        vals = ["" if r.get(c) is None else str(r.get(c)) for c in _TABLE_COLS]
+        for c in _ENRICH_COLS:
+            v = extra.get(c)
+            if v is None or v == "":
+                vals.append("")
+            elif c in _MONEY_COLS:
+                vals.append(_fmt_money(v))
+            else:
+                vals.append(str(v))
+        rows.append(",".join(vals))
+    return "\n".join([",".join(cols), *rows])
+
+
+def enrich_data(state: StockAgentState) -> StockAgentState:
+    """节点3.5：候选股增量数据采集（资金结构/主力动向/股东面/52周区间）
+    【刚性代码逻辑】只采集原始数据 + 纯数学计算，不判断；单股失败不阻塞"""
+    source = get_datasource()
+    inst_map: dict = {}
+    try:
+        inst_map = source.fetch_institute_hold_map()
+    except Exception as exc:  # noqa: BLE001 机构持股全景失败不阻塞
+        logger.warning("机构持股全景拉取失败，跳过: %s", exc)
+    enriched: dict[str, dict] = {}
+    for cand in state.get("shortlist") or []:
+        code = cand["stock_code"]
+        try:
+            enriched[code] = _enrich_candidate_data(source, inst_map, code, cand.get("stock_name", ""))
+        except Exception as exc:  # noqa: BLE001 单股失败不阻塞
+            logger.warning("候选 %s 增量数据采集失败: %s", code, exc)
+            enriched[code] = {}
+    state["data_enrichment"] = enriched
+    state["trace"] = [*state.get("trace", []), "候选增量数据采集完成"]
+    return state
+
+
 def llm_final(state: StockAgentState) -> StockAgentState:
-    """节点4：结合新闻 LLM 最终确认 + 落库"""
+    """节点4：结合新闻+增量数据 LLM 最终确认 + 落库"""
     shortlist = state.get("shortlist") or []
     enrichment = state.get("enrichment") or {}
+    data_enrichment = state.get("data_enrichment") or {}
     if not shortlist:
         return state
 
-    table = _table_text(shortlist)
+    table = _final_table_text(shortlist, data_enrichment)
     news_ctx = []
     for cand in shortlist:
         news = enrichment.get(cand["stock_code"], [])
@@ -191,24 +424,41 @@ def llm_final(state: StockAgentState) -> StockAgentState:
     news_text = "\n".join(news_ctx) if news_ctx else "（无）"
 
     date_key = state.get("trade_date", _today())
+    cap = state.get("market_cap")
     output = agent_call(
         agent="discover_final",
-        cache_key=f"final:{date_key}",
+        cache_key=f"final:v2:{date_key}",
         system_prompt=discover_prompt.SYSTEM_PROMPT,
-        user_prompt=discover_prompt.build_final_prompt(_table_text(shortlist), news_text),
+        user_prompt=discover_prompt.build_final_prompt(
+            table, news_text, cap=cap, market_note=_market_note(state)),
         schema=DiscoverOutput,
         ttl_seconds=86400,
+        model_level=ModelLevel.DEEP,
     )
+
+    # 市况档位上限（人工映射）：按 LLM 输出优先级客观截断（LLM 输出已按优先级排序）
+    final_list = output.candidates
+    if cap and len(final_list) > cap:
+        final_list = final_list[:cap]
 
     trade_date = state.get("trade_date", _today())
     candidates = []
-    for rank, cand in enumerate(output.candidates, start=1):
+    for rank, cand in enumerate(final_list, start=1):
         item = cand.model_dump()
         candidates.append(item)
         snapshot = next((u for u in state.get("universe") or []
                          if u.get("code") == cand.stock_code), {})
+        detail = {
+            "confidence_tier": cand.confidence_tier, "confidence_pct": cand.confidence_pct,
+            "macro_view": cand.macro_view, "meso_view": cand.meso_view,
+            "micro_view": cand.micro_view, "volume_analysis": cand.volume_analysis,
+            "risks": cand.risks, "focus_type": cand.focus_type,
+            "tech_view": cand.tech_view, "price_levels": cand.price_levels,
+            "position_hint": cand.position_hint,
+            "enriched": data_enrichment.get(cand.stock_code) or {},
+        }
         repo.upsert_candidate(cand.stock_code, cand.stock_name, trade_date,
-                              rank, [cand.reason], [cand.risk_notice], snapshot)
+                              rank, [cand.reason], [cand.risk_notice], snapshot, detail)
     state["candidates"] = candidates
     state["stage"] = "discover"
     state["trace"] = [*state.get("trace", []), f"落库候选: {len(candidates)}只"]

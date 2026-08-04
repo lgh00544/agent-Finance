@@ -29,13 +29,13 @@ APScheduler==3.11.0
 httpx==0.28.1
 
 # ===== OCR 持仓截图识别（可选依赖，.env 设置 OCR_ENABLE=true 时启用）=====
-# 本地 PaddleOCR 轻量版，离线识别，不调用外部 API；关闭 OCR_ENABLE 可完全绕过本组依赖。
-#   CPU 运行（推荐，已验证 Python 3.14）：
-#     paddleocr + onnxruntime 即可；若环境为 Python 3.11/3.12（含 Docker 容器），
-#     可额外安装 paddlepaddle 获得更好性能（未装时自动回退 onnxruntime 引擎）
-#   GPU 运行：卸载 paddlepaddle 后安装 paddlepaddle-gpu（需 NVIDIA 显卡 + CUDA），
-#     并在 .env 设置 OCR_DEVICE=gpu
-# 首次识别自动下载识别模型（约 150MB，缓存于用户目录 ~/.paddlex/），离线环境需提前联网下载一次
+# 本地 PaddleOCR 离线识别，不调用外部 API。不用 OCR 时可直接注释本组依赖（OCR_ENABLE 保持 false）。
+#   仅安装必要组件，GPU 版/额外模型均为可选项，按需手动安装：
+#   CPU 运行（推荐，已验证 Python 3.14）：paddleocr + onnxruntime 即可；
+#     若环境为 Python 3.11/3.12（含 Docker 容器），可额外安装 paddlepaddle 获得更好性能（未装时自动回退 onnxruntime）
+#   GPU 运行：卸载 paddlepaddle 后安装 paddlepaddle-gpu（需 NVIDIA 显卡 + CUDA），并在 .env 设置 OCR_DEVICE=gpu
+# 模型默认轻量版（OCR_MODEL_LEVEL=light，PP-OCRv4 mobile，体积约 20-50MB）；
+# 需更高精度可设 OCR_MODEL_LEVEL=full（完整模型，体积更大，首次识别自动下载到 ~/.paddlex/）
 paddleocr==3.7.0
 onnxruntime==1.28.0
 

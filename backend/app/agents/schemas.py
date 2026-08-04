@@ -7,16 +7,44 @@ from pydantic import BaseModel, Field
 
 # ================= DiscoverAgent 潜力发掘 =================
 class DiscoverCandidate(BaseModel):
+    """v2.0 输出格式强制升级：代码+全称成对、K202 信心度档位、三维分析、量能判定、
+    核心风险（≥2 项）、关注类型；禁止仅输出代码与理由。"""
     stock_code: str = Field(description="6 位股票代码")
-    stock_name: str = Field(description="股票名称")
+    stock_name: str = Field(description="股票全称（与代码成对出现）")
     reason: str = Field(description="候选理由（结合量能/趋势/行业热度/基本面预期的研判）")
     risk_notice: str = Field(description="风险初步判断")
+    confidence_tier: str = Field(
+        pattern="^(谨慎观察|建议关注|强烈推荐)$",
+        description="K202 信心度档位：谨慎观察/建议关注/强烈推荐")
+    confidence_pct: float = Field(ge=0, le=100, description="信心度百分比参考")
+    macro_view: str = Field(description="宏观维度核心判断（大盘/政策/周期）")
+    meso_view: str = Field(description="中观维度核心判断（日线/量价/形态）")
+    micro_view: str = Field(description="微观维度核心判断（分时/盘口/当日资金）")
+    volume_analysis: str = Field(description="量能判定：资金结构、主力动向结论")
+    risks: list[str] = Field(min_length=2, description="核心风险清单（至少 2 项）")
+    focus_type: str = Field(pattern="^(低吸|突破|观察)$", description="关注类型：低吸/突破/观察")
+    tech_view: str = Field(default="",
+        description="技术面研判（威科夫/量价/K线形态/谐波至少两套体系交叉验证，标注体系与支撑依据）")
+    price_levels: str = Field(default="", description="关键价位（支撑位/压力位/建议关注区间）")
+    position_hint: str = Field(default="", description="操作建议（低吸/突破/观望 + 参考仓位建议）")
 
 
 class DiscoverOutput(BaseModel):
     """每日候选池输出"""
     market_summary: str = Field(description="当日市场环境一句话简述")
     candidates: list[DiscoverCandidate] = Field(description="候选标的列表，按优先级排序")
+
+
+# ================= 市况评分（v2.0 Discover 前置步骤） =================
+class MarketConditionOutput(BaseModel):
+    """市况五维打分（LLM 输出各维度 0-10 分；代码仅求和 0-50 并按档位映射候选池上限，
+    代码不做任何市场判断）"""
+    dim_index: int = Field(ge=0, le=10, description="指数位置维度得分 0-10（大盘位置/趋势强弱）")
+    dim_sector: int = Field(ge=0, le=10, description="板块结构维度得分 0-10（板块普涨共振程度）")
+    dim_money: int = Field(ge=0, le=10, description="资金方向维度得分 0-10（主力资金流向）")
+    dim_sentiment: int = Field(ge=0, le=10, description="情绪指标维度得分 0-10（涨跌家数/赚钱效应）")
+    dim_risk: int = Field(ge=0, le=10, description="风险维度得分 0-10（风险越高得分越低）")
+    summary: str = Field(description="当日市况一句话综述（含操作节奏建议）")
 
 
 # ================= ScoreAgent 多维打分 =================

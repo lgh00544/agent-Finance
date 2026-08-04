@@ -166,9 +166,11 @@ def test_agent_call_global_base_first(monkeypatch):
 
     captured = {}
 
-    def fake_call(agent, cache_key, system_prompt, user_prompt, schema, ttl_seconds):
+    def fake_call(agent, cache_key, system_prompt, user_prompt, schema, ttl_seconds,
+                  model_level=None):
         captured["cache_key"] = cache_key
         captured["system_prompt"] = system_prompt
+        captured["model_level"] = model_level
         return _Mini()
 
     monkeypatch.setattr(common_mod, "call_llm_cached", fake_call)

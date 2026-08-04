@@ -7,10 +7,11 @@ ScoreAgent 多维打分 - LangGraph 节点
 import logging
 import time
 
-from app.agents.common import agent_call
+from app.agents.common import ModelLevel, agent_call
 from agent_prompts import score_prompt
 from app.agents.schemas import ScoreOutput
-from app.datasource.akshare_source import AkshareSource
+from app.datasource.base import DataSource
+from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
 from app.services.indicator import compute_indicators
@@ -24,7 +25,7 @@ _KLINE_DAYS = 250  # 约一年交易日
 def collect_data(state: StockAgentState) -> StockAgentState:
     """节点1：聚合个股全部原始数据【刚性代码逻辑】"""
     code = state["stock_code"]
-    source = AkshareSource()
+    source = get_datasource()
     today = state.get("trade_date") or time.strftime("%Y-%m-%d")
 
     # 行情与指标
@@ -106,6 +107,7 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         user_prompt=score_prompt.build_user_prompt(_compact(data_pack), preference_text),
         schema=ScoreOutput,
         ttl_seconds=86400,
+        model_level=ModelLevel.DEEP,
     )
 
     repo.upsert_score(

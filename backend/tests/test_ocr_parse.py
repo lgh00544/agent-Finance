@@ -15,16 +15,19 @@ def _line(text, x, y=0, w=70, h=20, conf=0.99):
 HEADER = [
     _line("证券代码", 30), _line("证券名称", 260), _line("持仓数量", 490),
     _line("成本价", 690), _line("市价", 880), _line("浮动盈亏", 1080),
+    _line("盈亏比例", 1280),
 ]
 ROW_1 = [
     _line("600519", 30, y=100), _line("贵州茅台", 260, y=100),
     _line("100", 490, y=100), _line("1520.00", 690, y=100),
     _line("1550.30", 880, y=100), _line("+3,030.00", 1080, y=100),
+    _line("-1.9%", 1280, y=100),
 ]
 ROW_2 = [
     _line("300750", 30, y=170), _line("宁德时代", 260, y=170),
     _line("2,000", 490, y=170), _line("198.45", 690, y=170),
     _line("210.62", 880, y=170), _line("+24,340.00", 1080, y=170),
+    _line("+6.13%", 1280, y=170),
 ]
 
 
@@ -39,12 +42,16 @@ def test_parse_with_header_column_alignment():
     assert r1["shares"] == 100
     assert r1["cost_price"] == 1520.0
     assert r1["current_price"] == 1550.3
+    assert r1["pnl_amount"] == 3030.0
+    assert r1["pnl_pct"] == -1.9
 
     assert r2["stock_code"] == "300750"
     assert r2["stock_name"] == "宁德时代"
     assert r2["shares"] == 2000
     assert r2["cost_price"] == 198.45
     assert r2["current_price"] == 210.62
+    assert r2["pnl_amount"] == 24340.0
+    assert r2["pnl_pct"] == 6.13
 
 
 def test_parse_header_missing_fields_kept_none():
@@ -61,15 +68,18 @@ def test_parse_header_missing_fields_kept_none():
     assert r["shares"] is None
     assert r["cost_price"] is None
     assert r["current_price"] == 1550.3
+    assert r["pnl_amount"] is None
+    assert r["pnl_pct"] is None
 
 
 def test_parse_heuristic_fallback_no_header():
-    """无表头兜底：按代码行聚合，股数不应包含代码本身"""
+    """无表头兜底：按代码行聚合，股数不应包含代码本身；带号金额/百分比归入盈亏字段"""
     lines = [
         _line("持仓", 10, y=10, w=40),
         _line("600519", 10, y=50), _line("贵州茅台", 90, y=50, w=90),
         _line("100", 190, y=50, w=40), _line("1520.00", 240, y=50),
-        _line("1550.30", 320, y=50),
+        _line("1550.30", 320, y=50), _line("+3,030.00", 400, y=50),
+        _line("-1.9%", 480, y=50),
     ]
     rows = ocr.parse_lines(lines)
     assert len(rows) == 1
@@ -79,6 +89,8 @@ def test_parse_heuristic_fallback_no_header():
     assert r["shares"] == 100
     assert r["cost_price"] == 1520.0
     assert r["current_price"] == 1550.3
+    assert r["pnl_amount"] == 3030.0
+    assert r["pnl_pct"] == -1.9
 
 
 def test_parse_ignores_noise_rows():

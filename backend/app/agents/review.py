@@ -8,10 +8,11 @@ import logging
 import time
 from hashlib import md5
 
-from app.agents.common import agent_call
+from app.agents.common import ModelLevel, agent_call
 from agent_prompts import review_prompt
 from app.agents.schemas import ReviewOutput
-from app.datasource.akshare_source import AkshareSource
+from app.datasource.base import DataSource
+from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
 
@@ -60,7 +61,7 @@ def collect_review(state: StockAgentState) -> StockAgentState:
                   "confidence": (s.decision or {}).get("confidence"),
                   "reasons": (s.decision or {}).get("reasons", [])} for s in sell_decisions]
 
-    source = AkshareSource()
+    source = get_datasource()
     kline = source.fetch_daily_kline(code, holding.entry_date.replace("-", "")[:4] + "0101", _today())
 
     # 持仓期间行情统计（客观数值）
@@ -123,6 +124,7 @@ def llm_review(state: StockAgentState) -> StockAgentState:
         user_prompt=review_prompt.build_user_prompt(review_data),
         schema=ReviewOutput,
         ttl_seconds=86400,
+        model_level=ModelLevel.DEEP,
     )
 
     # profile_suggestion 随 feedback 持久化（供前端一键采纳/驳回）
@@ -180,6 +182,7 @@ def llm_rethink_suggestion(review_id: int, reject_reason: str) -> dict:
         user_prompt=review_prompt.build_rethink_user_prompt(original_text, reject_reason, history),
         schema=ReviewOutput,
         ttl_seconds=1,  # 用户驱动的重思考：不进当日缓存，每次驳回都重新推理
+        model_level=ModelLevel.DEEP,
     )
 
     stored_feedback = dict(output.feedback)

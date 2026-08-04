@@ -31,6 +31,32 @@ def health() -> dict:
     return _get("/api/health")
 
 
+# ================= 后台异步任务（提交即返回 + 状态查询 + 重试） =================
+def submit_task(kind: str, params: dict | None = None) -> dict:
+    """提交后台任务，立即返回 task_id（不阻塞页面，可切换页面继续操作）"""
+    return _post("/api/tasks/submit", {"kind": kind, "params": params or {}})
+
+
+def recent_tasks(limit: int = 8) -> list:
+    """最近后台任务（最新在前，含状态/提交时间/失败原因）"""
+    return _get("/api/tasks/recent", {"limit": limit})
+
+
+def task_detail(tid: str) -> dict:
+    """任务详情（状态/结果/失败原因）"""
+    return _get(f"/api/tasks/{tid}")
+
+
+def retry_task(tid: str) -> dict:
+    """失败任务一键重试（复用原任务ID）"""
+    return _post(f"/api/tasks/{tid}/retry")
+
+
+def batch_import_knowledge(items: list[dict]) -> dict:
+    """批量导入私有知识条目（异步提交，逐条落库）"""
+    return _post("/api/knowledge/batch-import", {"items": items})
+
+
 def run_discover() -> dict:
     return _post("/api/jobs/discover/run")
 
@@ -41,6 +67,36 @@ def job_status() -> dict:
 
 def system_status() -> dict:
     return _get("/api/system/status")
+
+
+def llm_stats() -> dict:
+    """LLM 运行统计（当日累计：请求次数/缓存命中 token/命中率/模型分布）"""
+    return _get("/api/llm/stats")
+
+
+def market_condition() -> dict | None:
+    """当日市况评分（v2.0 前置步骤：总分/档位/候选池上限/五维/综述）"""
+    return _get("/api/market-condition")
+
+
+def market_indices() -> dict:
+    """三大指数实时行情（上证指数/深证成指/创业板指 + 更新时间；失败含 error 标注）"""
+    return _get("/api/market/indices")
+
+
+def market_hot_sectors() -> dict:
+    """今日涨幅前 5 行业板块 + 领涨龙头（代码+名称）+ 更新时间"""
+    return _get("/api/market/hot-sectors")
+
+
+def account_summary() -> dict:
+    """账户核心资产摘要（双数据路径：有 OCR 账户基准用券商值，否则按总资金设定估算）"""
+    return _get("/api/account/summary")
+
+
+def save_account_baseline(body: dict) -> dict:
+    """保存账户基准（OCR 识别结果经人工确认后调用）"""
+    return _post("/api/account/baseline", body)
 
 
 def candidates(date: str | None = None, limit: int | None = None) -> list:
@@ -78,6 +134,11 @@ def create_plan(code: str, name: str = "") -> dict:
 
 def holdings(status: str | None = None) -> list:
     return _get("/api/holdings", {"status": status} if status else None)
+
+
+def holding_quotes() -> dict:
+    """持仓列表视图：实时行情 + 参考止损/止盈 + 目标仓位%（只读；去重合并由前端展示层完成）"""
+    return _get("/api/holdings/quotes")
 
 
 def add_holding(body: dict) -> dict:

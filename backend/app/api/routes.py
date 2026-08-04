@@ -10,14 +10,99 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.agents.review import llm_rethink_suggestion
+from app.core.config import settings
 from app.db import repo
 from app.graph import router as graph_router
 from app.scheduler import jobs as scheduler_jobs
-from app.services import ocr as ocr_service
-from app.services import status as status_service
+from app.services import holding_view, market_view, ocr as ocr_service
+from app.services import status as status_service, task_queue
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
+
+
+# ================= 后台异步任务（耗时操作提交即返回，不阻塞页面） =================
+# 执行函数统一签名 fn(params: dict)；kind → (中文标签, 执行函数)
+def _task_batch_import_knowledge(items: list[dict]) -> dict:
+    """批量导入私有知识条目（逐条落库，存储抽象层不变）"""
+    imported = 0
+    for item in items:
+        if item.get("title") and item.get("content"):
+            repo.add_knowledge(str(item["title"]).strip(), str(item["content"]).strip(),
+                               item.get("agent_tag") or "all")
+            imported += 1
+    return {"imported": imported}
+
+
+_TASK_KINDS: dict[str, tuple[str, object]] = {
+    "daily_pipeline": ("每日挖掘（Discover → 候选打分）",
+                       lambda p: graph_router.run_daily_pipeline()),
+    "score": ("单股评分",
+              lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
+    "position": ("分批建仓方案",
+                 lambda p: graph_router.run_position(p.get("stock_code", ""), p.get("stock_name", ""))),
+    "sell_decision": ("卖出决策",
+                      lambda p: graph_router.run_sell_decision(p.get("holding_id"))),
+    "monitor_all": ("全量持仓实时监控",
+                    lambda p: _task_monitor_all()),
+    "review": ("卖出复盘",
+               lambda p: graph_router.run_review(p.get("holding_id"), p.get("exit_date"))),
+    "review_rethink": ("复盘建议重思考",
+                       lambda p: llm_rethink_suggestion(p.get("review_id"), p.get("reason", ""))),
+    "knowledge_import": ("知识库批量导入",
+                         lambda p: _task_batch_import_knowledge(p.get("items") or [])),
+}
+
+
+def _task_monitor_all() -> dict:
+    """全量持仓实时监控（前端「立即刷新监控」按钮用）；返回 JSON 安全摘要"""
+    results = graph_router.run_monitor_all()
+    return {"monitored": len(results),
+            "signals": [{"code": r.get("stock_code"),
+                         "action": ((r.get("holding_signal") or {}).get("action")),
+                         "severity": ((r.get("holding_signal") or {}).get("severity"))}
+                        for r in results]}
+
+
+def _submit_task(kind: str, params: dict) -> dict:
+    """提交后台任务：立即返回任务ID，页面可自由切换"""
+    label, fn = _TASK_KINDS[kind]
+    tid = task_queue.submit(kind, label, fn, params)
+    return {"task_id": tid, "label": label, "status": "pending"}
+
+
+class TaskSubmitBody(BaseModel):
+    kind: str = Field(description="任务类型")
+    params: dict = Field(default_factory=dict, description="任务参数")
+
+
+@router.post("/tasks/submit")
+def submit_task(body: TaskSubmitBody):
+    if body.kind not in _TASK_KINDS:
+        raise HTTPException(status_code=400, detail=f"未知任务类型: {body.kind}")
+    return _submit_task(body.kind, body.params or {})
+
+
+@router.get("/tasks/recent")
+def recent_tasks(limit: int = 10):
+    """最近后台任务（最新在前，含状态/提交时间/失败原因）"""
+    return task_queue.recent_tasks(limit)
+
+
+@router.get("/tasks/{tid}")
+def task_detail(tid: str):
+    task = task_queue.get(tid)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+@router.post("/tasks/{tid}/retry")
+def retry_task(tid: str):
+    """失败任务一键重试（仅 failed 状态可重试，复用原任务ID）"""
+    if not task_queue.retry(tid):
+        raise HTTPException(status_code=400, detail="任务不存在或当前状态不可重试（仅失败任务可重试）")
+    return {"task_id": tid, "status": "pending"}
 
 
 # ================= 任务触发 =================
@@ -28,8 +113,8 @@ class CodeBody(BaseModel):
 
 @router.post("/jobs/discover/run")
 def run_discover_job():
-    """手动触发每日挖掘（discover → 候选打分）"""
-    return graph_router.run_daily_pipeline()
+    """手动触发每日挖掘（异步提交：discover → 候选打分 全流程后台执行）"""
+    return _submit_task("daily_pipeline", {})
 
 
 @router.get("/jobs/status")
@@ -41,6 +126,78 @@ def job_status():
 def system_status():
     """外部连接探活（数据源/LLM/数据库/向量库）+ 检测时间，供首页系统状态看板"""
     return status_service.system_status()
+
+
+@router.get("/llm/stats")
+def llm_stats():
+    """LLM 运行统计（当日累计：请求次数 / 缓存命中·未命中 token / 命中率 / 模型分布），
+    供首页「系统运行状态」看板；数据来自调用层每次成功响应的 usage 记录"""
+    from app.services import llm_stats as llm_stats_service
+
+    return llm_stats_service.snapshot()
+
+
+@router.get("/market-condition")
+def market_condition():
+    """当日市况评分（v2.0 前置步骤结果：总分/档位/候选池上限/五维/综述），供首页「今日操作提示」"""
+    return repo.get_latest_market_condition()
+
+
+# ================= 市场概览（顶部状态栏 / 首页热门板块，只读聚合） =================
+@router.get("/market/indices")
+def market_indices():
+    """三大指数实时行情（上证指数/深证成指/创业板指，60s 缓存防限流）；
+    数据源失败返回空列表 + error 标注（前端显示「数据加载中」或上次缓存值，不抛原始报错）"""
+    return market_view.index_quotes()
+
+
+@router.get("/market/hot-sectors")
+def market_hot_sectors():
+    """今日涨幅前 5 行业板块（客观排序）+ 领涨龙头（代码+名称）+ 更新时间，供首页看板"""
+    return market_view.hot_sectors()
+
+
+@router.get("/account/summary")
+def account_summary():
+    """账户核心资产摘要（双数据路径：有 OCR 账户基准用券商值，否则按总资金设定估算；
+    纯数学计算，不落库不研判）"""
+    return holding_view.build_account_summary()
+
+
+class AccountBaselineBody(BaseModel):
+    """账户基准（券商持仓截图 OCR 提取，人工确认后保存）"""
+    total_asset: float = Field(gt=0, description="总资产（元）")
+    available_cash: float = Field(ge=0, description="可用资金（元）")
+    position_pct: float = Field(ge=0, le=100, description="整体仓位占比（%）")
+    trade_date: str = Field(default="", description="基准日期（YYYY-MM-DD，留空取今天）")
+    source: str = Field(default="ocr", description="来源：ocr / manual")
+
+
+@router.post("/account/baseline")
+def save_account_baseline(body: AccountBaselineBody):
+    """保存账户基准（仅人工确认后调用；每次插入一行保留历史，读取取最新）"""
+    from datetime import datetime, timedelta, timezone
+
+    trade_date = body.trade_date.strip() or datetime.now(
+        timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    bid = repo.insert_account_baseline(trade_date, body.total_asset, body.available_cash,
+                                       body.position_pct, body.source)
+    return {"id": bid, "trade_date": trade_date, "saved": True}
+
+
+@router.post("/db/maintenance")
+def run_db_maintenance():
+    """手动触发存储空间维护：超期新闻清理 + SQLite 真空收缩 + 向量库超期索引清理（低频操作）"""
+    from app.services.vector_store import get_vector_store
+
+    try:
+        stats = repo.maintenance_db()
+        cutoff = time.time() - settings.news_retention_days * 86400
+        vector_removed = get_vector_store().cleanup_old_news(cutoff)
+        return {**stats, "vector_removed": vector_removed}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("空间维护失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"空间维护失败: {exc}")
 
 
 # ================= 候选池 / 评分 =================
@@ -56,25 +213,16 @@ def list_scores(code: Optional[str] = None, date: Optional[str] = None, limit: i
 
 @router.post("/score/{code}")
 def trigger_score(code: str, body: Optional[CodeBody] = None):
-    """手动触发单股打分"""
+    """手动触发单股打分（异步提交，立即返回任务ID，不阻塞页面）"""
     name = body.stock_name if body else ""
-    try:
-        result = graph_router.run_score(code, name)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("打分失败 %s: %s", code, exc)
-        raise HTTPException(status_code=500, detail=f"打分失败: {exc}")
-    return {"stock_code": code, "score_result": result.get("score_result")}
+    return _submit_task("score", {"stock_code": code, "stock_name": name})
 
 
 # ================= 建仓方案 =================
 @router.post("/positions/plan")
 def create_plan(body: CodeBody):
-    try:
-        result = graph_router.run_position(body.stock_code, body.stock_name)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("建仓方案失败 %s: %s", body.stock_code, exc)
-        raise HTTPException(status_code=500, detail=f"建仓方案生成失败: {exc}")
-    return result.get("position_plan")
+    """手动触发分批建仓方案（异步提交，立即返回任务ID，不阻塞页面）"""
+    return _submit_task("position", {"stock_code": body.stock_code, "stock_name": body.stock_name})
 
 
 @router.get("/positions")
@@ -110,6 +258,13 @@ def list_holdings(status: Optional[str] = None):
     return repo.list_holdings(status)
 
 
+@router.get("/holdings/quotes")
+def holding_quotes():
+    """持仓列表视图：实时行情 + 参考止损/止盈 + 目标仓位%（只读，不落库；
+    去重合并由前端展示层完成，数据库原始记录完整保留）"""
+    return holding_view.build_holding_view()
+
+
 @router.post("/holdings")
 def add_holding(body: HoldingBody):
     """新增持仓（人工建仓后录入，触发创建后建议手动跑 monitor）"""
@@ -134,14 +289,11 @@ def exit_holding(hid: int, body: ExitBody):
     remain = holding.shares - body.shares
     repo.update_holding(hid, shares=remain)
 
-    result = {"holding_id": hid, "remain_shares": remain, "review_triggered": False}
+    result = {"holding_id": hid, "remain_shares": remain, "review_task_id": None}
     if remain == 0:
         repo.update_holding(hid, status="exited")
-        try:
-            graph_router.run_review(hid, body.trade_date)
-            result["review_triggered"] = True
-        except Exception as exc:  # noqa: BLE001
-            logger.error("复盘触发失败 %s: %s", hid, exc)
+        task = _submit_task("review", {"holding_id": hid, "exit_date": body.trade_date})
+        result["review_task_id"] = task["task_id"]
     return result
 
 
@@ -158,13 +310,8 @@ def trigger_monitor(hid: int):
 
 @router.post("/holdings/{hid}/sell-decision")
 def trigger_sell_decision(hid: int):
-    """立即生成一次卖出决策（SellAgent；决策仅供参考，卖出由人工执行）"""
-    try:
-        result = graph_router.run_sell_decision(hid)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("卖出决策失败 %s: %s", hid, exc)
-        raise HTTPException(status_code=500, detail=f"卖出决策失败: {exc}")
-    return {"holding_id": hid, "decision": result.get("sell_decision")}
+    """生成一次卖出决策（SellAgent；异步提交，决策仅供参考，卖出由人工执行）"""
+    return _submit_task("sell_decision", {"holding_id": hid})
 
 
 @router.get("/holdings/{hid}/sell-decisions")
@@ -242,14 +389,9 @@ def reject_review_suggestion(rid: int, body: RejectReviewBody):
         raise HTTPException(status_code=404, detail="复盘记录不存在")
     if review.suggest_status == "adopted":
         raise HTTPException(status_code=400, detail="该建议已采纳，不能再驳回")
-    try:
-        result = llm_rethink_suggestion(rid, reason)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("建议重思考失败 review_id=%s: %s", rid, exc)
-        raise HTTPException(status_code=500, detail=f"重思考失败: {exc}")
-    return {"rejected": True, "review_id": rid,
-            "new_iteration": result["iteration"],
-            "profile_suggestion": result["profile_suggestion"]}
+    task = _submit_task("review_rethink", {"review_id": rid, "reason": reason})
+    return {"rejected": True, "review_id": rid, "task_id": task["task_id"],
+            "status": task["status"]}
 
 
 # ================= 个人交易偏好档案 =================
@@ -313,6 +455,18 @@ def remove_knowledge(kid: int):
     if not ok:
         raise HTTPException(status_code=404, detail="知识条目不存在")
     return {"deleted": True}
+
+
+class KnowledgeBatchBody(BaseModel):
+    items: list[KnowledgeBody] = Field(min_length=1, description="批量知识条目（至少 1 条）")
+
+
+@router.post("/knowledge/batch-import")
+def batch_import_knowledge(body: KnowledgeBatchBody):
+    """批量导入私有知识（异步提交：逐条落库，立即返回任务ID，不阻塞页面）"""
+    items = [{"title": it.title, "content": it.content, "agent_tag": it.agent_tag}
+             for it in body.items]
+    return _submit_task("knowledge_import", {"items": items})
 
 
 # ================= 策略闭环·Agent 优化建议（人工审核） =================

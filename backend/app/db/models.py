@@ -6,7 +6,7 @@ JSON 字段用 Text 存储（SQLAlchemy JSON 在 SQLite/MySQL 均可，但 MySQL
 from datetime import datetime
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint,
+    JSON, Boolean, DateTime, Float, Index, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -22,7 +22,10 @@ def _now() -> datetime:
 class StockCandidate(Base):
     """每日候选池（DiscoverAgent 输出）"""
     __tablename__ = "stock_candidate"
-    __table_args__ = (UniqueConstraint("stock_code", "trade_date", name="uq_candidate_code_date"),)
+    __table_args__ = (
+        UniqueConstraint("stock_code", "trade_date", name="uq_candidate_code_date"),
+        Index("ix_candidate_date_rank", "trade_date", "rank"),  # 按日期取当日候选并排序
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
@@ -32,6 +35,21 @@ class StockCandidate(Base):
     reasons: Mapped[list] = mapped_column(JSON, default=list)        # 候选理由（LLM 输出）
     risk_notice: Mapped[list] = mapped_column(JSON, default=list)    # 风险初判（LLM 输出）
     snapshot: Mapped[dict] = mapped_column(JSON, default=dict)       # 当日原始行情快照（计算层）
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # v2.0 输出详情（信心度/三维/量能/风险/关注类型 + 增量数据）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class MarketCondition(Base):
+    """每日市况评分（v2.0 Discover 前置步骤）：LLM 五维打分 + 代码档位映射候选池上限"""
+    __tablename__ = "market_condition"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_market_condition_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
+    total_score: Mapped[int] = mapped_column(Integer)                # 0-50（LLM 五维求和）
+    dims: Mapped[dict] = mapped_column(JSON, default=dict)           # 五维明细（LLM 输出）
+    cap: Mapped[int] = mapped_column(Integer)                        # 当日候选池上限（档位映射）
+    summary: Mapped[str] = mapped_column(Text, default="")           # 市况综述（LLM 输出）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -71,6 +89,7 @@ class PositionPlan(Base):
 class Holding(Base):
     """持仓记录（人工录入，监控对象）"""
     __tablename__ = "holding"
+    __table_args__ = (Index("ix_holding_status", "status"),)  # 筛选有效持仓（巡检/首页）
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
@@ -124,6 +143,7 @@ class AlertLog(Base):
 class ReviewResult(Base):
     """卖出复盘（ReviewAgent 输出）"""
     __tablename__ = "review_result"
+    __table_args__ = (Index("ix_review_exit_status", "exit_date", "suggest_status"),)  # 近期复盘/待审核
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
@@ -206,6 +226,23 @@ class SellDecision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class AccountBaseline(Base):
+    """账户基准快照（券商持仓截图 OCR 提取的总资产/可用资金/仓位比例，人工确认后保存）
+
+    每次确认保存插入一行（保留历史），读取最新一条作为顶部栏账户展示的权威值；
+    无基准时顶部栏按 TOTAL_CAPITAL + 持仓盈亏估算并明确标注「估算」。
+    """
+    __tablename__ = "account_baseline"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
+    total_asset: Mapped[float] = mapped_column(Float, default=0.0)   # 总资产（元）
+    available_cash: Mapped[float] = mapped_column(Float, default=0.0)  # 可用资金（元）
+    position_pct: Mapped[float] = mapped_column(Float, default=0.0)  # 整体仓位占比 %
+    source: Mapped[str] = mapped_column(String(32), default="ocr")   # ocr / manual
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class AgentSuggestion(Base):
     """复盘进化Agent 输出的各 Agent 规则/参数优化建议（策略闭环）
     状态机：pending → approved/rejected；任何生效必须先经人工审核确认。
@@ -213,6 +250,7 @@ class AgentSuggestion(Base):
       profile = 直接写入个人交易偏好档案（sys_trade_profile，字段级）；
       prompt  = 需人工修改 agent_prompts/ 对应提示词文件或 common.py HARD_RULES。"""
     __tablename__ = "agent_suggestion"
+    __table_args__ = (Index("ix_suggestion_status", "status"),)  # 待审核建议查询（首页/策略闭环）
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     review_id: Mapped[int] = mapped_column(Integer, index=True)

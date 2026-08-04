@@ -13,10 +13,10 @@
 六个 Agent（LangGraph 有向图编排，DeepSeek 结构化输出，各自独立隔离的提示词文件）：
 
 ```
-DiscoverAgent  每日全市场潜力挖掘（硬过滤 → LLM 初选 → 新闻核实 → 落库）
+DiscoverAgent  每日全市场潜力挖掘（市况评分 → 硬过滤 → LLM 初选 → 新闻核实 → 数据富化 → LLM 终选 → 落库）
 ScoreAgent     单股 0-100 多维打分（基本面/技术/资金/舆情/行业景气）
 PositionAgent  分批建仓方案（4 档区间 + 资金配比 + 止损止盈参考）
-MonitorAgent   持仓监控预警（盘中每 5 分钟，飞书推送，LLM 信号研判）
+MonitorAgent   持仓监控预警（交易时段每 3 分钟，实时行情 60s 内缓存，飞书推送，LLM 信号研判）
 SellAgent      卖出决策参考（聚合监控信号/建仓计划/最新行情 → 持有/减仓/清仓建议）
 ReviewAgent    卖出复盘（盈亏归因 + 经验教训 + 筛选偏好回流 + 全链路优化建议）
 ```
@@ -78,7 +78,7 @@ docker compose up -d --build
 1. **工作日 16:10** 自动运行 DiscoverAgent + ScoreAgent，生成当日候选池与评分（也可面板手动触发）。
 2. 在「评分报告」查看五维评分与风险清单 → 在「建仓计划」生成分批方案（纯建议）。
 3. **人工执行建仓后**，在「持仓监控」录入持仓与成交明细（支持**券商持仓截图 OCR 自动识别**，见下方小贴士）。
-4. 交易时段每 5 分钟 MonitorAgent 自动研判，触发预警推送飞书（未配置则落库告警日志）。
+4. 交易时段（9:30-11:30 / 13:00-15:00）每 3 分钟 MonitorAgent 自动研判（实时行情 60 秒内缓存，信号基于当次最新价计算），触发预警推送飞书（未配置则落库告警日志）；收盘后 15:00-15:30 做收盘数据校验；「持仓监控」页可随时点「立即刷新监控」全量手动触发。
 5. 盘中可按需点击「生成卖出决策」，SellAgent 独立研判输出 持有/减仓/清仓 参考（**仅供参考，卖出必须人工执行**）。
 6. **人工卖出后**在「持仓监控」记录卖出 → 自动触发 ReviewAgent 复盘：①盈亏归因与经验教训；②建议采纳后可一键写入「个人交易偏好」档案；③全链路 Agent 优化建议进入「待审核」区。
 7. 偏好档案在「个人交易偏好」页可视化编辑、导入/导出，保存立即生效，并自动注入后续所有 Agent 的 LLM 调用。
@@ -149,15 +149,167 @@ docker compose up -d --build
 | 私有战法 / 经验条目 | Streamlit「交易知识库」页（按适用 Agent 打标签） | 保存立即生效（向量检索注入，当日缓存自动失效） |
 | 硬性底线（LLM 不得放宽的规则） | `backend/app/agents/common.py` 的 `HARD_RULES` 列表（当前为空，内有示例注释） | 改代码重启 |
 | 量化因子列（送哪些数值给 LLM） | `backend/app/agents/discover.py` 的 `_TABLE_COLS` | 改代码重启 |
+| 双模型路由与参数（flash/chat 模型 ID、max_tokens、reasoning_effort） | `.env` 的 `DEEPSEEK_DEFAULT_MODEL` / `DEEPSEEK_REASONING_MODEL` / `DEEPSEEK_FLASH_MAX_TOKENS` / `LLM_MAX_TOKENS` / `REASONING_EFFORT` | 重启后端 |
+| LLM 调用统计（当日请求/缓存命中率/模型分布） | 首页「系统运行状态」→ LLM 运行统计模块 | 手动刷新，实时 |
+
+## 每日候选池筛选机制 v2.0 补强
+
+> 本节为 v2.0 增量升级（2026-08-04），在上一节 v1.0 机制基础上叠加，v1.0 原文保留在上节作对照。
+> 不重构、不破坏既有五 Agent 体系 / 独立 Prompt 机制 / 存储抽象层；**代码仍只做客观数据采集与硬过滤，所有主观研判全部交给 LLM**，新增规则全部可经 Prompt / 配置 / 知识库持续调教，不写死黑盒。
+
+### 一、硬性规则补强（HARD_RULES 四条强制底线，LLM 无权突破）
+
+写入 `backend/app/agents/common.py` 的 `HARD_RULES`（已从 v1.0 的空列表改为四条全中文规则），以最高优先级注入所有 Agent 的 system prompt：
+
+| 规则 | 内容 | 约束性质 |
+|---|---|---|
+| 板块权限硬约束 | 创业板（300 开头）仅做分析**不推荐买入**；科创板（688 开头）、北交所（8/4 开头）**不纳入候选池** | 强制 |
+| 派发期一票否决 | 5 日涨幅 ≥15% + 主力资金净流出 + 换手率 ≥12% + 距 52 周高点 ≤10%，四者同时满足直接排除 | 强制（一票否决） |
+| 一日游避雷 | 板块共振个股 <3 只，或盘中涨幅收窄 ≥0.5%，不纳入候选池 | 强制 |
+| 超买否决 | 5 日累计涨幅 ≥15% 的标的**不得作建仓推荐**（关注类型不得为「低吸/突破」） | 强制 |
+
+> 阈值（15%/12%/10%/0.5%/3只）均写在 `HARD_RULES` 文本中，可直接编辑调参，**LLM 无权放宽**。
+
+### 二、研判知识体系补强（Prompt 注入，代码零新增判断）
+
+- **全局基线 `agent_prompts/global_base_prompt.md` 追加**：
+  - K168 三维分析标准：每只候选必须给出宏观/中观/微观三维结论，**三维矛盾必须显式提示风险**；
+  - K189 主力骗局识别：七大骗局对照（卖点/砸盘/洗盘/试盘/诱多/对倒/出货），任一疑点即视为风险项。
+- **DiscoverAgent Prompt（`agent_prompts/discover_prompt.py`）追加【v2.0 执行标准】**：
+  - 技术研判覆盖：威科夫 5 阶段 / 量价 7 条 / 6 大 K 线形态 / 4 大谐波形态，**至少两套体系交叉验证**；
+  - 估值研判：PE / PB / PEG / 市值对照**行业均值**（行业由数据层采集，代码不做估值打分）；
+  - 先验板块共振：先判板块共振强度，再判个股，防止个股孤军。
+
+### 三、输出格式强制升级（DiscoverCandidate Schema v2.0）
+
+`backend/app/agents/schemas.py` 的 `DiscoverCandidate` 强制携带（pydantic 校验，缺失即重试）：
+
+| 字段 | 约束 |
+|---|---|
+| `stock_code` + `stock_name` | 代码与股票全称**成对输出**，杜绝缺码 |
+| `confidence_tier` + `confidence_pct` | K202 信心度档位：`谨慎观察` / `建议关注` / `强烈推荐`（0-100 百分比） |
+| `macro_view` / `meso_view` / `micro_view` | 宏观/中观/微观三维分析结论 |
+| `volume_analysis` | 量能判定（主力流入流出定性） |
+| `risks` | 核心风险清单，**至少 2 项**（不足 2 项校验失败重试） |
+| `focus_type` | 关注类型：`低吸` / `突破` / `观察` |
+| `tech_view` | 技术面研判（可选字段）：威科夫/量价/K线形态/谐波至少两套体系交叉验证，标注体系名称与支撑依据 |
+| `price_levels` | 关键价位（可选字段）：支撑位 / 压力位 / 建议关注区间 |
+| `position_hint` | 操作建议（可选字段）：关注类型 + 参考仓位建议 |
+
+> 初选节点（`llm_shortlist`）输出即含以上字段；缓存键升级为 `shortlist:v2:{date}` / `final:v2:{date}`，旧版 v1 JSON 不会复用。
+> 三个可选字段默认 `""`：旧缓存/旧数据不回填校验不破坏，展示层自动降级（取 `meso_view` 兜底或提示重新触发挖掘）。
+
+### 四、数据层增量采集（代码只采集原始数据，不做任何打分）
+
+`llm_final` 最终确认前新增 `enrich_data` 节点，仅对**初选入围股**（非全市场）逐股增量采集，单项失败自动降级为缺失不阻塞：
+
+- **资金结构**：超大单 / 大单 / 中单 / 小单净流入（当日）+ 主力净流入累计 3 / 5 / 10 日（`tail(3/5/10)` 纯求和）；
+- **股东面**：股东户数环比增减比例（`stock_zh_a_gdhs_detail_em`）+ 机构持股占流通股比例（`stock_institute_hold` 全市场一次拉取建映射复用，6 小时缓存）；
+- **52 周区间**：52 周最高 / 最低价 + 距高点幅度（从日 K 纯数学计算）；
+- **盘中涨幅收窄**：`(当日最高 − 收盘) / 昨收 × 100%`（16:10 运行时当日分时已不可得，用日 K 近似）；
+- **行业归属**：东财个股资料（item/value 两列解析）。
+
+增量 13 列随最终数据表一并打包给 LLM（`_final_table_text`），金额列统一格式化（元 → 亿/万）。
+
+### 五、调度前置：市况评分 → 候选池规模上限（市况驱动）
+
+Discover 图新增首个节点 `market_condition`（`START → market_condition → hard_filter → llm_shortlist → enrich_news → enrich_data → llm_final`）：
+
+1. **代码打包市况原始数据**（纯客观）：上证近 60 日区间位置 + 近 5 日涨跌、行业板块涨跌分布（前 5 / 后 5）、大盘资金流、全市场涨跌家数分布（含涨幅 ≥9.5% / 跌幅 ≤-9.5% 客观计数）；
+2. **LLM 五维打分**（`agent_prompts/market_prompt.py`，`MarketConditionOutput` schema 校验）：指数位置 / 板块结构 / 资金方向 / 情绪指标 / 风险维度，各 0-10 分，共 0-50 分（数据不可用给保守 5 分）；
+3. **代码纯算术落库**：总分求和（非主观）→ `repo.upsert_market_condition` 写入 `market_condition` 表；
+4. **人工档位映射**（`config.market_band_info`，`.env` 可用 `MARKET_CAP_BANDS` JSON 覆盖）：
+
+| 总分 | 档位 | 候选池规模上限 |
+|---|---|---|
+| 0-20 | 防御期 | 5 只 |
+| 21-35 | 过渡期 | 10 只 |
+| 36-45 | 温和期 | 15 只 |
+| 46-50 | 强势期 | 20 只 |
+
+5. `llm_final` 按上限**客观截断**最终候选数量（`output.candidates[:cap]`）；上限值随市况综述注入 Prompt，LLM 知道「上限 N 只、宁缺毋滥」；
+6. 首页「今日操作提示」顶部同步展示：市况评分 X 分（档位，候选池上限 N 只）+ 五维分项 + LLM 综述（`GET /api/market-condition`）。
+
+> 降级：市况接口拉取失败 / LLM 打分失败时，按默认档位（上限 20）放行，不阻塞每日挖掘。
+
+### 六、可调教入口汇总（v2.0 新增）
+
+| 想调什么 | 去哪里改 | 生效方式 |
+|---|---|---|
+| 四条硬性底线阈值（15%/12%/0.5%/共振3只等） | `backend/app/agents/common.py` 的 `HARD_RULES` 文本 | 改代码重启 |
+| 市况五维打分标准 / 评分纪律 | `agent_prompts/market_prompt.py` | 重启后端 |
+| 市况档位 → 候选池上限映射 | `.env` 的 `MARKET_CAP_BANDS`（JSON，留空用默认四档） | 重启后端 |
+| 技术研判覆盖（威科夫/量价/K线/谐波）与估值对照标准 | `agent_prompts/discover_prompt.py` 的【v2.0 执行标准】 | 重启后端 |
+| 三维分析与骗局识别标准 | `agent_prompts/global_base_prompt.md`（K168 / K189） | 实时读取，保存即生效 |
+| 增量数据列（资金结构/股东面/52周区间等） | `backend/app/agents/discover.py` 的 `_ENRICH_COLS`（数据采集，不做打分） | 改代码重启 |
+| 输出强制字段（信心度档位/三维分析/风险≥2项/关注类型） | `backend/app/agents/schemas.py` 的 `DiscoverCandidate` | 改代码重启（升级后缓存键版本化自动失效） |
+| 双模型路由与 KV 缓存参数（flash/chat 模型 ID、token 上限、推理强度） | `.env` 的 `DEEPSEEK_DEFAULT_MODEL` / `DEEPSEEK_REASONING_MODEL` / `DEEPSEEK_FLASH_MAX_TOKENS` / `LLM_MAX_TOKENS` / `REASONING_EFFORT` | 重启后端（结果缓存按模型隔离，版本指纹变更自动失效） |
+
+## 每日候选池页面（评级筛选 + 分模块详情）
+
+「每日候选池」页为 DiscoverAgent 输出主入口，纯展示层（评级映射/排序/颜色仅为字段转换，不含任何二次判断）：
+
+- **手动触发**：页面顶部「手动触发每日挖掘」按钮异步提交（返回即走，不阻塞页面），任务状态区显示执行进度；
+- **日期选择**：按日期查看任意历史候选池（默认最新）；同日同股仅展示最新版本（数据库层面 `UNIQUE(code,date)` 保证，前端二次去重防御）；
+- **评级筛选与排序**：全部 / 可建仓 A+B / 仅观察 C（默认全部；A=强烈推荐 / B=建议关注 / C=谨慎观察，为 LLM 信心度档位的纯展示映射）；列表按 A→B→C 置顶排序，组内按 LLM 优先级 rank 升序；
+- **主表**：评级（A 红 / B 橙 / C 蓝颜色区分）+ 股票（代码+全称）+ 一句话核心理由 + 生成时间；
+- **详情分模块**（点击展开）：技术面研判（标注所用技术体系与支撑依据）/ 量价与资金结论 / 关键价位（支撑/压力/建议关注区间）/ 核心风险点（≥2 项）/ 操作建议（关注类型+参考仓位）；三维分析、风险初判折叠查看；原始 JSON 一律折叠（「查看原始数据」）；
+- **生成建仓方案**：单股异步提交 PositionAgent，完成后顶部任务状态区提示。
+
+## 全局顶部状态栏与市场概览
+
+### 顶部常驻状态栏（所有页面固定显示，不随滚动消失）
+
+页面最顶部固定常驻信息栏，三栏布局（左=北京时间，每分钟自动刷新；中=账户核心资产；右=三大指数）：
+
+- **账户核心资产 5 项**：总资产 / 总持仓成本 / 总盈亏（金额+比例）/ 整体仓位占比 / 可用资金；盈亏正红负绿（A 股习惯）；
+- **账户双数据路径**（`holding_view.build_account_summary`）：
+  - **有账户基准**（OCR 识别券商持仓截图后人工确认保存）：总资产/可用资金/仓位占比用券商真实值，盈亏与成本仍按持仓+最新市价实时计算；
+  - **无账户基准**：总资产 = 基准本金（`TOTAL_CAPITAL`）+ Σ持仓盈亏（**估算**，界面标注「估算」标签）；
+  - 行情整体失败且有持仓时：市价相关项显示「—」并标注 `quote_error`，**不伪造 0 值**；无持仓时总资产=基准本金、仓位 0%；
+- **三大指数**：上证指数 / 深证成指 / 创业板指（名称 + 最新点位 + 涨跌幅，涨跌颜色区分），标注更新时间，60 秒缓存；接口失败自动降级新浪源；
+- **失败降级**：接口失败显示上一次成功缓存值并标注「上次数据」，无缓存显示「数据加载中」，**不向页面抛原始报错**；
+- **详情展开**：点「账户明细 ▼」「指数详情 ▼」展开详细数值与口径说明。
+
+### 首页「今日热门板块」看板
+
+位于「今日候选与建仓机会」模块上方，当日涨幅前 5 行业板块（客观排序，非主观筛选）：
+
+- 每条含：板块名称 / 板块涨幅（正红负绿）/ 领涨龙头（代码+名称，来自板块行情「领涨股票」→ 全市场快照名称匹配代码，匹配失败降级拉该板块成分股按涨幅取最大）；
+- 默认每 30 分钟自动更新（`st.fragment(run_every="30m")`），顶部「手动刷新全部数据」可立即刷新；
+- **点击「筛选该行业」**跳转「每日候选池」页并按该行业筛选当日候选股（详情行业字段子串匹配），支持「清除行业筛选」返回全量。
+
+### 新增后端接口（只读视图，不触任何研判链路）
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/market/indices` | 三大指数实时行情（60s 缓存，东财→新浪降级） |
+| `GET /api/market/hot-sectors` | 涨幅前 5 行业板块 + 领涨龙头 |
+| `GET /api/account/summary` | 账户摘要（双数据路径，失败返回 `quote_error` 不抛 500） |
+| `POST /api/account/baseline` | 保存账户基准（`account_baseline` 表，每次插入保留历史，取最新一条生效） |
+
+## 持仓监控列表（自动去重合并 + 实时行情）
+
+「持仓监控」页顶部持仓列表在进入页面时自动加载全量实时行情并展示：
+
+- **自动去重合并（仅展示层，数据库原始记录完整保留，不删除任何数据）**：同一股票代码的多条持仓自动合并展示——同建仓日期的重复录入仅保留录入时间最晚一条，其余在「查看历史持仓明细」中标注「重复录入（已自动忽略）」；不同日期多笔建仓合并为**加权平均成本 + 总股数**，操作（监控/卖出决策/记录卖出）绑定「当前有效」持仓（建仓日期最新、录入时间最晚）；
+- **实时行情自动填充**：拉取每只标的最新价，实时计算当前市值、持仓盈亏金额、持仓盈亏比例；行情获取失败时字段显示「—」并给出警示，不显示 0 值或空值；
+- **参考止损/止盈自动补全**：取值顺序 = 手动设置 → 关联建仓计划 → 默认风控比例（`DEFAULT_STOP_LOSS_PCT`/`DEFAULT_TAKE_PROFIT_PCT`，.env 可调；仅展示参考，不触发任何判断）；**目标仓位%** = 当前市值 ÷ 基准本金（`TOTAL_CAPITAL`）；
+- **行情刷新**：表格顶部标注「行情最后更新时间」（精确到分钟），可点击「手动刷新行情」重算；
+- **展示规则**：股票强制「代码 + 名称」成对显示；盈亏金额/盈亏比例正收益红、负收益绿（A 股习惯，适配深色主题）；每只持仓可展开「查看历史持仓明细」查看每笔买入的原始记录（含被忽略的重复录入）。
 
 ## 持仓截图 OCR 识别（快捷录入）
 
-在「持仓监控」页上传券商持仓截图，自动识别 **股票代码/名称/持仓数量/持仓成本/当前市价** 并回填新增持仓表单。
+在「持仓监控」页上传券商持仓截图，自动识别 **股票代码 + 股票全称、持仓数量、持仓成本价、当前市价、持仓盈亏金额、持仓盈亏比例**，整理为标准结构化表格供人工核对后批量创建持仓；识别到券商账户汇总区域时**同时提取总资产 / 可用资金 / 整体仓位比例**，预填「账户基准」表单。
 
 - **识别结果不直接入库**：必须先人工核对修正字段，点击【确认创建持仓】才写入 `holding` 表，杜绝识别错误引发监控异常；
+- **账户基准人工确认红线**：OCR 提取的账户汇总字段（总资产/可用资金/仓位比例）仅预填表单，点击【保存账户基准（人工确认无误后落库）】才写入 `account_baseline` 表，此后顶部状态栏总资产/可用资金/仓位占比改用券商真实值（不再估算）；OCR 未识别到账户信息则不显示该区块，绝不编造数值；
 - **纯文字识别工具**：不做任何行情研判/交易决策，市场研判仍全部由 LLM 完成；截图仅内存/临时文件处理，识别完毕自动清理，不长期存储；
 - **开关**：`.env` 设置 `OCR_ENABLE=true/false`（默认 false），关闭后页面自动提示并仅保留手动录入；
-- **依赖**：CPU 运行装 `paddleocr + onnxruntime` 即可（Python 3.14 已验证；Python 3.11/3.12 或 Docker 可另装 `paddlepaddle` 提性能，GPU 则装 `paddlepaddle-gpu` 并设 `OCR_DEVICE=gpu`）；首次识别自动下载模型约 150MB（缓存于 `~/.paddlex/`）。
+- **引擎选择**：默认优先 MiniMax M3 云端多模态识别（准确率更高），失败/无结果自动回退本地 PaddleOCR（离线兜底，不阻塞录入）；`MINIMAX_OCR_ENABLE=false` 可强制仅用本地引擎（详见下方章节）；
+- **结构化输出**：识别结果自动整理为结构化表格（股票代码 + 股票全称、持仓数量、持仓成本价、当前市价、持仓盈亏金额、持仓盈亏比例），默认只展示表格；「查看原始识别内容」折叠展开原文；表格内可直接点击修改任意字段，缺失字段红色标注并提示「需补全」；
+- **模型档位**：`OCR_MODEL_LEVEL=light`（默认，PP-OCRv4 轻量模型，体积约 20-50MB，首次识别自动下载并缓存于 `~/.paddlex/`）；追求更高精度可改 `full` 完整模型（体积约 150MB 级，安装占用更大）；
+- **依赖**：CPU 运行装 `paddleocr + onnxruntime` 即可（Python 3.14 已验证；Python 3.11/3.12 或 Docker 可另装 `paddlepaddle` 提性能，GPU 则装 `paddlepaddle-gpu` 并设 `OCR_DEVICE=gpu`）；识别截图仅在临时文件处理，识别完毕立即删除，不持久化存储。
 
 **截图识别使用小贴士**：
 
@@ -165,6 +317,32 @@ docker compose up -d --build
 - 避开弹窗遮挡：识别前关闭涨跌弹窗、开户引导、新股申购提示等悬浮层，防止遮住代码/数量列；
 - 截图只需包含持仓表格区域即可（代码/名称/数量/成本/市价几列齐全）；
 - 识别缺失/错误的字段会在预览中标注，手动补全修正后保存即可，无需重新截图。
+
+## MiniMax M3 可选多模态能力（默认开启云端 OCR，一键可关）
+
+MiniMax M3 作为**可选多模态引擎**接入系统，用于持仓截图 OCR 识别（云端多模态识别，准确率远高于本地文本 OCR），
+并为 K 线图形态研判 / 技术形态识别 / 财报截图解析等后续多模态场景预留了统一调用接口。
+
+- **定位边界**：仅承担视觉专项任务，**不参与五 Agent 选股/建仓/监控等核心业务研判**（主模型仍为 DeepSeek）；
+- **总开关**：`MINIMAX_ENABLE=false` 时系统行为与原版本完全一致——不加载任何依赖、不发起任何请求（`.env.example` 默认 false）；
+- **配置项**（`.env`，密钥仅环境变量管理，更换只改这里）：
+  - `MINIMAX_ENABLE=false|true` —— 多模态能力总开关；
+  - `MINIMAX_API_KEY=<密钥>` —— MiniMax API 密钥（平台 platform.minimaxi.com 获取，严禁硬编码/提交版本库）；
+  - `MINIMAX_BASE_URL=https://api.minimax.chat/v1` —— 官方 OpenAI 兼容端点（国际站 `api.minimaxi.com/v1`）；
+  - `MINIMAX_MODEL=MiniMax-M3` —— 模型 ID（官方 ID 含连字符，勿去掉）；
+  - `MINIMAX_OCR_ENABLE=true|false` —— 默认 `true`（云端优先）：持仓截图默认先走 MiniMax 云端识别，
+    失败/无结果自动回退本地 PaddleOCR，不阻塞录入；设为 `false` 强制仅用本地 PaddleOCR（离线，零 API 消耗）。
+- **OCR 引擎抽象**：持仓截图识别为双引擎链——MiniMax 云端（默认优先）→ 本地 PaddleOCR（兜底）；
+  两引擎输出字段完全一致（股票代码/股票全称/持仓数量/持仓成本价/当前市价/持仓盈亏金额/持仓盈亏比例），
+  识别结果强制整理为结构化表格，**不输出零散原文**，前端录入流程不变；
+- **调用优化**：同一张截图 30 分钟内临时缓存识别结果，不重复识别、不重复消耗 API 调用次数；
+- **前端交互**：默认仅展示结构化持仓表格；「查看原始识别内容」折叠按钮展开模型原文（排查用）；
+  表格支持 inline 编辑任意字段；识别失败/字段缺失条目红色标注并提示「需补全」；
+  识别结果**必须人工核对确认后才批量创建持仓，禁止自动落库**；
+- **扩展预留**：多模态调用层为通用接口（图片 + 文本指令 → 文本输出），后续 K 线图/财报截图等场景
+  直接复用，无需重构调用框架；识别结果为结构化字段，可落库参与后续 Agent 研判；
+- **实现方式**：业务代码不依赖 MiniMax 原生 SDK，更换多模态模型只需新增实现类并修改工厂装配
+  （`backend/app/services/multimodal.py`）。
 
 ## 个性化调教（三层体系 + 统一调教接口）
 
@@ -247,11 +425,11 @@ backend/
     core/            配置与日志（APP_ENV / DB_BACKEND / CACHE_BACKEND / QDRANT_MODE 开关）
     db/              ORM 模型 + repo.py（唯一数据网关）+ 会话
     cache.py         缓存网关（默认内存 / 可选 Redis）
-    datasource/      akshare 封装（超时/重试/东财→新浪降级/列名兼容）
+    datasource/      akshare 主源（超时/重试/东财→新浪降级/列名兼容）+ 麦蕊增强源（可选，默认关闭）
     llm/             DeepSeek 结构化输出（json_object + pydantic + 重试）+ Embedding
     agents/          六 Agent 节点 + common.py（统一调教接口：HARD_RULES/偏好/知识注入）
     graph/           StockAgentState + 6 个 StateGraph + 图间编排
-    services/        indicator（纯数学指标）/ vector_store（向量网关）/ feishu / ocr
+    services/        indicator（纯数学指标）/ vector_store（向量网关）/ multimodal（MiniMax 可选多模态，默认关闭）/ feishu / ocr
     scheduler/       APScheduler 定时任务（Asia/Shanghai）
     api/             REST API（仅数据存取 + 手动触发，零 SQL 直连）
   tests/             pytest：过滤/指标/LLM 解析/状态流转/调教闭环/DB/页面渲染
@@ -275,19 +453,108 @@ data/                dev.db / qdrant_storage/ / logs（本地文件存储，复�
 切换后端只需改 `.env` 三个开关（`DB_BACKEND` / `CACHE_BACKEND` / `QDRANT_MODE`），业务代码零改动。
 所有持久化文件均为本地文件形式，**迁移系统直接复制 `data/` 目录即可**。
 
+## 麦蕊智数可选增强数据源（默认关闭，零开销）
+
+麦蕊智数（mairui.club）作为 akshare 的**补充数据源**，仅用于 v2.0 选股机制的高级资金面/股东面字段：
+
+- **默认关闭**：`MAIRUI_ENABLE=false` 时系统行为与未接入完全一致，不增加任何依赖与请求；
+- **配置项**（`.env`，更换证书只改这里，无需改动代码）：
+  - `MAIRUI_ENABLE=false|true` —— 总开关；
+  - `MAIRUI_LICENCE=<证书>` —— 麦蕊证书密钥（仅通过环境变量管理，严禁硬编码）；
+  - `MAIRUI_BASE_URL=https://api.mairuiapi.com` —— 接口基础地址。
+- **调用策略**：
+  - 基础行情（快照/涨跌幅/成交额/日K/新闻/行业/财务/日历）**仅走 akshare**（东财→新浪双通道，不消耗麦蕊配额）；
+  - 高级字段**按需调用**：成交分布（超大单/大单/中单/小单净流入 → 主力净流入）、股东户数变化；
+  - 同日同标的**当日缓存**（86400 秒），重复请求不二次消耗配额；
+  - 麦蕊失败 / 返回空 / 当日配额超限（101）→ 自动回退 akshare 现有字段，中文日志记录原因，前端友好提示，**不报错中断**。
+- **已核实端点**：`/hsmy/lscjt/{code}/{licence}`（最近 10 天成交分布）、`/hscp/gdbh/{code}/{licence}`（股东变化趋势）。
+- **边界说明**：机构持股占比、龙虎榜、财务分析等字段当前仍由 akshare 提供（麦蕊端点未实现，避免无认证前提下的接口漂移风险）。
+
+## 存储空间维护与轻量化
+
+### 运行时临时文件（自动清理）
+
+- OCR 识别截图仅内存/临时文件处理，识别完毕立即删除，**不持久化持仓截图**；
+- 数据源/LLM 结果缓存全部带 TTL（数据源 600 秒、LLM 当日 24h / 盘中 15min），到期自动失效，重启即清空，无残留文件；
+- 日志自动轮转：单个文件超过 `LOG_MAX_BYTES_MB`（默认 10MB）自动切割，最多保留 `LOG_BACKUP_COUNT`（默认 5）份。
+
+### 空间维护（自动 + 手动入口）
+
+- **SQLite 真空收缩**：删除超期数据后执行 `VACUUM` 回收磁盘空间（MySQL 无对应操作，记录日志跳过）；
+- **新闻/公告保留周期**：超过 `NEWS_RETENTION_DAYS`（默认 90 天）的新闻自动清理；候选/评分/持仓/复盘等关键分析数据**不清理**；
+- **向量库索引同步清理**：超期新闻的 Qdrant 索引一并删除；
+- **定时任务**：每周按 `DB_MAINTENANCE_DAY_OF_WEEK`（默认周日）凌晨 `DB_MAINTENANCE_HOUR:DB_MAINTENANCE_MINUTE`（默认 05:30）自动执行，`DB_MAINTENANCE_ENABLED=false` 可关闭；
+- **手动入口**：`POST /api/db/maintenance` 随时触发；
+- **Qdrant 压缩**：本地文件模式默认启用 INT8 标量量化压缩（`QDRANT_COMPRESSION=true`），减少向量库磁盘占用。
+
+### 轻量备份清单（只备份这三处）
+
+| 内容 | 位置 | 说明 |
+|---|---|---|
+| 全部业务数据 | `data/` | dev.db / qdrant_storage/ / logs，复制即迁移 |
+| 全部调教成果 | `agent_prompts/` | 全局基线 + 六个 Agent 提示词 |
+| 全部密钥配置 | `.env` | 含 DEEPSEEK/SILICONFLOW/麦蕊证书等密钥（严禁提交版本库） |
+
+Prompt 与配置**只保留一个有效版本**，不自动创建备份文件——版本控制交给 Git，升级覆盖前请先确认已提交。
+
+## 后台异步任务机制（手动触发不阻塞页面）
+
+所有耗时手动操作（每日挖掘/单股打分/建仓方案/卖出决策/复盘/驳回重思考/知识库批量导入）提交即返回
+任务ID，由后端单线程队列串行执行（防外部接口与 LLM 限流），页面可自由切换继续操作；
+顶部统一任务状态区每 3 秒轮询，显示执行中明细，失败红色提示可一键重试，任务结束自动消失。
+
+- 任务状态流转：`pending → running → done/failed`，保留最近 30 条，进程重启后清空（本地工具可接受）；
+- 失败任务重试复用原任务ID；状态查询含提交/开始/完成时间与失败原因；
+- 接口：`POST /api/tasks/submit`（提交任意任务，body 为 `{kind, params}`）、
+  `GET /api/tasks/recent`（最近任务，最新在前）、`GET /api/tasks/{tid}`（任务详情）、
+  `POST /api/tasks/{tid}/retry`（失败重试）、`POST /api/knowledge/batch-import`（知识库批量导入）。
+
 ## API 一览（backend:8000）
 
-任务触发：`POST /api/jobs/discover/run`、`GET /api/jobs/status`、`POST /api/score/{code}`、`POST /api/positions/plan`；
+任务触发：`POST /api/jobs/discover/run`、`GET /api/jobs/status`、`POST /api/score/{code}`、`POST /api/positions/plan`、
+`POST /api/holdings/{id}/sell-decision`、`POST /api/reviews/{id}/reject`（提交后均返回 `task_id`，见上方异步任务机制）；
 数据读取：`GET /api/candidates|/api/scores|/api/positions|/api/holdings|/api/alerts|/api/reviews`；
-持仓：`POST /api/holdings`、`POST /api/holdings/{id}/exit`（记录卖出并触发复盘）、`POST /api/holdings/{id}/monitor`、
+持仓：`GET /api/holdings`、`GET /api/holdings/quotes`（实时行情视图，只读）、`POST /api/holdings`、`POST /api/holdings/{id}/exit`（记录卖出；清仓时自动提交复盘任务，返回 `review_task_id`）、`POST /api/holdings/{id}/monitor`、
 `POST /api/holdings/{id}/sell-decision`（SellAgent 决策）、`GET /api/holdings/{id}/sell-decisions`；
-知识库：`GET/POST /api/knowledge`、`POST /api/knowledge/{id}/delete`；
+知识库：`GET/POST /api/knowledge`、`POST /api/knowledge/{id}/delete`、`POST /api/knowledge/batch-import`（批量导入）；
 策略闭环：`GET /api/agent-suggestions`、`POST /api/agent-suggestions/{id}/approve|reject`（人工审核）；
 偏好档案：`GET/PUT /api/profile`、`POST /api/profile/import|export`；
-其他：`GET /api/ocr/status`、`POST /api/ocr/holding`、`GET /api/health`。
+其他：`GET /api/ocr/status`、`POST /api/ocr/holding`、`POST /api/db/maintenance`（手动空间维护）、`GET /api/health`。
+
+## 模型选型与缓存优化（双模型分场景路由 + KV 缓存命中率提升）
+
+### 一、双模型分场景路由（LLM 调用层自动匹配，业务代码无感知）
+
+| 模型 | 配置项 | 定位 | 适用场景 |
+|---|---|---|---|
+| 轻量模型 `deepseek-v4-flash` | `DEEPSEEK_DEFAULT_MODEL` | 高频低成本的批量/巡检任务 | DiscoverAgent 初筛（300 只大表）、MonitorAgent 盘中巡检 |
+| 深度推理模型 `deepseek-chat` | `DEEPSEEK_REASONING_MODEL` | 低频高价值的深度研判 | Discover 最终确认、ScoreAgent 五维打分、PositionAgent 建仓、SellAgent 卖出决策、ReviewAgent 复盘、市况评分、驳回重思考 |
+
+- 每个 Agent 在调用点声明场景等级 `model_level`（LIGHT=轻量 / DEEP=深度，默认 DEEP，历史语义不变）；调用层按等级自动选模型与参数，Agent 代码不感知具体模型名；
+- 轻量模型不传 `reasoning_effort`（无推理参数），`max_tokens` 用 `DEEPSEEK_FLASH_MAX_TOKENS`（8192）；深度模型传 `reasoning_effort="low"` 与 `LLM_MAX_TOKENS`（32768）；
+- **降级保障**：轻量模型连续失败 3 次自动降级为深度推理模型重试（最多 3 次），不阻塞主流程；深度模型保持原语义（本模型内重试 3 次，不引入额外降级）；
+- 全部配置在 `.env`，修改后重启后端生效。
+
+### 二、KV 缓存命中率优化（纯结构优化，不改变任何输出）
+
+| 优化项 | 做法 | 收益 |
+|---|---|---|
+| system prompt 段序固定 | 全局基线 → 硬性规则 HARD_RULES → 个人交易偏好 → 私有知识库 → Agent 专属 Prompt，顺序永久固定 | 相同前缀跨请求完全一致，服务端前缀缓存命中 |
+| 固定内容前置、动态数据后置 | 所有动态数据（当日行情/持仓/候选表）一律放入 user 段，system 段同版本内 100% 重复 | 缓存命中时 system 段几乎零成本 |
+| 版本指纹入缓存键 | 偏好档案版本 `v{n}` + 知识库变更感知 `k{count}:{max_id}` + 基线内容指纹 `g{md5}`，拼接进缓存 key | 人工修改调教内容后缓存自动失效、立即生效 |
+| 恒定请求参数 | json_object / 温度 0.3 / max_tokens / schema 每次请求一致 | 服务端缓存有效性最大化 |
+| 双模型独立缓存 | 缓存 key 按 agent+model 隔离（`llm:{agent}:{model}:{key}`） | 同一任务两模型各走各的缓存，互不污染 |
+| 两段式 messages | 固定 system + user 两段，不追加多轮历史 | 符合主流缓存前缀模型，避免长轮次稀释命中 |
+
+### 三、LLM 运行统计（首页「系统运行状态」看板）
+
+- 每次成功响应自动记录服务端 usage（命中/未命中/输出 token），按自然日累计（`GET /api/llm/stats`）；
+- 看板展示：当日请求次数 / 整体缓存命中率 / 命中·未命中 token / 模型调用分布（flash 与 chat 各自次数与占比）/ 统计截止时间，支持手动刷新；
+- 存储于缓存抽象层（dev=内存 / prod=Redis），跨进程为近似值，仅作调优参考、不参与任何研判。
 
 ## 风险提示
 
+- **DeepSeek 推理模型行为**：`deepseek-chat` 别名现路由到带内部推理的模型，推理 token 计入输出预算——`max_tokens` 过小且输入较大时（如候选池 300 行大表）会出现**空响应**（`finish_reason=length`、content 为空）或 JSON 截断。已在调用层固定 `reasoning_effort="low"`（推理量最小化）并把 `LLM_MAX_TOKENS` 提到 32768；轻量任务（初筛/巡检）默认走 `deepseek-v4-flash`（`DEEPSEEK_FLASH_MAX_TOKENS=8192`），连续失败自动降级深度模型重试；修改 `.env` 需重启后端生效。
 - 数据源为 akshare 公开接口，可能限流/漂移，已做重试与降级但非 100% 稳定。
 - LLM 输出仅供参考，存在幻觉可能；所有结论必须结合你的独立判断。
 - **股市有风险，本系统不构成任何投资建议，一切盈亏由本人承担。**

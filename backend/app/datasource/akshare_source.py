@@ -53,6 +53,10 @@ _FUND_FLOW_COLS = {
     "中单净流入-净额": "medium_net", "中单净流入-净占比": "medium_pct",
     "小单净流入-净额": "small_net", "小单净流入-净占比": "small_pct",
 }
+_INST_COLS = {"证券代码": "code", "证券简称": "name", "机构数": "inst_count",
+              "机构数变化": "inst_change", "持股比例": "hold_pct",
+              "持股比例增幅": "hold_pct_change", "占流通股比例": "float_pct",
+              "占流通股比例增幅": "float_pct_change"}
 _FINANCIAL_SINA_COLS = {
     "日期": "report_date", "净资产收益率(%)": "roe", "净资产收益率-摊薄(%)": "roe_diluted",
     "主营业务收入增长率(%)": "revenue_yoy", "净利润增长率(%)": "profit_yoy",
@@ -176,9 +180,81 @@ class AkshareSource(DataSource):
             if "代码" in df.columns:
                 df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
             return df
-        df = self._fetch("spot_em", "spot_em", primary, ttl_seconds=600, fallback=fallback,
+        df = self._fetch("spot_em", "spot_em", primary, ttl_seconds=60, fallback=fallback,
                          normalize=lambda d: _normalize(d, _SPOT_COLS))
         return _to_json_safe(df)
+
+    # ---------------- 单股实时行情（持仓监控链路，60s 内缓存） ----------------
+    def fetch_spot_quote(self, code: str) -> dict:
+        """单股最新实时行情【刚性代码逻辑】：东财盘口 → 雪球单股 → 全市场快照匹配；
+        TTL 30s 确保监控每次执行拿到最新价；全部失败返回 {}（调用方用日K收盘兜底并标注）。
+        返回 {"code","name","price","change_pct","time"}，price/change_pct 解析失败为 None。
+        """
+        def parse_bid_ask(df: pd.DataFrame) -> pd.DataFrame:
+            # 东财盘口 item/value 列（最新价/涨幅）；构造为标准单行；解析失败返回空表（不缓存坏数据）
+            kv = {str(r["item"]): r["value"] for _, r in df.iterrows()}
+            try:
+                price = float(kv["最新"])
+                change_pct = float(kv.get("涨幅") or kv.get("涨跌幅") or 0.0)
+            except (TypeError, ValueError, KeyError):
+                return pd.DataFrame()
+            return pd.DataFrame([{"code": code, "name": kv.get("名称"), "price": price,
+                                  "change_pct": change_pct,
+                                  "time": kv.get("时间") or kv.get("最新时间") or ""}])
+
+        def parse_xq(df: pd.DataFrame) -> pd.DataFrame:
+            kv = {str(r["item"]): r["value"] for _, r in df.iterrows()}
+            try:
+                price = float(kv["现价"])
+                change_pct = float(kv.get("涨幅") or 0.0)
+            except (TypeError, ValueError, KeyError):
+                return pd.DataFrame()
+            return pd.DataFrame([{"code": code, "name": kv.get("名称"), "price": price,
+                                  "change_pct": change_pct, "time": kv.get("时间") or ""}])
+
+        def primary():
+            return parse_bid_ask(self._call_with_timeout(ak.stock_bid_ask_em, symbol=code))
+
+        def fallback():
+            # 雪球单股（独立于东财/新浪的轻量实时源，请求开销低）
+            prefix = "SH" if code.startswith("6") else ("BJ" if code.startswith(("4", "8", "9")) else "SZ")
+            return parse_xq(ak.stock_individual_spot_xq(symbol=f"{prefix}{code}"))
+
+        df = self._fetch(f"spot_quote:{code}", "spot_quote", primary, ttl_seconds=30,
+                         fallback=fallback, required=False)
+        if df is None or df.empty:
+            quote = self._quote_from_universe(code)
+        else:
+            row = df.iloc[0]
+            quote = {"code": code, "name": str(row.get("name") or ""),
+                     "price": float(row["price"]),
+                     "change_pct": float(row.get("change_pct") or 0.0),
+                     "time": str(row.get("time") or "")}
+        return quote
+
+    def _quote_from_universe(self, code: str) -> dict:
+        """第三级兜底：全市场快照匹配该股实时行情（快照本身东财→新浪双降级，缓存复用）"""
+        try:
+            df = self.fetch_spot_universe()
+            if df is None or df.empty or "code" not in df.columns:
+                return {}
+            row = df[df["code"].astype(str) == code]
+            if row.empty:
+                return {}
+            r = row.iloc[0]
+            try:
+                price = float(r.get("price"))
+            except (TypeError, ValueError):
+                price = None
+            try:
+                change_pct = float(r.get("change_pct"))
+            except (TypeError, ValueError):
+                change_pct = None
+            return {"code": code, "name": str(r.get("name") or ""), "price": price,
+                    "change_pct": change_pct, "time": ""}
+        except Exception as exc:  # noqa: BLE001 兜底失败返回空，调用方走日K收盘
+            logger.warning("快照匹配实时行情失败 %s: %s", code, exc)
+            return {}
 
     def fetch_suspended(self) -> pd.DataFrame:
         today = time.strftime("%Y%m%d")
@@ -204,6 +280,27 @@ class AkshareSource(DataSource):
                          ttl_seconds=3600, fallback=fallback,
                          normalize=lambda d: _normalize(d, _INDEX_COLS))
         return _to_json_safe(df)
+
+    def fetch_index_spot(self) -> pd.DataFrame:
+        """三大指数实时行情（东财指数快照：上证系列 + 深证系列，60s 缓存防限流）；
+        顶部状态栏使用，返回含 code/name/price/change_pct 的 DataFrame"""
+        def call():
+            parts = [
+                ak.stock_zh_index_spot_em(symbol="上证系列指数"),
+                ak.stock_zh_index_spot_em(symbol="深证系列指数"),
+            ]
+            return pd.concat(parts, ignore_index=True)
+        def fallback():
+            # 新浪指数快照（东财限流/宕机降级）；代码列带 sh/sz 前缀，与东财格式一致，保留供下方 keep 过滤
+            return ak.stock_zh_index_spot_sina()
+        df = self._fetch("index_spot", "index_spot", call, ttl_seconds=60, fallback=fallback,
+                         required=False,
+                         normalize=lambda d: _normalize(d, _SPOT_COLS))
+        if df is None or df.empty or "code" not in df.columns:
+            return pd.DataFrame(columns=["code", "name", "price", "change_pct"])
+        keep = {"sh000001", "sz399001", "sz399006"}  # 上证指数/深证成指/创业板指
+        out = df[df["code"].astype(str).isin(keep)]
+        return _to_json_safe(out)
 
     # ---------------- 个股日 K ----------------
     def fetch_daily_kline(self, code: str, start_date: str, end_date: str, adjust: str = "qfq") -> pd.DataFrame:
@@ -245,6 +342,58 @@ class AkshareSource(DataSource):
         df = self._fetch(f"fundflow:{code}", "fundflow", call, ttl_seconds=1800,
                          normalize=lambda d: _normalize(d, _FUND_FLOW_COLS))
         return _to_json_safe(df)
+
+    # ---------------- 个股增量数据（v2.0 候选富化） ----------------
+    def fetch_stock_info(self, code: str) -> dict:
+        """个股基本信息（item/value 两列 → dict，含 行业/上市时间等）；失败返回 {}"""
+        def call():
+            return self._call_with_timeout(ak.stock_individual_info_em, symbol=code)
+        df = self._fetch(f"stockinfo:{code}", "stockinfo", call, ttl_seconds=86400, required=False)
+        if df is None or df.empty or "item" not in df.columns:
+            return {}
+        return {str(k): v for k, v in zip(df["item"].astype(str), df["value"]) if k is not None}
+
+    def fetch_shareholder_detail(self, code: str) -> dict:
+        """股东户数最新一期（户数/较上期增减比例等）；失败返回 {}"""
+        def call():
+            return self._call_with_timeout(ak.stock_zh_a_gdhs_detail_em, symbol=code)
+        df = self._fetch(f"gdhs:{code}", "gdhs", call, ttl_seconds=86400, required=False)
+        if df is None or df.empty:
+            return {}
+        row = df.iloc[0]
+        out: dict = {}
+        for cn, key in [("股东户数统计截止日期", "report_date"), ("股东户数-本次", "holder_count"),
+                        ("股东户数-上次", "holder_prev"), ("股东户数-增减", "holder_diff"),
+                        ("股东户数-增减比例", "holder_change_pct")]:
+            if cn in df.columns:
+                out[key] = row[cn]
+        return out
+
+    def fetch_institute_hold_map(self) -> dict[str, dict]:
+        """机构持股全景（全市场一次拉取，缓存 6 小时）→ {code: {hold_pct, float_pct}}；失败返回 {}"""
+        def call():
+            return ak.stock_institute_hold()
+        df = self._fetch("inst_hold", "inst_hold", call, ttl_seconds=21600, required=False,
+                         normalize=lambda d: _normalize(d, _INST_COLS))
+        if df is None or df.empty or "code" not in df.columns:
+            return {}
+        return {str(r["code"]).zfill(6): {"hold_pct": r.get("hold_pct"),
+                                          "float_pct": r.get("float_pct")}
+                for _, r in df.iterrows()}
+
+    def fetch_market_fund_flow(self) -> dict:
+        """大盘资金流（东财）：最新一日各指数主力净流入/净占比摘要；失败返回 {}（非必需数据）"""
+        def call():
+            return ak.stock_market_fund_flow()
+        df = self._fetch("mkt_flow", "mkt_flow", call, ttl_seconds=600, required=False)
+        if df is None or df.empty:
+            return {}
+        row = df.iloc[-1]
+        summary: dict = {"date": str(row.get("日期", ""))}
+        for col in df.columns:
+            if "主力净流入" in str(col):
+                summary[str(col)] = row[col]
+        return summary
 
     # ---------------- 新闻公告 ----------------
     def fetch_news(self, code: str) -> pd.DataFrame:

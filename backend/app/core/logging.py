@@ -25,8 +25,8 @@ def setup_logging() -> None:
 
     file_handler = RotatingFileHandler(
         settings.log_dir / "app.log",
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        maxBytes=settings.log_max_bytes_mb * 1024 * 1024,
+        backupCount=settings.log_backup_count,
         encoding="utf-8",
     )
     file_handler.setFormatter(fmt)

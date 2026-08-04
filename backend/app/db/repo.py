@@ -2,15 +2,19 @@
 数据仓库层：Agent 落库/读取的统一入口（幂等 upsert）
 【刚性代码逻辑】只做数据存取，不含任何市场判断。
 """
+import hashlib
+import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, text
 
+from app.cache import cache
+from app.core.config import settings
 from app.db.models import (
-    AgentPreference, AgentSuggestion, AlertLog, Holding, NewsArticle, PositionPlan,
-    PrivateKnowledge, ReviewResult, SellDecision, StockCandidate, StockScore,
-    TradeProfile, TradeRecord,
+    AccountBaseline, AgentPreference, AgentSuggestion, AlertLog, Holding,
+    MarketCondition, NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult,
+    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord,
 )
 from app.db.session import SessionLocal
 
@@ -21,8 +25,37 @@ def _json(value: Any) -> Any:
     return value if value is not None else None
 
 
+# ==================== 高频读结果缓存（TTL 短缓存，写操作自动失效） ====================
+
+def _dbq(table: str, params: dict, loader: Callable[[], list]) -> list:
+    """列表查询 60 秒结果缓存：TTL 内相同参数不落库，直接复用上次结果。
+    写操作（_invalidate）删除该表命名空间全部缓存，保证数据一致性。"""
+    if settings.db_query_cache_ttl <= 0:
+        return loader()
+    digest = hashlib.md5(
+        json.dumps(params, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    key = f"dbq:{table}:{digest}"
+    raw = cache.get(key)
+    if raw is not None:
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    result = loader()
+    cache.set(key, json.dumps(result, ensure_ascii=False, default=str),
+              settings.db_query_cache_ttl)
+    return result
+
+
+def _invalidate(table: str) -> None:
+    """写操作后失效该表全部读缓存（按命名空间批量删除）"""
+    if settings.db_query_cache_ttl > 0:
+        cache.delete_prefix(f"dbq:{table}:")
+
+
 def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: int,
-                     reasons: list, risk_notice: list, snapshot: dict) -> None:
+                     reasons: list, risk_notice: list, snapshot: dict,
+                     detail: dict | None = None) -> None:
     with SessionLocal() as db:
         row = db.execute(
             select(StockCandidate).where(
@@ -32,7 +65,41 @@ def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: in
             row = StockCandidate(stock_code=stock_code, stock_name=stock_name, trade_date=trade_date)
             db.add(row)
         row.rank, row.reasons, row.risk_notice, row.snapshot = rank, reasons, risk_notice, snapshot
+        if detail is not None:
+            row.detail = detail
         db.commit()
+        _invalidate("candidate")
+
+
+# ==================== 市况评分（v2.0 Discover 前置步骤） ====================
+
+def upsert_market_condition(trade_date: str, total_score: int, dims: dict,
+                            cap: int, summary: str) -> None:
+    with SessionLocal() as db:
+        row = db.execute(
+            select(MarketCondition).where(MarketCondition.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = MarketCondition(trade_date=trade_date)
+            db.add(row)
+        row.total_score, row.dims, row.cap, row.summary = total_score, dims, cap, summary
+        db.commit()
+
+
+def get_latest_market_condition() -> dict | None:
+    """最新一日市况评分（首页「今日操作提示」数据源）"""
+    from app.core.config import market_band_info
+
+    with SessionLocal() as db:
+        row = db.execute(
+            select(MarketCondition).order_by(MarketCondition.trade_date.desc()).limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        cap, band = market_band_info(row.total_score)
+        return {"trade_date": row.trade_date, "total_score": row.total_score,
+                "band": band, "cap": row.cap, "dims": row.dims,
+                "summary": row.summary, "created_at": str(row.created_at)}
 
 
 def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float,
@@ -47,6 +114,7 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
             db.add(row)
         row.score, row.grade, row.detail, row.risk_list = score, grade, detail, risk_list
         db.commit()
+        _invalidate("score")
 
 
 def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: float,
@@ -58,6 +126,7 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
         db.add(row)
         db.commit()
         db.refresh(row)
+        _invalidate("plan")
         return row.id
 
 
@@ -69,6 +138,7 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
         db.add(row)
         db.commit()
         db.refresh(row)
+        _invalidate("alert")
         return row.id
 
 
@@ -82,6 +152,7 @@ def insert_review(stock_code: str, stock_name: str, holding_id: int, exit_date: 
         db.add(row)
         db.commit()
         db.refresh(row)
+        _invalidate("review")
         return row.id
 
 
@@ -95,6 +166,7 @@ def update_review_suggestion_status(review_id: int, status: str) -> None:
             return
         row.suggest_status = status
         db.commit()
+        _invalidate("review")
 
 
 def append_review_iteration(review_id: int, reject_reason: str) -> None:
@@ -114,6 +186,7 @@ def append_review_iteration(review_id: int, reject_reason: str) -> None:
         row.reject_reason = reject_reason
         row.suggest_status = "rejected"
         db.commit()
+        _invalidate("review")
 
 
 def apply_rethink_suggestion(review_id: int, feedback: dict, new_iteration: int) -> None:
@@ -126,6 +199,7 @@ def apply_rethink_suggestion(review_id: int, feedback: dict, new_iteration: int)
         row.suggest_iteration = new_iteration
         row.suggest_status = "pending"
         db.commit()
+        _invalidate("review")
 
 
 def get_review_reject_history(code: str | None = None, limit: int = 10) -> list[dict]:
@@ -164,6 +238,58 @@ def upsert_preference(content: dict, source_review_id: int | None = None) -> Non
         version = (latest.version + 1) if latest else 1
         db.add(AgentPreference(version=version, content=content, source_review_id=source_review_id))
         db.commit()
+
+
+# ==================== 存储空间维护（低频；仅清理非核心数据，不动关键分析数据） ====================
+
+def maintenance_db() -> dict:
+    """空间维护：超期新闻/公告清理 + SQLite 真空收缩（VACUUM）。
+    保留周期见 settings.news_retention_days（默认 90 天）；MySQL 模式仅清理不收缩（无对应操作）。
+    单项失败降级不中断；返回清理统计与库体积变化（MB）。
+    """
+    from datetime import datetime, timedelta
+
+    from app.core.config import settings
+    from app.db.session import engine
+
+    cutoff = datetime.now() - timedelta(days=settings.news_retention_days)
+    news_deleted = 0
+    try:
+        with SessionLocal() as db:
+            news_deleted = db.execute(
+                delete(NewsArticle).where(NewsArticle.created_at < cutoff)
+            ).rowcount
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 清理失败不中断主链路
+        logger.warning("新闻保留期清理失败（不影响使用）: %s", exc)
+
+    size_before = _db_size_mb()
+    if engine.dialect.name == "sqlite":
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("VACUUM"))
+        except Exception as exc:  # noqa: BLE001 VACUUM 失败不影响使用
+            logger.warning("SQLite 真空收缩失败（不影响使用）: %s", exc)
+    else:
+        logger.info("MySQL 模式无 VACUUM 对应操作，仅执行超期数据清理")
+    size_after = _db_size_mb()
+    logger.info("空间维护: 清理新闻 %s 条，库体积 %s → %s MB",
+                news_deleted, size_before, size_after)
+    return {"news_deleted": news_deleted, "size_before_mb": size_before, "size_after_mb": size_after}
+
+
+def _db_size_mb() -> float | None:
+    """SQLite 库文件体积（MB）；MySQL 返回 None"""
+    import os
+    from pathlib import Path
+
+    from app.db.session import engine
+
+    if engine.dialect.name != "sqlite":
+        return None
+    raw = str(engine.url).replace("sqlite:///", "")
+    path = Path(raw)
+    return round(path.stat().st_size / 1024 / 1024, 2) if path.exists() else None
 
 
 def add_news(stock_code: str, stock_name: str, title: str, content: str,
@@ -213,6 +339,33 @@ def update_trade_profile(content: dict) -> int:
         return row.version
 
 
+def insert_account_baseline(trade_date: str, total_asset: float, available_cash: float,
+                            position_pct: float, source: str = "ocr") -> int:
+    """保存账户基准快照（人工确认后调用；每次插入一行保留历史，读取取最新）"""
+    with SessionLocal() as db:
+        row = AccountBaseline(trade_date=trade_date, total_asset=total_asset,
+                              available_cash=available_cash, position_pct=position_pct,
+                              source=source)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def get_latest_account_baseline() -> dict | None:
+    """读取最新账户基准快照；无记录返回 None"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(AccountBaseline).order_by(AccountBaseline.id.desc()).limit(1)
+        ).first()
+        if row is None:
+            return None
+        r = row[0]
+        return {"id": r.id, "trade_date": r.trade_date, "total_asset": r.total_asset,
+                "available_cash": r.available_cash, "position_pct": r.position_pct,
+                "source": r.source, "created_at": str(r.created_at)}
+
+
 def _default_profile() -> dict:
     """默认偏好（全部外部化，用户可在面板自由修改）"""
     return {
@@ -242,6 +395,7 @@ def insert_holding(stock_code: str, stock_name: str, entry_date: str, entry_pric
         db.add(row)
         db.commit()
         db.refresh(row)
+        _invalidate("holding")
         return row.id
 
 
@@ -265,6 +419,7 @@ def update_holding(holding_id: int, **fields) -> None:
         for k, v in fields.items():
             setattr(row, k, v)
         db.commit()
+        _invalidate("holding")
 
 
 def get_active_holdings() -> list[Holding]:
@@ -298,78 +453,99 @@ def get_latest_plan(code: str) -> PositionPlan | None:
 # ==================== 面板读取（API 层统一经此网关，禁止直连会话） ====================
 
 def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
-    with SessionLocal() as db:
-        stmt = select(StockCandidate).order_by(StockCandidate.trade_date.desc(), StockCandidate.rank)
-        if date:
-            stmt = stmt.where(StockCandidate.trade_date == date)
-        rows = db.execute(stmt.limit(limit)).scalars().all()
-        return [{"stock_code": r.stock_code, "stock_name": r.stock_name,
-                 "trade_date": r.trade_date, "rank": r.rank,
-                 "reasons": r.reasons, "risk_notice": r.risk_notice,
-                 "created_at": str(r.created_at)} for r in rows]
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(StockCandidate).order_by(
+                StockCandidate.trade_date.desc(), StockCandidate.rank)
+            if date:
+                stmt = stmt.where(StockCandidate.trade_date == date)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "trade_date": r.trade_date, "rank": r.rank,
+                     "reasons": r.reasons, "risk_notice": r.risk_notice,
+                     "detail": r.detail or {}, "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("candidate", {"date": date, "limit": limit}, _load)
 
 
 def list_scores(code: str | None = None, date: str | None = None, limit: int = 100) -> list[dict]:
-    with SessionLocal() as db:
-        stmt = select(StockScore).order_by(StockScore.trade_date.desc())
-        if code:
-            stmt = stmt.where(StockScore.stock_code == code)
-        if date:
-            stmt = stmt.where(StockScore.trade_date == date)
-        rows = db.execute(stmt.limit(limit)).scalars().all()
-        return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                 "trade_date": r.trade_date, "score": r.score, "grade": r.grade,
-                 "detail": r.detail, "risk_list": r.risk_list,
-                 "created_at": str(r.created_at)} for r in rows]
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(StockScore).order_by(StockScore.trade_date.desc())
+            if code:
+                stmt = stmt.where(StockScore.stock_code == code)
+            if date:
+                stmt = stmt.where(StockScore.trade_date == date)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "trade_date": r.trade_date, "score": r.score, "grade": r.grade,
+                     "detail": r.detail, "risk_list": r.risk_list,
+                     "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("score", {"code": code, "date": date, "limit": limit}, _load)
 
 
 def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
-    with SessionLocal() as db:
-        stmt = select(PositionPlan).order_by(PositionPlan.id.desc())
-        if code:
-            stmt = stmt.where(PositionPlan.stock_code == code)
-        rows = db.execute(stmt.limit(limit)).scalars().all()
-        return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                 "plan_date": r.plan_date, "status": r.status, "total_pct": r.total_pct,
-                 "batches": r.batches, "stop_loss": r.stop_loss, "take_profit": r.take_profit,
-                 "rationale": r.rationale, "created_at": str(r.created_at)} for r in rows]
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(PositionPlan).order_by(PositionPlan.id.desc())
+            if code:
+                stmt = stmt.where(PositionPlan.stock_code == code)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "plan_date": r.plan_date, "status": r.status, "total_pct": r.total_pct,
+                     "batches": r.batches, "stop_loss": r.stop_loss, "take_profit": r.take_profit,
+                     "rationale": r.rationale, "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("plan", {"code": code, "limit": limit}, _load)
 
 
 def list_holdings(status: str | None = None) -> list[dict]:
-    with SessionLocal() as db:
-        stmt = select(Holding).order_by(Holding.id.desc())
-        if status:
-            stmt = stmt.where(Holding.status == status)
-        rows = db.execute(stmt).scalars().all()
-        return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                 "entry_date": r.entry_date, "entry_price": r.entry_price, "shares": r.shares,
-                 "cost": r.cost, "stop_loss": r.stop_loss, "take_profit": r.take_profit,
-                 "target_pct": r.target_pct, "status": r.status, "plan_id": r.plan_id,
-                 "note": r.note, "created_at": str(r.created_at)} for r in rows]
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(Holding).order_by(Holding.id.desc())
+            if status:
+                stmt = stmt.where(Holding.status == status)
+            rows = db.execute(stmt).scalars().all()
+            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "entry_date": r.entry_date, "entry_price": r.entry_price, "shares": r.shares,
+                     "cost": r.cost, "stop_loss": r.stop_loss, "take_profit": r.take_profit,
+                     "target_pct": r.target_pct, "status": r.status, "plan_id": r.plan_id,
+                     "note": r.note, "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("holding", {"status": status}, _load)
 
 
 def list_alerts(limit: int = 100) -> list[dict]:
-    with SessionLocal() as db:
-        rows = db.execute(select(AlertLog).order_by(AlertLog.id.desc()).limit(limit)).scalars().all()
-        return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                 "alert_type": r.alert_type, "severity": r.severity, "message": r.message,
-                 "action": r.action, "signal": r.signal, "pushed": r.pushed,
-                 "created_at": str(r.created_at)} for r in rows]
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(AlertLog).order_by(AlertLog.id.desc()).limit(limit)).scalars().all()
+            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "alert_type": r.alert_type, "severity": r.severity, "message": r.message,
+                     "action": r.action, "signal": r.signal, "pushed": r.pushed,
+                     "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("alert", {"limit": limit}, _load)
 
 
 def list_reviews(code: str | None = None, limit: int = 50) -> list[dict]:
-    with SessionLocal() as db:
-        stmt = select(ReviewResult).order_by(ReviewResult.id.desc())
-        if code:
-            stmt = stmt.where(ReviewResult.stock_code == code)
-        rows = db.execute(stmt.limit(limit)).scalars().all()
-        return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                 "exit_date": r.exit_date, "hold_days": r.hold_days, "pnl_pct": r.pnl_pct,
-                 "plan_vs_actual": r.plan_vs_actual, "lesson": r.lesson, "feedback": r.feedback,
-                 "suggest_status": r.suggest_status, "reject_reason": r.reject_reason,
-                 "suggest_iteration": r.suggest_iteration, "suggest_history": r.suggest_history or [],
-                 "created_at": str(r.created_at)}
-                for r in rows]
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(ReviewResult).order_by(ReviewResult.id.desc())
+            if code:
+                stmt = stmt.where(ReviewResult.stock_code == code)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "exit_date": r.exit_date, "hold_days": r.hold_days, "pnl_pct": r.pnl_pct,
+                     "plan_vs_actual": r.plan_vs_actual, "lesson": r.lesson, "feedback": r.feedback,
+                     "suggest_status": r.suggest_status, "reject_reason": r.reject_reason,
+                     "suggest_iteration": r.suggest_iteration,
+                     "suggest_history": r.suggest_history or [],
+                     "created_at": str(r.created_at)}
+                    for r in rows]
+
+    return _dbq("review", {"code": code, "limit": limit}, _load)
 
 
 def get_review(review_id: int) -> ReviewResult | None:
