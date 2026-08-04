@@ -1,0 +1,4 @@
+# ===== Streamlit 面板依赖（纯展示，仅调 backend API）=====
+streamlit==1.60.0
+requests==2.32.4
+pandas==3.0.5

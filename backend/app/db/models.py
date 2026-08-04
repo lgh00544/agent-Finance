@@ -1,0 +1,228 @@
+"""
+ORM 模型 - MySQL8 / SQLite 共用同一套模型
+JSON 字段用 Text 存储（SQLAlchemy JSON 在 SQLite/MySQL 均可，但 MySQL 原生 JSON 列
+对 SQLAlchemy 2.0 友好；统一用 JSON 类型，SQLite 自动映射为 TEXT）。
+"""
+from datetime import datetime
+
+from sqlalchemy import (
+    JSON, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def _now() -> datetime:
+    return datetime.now()
+
+
+class StockCandidate(Base):
+    """每日候选池（DiscoverAgent 输出）"""
+    __tablename__ = "stock_candidate"
+    __table_args__ = (UniqueConstraint("stock_code", "trade_date", name="uq_candidate_code_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
+    rank: Mapped[int] = mapped_column(Integer, default=0)            # 候选排序（LLM 输出）
+    reasons: Mapped[list] = mapped_column(JSON, default=list)        # 候选理由（LLM 输出）
+    risk_notice: Mapped[list] = mapped_column(JSON, default=list)    # 风险初判（LLM 输出）
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)       # 当日原始行情快照（计算层）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class StockScore(Base):
+    """评分结果（ScoreAgent 输出）"""
+    __tablename__ = "stock_score"
+    __table_args__ = (UniqueConstraint("stock_code", "trade_date", name="uq_score_code_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)         # 0-100（LLM 输出）
+    grade: Mapped[str] = mapped_column(String(4))                    # A/B/C（LLM 输出）
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # 五维明细（LLM 输出）
+    risk_list: Mapped[list] = mapped_column(JSON, default=list)      # 风险清单（LLM 输出）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class PositionPlan(Base):
+    """分批建仓方案（PositionAgent 输出）"""
+    __tablename__ = "position_plan"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    plan_date: Mapped[str] = mapped_column(String(10), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="proposed")  # proposed/accepted/expired
+    total_pct: Mapped[float] = mapped_column(Float, default=0.0)     # 总仓位上限 %（LLM 输出）
+    batches: Mapped[list] = mapped_column(JSON, default=list)        # 分批明细（LLM 输出）
+    stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（LLM 输出）
+    take_profit: Mapped[float] = mapped_column(Float, default=0.0)   # 止盈参考价（LLM 输出）
+    rationale: Mapped[str] = mapped_column(Text, default="")         # 建仓逻辑（LLM 输出）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class Holding(Base):
+    """持仓记录（人工录入，监控对象）"""
+    __tablename__ = "holding"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    entry_date: Mapped[str] = mapped_column(String(10))              # 建仓日期
+    entry_price: Mapped[float] = mapped_column(Float)                # 平均建仓成本价
+    shares: Mapped[int] = mapped_column(Integer)                     # 当前股数
+    cost: Mapped[float] = mapped_column(Float, default=0.0)          # 总成本（元）
+    stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（Plan/人工）
+    take_profit: Mapped[float] = mapped_column(Float, default=0.0)   # 止盈参考价
+    target_pct: Mapped[float] = mapped_column(Float, default=0.0)    # 目标仓位 %
+    status: Mapped[str] = mapped_column(String(16), default="holding")  # holding/exited
+    plan_id: Mapped[int] = mapped_column(Integer, nullable=True)     # 关联 position_plan.id
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class TradeRecord(Base):
+    """手工交易流水（买卖均由人工执行后录入，系统不做任何下单）"""
+    __tablename__ = "trade_record"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    holding_id: Mapped[int] = mapped_column(Integer, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    side: Mapped[str] = mapped_column(String(8))                     # buy/sell
+    price: Mapped[float] = mapped_column(Float)
+    shares: Mapped[int] = mapped_column(Integer)
+    amount: Mapped[float] = mapped_column(Float)                     # 成交金额
+    trade_date: Mapped[str] = mapped_column(String(10))
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class AlertLog(Base):
+    """告警日志（MonitorAgent 触发，飞书推送记录）"""
+    __tablename__ = "alert_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    alert_type: Mapped[str] = mapped_column(String(32), index=True)  # 由 LLM 信号决定
+    severity: Mapped[str] = mapped_column(String(8), default="info")  # info/warning/critical
+    message: Mapped[str] = mapped_column(Text)                       # 飞书推送文案（LLM 输出）
+    action: Mapped[str] = mapped_column(String(16), default="hold")  # hold/reduce/exit（LLM 输出）
+    signal: Mapped[dict] = mapped_column(JSON, default=dict)         # 完整信号结构化输出
+    pushed: Mapped[bool] = mapped_column(Boolean, default=False)     # 是否已推飞书
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class ReviewResult(Base):
+    """卖出复盘（ReviewAgent 输出）"""
+    __tablename__ = "review_result"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    holding_id: Mapped[int] = mapped_column(Integer, index=True)
+    exit_date: Mapped[str] = mapped_column(String(10))
+    hold_days: Mapped[int] = mapped_column(Integer, default=0)
+    pnl_pct: Mapped[float] = mapped_column(Float, default=0.0)       # 盈亏 %
+    plan_vs_actual: Mapped[dict] = mapped_column(JSON, default=dict) # 计划兑现度（LLM 输出）
+    lesson: Mapped[str] = mapped_column(Text, default="")            # 经验教训（LLM 输出）
+    feedback: Mapped[dict] = mapped_column(JSON, default=dict)       # 筛选偏好微调建议（LLM 输出）
+    # ---------- 建议驳回迭代（人工审核闭环） ----------
+    suggest_status: Mapped[str] = mapped_column(String(16), default="pending")  # pending=待审核 / adopted=已采纳 / rejected=已驳回
+    reject_reason: Mapped[str] = mapped_column(Text, default="")     # 最近一次驳回原因（必填）
+    suggest_iteration: Mapped[int] = mapped_column(Integer, default=1)  # 建议迭代次数（第几版）
+    suggest_history: Mapped[list] = mapped_column(JSON, default=list)   # 迭代轨迹 [{iteration, suggestion, reject_reason}]
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class NewsArticle(Base):
+    """新闻/公告原始文本（真源数据；Qdrant 仅做其向量索引，dev 模式 SQL LIKE 检索）"""
+    __tablename__ = "news_article"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    title: Mapped[str] = mapped_column(String(512))
+    content: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(64), default="")      # 来源（东财/新浪...）
+    url: Mapped[str] = mapped_column(String(512), default="")
+    published_at: Mapped[str] = mapped_column(String(32), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class AgentPreference(Base):
+    """LLM 复盘反馈回流档案（ReviewAgent 写入，注入后续 Discover/Score prompt）"""
+    __tablename__ = "agent_preference"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)         # 版本号递增
+    content: Mapped[dict] = mapped_column(JSON, default=dict)        # 偏好内容（LLM 输出）
+    source_review_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class TradeProfile(Base):
+    """个人交易偏好档案（sys_trade_profile，单行配置 id=1）
+    系统启动全局加载，所有 Agent 调用 LLM 时自动注入上下文。
+    字段全部外部化，禁止硬编码选股风格；version 递增使 LLM 缓存自动失效。
+    """
+    __tablename__ = "sys_trade_profile"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    content: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class PrivateKnowledge(Base):
+    """私有交易经验/战法知识库（人工录入；各 Agent 任务启动时自动检索注入参考上下文）"""
+    __tablename__ = "private_knowledge"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(256))
+    content: Mapped[str] = mapped_column(Text, default="")
+    # 适用 Agent：discover/score/position/monitor/sell/review/all（all=全部 Agent 通用）
+    agent_tag: Mapped[str] = mapped_column(String(32), index=True, default="all")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SellDecision(Base):
+    """卖出决策（SellAgent 输出；决策仅供参考，卖出必须由人工执行）"""
+    __tablename__ = "sell_decision"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    holding_id: Mapped[int] = mapped_column(Integer, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    decision: Mapped[dict] = mapped_column(JSON, default=dict)   # 完整决策结构化输出（LLM 输出）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class AgentSuggestion(Base):
+    """复盘进化Agent 输出的各 Agent 规则/参数优化建议（策略闭环）
+    状态机：pending → approved/rejected；任何生效必须先经人工审核确认。
+    target_kind 决定采纳后的生效方式：
+      profile = 直接写入个人交易偏好档案（sys_trade_profile，字段级）；
+      prompt  = 需人工修改 agent_prompts/ 对应提示词文件或 common.py HARD_RULES。"""
+    __tablename__ = "agent_suggestion"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    review_id: Mapped[int] = mapped_column(Integer, index=True)
+    target_agent: Mapped[str] = mapped_column(String(16), index=True)  # discover/score/position/monitor/sell/review
+    target_kind: Mapped[str] = mapped_column(String(16), default="profile")  # profile/prompt
+    rule_name: Mapped[str] = mapped_column(String(128))                # 规则/参数名称
+    current_value: Mapped[str] = mapped_column(Text, default="")       # 当前值
+    suggested_value: Mapped[str] = mapped_column(Text, default="")     # 建议值
+    reason: Mapped[str] = mapped_column(Text, default="")              # 建议理由
+    evidence: Mapped[str] = mapped_column(Text, default="")            # 事实依据
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/approved/rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

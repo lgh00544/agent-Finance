@@ -1,0 +1,45 @@
+# ============================================================
+# 单人 A 股全生命周期决策 Agent 系统 - 双服务编排（全本地文件存储）
+# 使用: cp .env.example .env 填写密钥后: docker compose up -d --build
+# 存储默认全本地文件（零外部依赖）：
+#   - SQLite 单文件 data/dev.db
+#   - 本地文件模式 Qdrant data/qdrant_storage（向量库）
+#   - 进程内存缓存
+# 所有数据经 ./data 挂载持久化，迁移系统直接复制 ./data 目录即可。
+# 如需外部 MySQL/Redis/Qdrant 服务，在 .env 设置 DB_BACKEND/CACHE_BACKEND/QDRANT_MODE。
+# 所有密钥只从 .env 读取，镜像内不硬编码任何秘密
+# ============================================================
+name: stock-agent
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: stock-backend
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  streamlit:
+    build: ./streamlit
+    container_name: stock-streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE: http://backend:8000
+      TZ: Asia/Shanghai
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

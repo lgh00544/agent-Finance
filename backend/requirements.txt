@@ -1,0 +1,47 @@
+# ===== 后端运行依赖（Python 3.11，容器/本机 dev 通用）=====
+fastapi==0.141.1
+uvicorn[standard]==0.41.0
+pydantic==2.12.5
+pydantic-settings==2.12.0
+
+# ORM / 存储
+SQLAlchemy==2.0.44
+PyMySQL==1.1.2
+redis==6.4.0
+qdrant-client==1.18.0
+
+# 数据源
+akshare==1.18.81
+# pandas 3.0.x：兼容 Python 3.14（本机 dev 直跑）与 3.11（容器），akshare 1.18.81 已适配
+pandas==3.0.5
+numpy==2.5.1
+
+# LLM（DeepSeek OpenAI 兼容端点）
+openai==1.99.0
+
+# 多智能体编排
+langgraph==1.2.10
+
+# 调度
+APScheduler==3.11.0
+
+# HTTP（飞书推送等）
+httpx==0.28.1
+
+# ===== OCR 持仓截图识别（可选依赖，.env 设置 OCR_ENABLE=true 时启用）=====
+# 本地 PaddleOCR 轻量版，离线识别，不调用外部 API；关闭 OCR_ENABLE 可完全绕过本组依赖。
+#   CPU 运行（推荐，已验证 Python 3.14）：
+#     paddleocr + onnxruntime 即可；若环境为 Python 3.11/3.12（含 Docker 容器），
+#     可额外安装 paddlepaddle 获得更好性能（未装时自动回退 onnxruntime 引擎）
+#   GPU 运行：卸载 paddlepaddle 后安装 paddlepaddle-gpu（需 NVIDIA 显卡 + CUDA），
+#     并在 .env 设置 OCR_DEVICE=gpu
+# 首次识别自动下载识别模型（约 150MB，缓存于用户目录 ~/.paddlex/），离线环境需提前联网下载一次
+paddleocr==3.7.0
+onnxruntime==1.28.0
+
+# 可选：本地 embedding 降级模型（EMBEDDING_PROVIDER=local 或硅基流动 API 故障时启用）
+# sentence-transformers==5.3.1
+
+# ===== 开发/测试 =====
+pytest==8.4.2
+pytest-asyncio==1.1.0

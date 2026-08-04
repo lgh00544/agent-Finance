@@ -1,0 +1,29 @@
+# ===== 版本库忽略规则 =====
+# 敏感配置（含 API Key，严禁提交）
+.env
+
+# 数据与运行产物
+data/
+*.db
+*.sqlite3
+logs/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+
+# 容器
+*.egg-info/
+
+# 运行产物与缓存
+_paddlex_check/
+
+# 本地个人配置
+.claude/settings.local.json
