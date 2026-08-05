@@ -1,0 +1,10 @@
+# Streamlit 全局深色科技感主题（与 render.py 全局 CSS 变量同色板，原生控件兜底适配）
+# 说明：此处为 streamlit 原生控件（dataframe 排序/按钮/输入框等）提供深色兜底，
+# 页面级卡片/徽章/溯源样式由 render.apply_global_theme() 注入。
+[theme]
+base = "dark"
+primaryColor = "#3B82F6"
+backgroundColor = "#0B0D13"
+secondaryBackgroundColor = "#141824"
+textColor = "#E5E7EB"
+font = "sans serif"

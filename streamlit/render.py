@@ -67,6 +67,118 @@ def raw_json_expander(data, label: str = "查看原始数据", key: str | None =
         st.json(data)
 
 
+# ================= 全局深色科技感主题（全站唯一视觉体系，纯 CSS 无外部资源） =================
+# 色板全部收敛为 CSS 变量（:root 单点），换肤只改一处；徽章/卡片/溯源行/空态为通用组件；
+# 数字一律等宽对齐（tabular-nums）；核心数据微发光；微动效 0.2s 过渡，无大面积动画。
+_GLOBAL_THEME_CSS = """
+<style>
+:root {
+  --bg-base: #0B0D13; --bg-card: #141824; --bg-hover: #1A1F2E; --bg-input: #0F1220;
+  --border: #2C2F36; --border-hi: #3D4460;
+  --primary: #3B82F6; --primary-dim: #1E3A5F;
+  --up: #F87171; --down: #4ADE80; --warn: #F59E0B; --err: #EF4444; --ok: #22C55E; --info: #60A5FA;
+  --tier-a: #F87171; --tier-b: #FBBF24; --tier-c: #60A5FA;
+  --text: #E5E7EB; --text-dim: #9CA3AF; --text-mute: #6B7280;
+}
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] { background: var(--bg-base); }
+html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select, button {
+  font-variant-numeric: tabular-nums;
+}
+/* 卡片容器（st.container(border=True)）：深色卡片 + 细线高亮描边 + 悬停过渡 */
+[data-testid="stVerticalBlockBorderWrapper"] {
+  background: var(--bg-card); border: 1px solid var(--border-hi); border-radius: 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:hover { border-color: var(--primary-dim); }
+/* 分区标题（st.subheader）：主色左侧竖条统一层级 */
+[data-testid="stHeading"] h2 { border-left: 3px solid var(--primary); padding-left: 0.5rem; }
+/* 徽章：评级 A/B/C + 状态 ok/warn/err/info/mute */
+.badge {
+  display: inline-block; padding: 0.05rem 0.5rem; border-radius: 4px;
+  font-size: 0.78em; font-weight: 600; line-height: 1.6;
+}
+.badge-tier-a { color: var(--tier-a); background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.45); }
+.badge-tier-b { color: var(--tier-b); background: rgba(251, 191, 36, 0.15); border: 1px solid rgba(251, 191, 36, 0.45); }
+.badge-tier-c { color: var(--tier-c); background: rgba(96, 165, 250, 0.15); border: 1px solid rgba(96, 165, 250, 0.45); }
+.badge-ok    { color: var(--ok);    background: rgba(34, 197, 94, 0.15);  border: 1px solid rgba(34, 197, 94, 0.45); }
+.badge-warn  { color: var(--warn);  background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); }
+.badge-err   { color: var(--err);   background: rgba(239, 68, 68, 0.15);  border: 1px solid rgba(239, 68, 68, 0.45); }
+.badge-info  { color: var(--info);  background: rgba(96, 165, 250, 0.15); border: 1px solid rgba(96, 165, 250, 0.45); }
+.badge-mute  { color: var(--text-dim); background: rgba(156, 163, 175, 0.12); border: 1px solid var(--border); }
+/* 溯源行：时间/数据源/置信度统一浅色小字，紧急信号琥珀高亮 */
+.trace-line { color: var(--text-dim); font-size: 0.82em; margin: 0.25rem 0; }
+.trace-line .hl { color: var(--warn); }
+/* 核心数字高亮（顶部栏与核心指标卡）：大字号 + 轻微发光 */
+.core-num { font-size: 1.25em; font-weight: 700; color: #FFFFFF;
+            text-shadow: 0 0 12px rgba(59, 130, 246, 0.35); }
+/* 空态：虚线框居中提示 */
+.empty-state { color: var(--text-dim); text-align: center; padding: 1.4rem 0;
+               border: 1px dashed var(--border); border-radius: 10px; font-size: 0.95em; }
+/* 按钮悬停微过渡 */
+[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-secondary"],
+[data-testid="stBaseButton-tertiary"] { transition: filter 0.2s ease; }
+[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-secondary"]:hover,
+[data-testid="stBaseButton-tertiary"]:hover { filter: brightness(1.12); }
+</style>
+"""
+
+
+def apply_global_theme() -> None:
+    """全站深色科技感主题注入（每个页面标题前调用一次，幂等）"""
+    st.markdown(_GLOBAL_THEME_CSS, unsafe_allow_html=True)
+
+
+_BADGE_TONES = {"a": "badge-tier-a", "b": "badge-tier-b", "c": "badge-tier-c",
+                "ok": "badge-ok", "warn": "badge-warn", "err": "badge-err",
+                "info": "badge-info", "mute": "badge-mute"}
+
+
+def badge(text: str, tone: str = "info") -> None:
+    """徽章：评级 a/b/c、状态 ok/warn/err/info/mute（纯展示样式，无任何研判语义）"""
+    st.markdown(f'<span class="badge {_BADGE_TONES.get(tone, "badge-info")}">{text}</span>',
+                unsafe_allow_html=True)
+
+
+def trace_line(label: str, time_str: str | None = None, source: str | None = None,
+               confidence=None, highlight: bool = False) -> None:
+    """强制追溯项统一呈现：时间 + 数据源 + 置信度 一行浅色小字；
+    紧急信号（highlight=True）时间琥珀色高亮。缺失字段不渲染，但字段级数据不删减。"""
+    parts = []
+    if time_str:
+        parts.append(f"{label}：{str(time_str)[:16]}")
+    if source:
+        parts.append(f"数据源：{source}")
+    if confidence is not None and str(confidence).strip():
+        parts.append(f"置信度：{confidence}")
+    if not parts:
+        return
+    cls = " class='hl'" if highlight else ""
+    st.markdown(f'<div class="trace-line"><span{cls}>{"　·　".join(parts)}</span></div>',
+                unsafe_allow_html=True)
+
+
+def empty_state(text: str) -> None:
+    """统一空态提示（虚线框居中，附下一步操作说明）"""
+    st.markdown(f'<div class="empty-state">{text}</div>', unsafe_allow_html=True)
+
+
+def record_list(items: list, render_fn, batch: int = 20, key: str = "rl",
+                empty_text: str = "暂无数据。") -> None:
+    """懒加载列表（全站统一分页）：首屏渲染前 batch 条，点「加载更多」增量展示；
+    render_fn(item, index) 渲染单条；切换筛选条件时 key 变化自动回到首屏。"""
+    if not items:
+        empty_state(empty_text)
+        return
+    visible = st.session_state.get(key, batch)
+    for i, item in enumerate(items[:visible]):
+        render_fn(item, i)
+    if len(items) > visible:
+        if st.button(f"加载更多（已显示 {visible} / {len(items)}）", key=f"more_{key}"):
+            st.session_state[key] = visible + batch
+            st.rerun()
+
+
 def submit_task(kind: str, params: dict | None = None, label: str = "后台任务") -> bool:
     """提交后台任务：重复触发（后端 409）与后端不可达时显示中文提示，返回是否成功"""
     import requests
@@ -303,23 +415,9 @@ def top_status_bar() -> None:
 
     st.markdown(f'<div class="top-status-bar">{"".join(parts)}</div>', unsafe_allow_html=True)
 
-    # ---------- 展开详情（默认收起，点击展开查看详细数据） ----------
-    show_acc = st.session_state.setdefault("_bar_show_acc", False)
-    show_idx = st.session_state.setdefault("_bar_show_idx", False)
-    c1, c2, c3 = st.columns([1.2, 1.2, 6])
-    with c1:
-        if st.button("账户明细 ▼" if not show_acc else "账户明细 ▲",
-                     key="bar_toggle_acc", use_container_width=True):
-            st.session_state["_bar_show_acc"] = not show_acc
-            st.rerun()
-    with c2:
-        if st.button("指数详情 ▼" if not show_idx else "指数详情 ▲",
-                     key="bar_toggle_idx", use_container_width=True):
-            st.session_state["_bar_show_idx"] = not show_idx
-            st.rerun()
-
-    if show_acc and acc:
-        st.markdown("**账户明细**")
+    # ---------- 展开详情（默认收起：单行 expander 入口，不占多列挤压主区） ----------
+    with st.expander("查看账户明细 / 指数详情", expanded=False):
+        show_acc = acc is not None
         if acc.get("source") == "estimate":
             st.caption("暂无券商账户基准：总资产/可用资金/整体仓位按「总资金设定 + 持仓实时盈亏」估算。"
                        "上传持仓截图 OCR 识别并经人工确认保存账户基准后，自动切换为券商真实值。")
@@ -345,7 +443,7 @@ def top_status_bar() -> None:
         if acc.get("quote_error"):
             st.caption(f"⚠️ 行情刷新失败：{acc['quote_error']}（市价相关数值可能不准确）")
 
-    if show_idx and idx:
+    if idx:
         st.markdown("**指数详情**")
         for it in idx.get("indices") or []:
             pct = it.get("change_pct")

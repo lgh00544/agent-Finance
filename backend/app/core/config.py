@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     # 麦蕊（mairui.club）作为 akshare 的补充数据源：仅用于 v2.0 选股机制的高级资金面/股东面字段，
     # 基础行情数据仍优先走 akshare（东财→新浪双通道），减少配额消耗。默认关闭时行为与之前完全一致。
     mairui_enable: bool = False
-    mairui_licence: str = "519B8996-416A-4358-AEDC-87CD2A54023F"  # 证书密钥（仅环境变量管理，禁止硬编码到业务代码）
+    mairui_licence: str = ""  # 证书密钥（仅从环境变量 MAIRUI_LICENCE 读取，禁止硬编码入库）
     mairui_base_url: str = "https://api.mairuiapi.com"
 
     # ---------- 存储空间维护（低频自动清理，防无限堆积）----------
