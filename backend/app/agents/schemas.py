@@ -8,11 +8,15 @@ from pydantic import BaseModel, Field
 # ================= DiscoverAgent 潜力发掘 =================
 class DiscoverCandidate(BaseModel):
     """v2.0 输出格式强制升级：代码+全称成对、K202 信心度档位、三维分析、量能判定、
-    核心风险（≥2 项）、关注类型；禁止仅输出代码与理由。"""
+    核心风险（≥2 项）、关注类型、标的类型标识；禁止仅输出代码与理由。"""
     stock_code: str = Field(description="6 位股票代码")
     stock_name: str = Field(description="股票全称（与代码成对出现）")
     reason: str = Field(description="候选理由（结合量能/趋势/行业热度/基本面预期的研判）")
     risk_notice: str = Field(description="风险初步判断")
+    stock_type: str = Field(
+        pattern="^(吸筹末期-优选型|拉升初期-突破型|拉升中段-趋势型|派发期-高风险型|下跌期-反弹型|观察期-蓄势型)$",
+        description="标的类型标识（威科夫阶段定位 6 类）：吸筹末期-优选型/拉升初期-突破型/"
+                    "拉升中段-趋势型/派发期-高风险型/下跌期-反弹型/观察期-蓄势型")
     confidence_tier: str = Field(
         pattern="^(谨慎观察|建议关注|强烈推荐)$",
         description="K202 信心度档位：谨慎观察/建议关注/强烈推荐")

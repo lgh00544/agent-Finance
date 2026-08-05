@@ -19,10 +19,9 @@ st.caption("筛选标准由 LLM 综合量能/趋势/行业热度/基本面研判
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
 
-# 顶部手动触发每日挖掘（异步提交，立即返回，不阻塞页面）
+# 顶部手动触发每日挖掘（异步提交，立即返回，不阻塞页面；重复触发会给出中文提示）
 if st.button("手动触发每日挖掘", type="primary", key="btn_run_discover"):
-    api.submit_task("daily_pipeline")
-    st.toast("每日挖掘任务已提交后台，可切换页面继续操作")
+    render.submit_task("daily_pipeline", label="每日挖掘")
 
 # 评级映射（LLM 信心度档位 → 展示评级；纯展示层转换，不含任何研判）
 TIER_MAP = {"强烈推荐": "A", "建议关注": "B", "谨慎观察": "C"}
@@ -32,20 +31,12 @@ TIER_COLOR = {"A": "#F87171", "B": "#FBBF24", "C": "#60A5FA"}
 _SORT = {"A": 0, "B": 1, "C": 2}
 
 try:
-    rows = api.candidates(limit=500)
-    if not rows:
+    # 默认仅加载最新一天：日期列表轻量接口获取，选中日期后再按需查询当日候选
+    dates = api.candidate_dates()
+    if not dates:
         st.info("暂无候选数据。可点击上方「手动触发每日挖掘」，或等待每日定时任务。")
         st.stop()
 
-    # 同日同股按最新版本覆盖（created_at 最大），历史版本不参与渲染
-    latest: dict[tuple, dict] = {}
-    for r in rows:
-        key = (r["stock_code"], r["trade_date"])
-        if key not in latest or (r.get("created_at") or "") > (latest[key].get("created_at") or ""):
-            latest[key] = r
-    rows = list(latest.values())
-
-    dates = sorted({r["trade_date"] for r in rows}, reverse=True)
     c1, c2 = st.columns([2, 3])
     with c1:
         date = st.selectbox("选择日期", dates, index=0)
@@ -53,7 +44,15 @@ try:
         filter_opt = st.radio("评级筛选", ["全部", "可建仓 A+B", "仅观察 C"], horizontal=True)
     st.caption("评级：🔴 A 强烈推荐 ／ 🟠 B 建议关注 ／ 🔵 C 谨慎观察（LLM 信心度档位映射，纯展示）")
 
-    day_rows = [r for r in rows if r["trade_date"] == date]
+    rows = api.candidates(date=date, limit=300)
+
+    # 同日同股按最新版本覆盖（created_at 最大），历史版本不参与渲染
+    latest: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["stock_code"], r["trade_date"])
+        if key not in latest or (r.get("created_at") or "") > (latest[key].get("created_at") or ""):
+            latest[key] = r
+    day_rows = list(latest.values())
 
     def _tier(r: dict) -> str:
         t = ((r.get("detail") or {}).get("confidence_tier") or "")
@@ -87,25 +86,35 @@ try:
     # 可建仓置顶：A→B→C，组内按 rank 升序
     day_rows.sort(key=lambda r: (_SORT.get(_tier(r), 3), int(r.get("rank") or 999)))
 
-    # 主表：评级（颜色区分）/股票/一句话核心理由/生成时间
+    # 懒加载：长列表首屏只渲染前 20 条，点击「加载更多」增量展示（避免一次性渲染大量详情卡顿）；
+    # 分页进度随日期/筛选条件各自独立记录，切换条件自动回到首屏
+    BATCH = 20
+    vis_key = f"_cand_visible_{date}_{filter_opt}_{sector}"
+    visible = st.session_state.get(vis_key, BATCH)
+    day_rows_show = day_rows[:visible]
+
+    # 主表：评级（颜色区分）/股票/标的类型/一句话核心理由/生成时间
     summary = pd.DataFrame([{
         "评级": TIER_LABEL.get(_tier(r), "未评级"),
         "股票": render.stock_label(r["stock_code"], r["stock_name"]),
+        "类型": (r.get("detail") or {}).get("stock_type", ""),
         "核心理由": (r.get("reasons") or [""])[0] or ((r.get("detail") or {}).get("meso_view") or ""),
         "生成时间": str(r.get("created_at") or "")[:16],
-    } for r in day_rows])
+    } for r in day_rows_show])
     styled = summary.style.map(
         lambda v: f"color: {TIER_COLOR.get(v, '#9CA3AF')}", subset=["评级"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    for r in day_rows:
+    for r in day_rows_show:
         label = render.stock_label(r["stock_code"], r["stock_name"])
         detail = r.get("detail") or {}
         tier = _tier(r)
         focus = detail.get("focus_type", "")
+        stock_type = detail.get("stock_type", "")
         with st.expander(f"#{r.get('rank', '-')} {label}　{TIER_ICON.get(tier, '')}"
                          f"{TIER_LABEL.get(tier, '未评级')}"
-                         + (f"　[{focus}]" if focus else "")):
+                         + (f"　[{focus}]" if focus else "")
+                         + (f"　· {stock_type}" if stock_type else "")):
             render.time_text("本轮挖掘执行时间", r.get("created_at"))
 
             st.markdown("**候选理由**")
@@ -129,7 +138,9 @@ try:
             else:
                 st.markdown("（无）")
 
-            st.markdown("**操作建议**（关注类型 + 参考仓位）")
+            st.markdown("**操作建议**（标的类型 + 关注类型 + 参考仓位）")
+            st.markdown(f"- 标的类型：{stock_type or '（未输出）'}"
+                        f"（威科夫阶段定位，参考权重）")
             hint = detail.get("position_hint") or ""
             st.markdown(f"- 关注类型：{focus or '观察'}")
             st.markdown(f"- 参考建议：{hint}" if hint else "- 参考建议：（该轮未输出）")
@@ -148,11 +159,17 @@ try:
 
             code, name = r["stock_code"], r["stock_name"]
             if st.button("生成建仓方案", key=f"plan_{code}_{r['trade_date']}"):
-                api.submit_task("position", {"stock_code": code, "stock_name": name})
-                st.toast("建仓方案生成任务已提交后台，可切换页面继续操作")
+                render.submit_task("position", {"stock_code": code, "stock_name": name},
+                                   label="建仓方案生成")
             render.raw_json_expander(
                 {"reasons": r.get("reasons"), "risk_notice": r.get("risk_notice"),
                  "detail": detail},
                 key=f"raw_cand_{code}_{r['trade_date']}")
+
+    if len(day_rows) > visible:
+        if st.button(f"加载更多候选（已显示 {visible} / {len(day_rows)}）",
+                     key=f"load_more_{vis_key}"):
+            st.session_state[vis_key] = visible + BATCH
+            st.rerun()
 except Exception as exc:
     st.error(f"候选池获取失败: {exc}")

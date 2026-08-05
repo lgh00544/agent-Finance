@@ -3,7 +3,9 @@ REST API：仅提供数据存取与手动触发任务（无任何二次判断逻
 面板等前端不内置研判，全部展示 LLM 输出结论与原始数据。
 """
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -34,9 +36,23 @@ def _task_batch_import_knowledge(items: list[dict]) -> dict:
     return {"imported": imported}
 
 
+def _task_daily_pipeline(params: dict) -> dict:
+    """手动触发每日挖掘：先失效当日 LLM 结果缓存（初选/终选/市况），
+    强制重新执行完整链路（硬过滤 → LLM 初选 → 新闻核验 → 最终确认 → 批量打分），
+    保证手动触发绝不命中缓存、结果与已有数据不同也必然覆盖更新。"""
+    from app.cache import cache
+
+    date_key = time.strftime("%Y-%m-%d")
+    for prefix in ("shortlist:v2:", "final:v2:", "market:v2:"):
+        cache.delete_prefix(f"{prefix}{date_key}")
+    result = graph_router.run_daily_pipeline()
+    return {"candidates": result.get("candidates", 0),
+            "scored": result.get("scored", 0),
+            "date": date_key}
+
+
 _TASK_KINDS: dict[str, tuple[str, object]] = {
-    "daily_pipeline": ("每日挖掘（Discover → 候选打分）",
-                       lambda p: graph_router.run_daily_pipeline()),
+    "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
     "score": ("单股评分",
               lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
     "position": ("分批建仓方案",
@@ -51,6 +67,9 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
                        lambda p: llm_rethink_suggestion(p.get("review_id"), p.get("reason", ""))),
     "knowledge_import": ("知识库批量导入",
                          lambda p: _task_batch_import_knowledge(p.get("items") or [])),
+    "chat_ask": ("Agent 对话·提问答疑", lambda p: _task_chat_ask(p)),
+    "chat_rule": ("Agent 对话·规则调教", lambda p: _task_chat_rule(p)),
+    "chat_learn": ("Agent 对话·图片学习", lambda p: _task_chat_learn(p)),
 }
 
 
@@ -64,8 +83,49 @@ def _task_monitor_all() -> dict:
                         for r in results]}
 
 
+def _task_chat_ask(params: dict) -> dict:
+    """Agent 对话·文字提问答疑"""
+    from app.services import agent_chat
+
+    return agent_chat.ask_agent(str(params.get("agent", "")), str(params.get("question", "")))
+
+
+def _task_chat_rule(params: dict) -> dict:
+    """Agent 对话·规则调教校验（采纳自动沉淀知识库）"""
+    from app.services import agent_chat
+
+    return agent_chat.rule_feedback(str(params.get("agent", "")), str(params.get("proposal", "")))
+
+
+def _task_chat_learn(params: dict) -> dict:
+    """Agent 对话·多模态上传学习（识别+提炼，返回确认摘要；确认落库走独立接口）
+    图片经临时文件传递（任务参数只含路径，避免二进制入任务表）；处理完毕立即清理"""
+    import os
+
+    from app.services import agent_chat
+
+    tmp_path = params.get("tmp_path", "")
+    try:
+        with open(tmp_path, "rb") as f:
+            image_bytes = f.read()
+        return agent_chat.learn_from_image(str(params.get("agent", "")),
+                                           image_bytes,
+                                           str(params.get("filename", "upload.png")))
+    finally:
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _submit_task(kind: str, params: dict) -> dict:
-    """提交后台任务：立即返回任务ID，页面可自由切换"""
+    """提交后台任务：立即返回任务ID，页面可自由切换；
+    同类型任务正在执行/排队时拒绝（重复触发防护，防脏数据与资源浪费）"""
+    if task_queue.has_active(kind):
+        raise HTTPException(status_code=409,
+                            detail=f"已有同类任务（{_TASK_KINDS[kind][0]}）正在执行，"
+                                   f"请等待其完成后重试")
     label, fn = _TASK_KINDS[kind]
     tid = task_queue.submit(kind, label, fn, params)
     return {"task_id": tid, "label": label, "status": "pending"}
@@ -137,6 +197,25 @@ def llm_stats():
     return llm_stats_service.snapshot()
 
 
+@router.get("/datasource/stats")
+def datasource_stats():
+    """行情数据源状态（当日累计：主源调用/失败/降级/恢复次数、成功率、当前源状态），
+    供首页「数据源状态」看板；数据来自数据源调用层与断路器"""
+    from app.services import datasource_stats as datasource_stats_service
+
+    return datasource_stats_service.snapshot()
+
+
+@router.get("/dashboard")
+def dashboard():
+    """首页看板聚合：系统状态/LLM统计/市况/持仓与信号/候选评分方案/复盘与建议
+    一次请求返回全部模块（内部并行执行），替代首页多次串行请求；
+    单模块失败仅标注 error，不影响整体"""
+    from app.services.dashboard import build_dashboard
+
+    return build_dashboard()
+
+
 @router.get("/market-condition")
 def market_condition():
     """当日市况评分（v2.0 前置步骤结果：总分/档位/候选池上限/五维/综述），供首页「今日操作提示」"""
@@ -204,6 +283,12 @@ def run_db_maintenance():
 @router.get("/candidates")
 def list_candidates(date: Optional[str] = None, limit: int = 50):
     return repo.list_candidates(date, limit)
+
+
+@router.get("/candidates/dates")
+def candidate_dates(limit: int = 30):
+    """候选池可选日期（去重降序）：页面默认仅加载最新一天，切换日期再按需查询"""
+    return {"dates": repo.list_candidate_dates(limit)}
 
 
 @router.get("/scores")
@@ -539,3 +624,82 @@ def reject_agent_suggestion(sid: int):
 @router.get("/health")
 def health():
     return {"status": "ok", "time": time.strftime("%Y-%m-%d %H:%M:%S"), "env": __import__("app.core.config", fromlist=["settings"]).settings.app_env}
+
+
+# ================= Agent 专属对话（提问答疑 / 规则调教 / 多模态学习） =================
+# 交互全程复用：agent_call 统一知识注入 + 双模型路由 + 异步任务 + 知识库沉淀；
+# 硬性规则与核心方法论只读，对话无权修改（校验由 LLM 强制 + 代码无写入路径）。
+from app.services import agent_chat as chat_service
+
+
+@router.get("/agent-chat/agents")
+def chat_agents():
+    """六 Agent 对话元信息（页面标注名称/职责范围/知识库来源）"""
+    return [{"agent": k, **v} for k, v in chat_service.AGENT_CHAT_META.items()]
+
+
+@router.get("/agent-chat/history")
+def chat_history(agent: str, limit: int = 50):
+    """某 Agent 的对话历史（最新在前，可回溯每次提问/调教/学习）"""
+    if agent not in chat_service.AGENT_TAGS:
+        raise HTTPException(status_code=400,
+                            detail=f"未知 Agent: {agent}（可选：{'/'.join(chat_service.AGENT_TAGS)}）")
+    return repo.list_chat_messages(agent, limit)
+
+
+class ChatAskBody(BaseModel):
+    agent: str = Field(description="目标 Agent：discover/score/position/monitor/sell/review")
+    question: str = Field(min_length=1, description="问题内容")
+
+
+@router.post("/agent-chat/ask")
+def chat_ask(body: ChatAskBody):
+    """文字提问答疑（异步：提交任务后轮询结果；答案标注依据来源与信心度）"""
+    return _submit_task("chat_ask", {"agent": body.agent, "question": body.question})
+
+
+class ChatRuleBody(BaseModel):
+    agent: str = Field(description="目标 Agent")
+    proposal: str = Field(min_length=1, description="规则修改/新增提案")
+
+
+@router.post("/agent-chat/rules")
+def chat_rule(body: ChatRuleBody):
+    """规则调教校验（异步）：按验证流程给「采纳/部分采纳/维持原规则」结论；
+    采纳/部分采纳自动沉淀到对应 Agent 知识库；硬性规则与核心方法论只读。"""
+    return _submit_task("chat_rule", {"agent": body.agent, "proposal": body.proposal})
+
+
+@router.post("/agent-chat/learn")
+async def chat_learn(agent: str, file: UploadFile = File(...)):
+    """多模态上传学习（异步）：MiniMax 识别（失败降级 PaddleOCR）→ 提炼知识点与标签
+    → 返回确认摘要（未落库）；确认/修正标签后调用 learn/confirm 落库。"""
+    import tempfile
+
+    if agent not in chat_service.AGENT_TAGS:
+        raise HTTPException(status_code=400,
+                            detail=f"未知 Agent: {agent}（可选：{'/'.join(chat_service.AGENT_TAGS)}）")
+    image_bytes = await file.read()
+    if len(image_bytes) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="图片过大（上限 15MB）")
+    suffix = Path(file.filename or "upload.png").suffix.lower() or ".png"
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="chat_learn_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(image_bytes)
+    return _submit_task("chat_learn", {"agent": agent, "tmp_path": tmp_path,
+                                       "filename": file.filename or "upload.png"})
+
+
+class ChatLearnConfirmBody(BaseModel):
+    agent: str = Field(description="目标 Agent")
+    entries: list[dict] = Field(min_length=1, description="确认的知识点列表（可含修正后的标签）")
+
+
+@router.post("/agent-chat/learn/confirm")
+def chat_learn_confirm(body: ChatLearnConfirmBody):
+    """确认多模态学习结果：将知识点写入对应 Agent 知识库（同步，立即生效）"""
+    try:
+        result = chat_service.confirm_learn(body.agent, body.entries)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return result

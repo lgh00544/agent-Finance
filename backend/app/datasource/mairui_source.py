@@ -23,11 +23,11 @@ import time
 from typing import Any
 
 import pandas as pd
-import requests
 
 from app.cache import cache
 from app.core.config import settings
 from app.datasource.base import DataSourceError
+from app.datasource.http_client import get as http_get
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,9 @@ class MairuiSource:
         last_err: Exception | None = None
         for attempt, delay in enumerate(_RETRY_DELAYS, 1):
             try:
-                resp = requests.get(url, timeout=settings.datasource_timeout)
+                # 共享连接池 + 浏览器请求头（与 akshare 源同款请求加固，降被限流概率）
+                resp = http_get(url, referer=settings.mairui_base_url,
+                                timeout=settings.datasource_timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 if isinstance(data, str) and _QUOTA_MARK in data:

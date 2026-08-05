@@ -122,6 +122,47 @@ def _knowledge_version() -> str:
         return "k0:0"
 
 
+# ==================== 分职能战法知识库（方法论文本沉淀，插槽1实现） ====================
+# agent_prompts/knowledge/：按 Agent 拆分的战法知识 md 文件（人工可编辑），
+# 由 agent_call 在私有知识库之后、Agent 专属 Prompt 之前注入；
+# 内容指纹入缓存键：人工编辑知识文件后 LLM 缓存自动失效、立即生效。
+_AGENT_KNOWLEDGE_FILES: dict[str, list[str]] = {
+    "discover": ["discover.md", "counter_examples.md"],
+    "discover_final": ["discover.md", "counter_examples.md"],
+    "market_condition": ["market.md"],
+    "score": ["score.md"],
+    "monitor": ["monitor.md"],
+    "sell": ["sell.md"],
+    "review": ["review.md", "counter_examples.md"],
+}
+
+
+def _agent_knowledge_text(agent: str) -> str:
+    """分职能战法知识库：按 Agent 读取对应 md 文件拼接（缺失不阻塞）"""
+    files = _AGENT_KNOWLEDGE_FILES.get(agent)
+    if not files:
+        return ""
+    kb_dir = _global_base_path().resolve().parent / "knowledge"
+    parts = []
+    for fname in files:
+        try:
+            text = (kb_dir / fname).read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 知识文件缺失不阻塞主链路
+            logger.warning("战法知识文件 %s 加载失败: %s", fname, exc)
+            continue
+        if text.strip():
+            parts.append(text.strip())
+    return "\n\n".join(parts)
+
+
+def _agent_knowledge_version(agent: str) -> str:
+    """分职能知识内容指纹 → 入缓存键：编辑知识文件后 LLM 缓存自动失效"""
+    text = _agent_knowledge_text(agent)
+    if not text:
+        return "a-"
+    return "a" + hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+
+
 def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
                schema: Type[T], ttl_seconds: int = 86400,
                with_profile: bool = True, with_knowledge: bool = True,
@@ -130,7 +171,8 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
 
     system prompt 段序（永久固定，利于服务端前缀缓存命中）：
     全局通用知识库基线 → 硬性规则 HARD_RULES → 个人交易偏好档案 → 私有知识库检索结果
-    → Agent 专属 Prompt（动态数据一律在 user 段，前置段同版本内 100% 重复）。
+    → 分职能战法知识库（方法论文本沉淀） → Agent 专属 Prompt
+    （动态数据一律在 user 段，前置段同版本内 100% 重复）。
 
     model_level 声明场景等级：LIGHT=高频轻量（初筛/巡检），DEEP=深度复杂（默认）。"""
     sections: list[str] = []
@@ -155,6 +197,14 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
         section = knowledge_section(agent)
         if section:
             sections.append(section)
+    # 拼接位3.5 · 分职能战法知识库（方法论文本沉淀，参考权重非死条件）
+    kb_text = _agent_knowledge_text(agent)
+    if kb_text:
+        sections.append(
+            "【分职能战法知识库】（沉淀自《潜力股发掘方法论》，全部条目为参考权重，"
+            "不是死条件；与硬性规则冲突时以硬性规则为准，动态调整须在输出中标注理由）\n"
+            + kb_text
+        )
     # 拼接位4 · 分职能 Agent 专属 Prompt（独立存放、可单独修改）
     if system_prompt:
         sections.append(system_prompt)
@@ -162,6 +212,6 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
 
     version = repo.get_trade_profile().version
     return call_llm_cached(agent,
-                           f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}",
+                           f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}:{_agent_knowledge_version(agent)}",
                            sys_prompt, user_prompt, schema, ttl_seconds=ttl_seconds,
                            model_level=model_level)

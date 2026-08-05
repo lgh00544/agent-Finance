@@ -1,0 +1,49 @@
+{
+  "stock": {"code": "603993", "name": "洛阳钼业"},
+  "fetched_at": "2026-08-05 16:14:45",
+  "sources": {
+    "quote": "腾讯 qt.gtimg.cn (2026-08-05 16:14:45 BJT)",
+    "kline": "腾讯 web.ifzq.gtimg.cn 不复权 / 东财 push2his.eastmoney.com 前复权",
+    "fund_flow": "新浪 MoneyFlow + 东财 fflow (2026-08-05 收盘全口径)"
+  },
+  "spot": {
+    "price": 20.47, "prev_close": 19.19, "change_pct": 6.67,
+    "open": 19.42, "high": 20.58, "low": 19.26, "amplitude_pct": 6.88,
+    "volume_hands": 3904606, "amount_yi": 78.42, "turnover_pct": 2.24,
+    "volume_ratio": 2.06, "circ_mv_yi": 3574.23, "total_mv_yi": 4379.42,
+    "pb": 5.29, "pe_dyn": 14.11, "pe_static": 21.53, "pe_ttm": 18.13,
+    "limit_up": 21.11, "limit_down": 17.27
+  },
+  "kline_unadj": {
+    "date_last": "2026-08-05",
+    "chg_5d_pct": 7.29, "chg_20d_pct": 16.77, "chg_60d_pct": -0.53,
+    "high_52w": 28.78, "high_52w_date": "2026-01-29",
+    "low_52w": 8.85, "low_52w_date": "2025-08-01",
+    "dist_52w_high_pct": -28.9, "dist_52w_low_pct": 131.3,
+    "pos_52w_pct": 58.3,
+    "high_60d": 21.74, "high_60d_date": "2026-06-22",
+    "low_60d": 16.18, "low_60d_date": "2026-06-10",
+    "pos_60d_pct": 77.2,
+    "breakout_note": "8/5 收盘 20.47 为 6/22 以来最高收盘价，成交量 2.12 倍于前日，突破 7 月下旬 19.3-20.6 平台"
+  },
+  "kline_qfq_crosscheck": {
+    "high_52w": 28.49, "low_52w": 8.56, "pos_52w_pct": 59.8,
+    "chg_5d_pct": 7.29, "chg_20d_pct": 16.77, "chg_60d_pct": 0.89
+  },
+  "fund_flow": {
+    "sina_20260805": {"main_net": 11.71, "total_net": 8.13},
+    "sina_3d": 8.89, "sina_5d": 8.86, "sina_10d": 11.06,
+    "em_20260805": {"main_net": 12.23, "main_ratio_pct": 15.6, "big_net": 4.34, "super_big_net": 7.89},
+    "em_5d": 10.07, "em_10d": 11.39,
+    "note": "第三方所称主力净流出 -4.69 亿（15:39 盘中）无法从任何收盘口径复现，方向与收盘全口径相反"
+  },
+  "third_party_field_misreads": {
+    "claimed_52w_high_21.11": "当日涨停价 19.19*1.10=21.109",
+    "claimed_52w_low_17.27": "当日跌停价 19.19*0.90=17.271",
+    "claimed_5d_14.11": "动态市盈率(总市值/2026E净利约310亿)",
+    "claimed_20d_21.53": "静态市盈率(总市值/2025净利约205亿)",
+    "claimed_60d_27.09": "市现率类估值字段",
+    "claimed_ytd_28.49": "市销率类估值字段",
+    "conclusion": "第三方'严重错位/顶部区域'论证建立在腾讯字段误读之上"
+  }
+}

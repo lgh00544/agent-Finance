@@ -32,5 +32,6 @@ class StockAgentState(TypedDict, total=False):
     market_cap: Optional[int]             # 当日候选池上限（市况档位映射）
     candidates: Optional[List[Dict]]      # 最终候选（Discover）
     holding_id: Optional[int]             # 持仓 ID（Monitor/Review）
+    batch_quotes: Optional[Dict[str, Dict]]  # code -> 批量预取实时行情（批量监控一次获取）
     error: Optional[str]                  # 节点错误信息（容错流转）
     trace: List[str]                      # 执行轨迹（调试/面板展示）

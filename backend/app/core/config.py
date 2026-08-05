@@ -121,6 +121,19 @@ class Settings(BaseSettings):
     # ---------- 数据源 ----------
     datasource_timeout: int = 15  # akshare 请求超时秒数
 
+    # ---------- 数据源稳定性（请求加固/断路器/限流） ----------
+    # 东财/新浪实时接口易被反爬限流：浏览器请求头 + 超时拆分 + 失败后间隔重试 1 次 +
+    # 连续失败进入临时降级（只走备用源，冷却到期静默探测自动切回），避免次次打主源刷日志。
+    datasource_connect_timeout: float = 5    # 连接超时秒数（TCP 握手）
+    datasource_read_timeout: float = 15      # 读取超时秒数
+    datasource_retry_times: int = 1          # 实时热点路径失败后重试次数（间隔 1-2s，勿立即重试触发限流）
+    datasource_retry_delay: float = 1.5      # 重试间隔秒数
+    datasource_breaker_threshold: int = 3    # 连续失败次数阈值，达到后进入临时降级
+    datasource_breaker_cooldown: int = 600   # 临时降级持续时间（秒），到期下次调用静默探测主源
+    datasource_min_request_interval: float = 0.5  # 同类实时请求最小间隔（秒），高频场景自动补齐间隔
+    datasource_user_agent: str = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
+
     # ---------- 麦蕊智数增强数据源（可选，默认关闭）----------
     # 麦蕊（mairui.club）作为 akshare 的补充数据源：仅用于 v2.0 选股机制的高级资金面/股东面字段，
     # 基础行情数据仍优先走 akshare（东财→新浪双通道），减少配额消耗。默认关闭时行为与之前完全一致。

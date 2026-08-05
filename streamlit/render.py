@@ -67,6 +67,26 @@ def raw_json_expander(data, label: str = "查看原始数据", key: str | None =
         st.json(data)
 
 
+def submit_task(kind: str, params: dict | None = None, label: str = "后台任务") -> bool:
+    """提交后台任务：重复触发（后端 409）与后端不可达时显示中文提示，返回是否成功"""
+    import requests
+
+    from api_client import submit_task as api_submit
+    try:
+        api_submit(kind, params)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 409:
+            st.warning(f"{label}正在执行中，请等待其完成后再试")
+        else:
+            st.error(f"{label}提交失败，请确认后端服务正常运行（{type(exc).__name__}）")
+        return False
+    except Exception as exc:  # noqa: BLE001 后端不可达统一提示，不向页面抛原始报错
+        st.error(f"{label}提交失败，请确认后端服务正常运行（{type(exc).__name__}）")
+        return False
+    st.toast(f"{label}已提交后台，可切换页面继续操作")
+    return True
+
+
 def time_text(label: str, time_str: str | None, highlight: bool = False) -> None:
     """时效标注：浅色小字（YYYY-MM-DD HH:mm）；紧急信号时间用琥珀色高亮"""
     if not time_str:
@@ -77,13 +97,14 @@ def time_text(label: str, time_str: str | None, highlight: bool = False) -> None
         unsafe_allow_html=True)
 
 
-@st.fragment(run_every="3s")
+@st.fragment(run_every="5s")
 def task_status_area() -> None:
-    """页面顶部统一后台任务状态区：每 3 秒轮询最近任务，任务全部结束自动消失
+    """页面顶部统一后台任务状态区：每 5 秒轮询最近任务，任务全部结束自动消失
 
     - pending/running：琥珀色「后台任务执行中」明细 + 可切换页面继续操作提示；
     - failed：红色提示 + 一键重试（复用原任务ID重新入队）；
     - 任务完成/失败瞬间弹一次性 toast（session_state 标记，不重复弹）；
+      任务完成时自动刷新整页（候选池等模块立即展示最新结果，无需手动刷新）；
     - 无未完成任务时本区域不渲染任何内容。
     """
     from api_client import recent_tasks, retry_task
@@ -95,13 +116,15 @@ def task_status_area() -> None:
     active = [t for t in tasks if t["status"] in ("pending", "running")]
     failed = [t for t in tasks if t["status"] == "failed"]
 
-    # 完成/失败一次性 toast（仅状态从进行中变为终态时弹一次）
+    # 完成/失败一次性 toast（仅状态从进行中变为终态时弹一次）；
+    # 完成瞬间自动刷新整页（scope=app），候选池/持仓等数据立即展示最新结果
     seen = st.session_state.setdefault("_task_seen", {})
     for t in tasks:
         prev = seen.get(t["task_id"])
         seen[t["task_id"]] = t["status"]
         if prev in ("pending", "running") and t["status"] == "done":
             st.toast(f"任务完成：{t['label']}")
+            st.rerun(scope="app")
         elif prev in ("pending", "running") and t["status"] == "failed":
             st.toast(f"任务失败：{t['label']}，可点击重试", icon="⚠️")
     if len(seen) > 60:  # 只保留最近标记，防无限增长
@@ -128,24 +151,39 @@ def task_status_area() -> None:
 
 # ================= 全局顶部常驻状态栏 =================
 # 固定于原生顶部栏（stHeader，z-index 1000）之下、z-index 998，不随页面滚动消失；
-# 状态栏条目较多时允许换行（≤2 行 ≈3rem）：主内容区与侧边栏同步预留 3.6rem
-# 顶部内边距，保证首屏标题与核心内容不被固定栏遮挡；栏本体保持紧凑单行风格
+# 布局规范：width 100% 撑满视口、左右内边距对称（无单侧大 padding）、
+# align-items: center 全部内容统一垂直居中同一基线、line-height 1.5 紧凑行高；
+# 信息按「账户资产」「大盘指数」两组展示（组间竖线分隔 + 组标签），
+# 核心数据（总资产/总盈亏/上证指数）加粗加大；
+# 主内容区与侧边栏同步预留 4.3rem 顶部内边距，保证首屏标题与核心操作区不被遮挡
 _TOP_BAR_CSS = """
 <style>
-[data-testid="stMain"] { padding-top: 3.6rem; }
-[data-testid="stSidebarContent"] { padding-top: 3.6rem; }
+[data-testid="stMain"] { padding-top: 4.3rem; }
+[data-testid="stSidebarContent"] { padding-top: 4.3rem; }
 .top-status-bar {
   position: fixed; top: 2.95rem; left: 0; right: 0; z-index: 998;
+  width: 100%; box-sizing: border-box;
   display: flex; align-items: center; flex-wrap: wrap;
-  column-gap: 1rem; row-gap: 0.15rem;
-  padding: 0.28rem 1rem; font-size: 0.8rem; line-height: 1.4;
+  column-gap: 1rem; row-gap: 0.2rem;
+  padding: 0.3rem 1rem; font-size: 0.92rem; line-height: 1.5;
   background: rgba(11, 13, 19, 0.98); border-bottom: 1px solid #2C2F36;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
 }
-.top-status-bar .bar-label { color: #9CA3AF; font-size: 0.78em; margin-right: 0.25rem; }
-.top-status-bar .up { color: #F87171; font-weight: 600; }
-.top-status-bar .down { color: #4ADE80; font-weight: 600; }
-.top-status-bar .flat { color: #9CA3AF; }
+.top-status-bar .bar-label { color: #B8BCC4; font-size: 0.82em; margin-right: 0.3rem; }
+.top-status-bar .bar-group {
+  display: inline-flex; align-items: center; flex-wrap: wrap;
+  column-gap: 1.15rem; row-gap: 0.1rem;
+  padding-left: 0.9rem; border-left: 1px solid #2C2F36;
+}
+.top-status-bar .bar-group-label {
+  color: #7A8090; font-size: 0.76em; letter-spacing: 0.06em;
+  margin-right: 0.15rem;
+}
+.top-status-bar b { font-weight: 700; color: #E5E7EB; }
+.top-status-bar .bar-key { font-weight: 700; font-size: 1.08em; color: #FFFFFF; }
+.top-status-bar .up { color: #FF6B6B; font-weight: 700; }
+.top-status-bar .down { color: #34D399; font-weight: 700; }
+.top-status-bar .flat { color: #B8BCC4; }
 .top-status-bar .stale { color: #F59E0B; font-size: 0.8em; }
 </style>
 """
@@ -215,46 +253,53 @@ def top_status_bar() -> None:
 
     parts = [f'<span class="bar-label">北京时间</span><b>{now}</b>']
 
-    # ---------- 中：账户核心资产 ----------
+    # ---------- 中：账户资产组（组标签 + 组内分隔，核心数据加粗加大） ----------
+    acc_parts = ['<span class="bar-group-label">账户资产</span>']
     if acc:
         total = acc.get("total_asset")
         estimate_tag = ('<span class="stale">估算</span>'
                         if (acc.get("source") == "estimate" and total is not None) else "")
-        parts.append(f'<span class="bar-label">总资产</span><b>{_bar_money(total)}{estimate_tag}</b>')
-        parts.append(f'<span class="bar-label">总持仓成本</span><b>{_bar_money(acc.get("total_cost"))}</b>')
+        acc_parts.append(f'<span class="bar-label">总资产</span>'
+                         f'<b class="bar-key">{_bar_money(total)}{estimate_tag}</b>')
+        acc_parts.append(f'<span class="bar-label">总持仓成本</span><b>{_bar_money(acc.get("total_cost"))}</b>')
         pnl = acc.get("pnl_amount")
         if pnl is not None:
-            parts.append(f'<span class="bar-label">总盈亏</span>'
-                         f'<b class="{_bar_sign(pnl)}">{_bar_money(pnl)}（{_bar_pct(acc.get("pnl_pct"))}）</b>')
+            acc_parts.append(f'<span class="bar-label">总盈亏</span>'
+                             f'<b class="{_bar_sign(pnl)}">{_bar_money(pnl)}（{_bar_pct(acc.get("pnl_pct"))}）</b>')
         else:
-            parts.append(f'<span class="bar-label">总盈亏</span><b>—</b>')
-        parts.append(f'<span class="bar-label">整体仓位</span><b>{_bar_pct(acc.get("position_pct"))}</b>')
-        parts.append(f'<span class="bar-label">可用资金</span><b>{_bar_money(acc.get("available_cash"))}</b>')
+            acc_parts.append(f'<span class="bar-label">总盈亏</span><b>—</b>')
+        acc_parts.append(f'<span class="bar-label">整体仓位</span><b>{_bar_pct(acc.get("position_pct"))}</b>')
+        acc_parts.append(f'<span class="bar-label">可用资金</span><b>{_bar_money(acc.get("available_cash"))}</b>')
         if acc_err:
-            parts.append(f'<span class="stale">账户数据{acc_err}，显示上次数据</span>')
+            acc_parts.append(f'<span class="stale">账户数据{acc_err}，显示上次数据</span>')
     else:
         hint = "数据加载中" if acc_err else "—"
-        parts.append(f'<span class="bar-label">总资产</span><b>{hint}</b>')
-        parts.append(f'<span class="bar-label">可用资金</span><b>{hint}</b>')
-        parts.append(f'<span class="bar-label">整体仓位</span><b>{hint}</b>')
+        acc_parts.append(f'<span class="bar-label">总资产</span><b>{hint}</b>')
+        acc_parts.append(f'<span class="bar-label">可用资金</span><b>{hint}</b>')
+        acc_parts.append(f'<span class="bar-label">整体仓位</span><b>{hint}</b>')
+    parts.append(f'<span class="bar-group">{"".join(acc_parts)}</span>')
 
-    # ---------- 右：三大指数 ----------
+    # ---------- 右：大盘指数组（组标签 + 上证指数加粗） ----------
+    idx_parts = ['<span class="bar-group-label">大盘指数</span>']
     if idx:
         for it in idx.get("indices") or []:
             label = it.get("name") or it.get("code") or ""
             pct = it.get("change_pct")
+            key_cls = " bar-key" if label in ("上证指数", "上证综指") else ""
             if pct is None:
-                parts.append(f'<span class="bar-label">{label}</span><b>—</b>')
+                idx_parts.append(f'<span class="bar-label">{label}</span><b>—</b>')
             else:
-                parts.append(f'<span class="bar-label">{label}</span>'
-                             f'<b class="{_bar_sign(pct)}">{_bar_money(it.get("price"))} {pct:+.2f}%</b>')
+                idx_parts.append(f'<span class="bar-label">{label}</span>'
+                                 f'<b class="{_bar_sign(pct)}{key_cls}">'
+                                 f'{_bar_money(it.get("price"))} {pct:+.2f}%</b>')
         if idx.get("updated_at"):
-            parts.append(f'<span class="bar-label">指数更新时间</span>'
-                         f'<span class="stale">{idx["updated_at"]}</span>')
+            idx_parts.append(f'<span class="bar-label">更新时间</span>'
+                             f'<span class="stale">{idx["updated_at"]}</span>')
         if idx_err:
-            parts.append(f'<span class="stale">指数{idx_err}，显示上次数据</span>')
+            idx_parts.append(f'<span class="stale">指数{idx_err}，显示上次数据</span>')
     else:
-        parts.append(f'<span class="bar-label">指数</span><b>{"数据加载中" if idx_err else "—"}</b>')
+        idx_parts.append(f'<span class="bar-label">指数</span><b>{"数据加载中" if idx_err else "—"}</b>')
+    parts.append(f'<span class="bar-group">{"".join(idx_parts)}</span>')
 
     st.markdown(f'<div class="top-status-bar">{"".join(parts)}</div>', unsafe_allow_html=True)
 

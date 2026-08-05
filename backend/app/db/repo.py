@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AlertLog, Holding,
     MarketCondition, NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult,
-    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord,
+    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord, _now,
 )
 from app.db.session import SessionLocal
 
@@ -29,7 +29,8 @@ def _json(value: Any) -> Any:
 
 def _dbq(table: str, params: dict, loader: Callable[[], list]) -> list:
     """列表查询 60 秒结果缓存：TTL 内相同参数不落库，直接复用上次结果。
-    写操作（_invalidate）删除该表命名空间全部缓存，保证数据一致性。"""
+    写操作（_invalidate）删除该表命名空间全部缓存，保证数据一致性。
+    防缓存穿透：loader 异常或返回 None 时不写缓存，直接抛出/返回。"""
     if settings.db_query_cache_ttl <= 0:
         return loader()
     digest = hashlib.md5(
@@ -42,6 +43,8 @@ def _dbq(table: str, params: dict, loader: Callable[[], list]) -> list:
         except (json.JSONDecodeError, TypeError):
             pass
     result = loader()
+    if result is None:  # 异常值不缓存，避免缓存穿透
+        return result
     cache.set(key, json.dumps(result, ensure_ascii=False, default=str),
               settings.db_query_cache_ttl)
     return result
@@ -67,8 +70,27 @@ def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: in
         row.rank, row.reasons, row.risk_notice, row.snapshot = rank, reasons, risk_notice, snapshot
         if detail is not None:
             row.detail = detail
+        row.created_at = _now()  # 覆盖更新：同日同股以最新执行时间为准（前端去重取最大）
         db.commit()
         _invalidate("candidate")
+
+
+def replace_day_candidates(codes: set[str], trade_date: str) -> int:
+    """当日候选池快照替换：删除当日不在本次执行结果中的残留候选（不残留历史版本）。
+    返回删除条数；仅删除 stock_code 不在 codes 中的记录，本次执行产物保留。"""
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(StockCandidate).where(StockCandidate.trade_date == trade_date)
+        ).scalars().all()
+        removed = 0
+        for row in rows:
+            if row.stock_code not in codes:
+                db.delete(row)
+                removed += 1
+        if removed:
+            db.commit()
+            _invalidate("candidate")
+        return removed
 
 
 # ==================== 市况评分（v2.0 Discover 前置步骤） ====================
@@ -468,6 +490,22 @@ def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
     return _dbq("candidate", {"date": date, "limit": limit}, _load)
 
 
+def list_candidate_dates(limit: int = 30) -> list[str]:
+    """候选池可选日期（去重降序，默认最新在前）：页面只加载最新一天，
+    切换历史日期时再按需查询，避免初始化全量加载"""
+
+    def _load() -> list[str]:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(StockCandidate.trade_date)
+                .distinct()
+                .order_by(StockCandidate.trade_date.desc())
+                .limit(limit)).scalars().all()
+            return list(rows)
+
+    return _dbq("candidate", {"dates": limit}, _load)
+
+
 def list_scores(code: str | None = None, date: str | None = None, limit: int = 100) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
@@ -684,3 +722,37 @@ def get_alerts_by_code(stock_code: str, limit: int = 50) -> list[AlertLog]:
         return list(db.execute(
             select(AlertLog).where(AlertLog.stock_code == stock_code)
             .order_by(AlertLog.id.desc()).limit(limit)).scalars().all())
+
+
+# ==================== Agent 专属对话（Agent 对话页，全程可回溯） ====================
+
+def add_chat_message(agent: str, role: str, content: str, message_type: str = "qa",
+                     verdict: str = "", knowledge_id: int | None = None,
+                     meta: dict | None = None) -> int:
+    """记录一条 Agent 对话消息（问答/规则调教/多模态学习）"""
+    from app.db.models import AgentChatMessage
+
+    with SessionLocal() as db:
+        row = AgentChatMessage(agent=agent, role=role, content=content,
+                               message_type=message_type, verdict=verdict,
+                               knowledge_id=knowledge_id, meta=meta or {})
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def list_chat_messages(agent: str, limit: int = 50) -> list[dict]:
+    """某 Agent 的对话历史（最新在前）"""
+    from app.db.models import AgentChatMessage
+
+    with SessionLocal() as db:
+        stmt = (select(AgentChatMessage)
+                .where(AgentChatMessage.agent == agent)
+                .order_by(AgentChatMessage.id.desc())
+                .limit(min(limit, 200)))
+        rows = list(db.execute(stmt).scalars().all())
+    return [{"id": r.id, "agent": r.agent, "role": r.role, "message_type": r.message_type,
+             "content": r.content, "verdict": r.verdict, "knowledge_id": r.knowledge_id,
+             "meta": r.meta or {}, "created_at": str(r.created_at)}
+            for r in rows]

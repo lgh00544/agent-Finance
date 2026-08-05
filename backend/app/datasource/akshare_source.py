@@ -5,8 +5,11 @@ Akshare 数据源实现（东财为主，新浪降级）
 
 统一 fetch 封装：
   - 15s 超时（接口支持时传入 timeout 参数）
-  - 指数退避重试 3 次（1.5s → 3s → 6s）
-  - 东财接口失败时按可降级映射尝试新浪/同花顺备选接口
+  - 失败后间隔 1-2s 重试 1 次（DATASOURCE_RETRY_TIMES/DELAY 可配），单次失败只打 DEBUG
+  - 实时热点路径（tick/snapshot）接入断路器：连续失败 3 次进入临时降级 10 分钟，
+    期间直接走备用源，冷却到期静默探测自动切回（切换才打 WARNING，日志不刷屏）
+  - 非交易时段（午间休盘/盘前盘后/周末节假日）不请求实时接口，仅用收盘数据
+  - 东财接口失败时按可降级映射尝试新浪/雪球/同花顺备选接口
   - 结果按 中文列名 → 英文标准列 规范化
   - Redis/内存缓存按接口设置 TTL，避免高频请求触发限流
 """
@@ -21,7 +24,12 @@ import pandas as pd
 
 from app.cache import cache
 from app.core.config import settings
+from app.datasource import market_hours
 from app.datasource.base import DataSource, DataSourceError
+from app.datasource.breaker import get_breaker
+from app.datasource.http_client import get as http_get
+from app.datasource.http_client import get_limiter, patch_requests_headers
+from app.services import datasource_stats
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +37,9 @@ try:
     import akshare as ak
 except ImportError:  # pragma: no cover
     ak = None
+
+# akshare 内部请求不传 headers，这里从 requests 层全局补浏览器 UA（一次性，见 http_client）
+patch_requests_headers()
 
 
 # ---------------- 列名规范化映射（中文 → 英文标准列） ----------------
@@ -99,6 +110,118 @@ def _to_json_safe(df: pd.DataFrame) -> pd.DataFrame:
     return df.where(pd.notna(df), None)
 
 
+_NEWS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
+
+
+def _clean_em_tags(df: pd.DataFrame) -> pd.DataFrame:
+    """清理东财高亮 <em> 标签与全角空格（纯清洗，不含任何判断）"""
+    for col in ("新闻标题", "新闻内容"):
+        if col not in df.columns:
+            continue
+        s = df[col].astype(str)
+        df[col] = (s.str.replace(r"\(<em>", "", regex=True)
+                   .str.replace(r"</em>\)", "", regex=True)
+                   .str.replace("<em>", "", regex=False)
+                   .str.replace("</em>", "", regex=False)
+                   .str.replace("　", "", regex=False)  # 全角空格
+                   .str.replace("\r\n", " ", regex=False))
+    return df
+
+
+def _stock_news_em_fixed(code: str) -> pd.DataFrame:
+    """东财个股新闻（vendored 修复版）【刚性代码逻辑】
+    上游 akshare 1.18.81 在 news_stock.py 用 `str.replace(r"\\u3000", regex=True)`
+    清理全角空格，pandas 3 + pyarrow 字符串后端下 `\\u` 属非法正则，抛
+    ArrowInvalid: Invalid regular expression: invalid escape sequence: \\u，
+    导致个股新闻检索整体不可用。本函数为同接口等价实现，仅修正非法正则
+    （全角空格/换行改为字面量替换，regex=False），清洗逻辑与上游一致。"""
+    import json
+
+    import requests
+
+    url = "https://search-api-web.eastmoney.com/search/jsonp"
+    inner_param = {
+        "uid": "", "keyword": code, "type": ["cmsArticleWebOld"],
+        "client": "web", "clientType": "web", "clientVersion": "curr",
+        "param": {"cmsArticleWebOld": {"searchScope": "default", "sort": "default",
+                                       "pageIndex": 1, "pageSize": 10,
+                                       "preTag": "<em>", "postTag": "</em>"}},
+    }
+    params = {"cb": "jQuery_fixed_cb",
+              "param": json.dumps(inner_param, ensure_ascii=False), "_": "1"}
+    headers = {"user-agent": _NEWS_UA, "referer": f"https://so.eastmoney.com/news/s?keyword={code}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=15)
+    resp.raise_for_status()
+    text = resp.text.strip()
+    start, end = text.find("("), text.rfind(")")  # JSONP 包裹: jQueryxxx(...)
+    if start < 0 or end <= start:
+        raise DataSourceError(f"新闻接口响应格式异常: {text[:80]}")
+    data = json.loads(text[start + 1:end])
+    rows = (data.get("result") or {}).get("cmsArticleWebOld") or []
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    if "code" in df.columns:
+        df["新闻链接"] = "http://finance.eastmoney.com/a/" + df["code"].astype(str) + ".html"
+    df = df.rename(columns={"date": "发布时间", "mediaName": "文章来源",
+                            "title": "新闻标题", "content": "新闻内容"})
+    df["关键词"] = code
+    keep = [c for c in ("关键词", "新闻标题", "新闻内容", "发布时间", "文章来源", "新闻链接")
+            if c in df.columns]
+    return _clean_em_tags(df[keep])
+
+
+def _stock_announcements(code: str) -> pd.DataFrame:
+    """东财个股公告（搜索新闻接口失效时的降级源，2026-08 起搜索接口仅返回 profile 数据）【刚性代码逻辑】
+    列表接口取最近公告，正文接口逐条取内容（最多 5 条正文，控制调用量）"""
+    import requests
+
+    headers = {"user-agent": _NEWS_UA, "referer": "https://data.eastmoney.com/"}
+    ann = requests.get("https://np-anotice-stock.eastmoney.com/api/security/ann",
+                       params={"sr": -1, "page_size": 10, "page_index": 1, "ann_type": "A",
+                               "client_source": "web", "stock_list": code},
+                       headers=headers, timeout=15).json()
+    items = ((ann.get("data") or {}).get("list")) or []
+    rows = []
+    for it in items[:5]:
+        art_code = str(it.get("art_code") or "")
+        title = str(it.get("title") or "").strip()
+        if not title or not art_code:
+            continue
+        content = ""
+        try:
+            detail = requests.get(
+                "https://np-cnotice-stock.eastmoney.com/api/content/ann",
+                params={"art_code": art_code, "client_source": "web", "page_index": 1},
+                headers=headers, timeout=15).json()
+            content = str(((detail.get("data") or {}).get("notice_content") or ""))
+        except Exception as exc:  # noqa: BLE001 单条正文失败不阻塞
+            logger.warning("公告 %s 正文拉取失败: %s", art_code, exc)
+        rows.append({"新闻标题": title, "新闻内容": content,
+                     "发布时间": str(it.get("notice_date") or "")[:10],
+                     "文章来源": "东方财富-公告",
+                     "新闻链接": f"https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["关键词"] = code
+    return _clean_em_tags(df[["关键词", "新闻标题", "新闻内容", "发布时间", "文章来源", "新闻链接"]])
+
+
+def _stock_news_fixed(code: str) -> pd.DataFrame:
+    """东财个股新闻（vendored）：搜索接口为主，异常/空结果自动降级个股公告"""
+    try:
+        df = _stock_news_em_fixed(code)
+    except Exception as exc:  # noqa: BLE001 搜索接口异常不阻塞，降级公告源
+        logger.warning("个股新闻搜索接口失败，降级为个股公告源: %s (%s)", code, exc)
+        df = pd.DataFrame()
+    if not df.empty:
+        return df
+    logger.info("个股新闻搜索为空，降级为个股公告源: %s", code)
+    return _stock_announcements(code)
+
+
 def _cache_key(scope: str) -> str:
     """scope 需包含全部标识参数（如 'kline:600519:20240101:20240801:qfq'）"""
     return "ak:" + hashlib.md5(scope.encode()).hexdigest()
@@ -120,8 +243,8 @@ class AkshareSource(DataSource):
     # ---------------- 统一 fetch 封装 ----------------
     def _fetch(self, scope: str, func_name: str, call: Callable, ttl_seconds: int,
                fallback: Callable | None = None, required: bool = True,
-               normalize: Callable | None = None) -> pd.DataFrame:
-        """带缓存 + 指数退避重试 + 降级的数据采集【刚性逻辑】。
+               normalize: Callable | None = None, kind: str | None = None) -> pd.DataFrame:
+        """带缓存 + 重试 + 降级 + （kind 非空时）断路器/限流/统计的数据采集【刚性逻辑】。
         scope 必须包含全部标识参数（股票代码/日期等），作为缓存键。
         """
         key = _cache_key(scope)
@@ -133,7 +256,7 @@ class AkshareSource(DataSource):
             except (ValueError, TypeError):
                 pass
         try:
-            df = self._call_with_retry(func_name, call, fallback)
+            df = self._call_with_retry(func_name, call, fallback, kind=kind)
             if normalize is not None:
                 df = normalize(df)
             if df is not None and not df.empty and "date" in df.columns:
@@ -145,33 +268,85 @@ class AkshareSource(DataSource):
             return df
         except DataSourceError:
             if not required:
-                logger.warning("数据源 %s 失败，返回空表（非必需数据）", func_name)
+                if kind is not None and get_breaker(kind).is_degraded:
+                    # 降级期间的例行失败不刷屏（进入降级的 WARNING 已记录一次）
+                    logger.debug("数据源 %s 失败，返回空表（降级期间，非必需数据）", func_name)
+                else:
+                    logger.warning("数据源 %s 失败，返回空表（非必需数据）", func_name)
                 return pd.DataFrame()
             raise
 
-    def _call_with_retry(self, func_name: str, call: Callable, fallback: Callable | None) -> pd.DataFrame:
+    def _call_with_retry(self, func_name: str, call: Callable, fallback: Callable | None,
+                         kind: str | None = None) -> pd.DataFrame:
+        """主源重试 + 降级 + （kind 非空时）断路器/限流/统计。
+
+        kind 用于实时热点路径（tick=实时行情 / snapshot=全市场快照）：
+        - 断路器降级期间跳过主源直接走备用，不再打无效请求
+        - 同类请求最小间隔限流（防高频触发对方限流）
+        - 失败计数进断路器：连续失败达阈值进入临时降级（切换仅打一次 WARNING）
+        - 单次失败只打 DEBUG（去重），最终失败由上层 WARNING 汇总
+        """
+        delay = settings.datasource_retry_delay
+        if kind is not None:
+            breaker = get_breaker(kind)
+            if not breaker.should_try():
+
+                datasource_stats.record_degraded(kind)
+                logger.debug("数据源 %s 临时降级中，跳过主源直接走备用", func_name)
+                if fallback is None:
+                    raise DataSourceError(f"数据源 {func_name} 临时降级中且无备用源")
+                return self._run_fallback(func_name, fallback)
+            get_limiter(kind).wait()
         last_err: Exception | None = None
-        delay = 1.5
-        for attempt in range(1, 4):
+        for attempt in range(1, settings.datasource_retry_times + 2):
+            if kind is not None:
+
+                datasource_stats.record_request(kind)
             try:
-                return call()
+                df = call()
+                if kind is not None:
+                    get_breaker(kind).record_success()
+                return df
             except Exception as exc:  # noqa: BLE001 数据源异常类型繁多，统一捕获
                 last_err = exc
-                logger.warning("akshare %s 第 %d 次失败: %s", func_name, attempt, exc)
+                if kind is not None:
+                    get_breaker(kind).record_failure()
+                    datasource_stats.record_failure(kind)
+                logger.debug("数据源 %s 第 %d 次失败: %s", func_name, attempt, exc)
                 if fallback is not None:
                     try:
-                        df = fallback()
-                        logger.info("akshare %s 已降级到备用接口", func_name)
-                        return df
+                        return self._run_fallback(func_name, fallback)
                     except Exception as f_exc:  # noqa: BLE001
                         last_err = f_exc
-                if attempt < 3:
+                if attempt <= settings.datasource_retry_times:
                     time.sleep(delay)
-                    delay *= 2
-        raise DataSourceError(f"akshare {func_name} 3 次重试失败: {last_err}")
+        raise DataSourceError(f"数据源 {func_name} 重试失败: {last_err}")
+
+    def _run_fallback(self, func_name: str, fallback: Callable) -> pd.DataFrame:
+        """执行备用接口；降级期间只打 DEBUG（切换时的 WARNING 已在断路器记录一次）"""
+        try:
+            df = fallback()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("数据源 %s 备用接口也失败: %s", func_name, exc)
+            raise
+        if isinstance(df, pd.DataFrame) and df.empty:
+            logger.debug("数据源 %s 备用接口返回空表", func_name)
+        else:
+            logger.info("数据源 %s 已降级到备用接口", func_name)
+        return df
 
     # ---------------- 全市场快照 ----------------
     def fetch_spot_universe(self) -> pd.DataFrame:
+        if not market_hours.snapshot_allowed():
+            cached = cache.get(_cache_key("spot_em"))
+            if cached:
+                try:
+                    return pd.DataFrame(json.loads(cached))  # 复用收盘缓存
+                except (ValueError, TypeError):
+                    pass
+            logger.info("非交易日（%s），全市场快照暂不请求实时接口，返回空表",
+                        market_hours._now().strftime("%Y-%m-%d %A"))
+            return pd.DataFrame(columns=list(_SPOT_COLS.values()))
         def primary():
             return self._call_with_timeout(ak.stock_zh_a_spot_em)
         def fallback():
@@ -181,7 +356,7 @@ class AkshareSource(DataSource):
                 df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
             return df
         df = self._fetch("spot_em", "spot_em", primary, ttl_seconds=60, fallback=fallback,
-                         normalize=lambda d: _normalize(d, _SPOT_COLS))
+                         normalize=lambda d: _normalize(d, _SPOT_COLS), kind="snapshot")
         return _to_json_safe(df)
 
     # ---------------- 单股实时行情（持仓监控链路，60s 内缓存） ----------------
@@ -189,7 +364,12 @@ class AkshareSource(DataSource):
         """单股最新实时行情【刚性代码逻辑】：东财盘口 → 雪球单股 → 全市场快照匹配；
         TTL 30s 确保监控每次执行拿到最新价；全部失败返回 {}（调用方用日K收盘兜底并标注）。
         返回 {"code","name","price","change_pct","time"}，price/change_pct 解析失败为 None。
+        非交易时段（午间休盘/盘前盘后）不请求实时接口，直接用收盘快照兜底。
         """
+        if not market_hours.realtime_open():
+            logger.debug("非交易时段（%s），%s 实时行情走收盘快照",
+                         market_hours._now().strftime("%Y-%m-%d %H:%M"), code)
+            return self._quote_from_universe(code)
         def parse_bid_ask(df: pd.DataFrame) -> pd.DataFrame:
             # 东财盘口 item/value 列（最新价/涨幅）；构造为标准单行；解析失败返回空表（不缓存坏数据）
             kv = {str(r["item"]): r["value"] for _, r in df.iterrows()}
@@ -221,7 +401,7 @@ class AkshareSource(DataSource):
             return parse_xq(ak.stock_individual_spot_xq(symbol=f"{prefix}{code}"))
 
         df = self._fetch(f"spot_quote:{code}", "spot_quote", primary, ttl_seconds=30,
-                         fallback=fallback, required=False)
+                         fallback=fallback, required=False, kind="tick")
         if df is None or df.empty:
             quote = self._quote_from_universe(code)
         else:
@@ -256,6 +436,114 @@ class AkshareSource(DataSource):
             logger.warning("快照匹配实时行情失败 %s: %s", code, exc)
             return {}
 
+    # ---------------- 批量实时行情（监控全持仓一次获取） ----------------
+    _BATCH_QUOTE_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+
+    def fetch_spot_quotes_batch(self, codes: list[str]) -> dict[str, dict]:
+        """批量实时行情【刚性代码逻辑】：全持仓统一获取后再过滤，禁止循环内逐只请求。
+
+        链路：东财 push2 ulist 批量（一次请求全部代码）→ 全市场快照过滤（收盘数据）
+        → 仍缺的逐只 fetch_spot_quote 兜底（极少）；TTL 30s，key 按排序代码哈希。
+        非交易时段不请求实时接口，直接走快照（收盘数据）。
+        返回 {code: {"code","name","price","change_pct","time"}}，price 缺失置 None。
+        """
+        codes = sorted({str(c) for c in codes if c})
+        if not codes:
+            return {}
+        key = _cache_key("batch_quote:" + ",".join(codes))
+        cached = cache.get(key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except (ValueError, TypeError):
+                pass
+        out: dict[str, dict] = {}
+        if market_hours.realtime_open():
+            try:
+                out = self._batch_from_ulist(codes)
+            except Exception as exc:  # noqa: BLE001 批量主源失败不阻塞，走快照降级
+                logger.debug("批量行情主源失败，走快照降级: %s", exc)
+        else:
+            logger.debug("非交易时段，批量行情直接走收盘快照")
+        # 仅对 ulist 未返回的代码兜底；已返回但字段缺失的保留 None（容错，不重复请求）
+        missing = [c for c in codes if c not in out]
+        if missing:
+            out.update(self._batch_from_universe(missing))
+        missing = [c for c in codes if c not in out]
+        for c in missing:
+            quote = self.fetch_spot_quote(c)  # 逐只兜底（自身断路器，极少触发）
+            if quote:
+                out[c] = quote
+        if out:
+            cache.set(key, json.dumps(out, ensure_ascii=False), 30)
+        return out
+
+    def _batch_from_ulist(self, codes: list[str]) -> dict[str, dict]:
+        """东财 push2 ulist 批量行情（含断路器/限流/统计）"""
+
+        breaker = get_breaker("tick")
+        if not breaker.should_try():
+            datasource_stats.record_degraded("tick")
+            raise DataSourceError("tick 临时降级中，批量行情跳过主源")
+        get_limiter("tick").wait()
+        datasource_stats.record_request("tick")
+        secids = ",".join(("1." if c.startswith("6") else "0.") + c for c in codes)
+        try:
+            resp = http_get(self._BATCH_QUOTE_URL, referer="eastmoney",
+                            params={"secids": secids, "fields": "f12,f14,f2,f3,f124",
+                                    "fltt": 2, "invt": 2, "np": 1, "pn": 1, "pz": len(codes)})
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data")
+            if not data or not data.get("diff"):
+                raise DataSourceError("东财批量行情 data 为空（限流或参数异常）")
+            out: dict[str, dict] = {}
+            for item in data["diff"]:
+                code = str(item.get("f12") or "").zfill(6)
+                if not code:
+                    continue
+                try:
+                    price = float(item.get("f2"))
+                except (TypeError, ValueError):
+                    price = None
+                try:
+                    change_pct = float(item.get("f3"))
+                except (TypeError, ValueError):
+                    change_pct = None
+                out[code] = {"code": code, "name": str(item.get("f14") or ""),
+                             "price": price, "change_pct": change_pct,
+                             "time": str(item.get("f124") or "")}
+            breaker.record_success()
+            return out
+        except Exception as exc:  # noqa: BLE001 数据源异常类型繁多，统一捕获
+            breaker.record_failure()
+            datasource_stats.record_failure("tick")
+            raise
+
+    def _batch_from_universe(self, codes: list[str]) -> dict[str, dict]:
+        """快照降级：单次全市场快照过滤全部缺失代码（快照本身东财→新浪双降级）"""
+        out: dict[str, dict] = {}
+        try:
+            uni = self.fetch_spot_universe()
+        except Exception as exc:  # noqa: BLE001 快照失败不阻塞
+            logger.debug("批量快照降级失败: %s", exc)
+            return out
+        if uni is None or uni.empty or "code" not in uni.columns:
+            return out
+        rows = uni[uni["code"].astype(str).isin(codes)]
+        for _, r in rows.iterrows():
+            code = str(r["code"])
+            try:
+                price = float(r.get("price"))
+            except (TypeError, ValueError):
+                price = None
+            try:
+                change_pct = float(r.get("change_pct"))
+            except (TypeError, ValueError):
+                change_pct = None
+            out[code] = {"code": code, "name": str(r.get("name") or ""),
+                         "price": price, "change_pct": change_pct, "time": ""}
+        return out
+
     def fetch_suspended(self) -> pd.DataFrame:
         today = time.strftime("%Y%m%d")
         def call():
@@ -283,7 +571,11 @@ class AkshareSource(DataSource):
 
     def fetch_index_spot(self) -> pd.DataFrame:
         """三大指数实时行情（东财指数快照：上证系列 + 深证系列，60s 缓存防限流）；
-        顶部状态栏使用，返回含 code/name/price/change_pct 的 DataFrame"""
+        顶部状态栏使用，返回含 code/name/price/change_pct 的 DataFrame。
+        非交易日不请求实时接口，返回空表（顶部状态栏隐藏）。"""
+        if not market_hours.snapshot_allowed():
+            logger.debug("非交易日，指数实时行情跳过（返回空表）")
+            return pd.DataFrame(columns=["code", "name", "price", "change_pct"])
         def call():
             parts = [
                 ak.stock_zh_index_spot_em(symbol="上证系列指数"),
@@ -294,7 +586,7 @@ class AkshareSource(DataSource):
             # 新浪指数快照（东财限流/宕机降级）；代码列带 sh/sz 前缀，与东财格式一致，保留供下方 keep 过滤
             return ak.stock_zh_index_spot_sina()
         df = self._fetch("index_spot", "index_spot", call, ttl_seconds=60, fallback=fallback,
-                         required=False,
+                         required=False, kind="snapshot",
                          normalize=lambda d: _normalize(d, _SPOT_COLS))
         if df is None or df.empty or "code" not in df.columns:
             return pd.DataFrame(columns=["code", "name", "price", "change_pct"])
@@ -398,11 +690,9 @@ class AkshareSource(DataSource):
     # ---------------- 新闻公告 ----------------
     def fetch_news(self, code: str) -> pd.DataFrame:
         def primary():
-            # 新旧版本参数名兼容：新版 symbol / 旧版 stock
-            try:
-                return self._call_with_timeout(ak.stock_news_em, symbol=code)
-            except TypeError:
-                return self._call_with_timeout(ak.stock_news_em, stock=code)
+            # vendored 修复版：上游 1.18.81 非法正则 r"　" 在 pandas3+pyarrow 下抛
+            # ArrowInvalid；搜索接口空结果时自动降级个股公告源
+            return self._call_with_timeout(_stock_news_fixed, code)
         def fallback():
             return pd.DataFrame(columns=["title", "content", "published_at", "source", "url"])
         df = self._fetch(f"news:{code}", "news", primary, ttl_seconds=600, fallback=fallback,

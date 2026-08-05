@@ -108,6 +108,13 @@ def retry(tid: str) -> bool:
     return True
 
 
+def has_active(kind: str) -> bool:
+    """是否存在未结束（pending/running）的同类型任务：供重复触发防护"""
+    with _lock:
+        return any(t["kind"] == kind and t["status"] in ("pending", "running")
+                   for t in _tasks.values())
+
+
 def _public(task: dict) -> dict:
     return {k: v for k, v in task.items() if k != "_fn"}
 

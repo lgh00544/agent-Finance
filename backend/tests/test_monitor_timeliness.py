@@ -15,6 +15,22 @@ from app.datasource.akshare_source import AkshareSource
 from app.scheduler import jobs
 
 
+@pytest.fixture(autouse=True)
+def _trading_window(monkeypatch):
+    """固定为交易日盘中 14:00（实时行情闸门放行，否则夜间/周末跑测试会被时段闸门拦截）
+    + 断路器/限流隔离（防跨用例状态泄漏与真实 sleep 拖慢）"""
+    from app.datasource import market_hours
+    from app.datasource.breaker import reset as breaker_reset
+    from app.datasource import http_client
+
+    monkeypatch.setattr(market_hours, "_now", lambda: datetime(2026, 8, 4, 14, 0))
+    monkeypatch.setattr(market_hours, "_load_calendar", lambda: set())
+    monkeypatch.setattr(http_client.time, "sleep", lambda s: None)
+    breaker_reset()
+    yield
+    breaker_reset()
+
+
 # ================= 调度窗口 =================
 
 def test_trading_window_boundaries():

@@ -49,10 +49,28 @@ def _fail(module_name: str, exc: Exception) -> None:
              f"「手动刷新全部数据」重试（{type(exc).__name__}）")
 
 
+# ============ 首页聚合数据源：一次请求并行拉取全部模块（替代多次串行请求） ============
+_dash = None
+try:
+    _dash = api.dashboard()
+except Exception as exc:  # noqa: BLE001 后端整体不可达时统一提示，不再逐模块重复报错
+    st.error(f"首页数据加载失败，请确认后端服务正常运行后点击"
+             f"「手动刷新全部数据」重试（{type(exc).__name__}）")
+_dash_modules = (_dash or {}).get("modules", {})
+
+
+def _module(key: str):
+    """取聚合模块数据；单模块失败（error 标注）抛异常交给 _fail 统一渲染"""
+    m = _dash_modules.get(key)
+    if isinstance(m, dict) and m.get("error"):
+        raise RuntimeError(m["error"])
+    return m
+
+
 # ============ 模块1：系统运行状态看板 ============
 st.subheader("系统运行状态")
 try:
-    stt = api.system_status()
+    stt = _module("system")
     render.time_text("页面数据整体刷新时间", stt.get("checked_at"))
     cols = st.columns(len(stt["connections"]))
     for col, conn in zip(cols, stt["connections"]):
@@ -93,12 +111,45 @@ def llm_stats_board() -> None:
 
 llm_stats_board()
 
+# ---- 子模块 1.2：数据源状态（当日累计，手动刷新） ----
+@st.fragment
+def datasource_stats_board() -> None:
+    """行情数据源状态（当日累计）：主源调用/失败/降级次数、主源成功率、
+    当前使用主源还是备用源（tick 实时行情 / snapshot 全市场快照）+ 统计截止时间。
+    数据来源：数据源调用层与断路器（连续失败自动降级 10 分钟，冷却到期静默探测恢复）。"""
+    try:
+        ds = api.datasource_stats()
+    except Exception as exc:  # noqa: BLE001 统计不可达不阻塞页面
+        st.error(f"数据源状态加载失败，请确认后端服务正常运行（{type(exc).__name__}）")
+        return
+    d1, d2, d3, d4 = st.columns(4)
+    with d1:
+        st.metric("主源调用次数（当日）", f"{ds['requests']} 次")
+    with d2:
+        st.metric("主源失败次数", f"{ds['failures']} 次")
+    with d3:
+        rate = ds.get("success_rate_pct")
+        st.metric("主源成功率", f"{rate}%" if rate is not None else "—（暂无调用）")
+    with d4:
+        st.metric("降级 / 恢复", f"{ds['degraded_use']} / {ds['recoveries']} 次")
+    kinds = "　".join(
+        f"**{('实时行情' if k['kind'] == 'tick' else '全市场快照')}**："
+        f"{'🟢 主源正常' if k['current_source'] == 'primary' else '🟠 临时降级·备用源'}"
+        for k in (ds.get("kinds") or []))
+    st.markdown(f"当前数据源：{kinds or '—'}")
+    render.time_text("统计截止时间", ds.get("checked_at"))
+    if st.button("刷新数据源状态", use_container_width=False):
+        st.rerun(scope="fragment")
+
+
+datasource_stats_board()
+
 st.divider()
 
 # ============ 模块1.5：今日操作提示（v2.0 市况评分） ============
 st.subheader("今日操作提示")
 try:
-    mc = api.market_condition()
+    mc = _module("market_condition")
     if not mc:
         st.info("暂无市况评分。每日挖掘运行时自动生成市况评分，也可点击下方「手动触发每日挖掘」。")
     else:
@@ -121,12 +172,12 @@ st.divider()
 # ============ 模块2：持仓与操作建议 ============
 st.subheader("持仓与操作建议")
 try:
-    holdings = api.holdings(status="holding")
+    holdings = _module("holdings")
     if not holdings:
         st.info("暂无持仓。在「持仓监控」页录入已人工建仓的标的。")
     else:
         latest_by_code = {}
-        for a in api.alerts(limit=100):
+        for a in _module("alerts"):
             latest_by_code.setdefault(a["stock_code"], a)
         for h in holdings:
             label = render.stock_label(h["stock_code"], h["stock_name"])
@@ -192,10 +243,10 @@ st.divider()
 # ============ 模块3：今日候选与建仓机会 ============
 st.subheader("今日候选与建仓机会")
 try:
-    cands = api.candidates(limit=5)
+    cands = _module("candidates")
     if cands:
         render.time_text("本轮挖掘执行时间", cands[0].get("created_at"))
-        score_map = {s["stock_code"]: s for s in api.scores(limit=200)}
+        score_map = {s["stock_code"]: s for s in _module("scores")}
         for c in cands:
             label = render.stock_label(c["stock_code"], c["stock_name"])
             sc = score_map.get(c["stock_code"])
@@ -205,7 +256,7 @@ try:
                 st.markdown(f"　· {reason}")
             if sc:
                 render.time_text("评分生成时间", sc.get("created_at"))
-        plan_rows = api.plans(limit=3)
+        plan_rows = _module("plans")
         if plan_rows:
             st.markdown("**最新建仓方案**")
             for p in plan_rows:
@@ -223,7 +274,7 @@ st.divider()
 # ============ 模块4：近期复盘动态 ============
 st.subheader("近期复盘动态")
 try:
-    revs = api.reviews(limit=3)
+    revs = _module("reviews")
     if revs:
         for r in revs:
             label = render.stock_label(r["stock_code"], r["stock_name"])
@@ -233,7 +284,7 @@ try:
     else:
         st.info("暂无复盘记录。在「持仓监控」页录入人工卖出后自动触发复盘。")
 
-    pending = api.agent_suggestions(status="pending")
+    pending = _module("pending_suggestions")
     if pending:
         st.markdown("**待审核优化建议**（经你人工确认后生效）")
         for s in pending[:3]:
@@ -247,7 +298,7 @@ st.divider()
 # ============ 模块5：紧急告警日志 ============
 st.subheader("紧急告警日志")
 try:
-    urgent_alerts = [a for a in api.alerts(limit=20) if a["action"] != "hold"]
+    urgent_alerts = [a for a in _module("alerts")[:20] if a["action"] != "hold"]
     if urgent_alerts:
         render.time_text("告警统计时间范围",
                          f"{urgent_alerts[0]['created_at'][:16]} ~ {urgent_alerts[-1]['created_at'][:16]}")
@@ -269,8 +320,7 @@ st.subheader("手动任务")
 c1, c2 = st.columns([2, 2])
 with c1:
     if st.button("手动触发每日挖掘（Discover → 候选打分）", type="primary", use_container_width=True):
-        api.submit_task("daily_pipeline")
-        st.toast("每日挖掘任务已提交后台，可切换页面继续操作")
+        render.submit_task("daily_pipeline", label="每日挖掘")
 with c2:
     try:
         jobs = api.job_status()["jobs"]

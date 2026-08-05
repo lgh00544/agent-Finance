@@ -26,9 +26,13 @@ class _FakeResp:
 
 
 def _mock_get(monkeypatch, responder):
-    """responder(url) -> 返回体（list / str 配额标记 / 抛异常）"""
-    monkeypatch.setattr("requests.get",
-                        lambda url, timeout=15: responder(url))
+    """responder(url) -> 返回体（list / str 配额标记 / 抛异常）
+    麦蕊走共享 HTTP 会话（http_client._session.get），mock 会话而非 requests.get"""
+    from app.datasource.http_client import _session
+
+    monkeypatch.setattr(
+        _session, "get",
+        lambda url, params=None, headers=None, timeout=None, **kw: responder(url))
 
 
 # ==================== 数据源工厂（默认关闭零开销） ====================

@@ -38,6 +38,7 @@ def _valid_candidate() -> dict:
     return {
         "stock_code": "600519", "stock_name": "贵州茅台", "reason": "量价健康",
         "risk_notice": "估值偏高",
+        "stock_type": "吸筹末期-优选型",
         "confidence_tier": "建议关注", "confidence_pct": 72.0,
         "macro_view": "宏观判断", "meso_view": "中观判断", "micro_view": "微观判断",
         "volume_analysis": "主力小幅流入", "risks": ["风险A", "风险B"],
@@ -215,7 +216,8 @@ def test_market_condition_upsert_and_read():
     assert mc["band"] == "温和期"
     assert mc["cap"] == 15
     assert mc["dims"]["money"] == 8
-    assert "2026-08-04" in mc["created_at"]
+    # created_at 为真实落库时间（当前日期），只校验格式不依赖具体运行日
+    assert len(mc["created_at"]) >= 16 and mc["created_at"][:10].count("-") == 2
 
     repo.upsert_market_condition("2026-08-04", 10, {"index": 2, "sector": 2, "money": 2,
                                                     "sentiment": 2, "risk": 2}, 5, "弱势")

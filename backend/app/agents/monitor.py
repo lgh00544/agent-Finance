@@ -36,7 +36,12 @@ def collect_quote(state: StockAgentState) -> StockAgentState:
     kline = source.fetch_daily_kline(code, _days_ago(30), today)
     indicators = compute_indicators(kline)
 
-    quote, stale = _fetch_realtime_quote(source, code, indicators)
+    batch_quote = (state.get("batch_quotes") or {}).get(code)
+    if batch_quote and batch_quote.get("price") is not None:
+        # 批量预取行情（全持仓一次获取，监控主路径）；与逐只取数同格式同语义
+        quote, stale = batch_quote, False
+    else:
+        quote, stale = _fetch_realtime_quote(source, code, indicators)
     state["real_time"] = quote
     state["quote_stale"] = stale
 

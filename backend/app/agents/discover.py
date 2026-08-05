@@ -450,6 +450,7 @@ def llm_final(state: StockAgentState) -> StockAgentState:
                          if u.get("code") == cand.stock_code), {})
         detail = {
             "confidence_tier": cand.confidence_tier, "confidence_pct": cand.confidence_pct,
+            "stock_type": cand.stock_type,
             "macro_view": cand.macro_view, "meso_view": cand.meso_view,
             "micro_view": cand.micro_view, "volume_analysis": cand.volume_analysis,
             "risks": cand.risks, "focus_type": cand.focus_type,
@@ -459,6 +460,16 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         }
         repo.upsert_candidate(cand.stock_code, cand.stock_name, trade_date,
                               rank, [cand.reason], [cand.risk_notice], snapshot, detail)
+    # 当日快照替换：删除当日不在本次执行结果中的残留候选，保证当日只保留最新一次执行产物。
+    # 结果为空（LLM 无输出/数据源故障）时保留既有快照，防止误清空当日候选造成数据丢失
+    if candidates:
+        removed = repo.replace_day_candidates({c["stock_code"] for c in candidates}, trade_date)
+        if removed:
+            logger.info("当日候选快照替换: 清理 %s 只残留", removed)
+            state["trace"] = [*state.get("trace", []), f"清理当日残留: {removed}只"]
+    else:
+        logger.warning("最终确认结果为空，保留当日已有候选快照（防止数据源故障误清空）")
+        state["trace"] = [*state.get("trace", []), "终选为空：保留当日已有候选快照"]
     state["candidates"] = candidates
     state["stage"] = "discover"
     state["trace"] = [*state.get("trace", []), f"落库候选: {len(candidates)}只"]

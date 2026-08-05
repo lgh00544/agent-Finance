@@ -222,7 +222,7 @@ class _Version:
 
 
 def _patch_sections(monkeypatch, base="【基线】", rules="【规则】", profile="【偏好】",
-                    knowledge="【知识】"):
+                    knowledge="【知识】", tactic="【战法知识】", tactic_ver="aA1"):
     monkeypatch.setattr(common_mod.repo, "get_trade_profile", lambda: _Version())
     monkeypatch.setattr(common_mod, "_knowledge_version", lambda: "k2:5")
     monkeypatch.setattr(common_mod, "_global_base_version", lambda: "gabc")
@@ -230,6 +230,8 @@ def _patch_sections(monkeypatch, base="【基线】", rules="【规则】", prof
     monkeypatch.setattr(common_mod, "hard_rules_section", lambda: rules)
     monkeypatch.setattr(common_mod, "profile_section", lambda: profile)
     monkeypatch.setattr(common_mod, "knowledge_section", lambda agent: knowledge)
+    monkeypatch.setattr(common_mod, "_agent_knowledge_text", lambda agent: tactic)
+    monkeypatch.setattr(common_mod, "_agent_knowledge_version", lambda agent: tactic_ver)
     captured = {}
 
     def fake_call(agent, cache_key, system_prompt, user_prompt, schema,
@@ -244,7 +246,7 @@ def _patch_sections(monkeypatch, base="【基线】", rules="【规则】", prof
 
 
 def test_agent_call_section_order_fixed(monkeypatch):
-    """段序永久固定：基线 → 硬性规则 → 偏好 → 知识库 → Agent 专属 Prompt（动态数据全在 user 段）"""
+    """段序永久固定：基线 → 硬性规则 → 偏好 → 私有知识库 → 战法知识库 → Agent 专属 Prompt"""
     captured = _patch_sections(monkeypatch)
     common_mod.agent_call("discover", "shortlist:v2:2026-08-04",
                           "【专属 Prompt】", "【动态数据】", _Out,
@@ -252,21 +254,30 @@ def test_agent_call_section_order_fixed(monkeypatch):
     assert captured["sys"] == ("【基线】\n\n【规则】\n\n"
                                "【用户个人交易偏好档案】（你的研判必须尊重用户这些偏好，"
                                "如有冲突需在输出中说明）\n【偏好】\n\n"
-                               "【知识】\n\n【专属 Prompt】")
-    assert captured["key"] == "shortlist:v2:2026-08-04:v7:k2:5:ggabc"
+                               "【知识】\n\n"
+                               "【分职能战法知识库】（沉淀自《潜力股发掘方法论》，全部条目为参考权重，"
+                               "不是死条件；与硬性规则冲突时以硬性规则为准，动态调整须在输出中标注理由）\n"
+                               "【战法知识】\n\n【专属 Prompt】")
+    assert captured["key"] == "shortlist:v2:2026-08-04:v7:k2:5:ggabc:aA1"
     assert captured["level"] is ModelLevel.LIGHT
 
 
 def test_agent_call_optional_sections(monkeypatch):
-    """关闭偏好/知识注入时对应段跳过；空基线不产生空段"""
+    """关闭偏好/私有知识注入时对应段跳过（战法知识库为独立常驻段）；空基线不产生空段"""
     captured = _patch_sections(monkeypatch, base="")
     common_mod.agent_call("score", "k", "【专属 Prompt】", "u", _Out,
                           with_profile=False, with_knowledge=False)
-    assert captured["sys"] == "【规则】\n\n【专属 Prompt】"
+    assert captured["sys"] == ("【规则】\n\n"
+                               "【分职能战法知识库】（沉淀自《潜力股发掘方法论》，全部条目为参考权重，"
+                               "不是死条件；与硬性规则冲突时以硬性规则为准，动态调整须在输出中标注理由）\n"
+                               "【战法知识】\n\n【专属 Prompt】")
     captured = _patch_sections(monkeypatch)
     common_mod.agent_call("score", "k", "【专属 Prompt】", "u", _Out,
                           with_profile=False, with_knowledge=False)
-    assert captured["sys"] == "【基线】\n\n【规则】\n\n【专属 Prompt】"
+    assert captured["sys"] == ("【基线】\n\n【规则】\n\n"
+                               "【分职能战法知识库】（沉淀自《潜力股发掘方法论》，全部条目为参考权重，"
+                               "不是死条件；与硬性规则冲突时以硬性规则为准，动态调整须在输出中标注理由）\n"
+                               "【战法知识】\n\n【专属 Prompt】")
 
 
 # ================= 调用统计 =================

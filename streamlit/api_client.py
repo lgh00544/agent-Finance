@@ -69,9 +69,20 @@ def system_status() -> dict:
     return _get("/api/system/status")
 
 
+def dashboard() -> dict:
+    """首页看板聚合：一次请求并行返回系统状态/LLM统计/市况/持仓信号/候选评分/复盘建议
+    （单模块失败仅标注 error，不阻塞整体）"""
+    return _get("/api/dashboard")
+
+
 def llm_stats() -> dict:
     """LLM 运行统计（当日累计：请求次数/缓存命中 token/命中率/模型分布）"""
     return _get("/api/llm/stats")
+
+
+def datasource_stats() -> dict:
+    """行情数据源状态（当日累计：主源调用/失败/降级次数、成功率、当前源状态）"""
+    return _get("/api/datasource/stats")
 
 
 def market_condition() -> dict | None:
@@ -104,6 +115,11 @@ def candidates(date: str | None = None, limit: int | None = None) -> list:
     if limit is not None:
         params["limit"] = limit
     return _get("/api/candidates", params or None)
+
+
+def candidate_dates(limit: int = 30) -> list:
+    """候选池可选日期（去重降序，最新在前）：默认只加载最新一天，切换日期按需查询"""
+    return (_get("/api/candidates/dates", {"limit": limit}) or {}).get("dates") or []
 
 
 def scores(code: str | None = None, date: str | None = None, limit: int | None = None) -> list:
@@ -237,3 +253,38 @@ def export_profile() -> dict:
 
 def import_profile(content: dict) -> dict:
     return _post("/api/profile/import", {"content": content})
+
+
+# ================= Agent 专属对话（提问答疑 / 规则调教 / 多模态学习） =================
+def chat_agents() -> list:
+    """六 Agent 对话元信息（名称/职责范围/知识库来源）"""
+    return _get("/api/agent-chat/agents")
+
+
+def chat_history(agent: str, limit: int = 50) -> list:
+    """某 Agent 的对话历史（最新在前）"""
+    return _get("/api/agent-chat/history", {"agent": agent, "limit": limit})
+
+
+def chat_ask(agent: str, question: str) -> dict:
+    """文字提问（异步任务，返回 task_id；结果含答案/信心度/依据来源）"""
+    return _post("/api/agent-chat/ask", {"agent": agent, "question": question})
+
+
+def chat_rule(agent: str, proposal: str) -> dict:
+    """规则调教校验（异步任务；结论 采纳/部分采纳/维持原规则，采纳自动沉淀知识库）"""
+    return _post("/api/agent-chat/rules", {"agent": agent, "proposal": proposal})
+
+
+def chat_learn(agent: str, image_bytes: bytes, filename: str) -> dict:
+    """多模态上传学习（异步任务；结果含确认摘要与建议知识点，确认后才落库）"""
+    resp = requests.post(f"{API_BASE}/api/agent-chat/learn",
+                         params={"agent": agent},
+                         files={"file": (filename, image_bytes)}, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def chat_learn_confirm(agent: str, entries: list[dict]) -> dict:
+    """确认多模态学习结果：知识点（可含修正后的标签）写入对应 Agent 知识库"""
+    return _post("/api/agent-chat/learn/confirm", {"agent": agent, "entries": entries})

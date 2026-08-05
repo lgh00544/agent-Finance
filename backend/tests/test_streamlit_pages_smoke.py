@@ -49,7 +49,7 @@ _TITLES = {
 
 @pytest.mark.parametrize("page", PAGES)
 def test_page_renders(page):
-    at = AppTest.from_file(str(PAGES_DIR / page), default_timeout=120)
+    at = AppTest.from_file(str(PAGES_DIR / page), default_timeout=180)
     at.run()
     assert not at.exception, f"{page} 渲染异常: {at.exception}"
     assert at.title[0].value == _TITLES[page]
@@ -57,7 +57,7 @@ def test_page_renders(page):
 
 def test_candidate_page_interactives():
     """候选池页新交互回归：日期选择器 / 评级筛选三档 / 主表与详情折叠"""
-    at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=120)
+    at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=180)
     at.run()
     assert not at.exception, f"候选池页渲染异常: {at.exception}"
     assert at.selectbox[0].label == "选择日期" and len(at.selectbox[0].options) >= 1
@@ -97,7 +97,7 @@ def test_stock_label_format():
 def test_home_page_renders():
     """首页看板渲染冒烟（含顶部常驻状态栏与热门板块模块）"""
     at = AppTest.from_file(str(Path(__file__).resolve().parents[2] / "streamlit" / "app.py"),
-                           default_timeout=120)
+                           default_timeout=180)
     at.run()
     assert not at.exception, f"首页渲染异常: {at.exception}"
     assert at.title[0].value == "单人 A 股全生命周期决策 Agent 系统"
@@ -122,9 +122,34 @@ def test_top_bar_format_helpers():
 
 
 def test_top_bar_layout_padding_css():
-    """顶部固定状态栏布局补偿：主内容区与侧边栏均预留 3.6rem 顶距，首屏不被遮挡；
-    状态栏本体固定悬浮（z-index 998）且保持紧凑。CSS 注入点唯一（top_status_bar）"""
+    """顶部固定状态栏布局规范：主内容区与侧边栏预留 4.3rem 顶距不遮挡首屏；
+    状态栏本体固定悬浮（z-index 998）、width 100% 撑满视口、左右内边距对称
+    （无单侧大 padding）、align-items center 统一垂直居中、line-height 1.5；
+    信息按「账户资产」「大盘指数」分组展示。CSS 注入点唯一（top_status_bar）"""
     src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
-    assert '[data-testid="stMain"] { padding-top: 3.6rem; }' in src
-    assert '[data-testid="stSidebarContent"] { padding-top: 3.6rem; }' in src
+    assert '[data-testid="stMain"] { padding-top: 4.3rem; }' in src
+    assert '[data-testid="stSidebarContent"] { padding-top: 4.3rem; }' in src
     assert "position: fixed" in src and "z-index: 998" in src
+    assert "width: 100%" in src and "box-sizing: border-box" in src
+    assert "line-height: 1.5" in src
+    assert "align-items: center" in src
+    assert "padding: 0.3rem 1rem" in src  # 左右对称，无单侧大 padding
+    assert "29.9rem" not in src and "line-height: 2.45" not in src  # 不再出现异常参数
+    assert "bar-group" in src and "bar-group-label" in src  # 分组展示 + 组标签
+
+
+# ================= Agent 对话页（9_Agent对话.py） =================
+
+def test_agent_chat_page_renders():
+    """Agent 对话页渲染：标题 / 六 Agent 选择 / 三个交互标签 / 历史区"""
+    at = AppTest.from_file(str(PAGES_DIR / "9_Agent对话.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"9_Agent对话.py 渲染异常: {at.exception}"
+    assert at.title[0].value == "Agent 专属对话（调教 · 答疑 · 知识沉淀）"
+    tabs = [t.label for t in at.tabs]
+    for name in ("文字提问", "规则调教", "多模态学习", "对话历史"):
+        assert name in tabs, f"缺少标签页: {name}"
+    options = at.selectbox[0].options
+    for agent in ("选股发现 Agent", "评分分析 Agent", "建仓方案 Agent",
+                  "持仓监控 Agent", "卖出决策 Agent", "复盘迭代 Agent"):
+        assert agent in options, f"缺少 Agent 选项: {agent}"

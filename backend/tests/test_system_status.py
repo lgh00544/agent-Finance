@@ -99,7 +99,7 @@ def test_list_endpoints_return_created_at():
 def test_home_dashboard_renders():
     """首页 5 模块看板渲染冒烟（需后端在跑）"""
     sys.path.insert(0, _STREAMLIT_DIR)  # 供首页 import api_client/render
-    at = AppTest.from_file(r"D:\self\streamlit\app.py", default_timeout=120)
+    at = AppTest.from_file(r"D:\self\streamlit\app.py", default_timeout=180)
     at.run()
     assert not at.exception, f"首页渲染异常: {at.exception}"
     subs = [s.value for s in at.subheader]

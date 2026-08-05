@@ -264,3 +264,25 @@ class AgentSuggestion(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/approved/rejected
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class AgentChatMessage(Base):
+    """Agent 专属对话历史（Agent 对话页：问答/规则调教/多模态学习，全程可回溯）
+
+    message_type: qa=文字提问 / rule=规则调教 / learn=多模态学习
+    verdict: 规则调教结论 adopted/partial/maintained（仅 rule 类型有值）
+    knowledge_id: 规则调教采纳后沉淀到的知识条目 ID（可空）
+    meta: JSON 附加信息（依据来源/信心度/标签等，展示与审计用）
+    """
+    __tablename__ = "agent_chat_message"
+    __table_args__ = (Index("ix_chat_agent_time", "agent", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent: Mapped[str] = mapped_column(String(16), index=True)   # discover/score/position/monitor/sell/review
+    role: Mapped[str] = mapped_column(String(8))                 # user / assistant
+    message_type: Mapped[str] = mapped_column(String(16), default="qa")  # qa/rule/learn
+    content: Mapped[str] = mapped_column(Text, default="")
+    verdict: Mapped[str] = mapped_column(String(16), default="")  # adopted/partial/maintained（rule 类型）
+    knowledge_id: Mapped[int] = mapped_column(Integer, nullable=True)  # 沉淀知识条目 ID
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
