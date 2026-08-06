@@ -4,6 +4,7 @@
 3. 原始 JSON 折叠控件默认收起（expanded=False）；
 4. 股票标识统一「代码 名称」格式（600519 贵州茅台）。"""
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -63,10 +64,22 @@ def test_candidate_page_interactives():
     assert at.selectbox[0].label == "选择日期" and len(at.selectbox[0].options) >= 1
     assert at.segmented_control[0].label == "评级筛选"
     assert at.segmented_control[0].options == ["全部候选", "可建仓 A+B", "观察 C"]
-    # 评级筛选切换不报错
+
+    # ===== 数据真实渲染断言（2026-08-06 假绿修复：仅断言无异常会漏检列表崩溃被吞） =====
+    def _assert_list_state():
+        md_text = "\n".join(m.value for m in at.markdown if m.value)
+        for err in ("后端服务连接失败", "数据库查询失败", "请求超时", "数据解析失败", "加载失败"):
+            assert err not in md_text, f"API 正常时页面不应显示错误卡片: {md_text[:200]}"
+        # 列表行（#N 代码 名称）或空状态说明必须出现其一；两者皆无 = 列表被异常吞掉
+        row_or_empty = re.search(r"#\d+\s+\d{6}\s+\S+", md_text) or "当日无候选" in md_text
+        assert row_or_empty, "候选列表既无渲染行也无空状态说明（可能被异常吞掉转错误卡片）"
+
+    _assert_list_state()
+    # 评级筛选切换不报错，且筛选后列表状态仍合法
     at.segmented_control[0].set_value("可建仓 A+B")
     at.run()
     assert not at.exception, f"评级筛选切换后异常: {at.exception}"
+    _assert_list_state()
 
 
 def test_no_raw_st_json_in_pages():
@@ -407,3 +420,104 @@ def test_frontend_cache_roundtrip(monkeypatch, tmp_path):
     # 损坏文件 → None 不抛错
     (tmp_path / "frontend_cache_bad.json").write_text("{broken", encoding="utf-8")
     assert fc.load("bad") is None
+
+
+# ================= 假绿修复专项（2026-08-06：测试通过但列表从未渲染的事件复盘沉淀） =================
+
+def test_candidate_page_try_scope():
+    """候选池页错误处理必须限定在数据获取边界（假绿根因修复）：
+    try 正常路径块内禁止列表渲染调用（list_item_toggle/record_list），
+    防整页 try 吞异常把列表崩溃掩盖为错误卡片；except 块内 error_card 属合理错误处理"""
+    lines = (PAGES_DIR / "1_每日候选池.py").read_text(encoding="utf-8").splitlines()
+    bad: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        if not re.match(r"^\s*try:", line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        j = i + 1
+        while j < len(lines):
+            ln = lines[j]
+            if re.match(r"^\s*(except|else|finally)\b", ln):
+                break  # try 正常路径结束，except 内的错误展示不检查
+            if ln.strip() and len(ln) - len(ln.lstrip()) > indent:
+                if re.search(r"\b(list_item_toggle|record_list)\s*\(", ln):
+                    bad.append((j + 1, ln.strip()))
+            j += 1
+    assert not bad, f"try 块内发现列表渲染调用（错误处理越界）: {bad}"
+
+
+def test_candidate_row_contract():
+    """候选池 API 行契约（假绿根因修复）：行必须含页面渲染依赖的 8 键、且无 id
+    （前端用 代码+日期+rank 组合键，页面曾假设 id 字段导致列表崩溃被掩盖）；
+    API 不可达或无数据时跳过（防御性契约校验，不依赖后端常驻）"""
+    import api_client
+
+    try:
+        rows = api_client.candidates(limit=5)
+    except Exception:  # noqa: BLE001
+        pytest.skip("API 不可达，跳过候选行契约断言")
+    if not rows:
+        pytest.skip("无候选数据，跳过契约断言")
+    required = ("stock_code", "stock_name", "trade_date", "rank",
+                "reasons", "risk_notice", "detail", "created_at")
+    missing = [k for k in required if k not in rows[0]]
+    assert not missing, f"候选行缺少契约字段: {missing}"
+    assert "id" not in rows[0], "候选行不应含 id（页面使用组合键，出现 id 说明结构漂移）"
+
+
+# ================= AI 研判留痕交互全链路（2026-08-06 验证沉淀） =================
+# 断言要点：expander 标签不出现在 markdown（此前在 markdown 找「最终结论（默认展开）」
+# 必然失败）；全局主题 CSS 含 .rule-*/.trace-* 类名（markdown 断言须剔除首个 CSS，
+# 否则「规则徽章出现」恒真）；at.session_state 不支持 .get()/迭代（用 in 判断）；
+# expander 展开状态读 proto.expanded（AppTest 元素不暴露 expanded 属性）。
+
+def test_candidate_trace_chain():
+    """候选池页留痕全链路：触发按钮 → 留痕列表 → 详情卡片
+    （结论卡默认展开 + 推理分层折叠 + 结论内容渲染 + 头部徽章）"""
+    at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"候选池页渲染异常: {at.exception}"
+
+    detail_toggle = [b for b in at.button if b.label == "查看详情"]
+    if not detail_toggle:
+        pytest.skip("当日无候选详情，跳过留痕链路断言")
+    detail_toggle[0].click().run()
+    assert not at.exception, f"展开候选详情异常: {at.exception}"
+
+    btns = [b for b in at.button if "AI 研判留痕" in b.label]
+    assert btns, "未找到留痕按钮"
+    btns[0].click().run()
+    assert not at.exception, f"点击留痕后异常: {at.exception}"
+
+    row_btns = [b for b in at.button if b.label.startswith("查看 ") and "留痕" in b.label]
+    captions = [c.value for c in at.caption]
+    if not row_btns:
+        if any("暂无留痕记录" in c for c in captions):
+            pytest.skip("该标的本交易日无留痕数据，跳过详情断言")
+        assert any("留痕接口暂不可用" in c for c in captions), \
+            "留痕列表未出现且非空态/降级态（接口或渲染异常被吞）"
+        pytest.skip("留痕接口暂不可用，跳过详情断言")
+
+    row_btns[0].click().run()
+    assert not at.exception, f"打开留痕详情后异常: {at.exception}"
+
+    # 结论卡默认展开（acceptance：先给结论）
+    concl = [e for e in at.expander if "最终结论" in e.label]
+    assert concl, "结论卡未渲染（无「最终结论」expander）"
+    assert concl[0].proto.expanded is True, "结论卡未默认展开"
+
+    # 推理分层折叠渲染
+    layers = [e for e in at.expander
+              if e.label in ("事实依据（输入数据快照）", "技术面推理", "资金面推理",
+                             "基本面推理", "风险推理")]
+    assert len(layers) >= 3, f"推理分层渲染不足（{len(layers)} 层）"
+    assert all(e.proto.expanded is False for e in layers), "推理层必须默认折叠"
+
+    # 结论内容与头部徽章实际渲染（剔除 CSS 后的真实 markdown）
+    md_text = "\n".join(m.value for m in at.markdown if m.value
+                        and not m.value.lstrip().startswith("<style>"))
+    assert any(k in md_text for k in ("confidence_tier", "stock_type", "score",
+                                      "grade", "action", "plan_id", "lesson")), \
+        "结论卡内容未渲染"
+    assert 'class="badge badge-info"' in md_text, "留痕头部徽章未渲染"
+    assert 'class="trace-layer' in md_text, "推理层内容未渲染"

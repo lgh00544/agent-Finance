@@ -456,6 +456,7 @@ def llm_final(state: StockAgentState) -> StockAgentState:
             "risks": cand.risks, "focus_type": cand.focus_type,
             "tech_view": cand.tech_view, "price_levels": cand.price_levels,
             "position_hint": cand.position_hint,
+            "rule_refs": cand.rule_refs,
             "enriched": data_enrichment.get(cand.stock_code) or {},
         }
         repo.upsert_candidate(cand.stock_code, cand.stock_name, trade_date,

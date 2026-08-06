@@ -29,6 +29,8 @@ TIER_MAP = {"强烈推荐": "A", "建议关注": "B", "谨慎观察": "C"}
 TIER_LABEL = {"A": "A 强烈推荐", "B": "B 建议关注", "C": "C 谨慎观察"}
 TIER_DOT = {"A": "tier-a", "B": "tier-b", "C": "tier-c"}
 _SORT = {"A": 0, "B": 1, "C": 2}
+_TRACE_MODULE = {"discover": "选股研判", "score": "五维评分", "position": "建仓方案",
+                 "alert": "监控预警", "review": "交易复盘", "sell": "卖出决策"}
 
 CACHE_KEY = "candidates"
 _cached = fc.load(CACHE_KEY)  # 离线兜底缓存（接口失败时降级展示）
@@ -198,6 +200,45 @@ with rows_area:
                 if st.button("生成建仓方案", key=f"plan_{code}_{r['trade_date']}"):
                     render.submit_task("position", {"stock_code": code, "stock_name": name},
                                        label="建仓方案生成")
+                # ===== AI 研判留痕（推理链路可溯源）：按钮触发真懒加载，未点击零接口调用 =====
+                tk = f"traces_{code}_{r['trade_date']}"
+                if st.button("AI 研判留痕（推理链路可溯源）", key=f"trbtn_{key}",
+                             use_container_width=True):
+                    st.session_state[tk] = "open"
+                    st.rerun()
+                if st.session_state.get(tk) == "open":
+                    if f"{tk}_rows" not in st.session_state:
+                        try:
+                            st.session_state[f"{tk}_rows"] = api.traces(
+                                code=code, date=r["trade_date"], limit=10)
+                        except Exception:  # noqa: BLE001 留痕接口异常不阻塞候选展示
+                            st.session_state[f"{tk}_rows"] = False
+                    trace_rows = st.session_state.get(f"{tk}_rows")
+                    if trace_rows is False:
+                        st.caption("留痕接口暂不可用，可点击下方重试。")
+                        if st.button("重试", key=f"retry_trace_{key}"):
+                            st.session_state.pop(f"{tk}_rows", None)
+                            st.rerun()
+                    elif not trace_rows:
+                        st.caption("该标的本交易日暂无留痕记录（历史快照或留痕启用前数据）。")
+                    else:
+                        for t in trace_rows:
+                            dk = f"trace_open_{t['trace_id']}"
+                            opened = st.session_state.get(dk, False)
+                            mlabel = _TRACE_MODULE.get(t.get("source_module", ""),
+                                                       t.get("source_module", ""))
+                            if st.button(f"查看 {mlabel} 留痕（{str(t.get('create_time') or '')[:16]}）",
+                                         key=f"trace_btn_{t['trace_id']}",
+                                         use_container_width=True):
+                                opened = not opened
+                                st.session_state[dk] = opened
+                                st.rerun()
+                            if opened:
+                                try:
+                                    render.trace_card(api.trace_detail(t["trace_id"]),
+                                                      key=f"tc_{t['trace_id']}")
+                                except Exception as exc:  # noqa: BLE001 详情失败只降级为提示
+                                    st.caption(f"留痕详情暂不可用：{exc}")
                 render.raw_json_expander(
                     {"reasons": r.get("reasons"), "risk_notice": r.get("risk_notice"),
                      "detail": detail},

@@ -163,6 +163,39 @@ class ReviewResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class AiReasoningTrace(Base):
+    """AI 研判推理链路留痕（全模块通用：discover候选池/score评分/position建仓/
+    monitor持仓监控/alert告警/review复盘/sell卖出决策）
+
+    一次生成、结构化入库、多端复用；纠察复盘Agent 的「决策黑匣子」数据源。
+    同 code+generate_date+source_module 保留最新一次研判（写入覆盖，uq 约束天然支撑
+    联合查询，无需重复建普通联合索引；长文本列一律不建索引）。
+    """
+    __tablename__ = "ai_reasoning_trace"
+    __table_args__ = (
+        UniqueConstraint("stock_code", "generate_date", "source_module",
+                         name="uq_trace_code_date_module"),
+        Index("ix_trace_module_date", "source_module", "generate_date"),  # 模块+日期批量查询
+    )
+
+    trace_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))            # 禁止只存代码不存名称
+    source_module: Mapped[str] = mapped_column(String(16), index=True)  # discover/score/position/monitor/alert/review/sell
+    generate_date: Mapped[str] = mapped_column(String(10), index=True)  # 生成交易日 YYYY-MM-DD
+    fact_basis: Mapped[str] = mapped_column(Text, default="")      # 事实依据层（原始客观数据，标注数据源+时间戳）
+    technical_reasoning: Mapped[str] = mapped_column(Text, default="")  # 技术面推理
+    capital_reasoning: Mapped[str] = mapped_column(Text, default="")    # 资金面推理
+    fundamental_reasoning: Mapped[str] = mapped_column(Text, default="")  # 基本面推理
+    risk_reasoning: Mapped[str] = mapped_column(Text, default="")   # 风险推导（触发条件/判定理由/影响范围）
+    rule_refs: Mapped[str] = mapped_column(Text, default="")        # 引用规则清单（K 编号，逗号分隔）
+    final_conclusion: Mapped[str] = mapped_column(Text, default="")  # 最终结论（评级/操作建议/目标价位）
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)   # 结论置信度 0-1
+    data_source: Mapped[str] = mapped_column(String(64), default="")  # 数据源标识（如 行情快照+LLM 研判）
+    create_time: Mapped[str] = mapped_column(String(16), default="")  # 生成时间戳 YYYY-MM-DD HH:mm
+    ext_info: Mapped[str] = mapped_column(Text, default="")         # 各模块特有数据（JSON 字符串）
+
+
 class NewsArticle(Base):
     """新闻/公告原始文本（真源数据；Qdrant 仅做其向量索引，dev 模式 SQL LIKE 检索）"""
     __tablename__ = "news_article"

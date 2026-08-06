@@ -4,6 +4,8 @@
 后端存储与 LLM 交互保持结构化 JSON 不变，仅在此层做渲染转换。
 时间统一展示格式 YYYY-MM-DD HH:mm（北京时间），浅色小字标注数据生成/检测时间。
 """
+import json
+
 import streamlit as st
 
 # 时效标注配色：普通浅灰 / 紧急琥珀（深色主题下均清晰可读）
@@ -247,6 +249,28 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
   background: rgba(59, 130, 246, 0.18); border-left: 3px solid var(--primary);
   border-color: var(--border-hi);
 }
+/* ===== 推理留痕卡片（结论卡默认展开 + 推理分层折叠，可解释化展示） ===== */
+/* 推理层：左侧色条 + 浅一级文字 + 悬停 0.2s 过渡；五类色对应五维推理 */
+.trace-layer { font-size: 13px; color: var(--text-dim); line-height: 1.7;
+               border-left: 3px solid var(--info); padding: 4px 10px;
+               margin: 2px 0 6px; white-space: pre-wrap;
+               transition: color 0.2s ease, border-color 0.2s ease; }
+.trace-layer:hover { color: var(--text); }
+.trace-layer.fact    { border-color: var(--info); }
+.trace-layer.tech    { border-color: #8b5cf6; }
+.trace-layer.capital { border-color: #f59e0b; }
+.trace-layer.fund    { border-color: #10b981; }
+.trace-layer.risk    { border-color: #ef4444; }
+/* 规则徽章行：引用规则 chip，深色描边 */
+.rule-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+.rule-chip { font-size: 12px; color: var(--text-dim); padding: 1px 10px;
+             border-radius: 999px; border: 1px solid var(--border-hi);
+             background: rgba(59, 130, 246, 0.08); transition: color 0.2s ease; }
+.rule-chip:hover { color: var(--text); }
+/* 留痕头部：模块徽章 + 元信息小字 */
+.trace-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+              margin-bottom: 4px; }
+.trace-meta { font-size: 12px; color: var(--text-mute); }
 </style>
 """
 
@@ -793,6 +817,7 @@ def top_status_bar() -> None:
             b = acc.get("baseline") or {}
             st.caption(f"账户基准来自券商持仓截图（人工确认，{b.get('trade_date', '')} 保存）；"
                        f"总盈亏/总持仓成本随持仓与实时行情自动计算。")
+        # 账户数据可空（接口失败/未配置基准时 acc=None），明细渲染必须容忍 None（2026-08-06 修复）
         if acc is not None:
             pnl_sign = _bar_sign(acc.get("pnl_amount"))
             for label, value, colored in [
@@ -832,3 +857,71 @@ def top_status_bar() -> None:
         st.caption(f"指数数据更新时间：{idx.get('updated_at', '—')}")
         if idx_err:
             st.caption(f"⚠️ 指数行情更新失败：{idx_err}（显示上次缓存值）")
+
+
+# ================= 推理留痕卡片（结论卡默认展开 + 推理分层折叠，可解释化展示） =================
+
+_TRACE_MODULE_LABEL = {"discover": "选股研判", "score": "五维评分", "position": "建仓方案",
+                       "alert": "监控预警", "review": "交易复盘", "sell": "卖出决策"}
+_TRACE_LAYERS = (
+    ("fact_basis", "事实依据（输入数据快照）", "fact"),
+    ("technical_reasoning", "技术面推理", "tech"),
+    ("capital_reasoning", "资金面推理", "capital"),
+    ("fundamental_reasoning", "基本面推理", "fund"),
+    ("risk_reasoning", "风险推理", "risk"),
+)
+
+
+def _esc(text: str) -> str:
+    """HTML 转义（LLM 输出含 <>& 时防止破坏布局）"""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _parse_json_text(raw) -> dict:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, (dict, list)) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def trace_card(trace: dict, key: str) -> None:
+    """AI 研判推理留痕卡（可解释化统一范式）：
+    头部=模块徽章+标的+日期+置信度+数据源；结论卡默认展开；五层推理折叠（色条+浅一级文字）；
+    引用规则徽章；原始报文折叠。trace 为 /api/traces/{id} 完整详情，纯展示无判断。"""
+    module = _TRACE_MODULE_LABEL.get(trace.get("source_module", ""),
+                                     trace.get("source_module", ""))
+    conf = trace.get("confidence")
+    conf_text = f"置信度 {conf:.0%}" if isinstance(conf, (int, float)) and conf > 0 else ""
+    with st.container(border=True):
+        st.markdown(
+            f'<div class="trace-head"><span class="badge badge-info">{_esc(module)}</span>'
+            f'<span class="item-title">{_esc(stock_label(trace.get("stock_code", ""), trace.get("stock_name", "")))}</span>'
+            f'<span class="trace-meta">{_esc(trace.get("generate_date", ""))}'
+            f'{(" · " + conf_text) if conf_text else ""}'
+            f'{(" · " + _esc(trace.get("data_source", ""))) if trace.get("data_source") else ""}'
+            f'　{_esc(trace.get("create_time", ""))}</span></div>',
+            unsafe_allow_html=True)
+        # 结论卡：默认展开（可解释化的核心：先给结论）
+        with st.expander("最终结论（默认展开）", expanded=True, key=f"{key}_concl"):
+            conclusion = _parse_json_text(trace.get("final_conclusion"))
+            if conclusion:
+                render_dict(conclusion if isinstance(conclusion, dict) else {"结论": conclusion})
+            else:
+                st.markdown("（该模块此轮未输出结构化结论）")
+        # 推理分层：折叠展示，色条区分五维，浅一级文字
+        for field, label, tone in _TRACE_LAYERS:
+            text = (trace.get(field) or "").strip()
+            if not text:
+                continue
+            with st.expander(label, expanded=False, key=f"{key}_{field}"):
+                st.markdown(f'<div class="trace-layer {tone}">{_esc(text)}</div>',
+                            unsafe_allow_html=True)
+        # 引用规则徽章（rule_refs 逗号分隔文本 → chips）
+        refs = [x.strip() for x in str(trace.get("rule_refs") or "").split(",") if x.strip()]
+        if refs:
+            chips = "".join(f'<span class="rule-chip">{_esc(x)}</span>' for x in refs)
+            st.markdown(f'<div class="rule-chips">{chips}</div>', unsafe_allow_html=True)
+        raw_json_expander(trace, key=f"{key}_raw")

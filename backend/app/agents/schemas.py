@@ -31,6 +31,8 @@ class DiscoverCandidate(BaseModel):
         description="技术面研判（威科夫/量价/K线形态/谐波至少两套体系交叉验证，标注体系与支撑依据）")
     price_levels: str = Field(default="", description="关键价位（支撑位/压力位/建议关注区间）")
     position_hint: str = Field(default="", description="操作建议（低吸/突破/观望 + 参考仓位建议）")
+    rule_refs: list[str] = Field(default_factory=list,
+        description="引用的规则/战法清单（K 编号、战法名、人工硬性规则），留痕可溯源")
 
 
 class DiscoverOutput(BaseModel):

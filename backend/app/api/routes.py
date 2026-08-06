@@ -296,6 +296,23 @@ def list_scores(code: Optional[str] = None, date: Optional[str] = None, limit: i
     return repo.list_scores(code, date, limit)
 
 
+# ================= 推理留痕（可解释化展示数据源） =================
+@router.get("/traces")
+def list_traces(code: Optional[str] = None, date: Optional[str] = None,
+                module: Optional[str] = None, limit: int = 50):
+    """推理留痕轻量列表（不含长文本，毫秒级；详情按需单查）"""
+    return repo.list_traces(code, date, module, limit)
+
+
+@router.get("/traces/{trace_id}")
+def get_trace(trace_id: int):
+    """推理留痕完整详情（结论卡 + 分层推理全文）"""
+    trace = repo.get_trace(trace_id)
+    if trace is None:
+        raise HTTPException(status_code=404, detail="留痕记录不存在")
+    return trace
+
+
 @router.get("/stocks/names")
 def stock_names(codes: str = ""):
     """批量补名（只读）：基于行情源实时名称反查，不写库、不动任务体系。

@@ -12,6 +12,7 @@ from app.api.routes import router as api_router
 from app.core.logging import setup_logging
 from app.db.session import init_db
 from app.scheduler.jobs import start_scheduler, stop_scheduler
+from app.services import reasoning_trace
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ async def lifespan(app: FastAPI):
     logger.info("系统启动完成")
     yield
     stop_scheduler()
+    reasoning_trace.flush()  # 退出前兜底写入未落库的留痕记录
 
 
 app = FastAPI(title="Stock Agent Decision System", version="1.0.0", lifespan=lifespan)

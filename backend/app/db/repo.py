@@ -12,11 +12,12 @@ from sqlalchemy import delete, func, select, text
 from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
-    AccountBaseline, AgentPreference, AgentSuggestion, AlertLog, Holding,
+    AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog, Holding,
     MarketCondition, NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult,
     SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord, _now,
 )
 from app.db.session import SessionLocal
+from app.services import reasoning_trace
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,9 @@ def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: in
         row.created_at = _now()  # 覆盖更新：同日同股以最新执行时间为准（前端去重取最大）
         db.commit()
         _invalidate("candidate")
+        # 推理留痕（异步批量写，零阻塞）：discover 结论=候选理由+风险初判+detail 结构字段
+        reasoning_trace.trace_candidate(stock_code, stock_name, trade_date, reasons,
+                                        risk_notice, snapshot, detail or {}, row.created_at)
 
 
 def replace_day_candidates(codes: set[str], trade_date: str) -> int:
@@ -137,6 +141,9 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
         row.score, row.grade, row.detail, row.risk_list = score, grade, detail, risk_list
         db.commit()
         _invalidate("score")
+        # 推理留痕：score 五维分项研判（dimensions[].comment 按维度归入技术/资金/基本面）
+        reasoning_trace.trace_score(stock_code, stock_name, trade_date,
+                                    score, grade, detail, risk_list)
 
 
 def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: float,
@@ -149,6 +156,9 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
         db.commit()
         db.refresh(row)
         _invalidate("plan")
+        # 推理留痕：position 分批区间/止损止盈/总仓 + 建仓逻辑说明
+        reasoning_trace.trace_plan(stock_code, stock_name, plan_date, total_pct,
+                                   batches, stop_loss, take_profit, rationale, row.id)
         return row.id
 
 
@@ -161,6 +171,9 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
         db.commit()
         db.refresh(row)
         _invalidate("alert")
+        # 推理留痕：monitor 信号研判（signal 全量含 reasons/risks/key_levels）
+        reasoning_trace.trace_alert(stock_code, stock_name, _now().strftime("%Y-%m-%d"),
+                                    alert_type, severity, message, action, signal or {})
         return row.id
 
 
@@ -175,6 +188,9 @@ def insert_review(stock_code: str, stock_name: str, holding_id: int, exit_date: 
         db.commit()
         db.refresh(row)
         _invalidate("review")
+        # 推理留痕：review 计划兑现对比 + 经验教训 + 反馈偏好
+        reasoning_trace.trace_review(stock_code, stock_name, exit_date,
+                                     plan_vs_actual, lesson, feedback)
         return row.id
 
 
@@ -490,6 +506,51 @@ def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
     return _dbq("candidate", {"date": date, "limit": limit}, _load)
 
 
+def list_traces(code: str | None = None, date: str | None = None,
+                module: str | None = None, limit: int = 50) -> list[dict]:
+    """推理留痕轻量列表（不含长文本，详情按需单查；L1 缓存 dbq:trace:，写后由
+    reasoning_trace._flush 失效）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(AiReasoningTrace).order_by(
+                AiReasoningTrace.generate_date.desc(), AiReasoningTrace.trace_id.desc())
+            if code:
+                stmt = stmt.where(AiReasoningTrace.stock_code == code)
+            if date:
+                stmt = stmt.where(AiReasoningTrace.generate_date == date)
+            if module:
+                stmt = stmt.where(AiReasoningTrace.source_module == module)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"trace_id": r.trace_id, "stock_code": r.stock_code,
+                     "stock_name": r.stock_name, "source_module": r.source_module,
+                     "generate_date": r.generate_date, "confidence": r.confidence,
+                     "data_source": r.data_source, "create_time": r.create_time}
+                    for r in rows]
+
+    return _dbq("trace", {"code": code, "date": date, "module": module, "limit": limit}, _load)
+
+
+def get_trace(trace_id: int) -> dict | None:
+    """推理留痕完整详情（含全部推理分层文本）"""
+    def _load() -> dict | None:
+        with SessionLocal() as db:
+            r = db.get(AiReasoningTrace, trace_id)
+            if r is None:
+                return None
+            return {"trace_id": r.trace_id, "stock_code": r.stock_code,
+                    "stock_name": r.stock_name, "source_module": r.source_module,
+                    "generate_date": r.generate_date, "fact_basis": r.fact_basis,
+                    "technical_reasoning": r.technical_reasoning,
+                    "capital_reasoning": r.capital_reasoning,
+                    "fundamental_reasoning": r.fundamental_reasoning,
+                    "risk_reasoning": r.risk_reasoning, "rule_refs": r.rule_refs,
+                    "final_conclusion": r.final_conclusion, "confidence": r.confidence,
+                    "data_source": r.data_source, "create_time": r.create_time,
+                    "ext_info": r.ext_info}
+
+    return _dbq("trace", {"id": trace_id}, _load)
+
+
 def list_candidate_dates(limit: int = 30) -> list[str]:
     """候选池可选日期（去重降序，默认最新在前）：页面只加载最新一天，
     切换历史日期时再按需查询，避免初始化全量加载"""
@@ -702,6 +763,8 @@ def insert_sell_decision(holding_id: int, stock_code: str, stock_name: str, deci
         db.add(row)
         db.commit()
         db.refresh(row)
+        # 推理留痕：sell 卖出决策依据/离场区间/检查清单
+        reasoning_trace.trace_sell(stock_code, stock_name, _now().strftime("%Y-%m-%d"), decision)
         return row.id
 
 

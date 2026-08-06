@@ -156,3 +156,28 @@ CREATE TABLE IF NOT EXISTS agent_suggestion (
     KEY idx_suggestion_review (review_id),
     KEY idx_suggestion_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- AI 研判推理链路留痕（全模块通用：discover/score/position/monitor/alert/review/sell）
+-- 与 backend/app/db/models.py 的 AiReasoningTrace 一致；长文本列不建索引
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ai_reasoning_trace (
+    trace_id INT AUTO_INCREMENT PRIMARY KEY,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL,
+    source_module VARCHAR(16) NOT NULL,
+    generate_date VARCHAR(10) NOT NULL,
+    fact_basis LONGTEXT NULL,
+    technical_reasoning LONGTEXT NULL,
+    capital_reasoning LONGTEXT NULL,
+    fundamental_reasoning LONGTEXT NULL,
+    risk_reasoning LONGTEXT NULL,
+    rule_refs TEXT NULL,
+    final_conclusion LONGTEXT NULL,
+    confidence FLOAT NOT NULL DEFAULT 0,
+    data_source VARCHAR(64) NOT NULL DEFAULT '',
+    create_time VARCHAR(16) NOT NULL DEFAULT '',
+    ext_info LONGTEXT NULL,
+    UNIQUE KEY uq_trace_code_date_module (stock_code, generate_date, source_module),
+    KEY idx_trace_module_date (source_module, generate_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

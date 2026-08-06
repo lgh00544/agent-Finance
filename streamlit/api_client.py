@@ -122,6 +122,26 @@ def candidate_dates(limit: int = 30) -> list:
     return (_get("/api/candidates/dates", {"limit": limit}) or {}).get("dates") or []
 
 
+def traces(code: str | None = None, date: str | None = None,
+           module: str | None = None, limit: int = 50) -> list:
+    """推理留痕轻量列表（不含长文本，毫秒级；详情按需单查）"""
+    params = {}
+    if code:
+        params["code"] = code
+    if date:
+        params["date"] = date
+    if module:
+        params["module"] = module
+    if limit is not None:
+        params["limit"] = limit
+    return _get("/api/traces", params or None)
+
+
+def trace_detail(trace_id: int) -> dict:
+    """推理留痕完整详情（结论卡 + 分层推理全文）"""
+    return _get(f"/api/traces/{trace_id}")
+
+
 def scores(code: str | None = None, date: str | None = None, limit: int | None = None) -> list:
     params = {}
     if code:
