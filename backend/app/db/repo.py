@@ -506,6 +506,45 @@ def list_candidate_dates(limit: int = 30) -> list[str]:
     return _dbq("candidate", {"dates": limit}, _load)
 
 
+def _backfill_stock_names(rows: list[dict]) -> list[dict]:
+    """股票名称补齐（历史脏数据修复，查询层只读不写库）：
+    记录名称缺失或等于代码时，按「候选池最新 → 持仓 → 新闻」顺序批量反查真实名称；
+    仍查不到保留空名，前端统一展示「未知名称」。不修改任何落库逻辑与存储结构。"""
+    missing = {r["stock_code"] for r in rows
+               if not r.get("stock_name") or r["stock_name"] == r["stock_code"]}
+    if not missing:
+        return rows
+    names: dict[str, str] = {}
+    with SessionLocal() as db:
+        cand = db.execute(
+            select(StockCandidate.stock_code, StockCandidate.stock_name)
+            .where(StockCandidate.stock_code.in_(missing))
+            .order_by(StockCandidate.trade_date.desc())).all()
+        for code, name in cand:
+            if name and name != code and code not in names:
+                names[code] = name
+        still = missing - set(names)
+        if still:
+            hold = db.execute(
+                select(Holding.stock_code, Holding.stock_name)
+                .where(Holding.stock_code.in_(still))).all()
+            for code, name in hold:
+                if name and name != code and code not in names:
+                    names[code] = name
+        still -= set(names)
+        if still:
+            news = db.execute(
+                select(NewsArticle.stock_code, NewsArticle.stock_name)
+                .where(NewsArticle.stock_code.in_(still))).all()
+            for code, name in news:
+                if name and name != code and code not in names:
+                    names[code] = name
+    for r in rows:
+        if not r.get("stock_name") or r["stock_name"] == r["stock_code"]:
+            r["stock_name"] = names.get(r["stock_code"], "")
+    return rows
+
+
 def list_scores(code: str | None = None, date: str | None = None, limit: int = 100) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
@@ -515,10 +554,12 @@ def list_scores(code: str | None = None, date: str | None = None, limit: int = 1
             if date:
                 stmt = stmt.where(StockScore.trade_date == date)
             rows = db.execute(stmt.limit(limit)).scalars().all()
-            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                     "trade_date": r.trade_date, "score": r.score, "grade": r.grade,
-                     "detail": r.detail, "risk_list": r.risk_list,
-                     "created_at": str(r.created_at)} for r in rows]
+            return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
+                                           "stock_name": r.stock_name,
+                                           "trade_date": r.trade_date, "score": r.score,
+                                           "grade": r.grade, "detail": r.detail,
+                                           "risk_list": r.risk_list,
+                                           "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("score", {"code": code, "date": date, "limit": limit}, _load)
 
@@ -530,10 +571,13 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
             if code:
                 stmt = stmt.where(PositionPlan.stock_code == code)
             rows = db.execute(stmt.limit(limit)).scalars().all()
-            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                     "plan_date": r.plan_date, "status": r.status, "total_pct": r.total_pct,
-                     "batches": r.batches, "stop_loss": r.stop_loss, "take_profit": r.take_profit,
-                     "rationale": r.rationale, "created_at": str(r.created_at)} for r in rows]
+            return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
+                                           "stock_name": r.stock_name,
+                                           "plan_date": r.plan_date, "status": r.status,
+                                           "total_pct": r.total_pct, "batches": r.batches,
+                                           "stop_loss": r.stop_loss, "take_profit": r.take_profit,
+                                           "rationale": r.rationale,
+                                           "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("plan", {"code": code, "limit": limit}, _load)
 
@@ -545,11 +589,15 @@ def list_holdings(status: str | None = None) -> list[dict]:
             if status:
                 stmt = stmt.where(Holding.status == status)
             rows = db.execute(stmt).scalars().all()
-            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                     "entry_date": r.entry_date, "entry_price": r.entry_price, "shares": r.shares,
-                     "cost": r.cost, "stop_loss": r.stop_loss, "take_profit": r.take_profit,
-                     "target_pct": r.target_pct, "status": r.status, "plan_id": r.plan_id,
-                     "note": r.note, "created_at": str(r.created_at)} for r in rows]
+            return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
+                                           "stock_name": r.stock_name,
+                                           "entry_date": r.entry_date,
+                                           "entry_price": r.entry_price, "shares": r.shares,
+                                           "cost": r.cost, "stop_loss": r.stop_loss,
+                                           "take_profit": r.take_profit,
+                                           "target_pct": r.target_pct, "status": r.status,
+                                           "plan_id": r.plan_id, "note": r.note,
+                                           "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("holding", {"status": status}, _load)
 
@@ -559,10 +607,12 @@ def list_alerts(limit: int = 100) -> list[dict]:
         with SessionLocal() as db:
             rows = db.execute(
                 select(AlertLog).order_by(AlertLog.id.desc()).limit(limit)).scalars().all()
-            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                     "alert_type": r.alert_type, "severity": r.severity, "message": r.message,
-                     "action": r.action, "signal": r.signal, "pushed": r.pushed,
-                     "created_at": str(r.created_at)} for r in rows]
+            return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
+                                           "stock_name": r.stock_name,
+                                           "alert_type": r.alert_type, "severity": r.severity,
+                                           "message": r.message, "action": r.action,
+                                           "signal": r.signal, "pushed": r.pushed,
+                                           "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("alert", {"limit": limit}, _load)
 
@@ -574,14 +624,18 @@ def list_reviews(code: str | None = None, limit: int = 50) -> list[dict]:
             if code:
                 stmt = stmt.where(ReviewResult.stock_code == code)
             rows = db.execute(stmt.limit(limit)).scalars().all()
-            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                     "exit_date": r.exit_date, "hold_days": r.hold_days, "pnl_pct": r.pnl_pct,
-                     "plan_vs_actual": r.plan_vs_actual, "lesson": r.lesson, "feedback": r.feedback,
-                     "suggest_status": r.suggest_status, "reject_reason": r.reject_reason,
-                     "suggest_iteration": r.suggest_iteration,
-                     "suggest_history": r.suggest_history or [],
-                     "created_at": str(r.created_at)}
-                    for r in rows]
+            return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
+                                           "stock_name": r.stock_name,
+                                           "exit_date": r.exit_date, "hold_days": r.hold_days,
+                                           "pnl_pct": r.pnl_pct,
+                                           "plan_vs_actual": r.plan_vs_actual, "lesson": r.lesson,
+                                           "feedback": r.feedback,
+                                           "suggest_status": r.suggest_status,
+                                           "reject_reason": r.reject_reason,
+                                           "suggest_iteration": r.suggest_iteration,
+                                           "suggest_history": r.suggest_history or [],
+                                           "created_at": str(r.created_at)}
+                                          for r in rows])
 
     return _dbq("review", {"code": code, "limit": limit}, _load)
 
@@ -596,8 +650,10 @@ def list_sell_decisions(holding_id: int, limit: int = 10) -> list[dict]:
         rows = db.execute(
             select(SellDecision).where(SellDecision.holding_id == holding_id)
             .order_by(SellDecision.id.desc()).limit(limit)).scalars().all()
-        return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
-                 "decision": r.decision, "created_at": str(r.created_at)} for r in rows]
+        return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
+                                       "stock_name": r.stock_name,
+                                       "decision": r.decision,
+                                       "created_at": str(r.created_at)} for r in rows])
 
 
 # ==================== 私有知识库（人工录入，Agent 启动自动检索注入） ====================

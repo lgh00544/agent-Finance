@@ -11,6 +11,9 @@ import render
 
 st.set_page_config(page_title="个人交易偏好", layout="wide")
 
+# 全局深色科技感主题（卡片/徽章/溯源/数字等宽，全站唯一视觉体系）
+render.apply_global_theme()
+
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
@@ -24,7 +27,8 @@ try:
     content = dict(profile["content"])
     version = profile["version"]
 except Exception as exc:
-    st.error(f"偏好档案获取失败: {exc}")
+    render.error_card("偏好档案获取失败", "请确认后端服务运行正常后点击「重试」刷新。",
+                      detail=exc, retry_key="retry_profile")
     st.stop()
 
 st.markdown(f"当前版本：**v{version}**")
@@ -88,9 +92,11 @@ with c2:
         try:
             data = json.loads(uploaded.read().decode("utf-8"))
             if "content" not in data:
-                st.error("JSON 需包含 content 字段（可由本页导出文件生成）")
+                render.msg_card("warn", "导入文件格式不符",
+                                "JSON 需包含 content 字段（可由本页导出文件生成），请核对后重新上传。")
             else:
                 result = api.import_profile(data["content"])
                 st.success(f"导入成功，版本 v{result['version']}")
         except Exception as exc:
-            st.error(f"导入失败: {exc}")
+            render.msg_card("err", "导入失败", "未能导入该文件，请确认内容合法后重试。",
+                            detail=exc)

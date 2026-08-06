@@ -12,12 +12,13 @@ _TIME_HIGHLIGHT = "#F59E0B"
 
 
 def stock_label(code: str, name: str) -> str:
-    """统一股票标识：代码在前、名称紧随（如 600519 贵州茅台）"""
+    """统一股票标识：代码在前、名称紧随（如 600519 贵州茅台）；
+    名称缺失或等于代码（后端未补全到）时显示「名称待补」，禁止只显示纯代码。"""
     name = (name or "").strip()
     code = str(code or "").strip()
     if name and name != code:
         return f"{code} {name}"
-    return code
+    return f"{code} 名称待补"
 
 
 def render_dict(data: dict | None) -> None:
@@ -73,53 +74,179 @@ def raw_json_expander(data, label: str = "查看原始数据", key: str | None =
 _GLOBAL_THEME_CSS = """
 <style>
 :root {
-  --bg-base: #0B0D13; --bg-card: #141824; --bg-hover: #1A1F2E; --bg-input: #0F1220;
-  --border: #2C2F36; --border-hi: #3D4460;
-  --primary: #3B82F6; --primary-dim: #1E3A5F;
-  --up: #F87171; --down: #4ADE80; --warn: #F59E0B; --err: #EF4444; --ok: #22C55E; --info: #60A5FA;
-  --tier-a: #F87171; --tier-b: #FBBF24; --tier-c: #60A5FA;
-  --text: #E5E7EB; --text-dim: #9CA3AF; --text-mute: #6B7280;
+  /* 背景分层：页面 < 卡片 < 悬浮层 */
+  --bg-base: #0f1115; --bg-card: #171a21; --bg-hover: #1e242e; --bg-input: #12151b;
+  /* 边框：极细 1px 描边（用户规范 rgba(60,80,120,0.25)） */
+  --border: rgba(60, 80, 120, 0.25); --border-hi: rgba(96, 130, 190, 0.35);
+  /* 主色科技蓝 */
+  --primary: #3b82f6; --primary-dim: #1e3a5f;
+  /* 状态色：成功/警告/风险 */
+  --up: #ef4444; --down: #10b981; --ok: #10b981; --warn: #f59e0b; --err: #ef4444; --info: #3b82f6;
+  /* 评级色：A 红 / B 橙 / C 蓝 */
+  --tier-a: #ef4444; --tier-b: #f59e0b; --tier-c: #3b82f6;
+  /* 文字：正文 / 次要 / 禁用 */
+  --text: #e5e7eb; --text-dim: #9ca3af; --text-mute: #6b7280;
 }
 html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] { background: var(--bg-base); }
+/* 数字等宽对齐 + 字号体系（页标题 24 / 模块标题 16 / 正文 14 / 辅助 12） */
 html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select, button {
   font-variant-numeric: tabular-nums;
 }
-/* 卡片容器（st.container(border=True)）：深色卡片 + 细线高亮描边 + 悬停过渡 */
+[data-testid="stHeading"] h1 { font-size: 24px; font-weight: 600; }
+[data-testid="stHeading"] h2 { font-size: 16px; font-weight: 600;
+                               border-left: 3px solid var(--primary); padding-left: 0.5rem; }
+.stMarkdown p, .stMarkdown li { font-size: 14px; line-height: 1.7; }
+[data-testid="stCaptionContainer"] p { font-size: 12px; }
+/* 卡片容器（st.container(border=True)）：圆角 8px + 内边距 16px 20px + 极细描边 + 轻内阴影 */
 [data-testid="stVerticalBlockBorderWrapper"] {
-  background: var(--bg-card); border: 1px solid var(--border-hi); border-radius: 10px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  background: var(--bg-card); border: 1px solid var(--border-hi); border-radius: 8px;
+  padding: 16px 20px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   transition: background 0.2s ease, border-color 0.2s ease;
 }
 [data-testid="stVerticalBlockBorderWrapper"]:hover { border-color: var(--primary-dim); }
-/* 分区标题（st.subheader）：主色左侧竖条统一层级 */
-[data-testid="stHeading"] h2 { border-left: 3px solid var(--primary); padding-left: 0.5rem; }
+[data-testid="stVerticalBlockBorderWrapper"] + [data-testid="stVerticalBlockBorderWrapper"] {
+  margin-top: 16px;
+}
 /* 徽章：评级 A/B/C + 状态 ok/warn/err/info/mute */
 .badge {
   display: inline-block; padding: 0.05rem 0.5rem; border-radius: 4px;
   font-size: 0.78em; font-weight: 600; line-height: 1.6;
 }
-.badge-tier-a { color: var(--tier-a); background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.45); }
-.badge-tier-b { color: var(--tier-b); background: rgba(251, 191, 36, 0.15); border: 1px solid rgba(251, 191, 36, 0.45); }
-.badge-tier-c { color: var(--tier-c); background: rgba(96, 165, 250, 0.15); border: 1px solid rgba(96, 165, 250, 0.45); }
-.badge-ok    { color: var(--ok);    background: rgba(34, 197, 94, 0.15);  border: 1px solid rgba(34, 197, 94, 0.45); }
+.badge-tier-a { color: var(--tier-a); background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.45); }
+.badge-tier-b { color: var(--tier-b); background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); }
+.badge-tier-c { color: var(--tier-c); background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.45); }
+.badge-ok    { color: var(--ok);    background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.45); }
 .badge-warn  { color: var(--warn);  background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); }
 .badge-err   { color: var(--err);   background: rgba(239, 68, 68, 0.15);  border: 1px solid rgba(239, 68, 68, 0.45); }
-.badge-info  { color: var(--info);  background: rgba(96, 165, 250, 0.15); border: 1px solid rgba(96, 165, 250, 0.45); }
+.badge-info  { color: var(--info);  background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.45); }
 .badge-mute  { color: var(--text-dim); background: rgba(156, 163, 175, 0.12); border: 1px solid var(--border); }
 /* 溯源行：时间/数据源/置信度统一浅色小字，紧急信号琥珀高亮 */
-.trace-line { color: var(--text-dim); font-size: 0.82em; margin: 0.25rem 0; }
+.trace-line { color: var(--text-dim); font-size: 12px; margin: 0.25rem 0; }
 .trace-line .hl { color: var(--warn); }
-/* 核心数字高亮（顶部栏与核心指标卡）：大字号 + 轻微发光 */
-.core-num { font-size: 1.25em; font-weight: 700; color: #FFFFFF;
+/* 核心数据高亮（顶部栏与核心指标卡）：16px/600 + 状态色 */
+.core-num { font-size: 16px; font-weight: 600; color: var(--text);
             text-shadow: 0 0 12px rgba(59, 130, 246, 0.35); }
-/* 空态：虚线框居中提示 */
-.empty-state { color: var(--text-dim); text-align: center; padding: 1.4rem 0;
-               border: 1px dashed var(--border); border-radius: 10px; font-size: 0.95em; }
-/* 按钮悬停微过渡 */
-[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-secondary"],
-[data-testid="stBaseButton-tertiary"] { transition: filter 0.2s ease; }
-[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-secondary"]:hover,
-[data-testid="stBaseButton-tertiary"]:hover { filter: brightness(1.12); }
+/* 空态：图标 + 说明 + 可选按钮，虚线框居中（与错误态严格区分） */
+.empty-state { display: flex; flex-direction: column; align-items: center; gap: 6px;
+               color: var(--text-dim); text-align: center; padding: 1.6rem 0;
+               border: 1px dashed var(--border); border-radius: 8px; font-size: 14px; }
+.empty-state .empty-icon { font-size: 22px; }
+/* ===== 统一提示体系（阻断/提醒/成功/一般 4 级：左侧色条 + 图标 + 标题 + 正文） ===== */
+.msg-card { display: flex; gap: 10px; align-items: flex-start; margin: 0.5rem 0;
+            padding: 10px 14px; border-radius: 8px; border: 1px solid;
+            font-size: 14px; line-height: 1.6; }
+.msg-card .msg-ic { line-height: 1.5; }
+.msg-card.err  { background: rgba(239, 68, 68, 0.08);  border-color: rgba(239, 68, 68, 0.45);
+                 border-left: 3px solid var(--err); }
+.msg-card.warn { background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.45);
+                 border-left: 3px solid var(--warn); }
+.msg-card.ok   { background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.45);
+                 border-left: 3px solid var(--ok); }
+.msg-card.info { background: rgba(59, 130, 246, 0.08); border-color: rgba(59, 130, 246, 0.45);
+                 border-left: 3px solid var(--info); }
+.msg-card .msg-title { font-weight: 600; }
+.msg-card .msg-body { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+/* 表单字段原位错误：字段容器（st.container key="fld_*"）内输入框标红边框 */
+[class*="st-key-fld_"] input, [class*="st-key-fld_"] textarea,
+[class*="st-key-fld_"] [data-baseweb="input"] > div,
+[class*="st-key-fld_"] [data-baseweb="select"] > div {
+  border-color: var(--err) !important;
+}
+.field-err { color: var(--err); font-size: 12px; margin-top: 4px; }
+.field-err .field-hint { color: var(--text-dim); }
+/* 表单错误汇总条：X 项需修正（配合字段原位红框定位） */
+.field-summary { margin: 0.5rem 0; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+                 color: var(--err); background: rgba(239, 68, 68, 0.08);
+                 border: 1px solid rgba(239, 68, 68, 0.45); }
+/* 主按钮：深蓝底白字圆角 6px，悬停变亮 0.2s；次按钮：透明+细描边 */
+[data-testid="stBaseButton-primary"] {
+  background: var(--primary); color: #ffffff; border-radius: 6px;
+  transition: filter 0.2s ease;
+}
+[data-testid="stBaseButton-primary"]:hover { filter: brightness(1.15); }
+[data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-tertiary"] {
+  background: transparent; border: 1px solid var(--border-hi); border-radius: 6px;
+  color: var(--text-dim); transition: filter 0.2s ease;
+}
+[data-testid="stBaseButton-secondary"]:hover, [data-testid="stBaseButton-tertiary"]:hover {
+  filter: brightness(1.25);
+}
+/* 表格：深色主题底色（表头/斑马纹/hover 由 config.toml dark 主题提供，此处兜底主色强调） */
+[data-testid="stDataFrame"] { background: var(--bg-card); }
+/* ===== 企业级列表行（图二范式）：左=状态圆点+主标题(加粗)+副标题(灰)，右=辅助信息+操作按钮 ===== */
+[data-testid="stVerticalBlockBorderWrapper"][class*="st-key-lrow_"] {
+  padding: 10px 16px; margin-bottom: 8px; box-shadow: none;
+}
+.item-main { display: flex; align-items: center; gap: 10px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.dot-tier-a, .dot-err { background: #ef4444; box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
+.dot-tier-b, .dot-warn { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, 0.5); }
+.dot-tier-c, .dot-info { background: #3b82f6; box-shadow: 0 0 6px rgba(59, 130, 246, 0.5); }
+.dot-ok { background: #10b981; box-shadow: 0 0 6px rgba(16, 185, 129, 0.5); }
+.dot-mute { background: #6b7280; }
+.item-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.item-sub { font-size: 12px; color: var(--text-dim); margin-top: 3px; line-height: 1.6; }
+.item-meta { font-size: 12px; color: var(--text-dim); text-align: right; margin-bottom: 6px; }
+.item-meta .up { color: var(--up); } .item-meta .down { color: var(--down); }
+/* 详情分区小标题（左侧主色竖条） */
+.section-title { font-size: 13px; font-weight: 600; color: var(--text);
+                 border-left: 3px solid var(--primary); padding-left: 8px;
+                 margin: 6px 0 8px; }
+/* 嵌套卡片（详情内分区）：更紧凑的次级卡片 */
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlockBorderWrapper"] {
+  padding: 12px 16px; margin-top: 10px; background: rgba(255, 255, 255, 0.02);
+  box-shadow: none;
+}
+/* 指标卡网格（首页概览/性能统计） */
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+             gap: 16px; margin: 4px 0 12px; }
+.stat-card { background: var(--bg-card); border: 1px solid var(--border);
+             border-radius: 8px; padding: 14px 18px; }
+.stat-label { font-size: 12px; color: var(--text-dim); }
+.stat-value { font-size: 22px; font-weight: 600; margin-top: 4px; color: var(--text);
+              font-variant-numeric: tabular-nums; }
+.stat-value.up { color: var(--up); } .stat-value.down { color: var(--down); }
+.stat-value.ok { color: var(--ok); } .stat-value.warn { color: var(--warn); }
+.stat-value.err { color: var(--err); }
+.stat-sub { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
+/* 左侧导航：分组 + 图标 + 选中高亮（左侧色条）+ hover 反馈；侧边栏深于主背景 */
+[data-testid="stSidebar"] { background: #0d0f13; }
+[data-testid="stSidebarNav"] { padding: 0.4rem 0.6rem; }
+[data-testid="stSidebarNav"] a {
+  border-radius: 6px; margin: 2px 0; transition: background 0.15s ease;
+}
+[data-testid="stSidebarNav"] a:hover { background: rgba(59, 130, 246, 0.12); }
+[data-testid="stSidebarNav"] a[aria-current="page"] {
+  background: rgba(59, 130, 246, 0.18); border-left: 3px solid var(--primary);
+}
+[data-testid="stSidebarNavLink"], .stSidebarNavLink {
+  border-radius: 6px; margin: 2px 0; transition: background 0.15s ease;
+}
+[data-testid="stSidebarNavLink"]:hover, .stSidebarNavLink:hover {
+  background: rgba(59, 130, 246, 0.12);
+}
+[data-testid="stSidebarNavLink"][aria-current="page"], .stSidebarNavLink[aria-current="page"] {
+  background: rgba(59, 130, 246, 0.18); border-left: 3px solid var(--primary);
+}
+[data-testid="stSidebarNavSectionHeader"], .stSidebarNavSectionHeader {
+  color: var(--text-mute); font-size: 12px; letter-spacing: 0.06em;
+  padding: 0.2rem 0.4rem;
+}
+/* Agent 对话页：左侧 Agent 列表（radio 增强为导航列表样式，选中高亮 + hover 反馈） */
+[data-testid="stRadio"] > div[role="radiogroup"] > label {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; margin: 2px 0; border-radius: 8px;
+  border: 1px solid transparent; cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+[data-testid="stRadio"] > div[role="radiogroup"] > label:hover {
+  background: rgba(59, 130, 246, 0.12);
+}
+[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) {
+  background: rgba(59, 130, 246, 0.18); border-left: 3px solid var(--primary);
+  border-color: var(--border-hi);
+}
 </style>
 """
 
@@ -158,9 +285,139 @@ def trace_line(label: str, time_str: str | None = None, source: str | None = Non
                 unsafe_allow_html=True)
 
 
-def empty_state(text: str) -> None:
-    """统一空态提示（虚线框居中，附下一步操作说明）"""
-    st.markdown(f'<div class="empty-state">{text}</div>', unsafe_allow_html=True)
+def empty_state(text: str, icon: str = "📭", action_label: str = "",
+                action_key: str = "") -> None:
+    """统一空态提示（虚线框居中）：图标 + 说明文案 + 可选下一步操作按钮（点击刷新）。
+    禁止空白一片；空状态与错误状态样式严格区分。"""
+    st.markdown(f'<div class="empty-state"><span class="empty-icon">{icon}</span>'
+                f'<div>{text}</div></div>', unsafe_allow_html=True)
+    if action_label and action_key:
+        if st.button(action_label, key=action_key):
+            st.rerun()
+
+
+# ================= 统一提示体系（4 级：阻断/提醒/成功/空态，全站唯一规范） =================
+_MSG_ICON = {"err": "⛔", "warn": "⚠️", "ok": "✅", "info": "ℹ️"}
+
+
+def msg_card(tone: str, title: str, message: str = "", detail=None) -> None:
+    """业务规则/状态提示条：左侧色条 + 图标 + 标题 + 可选正文；
+    detail（原始错误/技术日志）折叠收纳默认不展示，用户只读友好文案。
+    tone: err 阻断 / warn 提醒 / ok 成功 / info 一般（色值对齐全局体系）"""
+    html = (f'<div class="msg-card {tone}"><span class="msg-ic">{_MSG_ICON.get(tone, "ℹ️")}</span>'
+            f'<div><span class="msg-title">{title}</span>')
+    if message:
+        html += f'<div class="msg-body">{message}</div>'
+    html += "</div></div>"
+    st.markdown(html, unsafe_allow_html=True)
+    if detail:
+        with st.expander("技术日志（排查用，默认收起）", expanded=False):
+            st.code(str(detail), language=None)
+
+
+def error_card(title: str, message: str = "", detail=None, retry_key: str = "",
+               retry_label: str = "重试", actions: tuple[tuple[str, str], ...] = ()) -> None:
+    """数据加载/提交失败局部错误卡片（阻断级）：友好文案 + 原因 + 卡片右侧操作按钮 + 技术日志折叠。
+    actions 为 ((按钮key, 按钮文案), ...)，渲染在卡片右侧（重试无需滚到页面底部）；
+    传 retry_key 时自动生成重试按钮。用于列表/详情等模块级失败，不整页报错；
+    原始异常只进折叠日志，不展示给用户。"""
+    if retry_key:
+        actions = ((retry_key, retry_label),) + tuple(a for a in actions if a[0] != retry_key)
+    if actions:
+        c_left, c_right = st.columns([5, 1.3], vertical_alignment="center")
+        with c_left:
+            msg_card("err", title, message, detail=detail)
+        with c_right:
+            for key, label in actions:
+                if st.button(label, key=key, use_container_width=True):
+                    st.rerun()
+    else:
+        msg_card("err", title, message, detail=detail)
+
+
+def classify_api_error(exc: Exception) -> tuple[str, str, str]:
+    """API 调用失败分类（数据页加载用）：返回 (标题, 具体原因+建议操作, 技术日志摘要)。
+    仅前端展示层分类，按异常类型区分后端服务/网络超时/数据库/解析/未知，
+    便于用户判断下一步操作；原始异常完整信息进折叠日志供排查。"""
+    import json  # noqa: PLC0415 局部导入避免顶部加重全局依赖
+    from datetime import datetime  # noqa: PLC0415
+
+    import requests  # noqa: PLC0415
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return ("后端服务连接失败", "请确认后端服务已启动后点击「重试」；持续失败时检查 8000 端口服务状态。",
+                f"{ts} · ConnectionError（无法连接后端服务）\n{exc}")
+    if isinstance(exc, requests.exceptions.Timeout):
+        return ("请求超时", "网络波动或后端繁忙，请稍后点击「重试」。",
+                f"{ts} · Timeout（超过 60s 未响应）\n{exc}")
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = exc.response
+        status = resp.status_code if resp is not None else "?"
+        body = (resp.text or "")[:500] if resp is not None else ""
+        req_desc = f"{exc.request.method} {exc.request.url}" if exc.request is not None else "?"
+        if any(kw in body.lower() for kw in ("database", "sql", "query")):
+            return ("数据库查询失败", "后端数据连接异常，请稍后点击「重试」，或查看后端日志。",
+                    f"{ts} · HTTP {status} · {req_desc}\n{body or exc}")
+        return (f"后端服务异常（HTTP {status}）", "后端处理出错，可点击「重试」，或展开技术日志排查。",
+                f"{ts} · HTTP {status} · {req_desc}\n{body or exc}")
+    if isinstance(exc, json.JSONDecodeError):
+        return ("数据解析失败", "后端返回了无法解析的数据，请点击「重试」或检查后端版本。",
+                f"{ts} · JSONDecodeError\n{exc}")
+    return ("加载失败", "发生未知错误，可点击「重试」或展开技术日志排查。",
+            f"{ts} · {type(exc).__name__}\n{exc}")
+
+
+def set_field_errors(errors: dict) -> None:
+    """记录表单字段校验错误（field → 原因），表单提交逻辑写入，渲染时原位展示"""
+    st.session_state["_fld_errs"] = errors
+
+
+def get_field_error(field: str) -> str:
+    """读取指定字段的错误原因（无错误返回空串）"""
+    return (st.session_state.get("_fld_errs") or {}).get(field, "")
+
+
+def get_field_errors() -> dict:
+    """读取当前全部字段错误（表单汇总条用）"""
+    return dict(st.session_state.get("_fld_errs") or {})
+
+
+def field_error(field: str, message: str = "", hint: str = "") -> None:
+    """表单字段原位错误标记：字段容器（st.container(key=f"fld_{field}")）内的输入框
+    自动标红框，字段下方显示原因 + 填写示例。message 为空（无错误）则不渲染。
+    禁止只在页面底部堆一段纯文字错误说明。"""
+    if not message:
+        return
+    html = f'<div class="field-err">⚠️ {message}'
+    if hint:
+        html += f' <span class="field-hint">（{hint}）</span>'
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def field_summary(errors: dict | None = None, label_map: dict | None = None) -> None:
+    """表单错误汇总条「X 项需修正」：列明需修正字段（配合各字段原位红框逐一定位）；
+    errors 缺省时读取当前 session 错误集（提交后 rerun 仍保持展示）"""
+    if errors is None:
+        errors = get_field_errors()
+    if not errors:
+        return
+    names = [label_map.get(k, k) for k in errors] if label_map else list(errors)
+    st.markdown(f'<div class="field-summary">⛔ 表单有 <b>{len(errors)}</b> 项需修正：'
+                f'{"、".join(f"「{n}」" for n in names)}（红色字段已原位标出）</div>',
+                unsafe_allow_html=True)
+
+
+def field_ok(value) -> bool:
+    """表单/OCR 字段有效性判定（纯展示层）：有值即有效；0 是合法数值（清仓记录，不标错误）"""
+    if value is None:
+        return False
+    if isinstance(value, float) and value != value:  # NaN
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
 
 
 def record_list(items: list, render_fn, batch: int = 20, key: str = "rl",
@@ -179,6 +436,107 @@ def record_list(items: list, render_fn, batch: int = 20, key: str = "rl",
             st.rerun()
 
 
+# ================= 企业级列表行 / 分区卡片 / 指标卡（图二范式） =================
+
+def list_item(key: str, title: str, subtitle: str = "", dot: str = "mute",
+              meta: str = "", actions: tuple[str, ...] = ("查看详情",)) -> int:
+    """企业级列表行：左=状态圆点+主标题(加粗)+副标题(灰色小字)，右=辅助信息+操作按钮组；
+    行高统一、分割线极淡。返回被点击操作按钮的下标（-1 表示无点击）。"""
+    with st.container(key=f"lrow_{key}", border=True):
+        c1, c2 = st.columns([4.2, 1.5], vertical_alignment="center")
+        with c1:
+            if dot:
+                st.markdown(f'<div class="item-main"><span class="dot dot-{dot}"></span>'
+                            f'<span class="item-title">{title}</span></div>',
+                            unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="item-title">{title}</div>', unsafe_allow_html=True)
+            if subtitle:
+                st.markdown(f'<div class="item-sub">{subtitle}</div>', unsafe_allow_html=True)
+        with c2:
+            if meta:
+                st.markdown(f'<div class="item-meta">{meta}</div>', unsafe_allow_html=True)
+            clicked = -1
+            for i, label in enumerate(actions):
+                if st.button(label, key=f"act_{key}_{i}", use_container_width=True):
+                    clicked = i
+            return clicked
+
+
+def list_item_toggle(key: str, title: str, subtitle: str = "", dot: str = "mute",
+                     meta: str = "") -> bool:
+    """列表行 + 「查看详情」展开管理：点击自动切换展开/收起，返回当前是否展开；
+    调用方在返回 True 时渲染详情卡片。"""
+    opened = st.session_state.get(f"open_{key}", False)
+    if list_item(key, title, subtitle, dot, meta, ("查看详情",)) == 0:
+        opened = not opened
+        st.session_state[f"open_{key}"] = opened
+        st.rerun()
+    return st.session_state.get(f"open_{key}", False)
+
+
+def section_title(text: str) -> None:
+    """详情分区小标题（左侧主色竖条 + 统一字号）"""
+    st.markdown(f'<div class="section-title">{text}</div>', unsafe_allow_html=True)
+
+
+def stat_cards(items: list[dict]) -> None:
+    """指标卡网格：items=[{label, value, sub?, tone?}]；tone: up/down/ok/warn/err/mute"""
+    cards = []
+    for it in items:
+        tone = it.get("tone") or "mute"
+        sub = f'<div class="stat-sub">{it["sub"]}</div>' if it.get("sub") else ""
+        cards.append(f'<div class="stat-card"><div class="stat-label">{it["label"]}</div>'
+                     f'<div class="stat-value {tone}">{it["value"]}</div>{sub}</div>')
+    st.markdown(f'<div class="stat-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def svc_cards(connections: list[dict]) -> None:
+    """系统服务状态横向卡片：状态圆点 + 服务名 + 状态说明 + 最后检测时间"""
+    cards = []
+    for c in connections:
+        ok = bool(c.get("ok"))
+        tone = "ok" if ok else "err"
+        cards.append(
+            f'<div class="stat-card"><div class="stat-label">'
+            f'<span class="dot dot-{tone}"></span>　{c.get("name", "")}</div>'
+            f'<div class="stat-value {tone}">{"运行正常" if ok else "异常"}</div>'
+            f'<div class="stat-sub">{c.get("detail", "")}</div>'
+            f'<div class="stat-sub">最后检测：{str(c.get("checked_at") or "")[:16]}</div></div>')
+    st.markdown(f'<div class="stat-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def alert_list(rows: list[dict], key: str = "alert_list",
+               empty_text: str = "暂无告警记录。") -> None:
+    """告警行列表（统一范式，供告警日志页与持仓监控页共用）：
+    严重度圆点（严重红/警告橙/一般蓝）+ 股票代码+名称+类型 + 消息摘要 + 时间+推送状态 + 查看详情"""
+    SEV_DOT = {"critical": "err", "warning": "warn", "info": "info"}
+    ACTION_MAP = {"hold": "持有", "reduce": "减仓", "exit": "清仓"}
+
+    def _fn(a: dict, _i: int) -> None:
+        sev = a.get("severity") or "info"
+        label = stock_label(a["stock_code"], a["stock_name"])
+        full = str(a.get("message") or "")
+        msg = full[:90] + ("…" if len(full) > 90 else "")
+        meta = (f'{str(a.get("created_at") or "")[:16]}　'
+                f'飞书推送 {"✅" if a.get("pushed") else "—"}')
+        if list_item_toggle(f"{key}_{a['id']}", f"{label} · {a.get('alert_type', '')}",
+                            subtitle=msg, dot=SEV_DOT.get(sev, "mute"), meta=meta):
+            with st.container(border=True):
+                trace_line("告警触发时间", a["created_at"], source="LLM 生成",
+                           confidence=(a.get("signal") or {}).get("confidence"),
+                           highlight=sev in ("warning", "critical") or a.get("action") != "hold")
+                st.markdown(a["message"])
+                act = a.get("action")
+                if act:
+                    st.markdown(f"- **建议动作**：{ACTION_MAP.get(act, act)}")
+                st.markdown("**LLM 研判结论**")
+                render_dict(a.get("signal"))
+                raw_json_expander(a.get("signal"), key=f"raw_{key}_{a['id']}")
+
+    record_list(rows, _fn, batch=20, key=key, empty_text=empty_text)
+
+
 def submit_task(kind: str, params: dict | None = None, label: str = "后台任务") -> bool:
     """提交后台任务：重复触发（后端 409）与后端不可达时显示中文提示，返回是否成功"""
     import requests
@@ -188,12 +546,13 @@ def submit_task(kind: str, params: dict | None = None, label: str = "后台任�
         api_submit(kind, params)
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 409:
-            st.warning(f"{label}正在执行中，请等待其完成后再试")
+            msg_card("warn", f"{label}正在执行中", "请等待其完成后再试，避免重复触发。")
         else:
-            st.error(f"{label}提交失败，请确认后端服务正常运行（{type(exc).__name__}）")
+            msg_card("err", f"{label}提交失败", "请确认后端服务正常运行后重试。",
+                     detail=exc)
         return False
     except Exception as exc:  # noqa: BLE001 后端不可达统一提示，不向页面抛原始报错
-        st.error(f"{label}提交失败，请确认后端服务正常运行（{type(exc).__name__}）")
+        msg_card("err", f"{label}提交失败", "请确认后端服务正常运行后重试。", detail=exc)
         return False
     st.toast(f"{label}已提交后台，可切换页面继续操作")
     return True
@@ -262,41 +621,49 @@ def task_status_area() -> None:
 
 
 # ================= 全局顶部常驻状态栏 =================
-# 固定于原生顶部栏（stHeader，z-index 1000）之下、z-index 998，不随页面滚动消失；
-# 布局规范：width 100% 撑满视口、左右内边距对称（无单侧大 padding）、
+# 固定于原生顶部栏（stHeader，z-index 1000）之下、z-index 999，不随页面滚动消失；
+# 布局规范：width 100% 撑满视口、左右内边距对称 8px 24px（无单侧大 padding）、
 # align-items: center 全部内容统一垂直居中同一基线、line-height 1.5 紧凑行高；
+# 背景 #0f1115 + 底部 1px 描边 rgba(60,80,120,0.25)，与全局主题同色板；
 # 信息按「账户资产」「大盘指数」两组展示（组间竖线分隔 + 组标签），
 # 核心数据（总资产/总盈亏/上证指数）加粗加大；
-# 主内容区与侧边栏同步预留 4.3rem 顶部内边距，保证首屏标题与核心操作区不被遮挡
+# 主内容区与侧边栏同步预留 60px 顶部内边距，保证首屏标题与核心操作区不被遮挡
 _TOP_BAR_CSS = """
 <style>
-[data-testid="stMain"] { padding-top: 4.3rem; }
-[data-testid="stSidebarContent"] { padding-top: 4.3rem; }
+[data-testid="stMain"] { padding-top: 60px; }
+[data-testid="stSidebarContent"] { padding-top: 60px; }
 .top-status-bar {
-  position: fixed; top: 2.95rem; left: 0; right: 0; z-index: 998;
+  position: fixed; top: 2.95rem; left: 0; right: 0; z-index: 999;
   width: 100%; box-sizing: border-box;
   display: flex; align-items: center; flex-wrap: wrap;
   column-gap: 1rem; row-gap: 0.2rem;
-  padding: 0.3rem 1rem; font-size: 0.92rem; line-height: 1.5;
-  background: rgba(11, 13, 19, 0.98); border-bottom: 1px solid #2C2F36;
+  padding: 8px 24px; font-size: 0.92rem; line-height: 1.5;
+  background: #0f1115; border-bottom: 1px solid rgba(60, 80, 120, 0.25);
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  transition: padding-left 0.2s ease;
 }
-.top-status-bar .bar-label { color: #B8BCC4; font-size: 0.82em; margin-right: 0.3rem; }
+/* 侧边栏展开（aria-expanded=true，默认宽 300px）时主内容区右移，顶部栏内容左缘
+   同步右移与主内容区左缘对齐；收起（aria-expanded=false，侧边栏移出视口）自动回落 24px。
+   侧边栏宽度可拖拽 200-600px，非默认宽度时仅存在拖拽差值内的微小偏差 */
+body:has([data-testid="stSidebar"][aria-expanded="true"]) .top-status-bar {
+  padding-left: calc(300px + 24px);
+}
+.top-status-bar .bar-label { color: #9ca3af; font-size: 0.82em; margin-right: 0.3rem; }
 .top-status-bar .bar-group {
   display: inline-flex; align-items: center; flex-wrap: wrap;
   column-gap: 1.15rem; row-gap: 0.1rem;
-  padding-left: 0.9rem; border-left: 1px solid #2C2F36;
+  padding-left: 0.9rem; border-left: 1px solid rgba(60, 80, 120, 0.25);
 }
 .top-status-bar .bar-group-label {
-  color: #7A8090; font-size: 0.76em; letter-spacing: 0.06em;
+  color: #6b7280; font-size: 0.76em; letter-spacing: 0.06em;
   margin-right: 0.15rem;
 }
-.top-status-bar b { font-weight: 700; color: #E5E7EB; }
-.top-status-bar .bar-key { font-weight: 700; font-size: 1.08em; color: #FFFFFF; }
-.top-status-bar .up { color: #FF6B6B; font-weight: 700; }
-.top-status-bar .down { color: #34D399; font-weight: 700; }
-.top-status-bar .flat { color: #B8BCC4; }
-.top-status-bar .stale { color: #F59E0B; font-size: 0.8em; }
+.top-status-bar b { font-weight: 700; color: #e5e7eb; }
+.top-status-bar .bar-key { font-weight: 700; font-size: 1.08em; color: #ffffff; }
+.top-status-bar .up { color: #ef4444; font-weight: 700; }
+.top-status-bar .down { color: #10b981; font-weight: 700; }
+.top-status-bar .flat { color: #9ca3af; }
+.top-status-bar .stale { color: #f59e0b; font-size: 0.8em; }
 </style>
 """
 _COLOR_UP = "up"
@@ -417,31 +784,33 @@ def top_status_bar() -> None:
 
     # ---------- 展开详情（默认收起：单行 expander 入口，不占多列挤压主区） ----------
     with st.expander("查看账户明细 / 指数详情", expanded=False):
-        show_acc = acc is not None
-        if acc.get("source") == "estimate":
+        if acc is None:
+            st.caption("暂无账户数据。")
+        elif acc.get("source") == "estimate":
             st.caption("暂无券商账户基准：总资产/可用资金/整体仓位按「总资金设定 + 持仓实时盈亏」估算。"
                        "上传持仓截图 OCR 识别并经人工确认保存账户基准后，自动切换为券商真实值。")
         else:
             b = acc.get("baseline") or {}
             st.caption(f"账户基准来自券商持仓截图（人工确认，{b.get('trade_date', '')} 保存）；"
                        f"总盈亏/总持仓成本随持仓与实时行情自动计算。")
-        pnl_sign = _bar_sign(acc.get("pnl_amount"))
-        for label, value, colored in [
-            ("总资产", _bar_money(acc.get("total_asset")), False),
-            ("总持仓成本", _bar_money(acc.get("total_cost")), False),
-            ("持仓市值", _bar_money(acc.get("market_value")), False),
-            ("总盈亏", _bar_money(acc.get("pnl_amount")), True),
-            ("总盈亏比例", _bar_pct(acc.get("pnl_pct")), True),
-            ("整体仓位占比", _bar_pct(acc.get("position_pct")), False),
-            ("可用资金", _bar_money(acc.get("available_cash")), False),
-        ]:
-            if colored:
-                st.markdown(f'- {label}：**<span class="{pnl_sign}">{value}</span>**',
-                            unsafe_allow_html=True)
-            else:
-                st.markdown(f"- {label}：**{value}**")
-        if acc.get("quote_error"):
-            st.caption(f"⚠️ 行情刷新失败：{acc['quote_error']}（市价相关数值可能不准确）")
+        if acc is not None:
+            pnl_sign = _bar_sign(acc.get("pnl_amount"))
+            for label, value, colored in [
+                ("总资产", _bar_money(acc.get("total_asset")), False),
+                ("总持仓成本", _bar_money(acc.get("total_cost")), False),
+                ("持仓市值", _bar_money(acc.get("market_value")), False),
+                ("总盈亏", _bar_money(acc.get("pnl_amount")), True),
+                ("总盈亏比例", _bar_pct(acc.get("pnl_pct")), True),
+                ("整体仓位占比", _bar_pct(acc.get("position_pct")), False),
+                ("可用资金", _bar_money(acc.get("available_cash")), False),
+            ]:
+                if colored:
+                    st.markdown(f'- {label}：**<span class="{pnl_sign}">{value}</span>**',
+                                unsafe_allow_html=True)
+                else:
+                    st.markdown(f"- {label}：**{value}**")
+            if acc.get("quote_error"):
+                st.caption(f"⚠️ 行情刷新失败：{acc['quote_error']}（市价相关数值可能不准确）")
 
     if idx:
         st.markdown("**指数详情**")

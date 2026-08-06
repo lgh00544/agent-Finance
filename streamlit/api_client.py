@@ -137,6 +137,13 @@ def trigger_score(code: str) -> dict:
     return _post(f"/api/score/{code}", {"stock_code": code})
 
 
+def stock_names(codes: list[str]) -> dict:
+    """批量补名（只读，不写库）：返回 {code: name}，查不到的名称不出现"""
+    if not codes:
+        return {}
+    return _get("/api/stocks/names", {"codes": ",".join(codes)})
+
+
 def plans(code: str | None = None, limit: int | None = None) -> list:
     params = {"code": code} if code else {}
     if limit is not None:
@@ -176,6 +183,21 @@ def ocr_holding(image_bytes: bytes, filename: str) -> dict:
 
 def exit_holding(hid: int, body: dict) -> dict:
     return _post(f"/api/holdings/{hid}/exit", body)
+
+
+def holding_add(hid: int, body: dict) -> dict:
+    """手动加仓：加权成本重算 + C3 止损联动 + 流水留痕"""
+    return _post(f"/api/holdings/{hid}/add", body)
+
+
+def holding_cost(hid: int, body: dict) -> dict:
+    """手动成本修正：cost/C3 联动重算 + adjust 流水留痕（原因必填）"""
+    return _post(f"/api/holdings/{hid}/cost", body)
+
+
+def holding_trades(hid: int) -> list:
+    """持仓操作流水（最新在前）：加仓/减仓/清仓/成本修正 可追溯"""
+    return _get(f"/api/holdings/{hid}/trades")
 
 
 def monitor_holding(hid: int) -> dict:

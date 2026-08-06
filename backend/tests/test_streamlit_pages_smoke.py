@@ -56,15 +56,15 @@ def test_page_renders(page):
 
 
 def test_candidate_page_interactives():
-    """候选池页新交互回归：日期选择器 / 评级筛选三档 / 主表与详情折叠"""
+    """候选池页新交互回归：日期选择器 / 评级筛选三档（segmented_control）/ 列表行与详情折叠"""
     at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=180)
     at.run()
     assert not at.exception, f"候选池页渲染异常: {at.exception}"
     assert at.selectbox[0].label == "选择日期" and len(at.selectbox[0].options) >= 1
-    assert [r.options for r in at.radio if r.label == "评级筛选"][0] == ["全部", "可建仓 A+B", "仅观察 C"]
+    assert at.segmented_control[0].label == "评级筛选"
+    assert at.segmented_control[0].options == ["全部候选", "可建仓 A+B", "观察 C"]
     # 评级筛选切换不报错
-    radio = next(r for r in at.radio if r.label == "评级筛选")
-    radio.set_value("可建仓 A+B")
+    at.segmented_control[0].set_value("可建仓 A+B")
     at.run()
     assert not at.exception, f"评级筛选切换后异常: {at.exception}"
 
@@ -83,14 +83,15 @@ def test_raw_json_expander_default_collapsed():
 
 
 def test_stock_label_format():
-    """股票标识统一格式：代码在前、名称紧随；名称缺失/与代码相同时仅代码"""
+    """股票标识统一格式：代码在前、名称紧随；名称缺失/等于代码显示「名称待补」，
+    禁止只展示纯代码（2026-08-05 名称修复硬性规则）"""
     spec = importlib.util.spec_from_file_location("render", PAGES_DIR.parent / "render.py")
     render = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(render)
 
     assert render.stock_label("600519", "贵州茅台") == "600519 贵州茅台"
-    assert render.stock_label("600519", "600519") == "600519"
-    assert render.stock_label("600519", "") == "600519"
+    assert render.stock_label("600519", "600519") == "600519 名称待补"
+    assert render.stock_label("600519", "") == "600519 名称待补"
     assert render.stock_label("601012", " 隆基绿能 ") == "601012 隆基绿能"
 
 
@@ -122,26 +123,97 @@ def test_top_bar_format_helpers():
 
 
 def test_top_bar_layout_padding_css():
-    """顶部固定状态栏布局规范：主内容区与侧边栏预留 4.3rem 顶距不遮挡首屏；
-    状态栏本体固定悬浮（z-index 998）、width 100% 撑满视口、左右内边距对称
-    （无单侧大 padding）、align-items center 统一垂直居中、line-height 1.5；
+    """顶部固定状态栏布局规范：主内容区与侧边栏预留 60px 顶距不遮挡首屏；
+    状态栏本体固定悬浮（z-index 999）、width 100% 撑满视口、左右内边距对称
+    8px 24px（无单侧大 padding）、align-items center 统一垂直居中、line-height 1.5、
+    背景 #0f1115 + 底部 1px 描边 rgba(60,80,120,0.25)；
     信息按「账户资产」「大盘指数」分组展示。CSS 注入点唯一（top_status_bar）"""
     src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
-    assert '[data-testid="stMain"] { padding-top: 4.3rem; }' in src
-    assert '[data-testid="stSidebarContent"] { padding-top: 4.3rem; }' in src
-    assert "position: fixed" in src and "z-index: 998" in src
+    assert '[data-testid="stMain"] { padding-top: 60px; }' in src
+    assert '[data-testid="stSidebarContent"] { padding-top: 60px; }' in src
+    assert "position: fixed" in src and "z-index: 999" in src
     assert "width: 100%" in src and "box-sizing: border-box" in src
     assert "line-height: 1.5" in src
     assert "align-items: center" in src
-    assert "padding: 0.3rem 1rem" in src  # 左右对称，无单侧大 padding
+    assert "padding: 8px 24px" in src  # 左右对称，无单侧大 padding
+    assert "background: #0f1115" in src  # 与全局主题同色板
+    assert "border-bottom: 1px solid rgba(60, 80, 120, 0.25)" in src
     assert "29.9rem" not in src and "line-height: 2.45" not in src  # 不再出现异常参数
     assert "bar-group" in src and "bar-group-label" in src  # 分组展示 + 组标签
+
+
+# ================= 全局深色科技感主题（2026-08-05 前端视觉体系升级） =================
+
+def test_global_theme_css_components():
+    """全局主题落地：CSS 变量色板 / 徽章 / 溯源行 / 懒加载列表组件齐备"""
+    src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
+    assert "_GLOBAL_THEME_CSS" in src and "def apply_global_theme" in src
+    for var in ("--bg-base", "--bg-card", "--primary", "--up", "--down",
+                "--tier-a", "--tier-b", "--tier-c", "--text-dim"):
+        assert var in src, f"缺少 CSS 变量: {var}"
+    assert "def badge" in src and "badge-tier-a" in src
+    assert "def trace_line" in src and "trace-line" in src
+    assert "def record_list" in src and "def empty_state" in src
+    assert "tabular-nums" in src  # 数字等宽对齐
+
+
+def test_all_pages_apply_global_theme():
+    """全部页面（含首页）均调用全局主题注入，无遗漏"""
+    pages = [p for p in PAGES_DIR.glob("*.py")]
+    assert pages, "未找到任何页面"
+    for p in pages:
+        src = p.read_text(encoding="utf-8")
+        assert "render.apply_global_theme()" in src, f"{p.name} 缺少全局主题注入"
+
+
+def test_streamlit_theme_config():
+    """config.toml 深色主题配置（原生控件深色兜底）"""
+    cfg = (PAGES_DIR.parent / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+    assert 'base = "dark"' in cfg
+    assert "primaryColor" in cfg and "backgroundColor" in cfg
+
+
+def test_score_page_debounce_query_button():
+    """评分报告页筛选防抖：输入后点「查询」才过滤，查询/清除按钮存在；
+    搜索区单行排布：代码/名称搜索 + 日期筛选"""
+    at = AppTest.from_file(str(PAGES_DIR / "2_评分报告.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"评分报告页渲染异常: {at.exception}"
+    labels = [b.label for b in at.button]
+    assert "查询" in labels, f"缺少查询按钮: {labels}"
+    assert "清除筛选" in labels, f"缺少清除按钮: {labels}"
+    assert at.text_input[0].label == "按代码或名称搜索（留空显示全部，输入后点查询）"
+    assert at.selectbox[0].label == "选择日期" and at.selectbox[0].options[0] == "全部"
+
+
+def test_score_page_master_detail_linkage():
+    """列表-详情联动：默认选中第一行；程序化选中第二行 → 详情切换（AppTest 无法模拟
+    真实表格点击，但 session_state 程序化选中与前端点击走同一 value_changed 链路）"""
+    at = AppTest.from_file(str(PAGES_DIR / "2_评分报告.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"评分报告页渲染异常: {at.exception}"
+    assert at.dataframe, "评分页应渲染总览表格"
+    dfv = at.dataframe[0].value  # 总览表（详情内的五维分项表在下方）
+    if len(dfv) < 2:
+        pytest.skip("评分数据不足 2 行，跳过联动断言")
+
+    def _detail_text() -> str:
+        return "\n".join(m.value for m in at.markdown if m.value)
+
+    first, second = dfv.iloc[0]["股票"], dfv.iloc[1]["股票"]
+    assert first in _detail_text(), "默认应选中第一行（详情区展示第一行）"
+    # 程序化选中第二行（等价于用户点击第 2 行）
+    at.session_state["_score_table"] = {"selection": {"rows": [1], "columns": [], "cells": []}}
+    at.run()
+    assert not at.exception, f"选中第二行后异常: {at.exception}"
+    assert second in _detail_text(), "选中第二行后详情应切换"
+    assert first not in _detail_text(), "详情区应只展示当前选中行"
 
 
 # ================= Agent 对话页（9_Agent对话.py） =================
 
 def test_agent_chat_page_renders():
-    """Agent 对话页渲染：标题 / 六 Agent 选择 / 三个交互标签 / 历史区"""
+    """Agent 对话页渲染：标题 / 左侧 Agent 导航列表（radio 高亮）/ 四个交互标签 / 历史区"""
     at = AppTest.from_file(str(PAGES_DIR / "9_Agent对话.py"), default_timeout=180)
     at.run()
     assert not at.exception, f"9_Agent对话.py 渲染异常: {at.exception}"
@@ -149,7 +221,189 @@ def test_agent_chat_page_renders():
     tabs = [t.label for t in at.tabs]
     for name in ("文字提问", "规则调教", "多模态学习", "对话历史"):
         assert name in tabs, f"缺少标签页: {name}"
-    options = at.selectbox[0].options
+    options = at.radio[0].options
     for agent in ("选股发现 Agent", "评分分析 Agent", "建仓方案 Agent",
                   "持仓监控 Agent", "卖出决策 Agent", "复盘迭代 Agent"):
         assert agent in options, f"缺少 Agent 选项: {agent}"
+    # 切换 Agent（radio 选中高亮，独立上下文）不报错
+    at.radio[0].set_value("持仓监控 Agent")
+    at.run()
+    assert not at.exception, f"Agent 切换后异常: {at.exception}"
+
+
+def test_holding_page_tabs():
+    """持仓监控页 3 Tab 结构：当前持仓 / 告警记录 / 历史持仓"""
+    at = AppTest.from_file(str(PAGES_DIR / "4_持仓监控.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"4_持仓监控.py 渲染异常: {at.exception}"
+    tabs = [t.label for t in at.tabs]
+    for name in ("当前持仓", "告警记录", "历史持仓"):
+        assert name in tabs, f"缺少标签页: {name}"
+
+
+def test_knowledge_page_tabs():
+    """交易知识库页顶部 Tab 操作区：新增条目 / 批量导入 / 知识条目"""
+    at = AppTest.from_file(str(PAGES_DIR / "8_交易知识库.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"8_交易知识库.py 渲染异常: {at.exception}"
+    tabs = [t.label for t in at.tabs]
+    for name in ("新增条目", "批量导入", "知识条目"):
+        assert name in tabs, f"缺少标签页: {name}"
+    src = (PAGES_DIR / "8_交易知识库.py").read_text(encoding="utf-8")
+    assert src.count('st.form("') >= 2  # 新增 + 批量导入表单
+    assert "按适用 Agent 过滤" in [s.label for s in at.selectbox]
+
+
+def test_review_page_expander():
+    """交易复盘页：策略闭环建议区折叠容器存在（待审核条数实时展示）"""
+    at = AppTest.from_file(str(PAGES_DIR / "5_交易复盘.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"5_交易复盘.py 渲染异常: {at.exception}"
+    assert any("策略闭环" in e.label for e in at.expander), "缺少策略闭环建议区"
+
+
+def test_enterprise_list_components():
+    """企业级列表行/分区卡片/指标卡/告警行组件与 CSS 类齐备"""
+    src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
+    for fn in ("list_item", "list_item_toggle", "section_title", "stat_cards",
+               "svc_cards", "alert_list"):
+        assert f"def {fn}" in src, f"缺少组件函数: {fn}"
+    for css in ("item-main", "item-title", "item-sub", "item-meta",
+                "section-title", "stat-card", "stat-grid", "dot-tier-a",
+                "st-key-lrow_"):
+        assert css in src, f"缺少 CSS 类: {css}"
+    assert "actions: tuple" in src and "enumerate(actions)" in src  # 列表行操作按钮组
+    assert ".item-meta .up" in src and ".item-meta .down" in src  # 盈亏着色
+
+
+def test_agent_radio_nav_css():
+    """Agent 对话页左侧列表（radio 增强为导航样式）：选中高亮 + hover 反馈"""
+    src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
+    assert "radiogroup" in src and "label:has(input:checked)" in src
+
+
+def test_navigation_app_groups():
+    """app.py 导航分组：4 组（系统概览/选股决策/持仓风控/策略沉淀）+ 全部页面挂载"""
+    src = (Path(__file__).resolve().parents[2] / "streamlit" / "app.py").read_text(encoding="utf-8")
+    for group in ("系统概览", "选股决策", "持仓风控", "策略沉淀"):
+        assert group in src, f"缺少导航分组: {group}"
+    for page in ("0_系统概览.py", "1_每日候选池.py", "2_评分报告.py", "3_建仓计划.py",
+                 "4_持仓监控.py", "5_交易复盘.py", "7_告警日志.py", "8_交易知识库.py",
+                 "9_Agent对话.py"):
+        assert page in src, f"导航未挂载页面: {page}"
+
+
+# ================= 统一错误提示系统（4 级分级：阻断/提醒/成功/空状态） =================
+
+def test_error_components_exist():
+    """错误提示组件体系齐备：4 级提示卡片/原位字段错误/汇总条/空状态/字段合法值判定"""
+    src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
+    for fn in ("msg_card", "error_card", "field_error", "field_summary", "field_ok",
+               "set_field_errors", "get_field_error", "get_field_errors", "empty_state"):
+        assert f"def {fn}" in src, f"缺少错误提示组件函数: {fn}"
+    for css in ("msg-card", "field-err", "field-summary", "empty-state", "empty-icon"):
+        assert css in src, f"缺少错误提示组件 CSS 类: {css}"
+    # 视觉分级色板：阻断 err / 提醒 warn / 成功 ok / 中性 info
+    for tone in ("err", "warn", "ok", "info"):
+        assert tone in src, f"缺少提示分级色: {tone}"
+
+
+def test_field_ok_clearing_is_valid():
+    """field_ok 纯函数：0（清仓股数）是合法值，None/NaN/空串不合法——OCR 清仓=正常 硬性规则"""
+    spec = importlib.util.spec_from_file_location("render", PAGES_DIR.parent / "render.py")
+    render = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render)
+
+    assert render.field_ok(0) is True, "0（清仓）必须是合法值"
+    assert render.field_ok(0.0) is True
+    assert render.field_ok(100) is True
+    assert render.field_ok("600519") is True
+    assert render.field_ok("") is False
+    assert render.field_ok(None) is False
+    assert render.field_ok(float("nan")) is False
+
+
+def test_no_bare_st_error_in_pages():
+    """页面禁止裸 st.error：阻断错误一律经 render.error_card/msg_card（原因+重试/折叠）"""
+    bad = [p.name for p in PAGES_DIR.glob("*.py") if "st.error(" in p.read_text(encoding="utf-8")]
+    assert not bad, f"以下页面仍直接使用 st.error（应改用 render.error_card/msg_card）: {bad}"
+
+
+def test_field_error_usage_in_forms():
+    """表单字段校验页面统一使用 fld_ 容器 + field_error 原位标记 + field_summary 汇总条"""
+    pages = ["3_建仓计划.py", "4_持仓监控.py", "5_交易复盘.py", "8_交易知识库.py"]
+    for name in pages:
+        src = (PAGES_DIR / name).read_text(encoding="utf-8")
+        assert 'render.field_error(' in src, f"{name} 缺少原位字段错误标记"
+        assert 'render.get_field_error(' in src, f"{name} 缺少字段错误读取"
+    # 汇总条：提交校验表单需展示错误汇总（不整段报错）
+    assert "field_summary" in (PAGES_DIR / "4_持仓监控.py").read_text(encoding="utf-8")
+    assert "field_summary" in (PAGES_DIR / "8_交易知识库.py").read_text(encoding="utf-8")
+
+
+def test_top_bar_sidebar_adapt_css():
+    """顶部状态栏侧边栏动态适配：:has 监听 aria-expanded（展开 300px 偏移/收起回落 24px）
+    + 0.2s 平滑过渡；原固定悬浮/垂直居中/底部描边规则保持不变"""
+    src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
+    assert 'body:has([data-testid="stSidebar"][aria-expanded="true"]) .top-status-bar' in src
+    assert "padding-left: calc(300px + 24px)" in src  # 展开态与主内容区左缘对齐
+    assert "transition: padding-left 0.2s ease" in src  # 切换平滑不跳动
+    # 原有样式规则保持：固定悬浮/垂直居中/底部描边
+    assert "position: fixed" in src and "z-index: 999" in src
+    assert "align-items: center" in src
+    assert "border-bottom: 1px solid rgba(60, 80, 120, 0.25)" in src
+
+
+def test_error_card_right_side_actions():
+    """错误卡片操作按钮渲染在卡片右侧（重试无需滚到页面底部）"""
+    src = (PAGES_DIR.parent / "render.py").read_text(encoding="utf-8")
+    assert "def error_card" in src
+    assert "actions: tuple[tuple[str, str], ...]" in src  # (按钮key, 按钮文案) 序列
+    assert "st.columns([5, 1.3], vertical_alignment" in src  # 左卡片右按钮布局
+    # 候选池页使用右侧重试按钮 + 分类错误提示
+    cand_src = (PAGES_DIR / "1_每日候选池.py").read_text(encoding="utf-8")
+    assert "render.classify_api_error(" in cand_src
+    assert "retry_key=\"retry_candidates\"" in cand_src
+
+
+def test_classify_api_error():
+    """API 失败分类纯函数：连接失败/超时/HTTP 数据库异常/未知 → 对应文案与技术日志摘要"""
+    import requests
+
+    spec = importlib.util.spec_from_file_location("render", PAGES_DIR.parent / "render.py")
+    render = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render)
+
+    title, hint, tech = render.classify_api_error(requests.exceptions.ConnectionError())
+    assert "连接失败" in title and "重试" in hint and "ConnectionError" in tech
+    assert "20" in tech  # 技术日志含时间戳
+
+    title, hint, tech = render.classify_api_error(requests.exceptions.Timeout())
+    assert "超时" in title and "重试" in hint
+
+    resp = requests.Response()
+    resp.status_code = 500
+    resp.encoding = "utf-8"
+    resp._content = b"database connection lost: pool exhausted"
+    req = requests.Request("GET", "http://localhost:8000/api/candidates").prepare()
+    err = requests.exceptions.HTTPError("500 Server Error", response=resp, request=req)
+    title, hint, tech = render.classify_api_error(err)
+    assert "数据库" in title and "重试" in hint and "HTTP 500" in tech
+
+    title, hint, tech = render.classify_api_error(ValueError("boom"))
+    assert "加载失败" in title and "重试" in hint and "ValueError" in tech
+
+
+def test_frontend_cache_roundtrip(monkeypatch, tmp_path):
+    """离线缓存模块：保存/读取回环（含保存时间戳），无缓存/损坏返回 None"""
+    import frontend_cache as fc
+
+    monkeypatch.setattr(fc, "_CACHE_DIR", tmp_path)
+    assert fc.load("cands") is None  # 无缓存
+    fc.save("cands", {"date": "2026-08-05", "rows": [{"id": 1}]})
+    data = fc.load("cands")
+    assert data is not None and data["data"]["date"] == "2026-08-05"
+    assert "saved_at" in data  # 标注缓存时间
+    # 损坏文件 → None 不抛错
+    (tmp_path / "frontend_cache_bad.json").write_text("{broken", encoding="utf-8")
+    assert fc.load("bad") is None

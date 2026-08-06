@@ -1,14 +1,19 @@
 """每日候选池：DiscoverAgent 输出（候选理由/技术面研判/量价与资金/关键价位/风险点/操作建议）
 
-纯展示层：评级筛选/排序/颜色仅为字段映射与展示，不含任何二次判断逻辑。
+企业级列表行范式：左=评级色圆点+代码名称(加粗)+标的类型与核心理由(副标题)，
+右=生成时间+「查看详情」；详情分区卡片化展示，原始 JSON 永久折叠在最底部。
+纯展示层：评级映射/排序/颜色仅为字段映射与展示，不含任何二次判断逻辑。
+
+错误处理：接口失败按类型分类提示（后端服务/超时/数据库/解析），重试按钮在卡片右侧；
+有离线缓存时降级展示最近一次成功数据（标注缓存时间，灰色弱化），避免完全不可用。
 """
-import pandas as pd
 import streamlit as st
 
 import api_client as api
+import frontend_cache as fc
 import render
 
-st.set_page_config(page_title="每日候选池", layout="wide")
+render.apply_global_theme()
 
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
@@ -19,33 +24,73 @@ st.caption("筛选标准由 LLM 综合量能/趋势/行业热度/基本面研判
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
 
-# 顶部手动触发每日挖掘（异步提交，立即返回，不阻塞页面；重复触发会给出中文提示）
-if st.button("手动触发每日挖掘", type="primary", key="btn_run_discover"):
-    render.submit_task("daily_pipeline", label="每日挖掘")
-
 # 评级映射（LLM 信心度档位 → 展示评级；纯展示层转换，不含任何研判）
 TIER_MAP = {"强烈推荐": "A", "建议关注": "B", "谨慎观察": "C"}
-TIER_ICON = {"A": "🔴", "B": "🟠", "C": "🔵"}
 TIER_LABEL = {"A": "A 强烈推荐", "B": "B 建议关注", "C": "C 谨慎观察"}
-TIER_COLOR = {"A": "#F87171", "B": "#FBBF24", "C": "#60A5FA"}
+TIER_DOT = {"A": "tier-a", "B": "tier-b", "C": "tier-c"}
 _SORT = {"A": 0, "B": 1, "C": 2}
 
+CACHE_KEY = "candidates"
+_cached = fc.load(CACHE_KEY)  # 离线兜底缓存（接口失败时降级展示）
+_stale = False  # 当前是否处于离线缓存降级模式
+
+# ===== 日期列表：接口失败 → 缓存降级或分类报错（不阻塞顶部状态栏等其余模块） =====
 try:
-    # 默认仅加载最新一天：日期列表轻量接口获取，选中日期后再按需查询当日候选
     dates = api.candidate_dates()
-    if not dates:
-        st.info("暂无候选数据。可点击上方「手动触发每日挖掘」，或等待每日定时任务。")
+except Exception as exc:  # noqa: BLE001 接口异常全链路捕获，绝不出现无反馈空白
+    if _cached and _cached["data"].get("date"):
+        dates = [_cached["data"]["date"]]
+        _stale = True
+    else:
+        title, hint, tech = render.classify_api_error(exc)
+        render.error_card(title, hint, detail=tech, retry_key="retry_candidates")
+        st.stop()
+if not dates:
+    render.empty_state("当日暂无生成结果。可点击下方按钮手动触发每日挖掘，或等待每日定时任务（工作日 16:10）。",
+                       icon="🔍", action_label="手动触发每日挖掘",
+                       action_key="empty_trigger_discover")
+    if st.session_state.get("empty_trigger_discover"):
+        render.submit_task("daily_pipeline", label="每日挖掘")
+        st.session_state["empty_trigger_discover"] = False
+    st.stop()
+
+# 顶部操作行：左=日期选择 + 评级筛选（Tab 样式），右=高频主按钮
+f1, f2, f3 = st.columns([1.2, 2.6, 1.2])
+with f1:
+    date = st.selectbox("选择日期", dates, index=0)
+with f2:
+    filter_opt = st.segmented_control("评级筛选", ["全部候选", "可建仓 A+B", "观察 C"],
+                                      default="全部候选")
+with f3:
+    if st.button("手动触发每日挖掘", type="primary", use_container_width=True):
+        render.submit_task("daily_pipeline", label="每日挖掘")
+st.caption("评级：A 强烈推荐 / B 建议关注 / C 谨慎观察（LLM 信心度档位映射，纯展示）")
+
+# ===== 当日候选：接口失败 → 缓存降级（灰色弱化）或分类报错卡片 =====
+try:
+    rows = api.candidates(date=date, limit=300)
+    fc.save(CACHE_KEY, {"date": date, "rows": rows})  # 成功即刷新离线缓存
+except Exception as exc:  # noqa: BLE001
+    if _cached and _cached["data"].get("rows"):
+        rows = _cached["data"]["rows"]
+        _stale = True
+    else:
+        title, hint, tech = render.classify_api_error(exc)
+        render.error_card(title, hint, detail=tech, retry_key="retry_candidates")
         st.stop()
 
-    c1, c2 = st.columns([2, 3])
-    with c1:
-        date = st.selectbox("选择日期", dates, index=0)
-    with c2:
-        filter_opt = st.radio("评级筛选", ["全部", "可建仓 A+B", "仅观察 C"], horizontal=True)
-    st.caption("评级：🔴 A 强烈推荐 ／ 🟠 B 建议关注 ／ 🔵 C 谨慎观察（LLM 信心度档位映射，纯展示）")
+if _stale:
+    # 离线缓存模式：明确标注缓存时间与数据日期，非最新
+    render.msg_card("warn", "离线缓存模式（数据非最新）",
+                    f"接口暂不可用，以下展示最近一次成功缓存：{_cached['saved_at']}"
+                    f"（{_cached['data']['date']} 数据），恢复后自动更新。")
+    st.markdown('<style>[class*="st-key-cached_rows"]{opacity:.62;filter:saturate(.75)}</style>',
+                unsafe_allow_html=True)
+    rows_area = st.container(key="cached_rows")
+else:
+    rows_area = st.container()
 
-    rows = api.candidates(date=date, limit=300)
-
+with rows_area:
     # 同日同股按最新版本覆盖（created_at 最大），历史版本不参与渲染
     latest: dict[tuple, dict] = {}
     for r in rows:
@@ -60,7 +105,7 @@ try:
 
     if filter_opt == "可建仓 A+B":
         day_rows = [r for r in day_rows if _tier(r) in ("A", "B")]
-    elif filter_opt == "仅观察 C":
+    elif filter_opt == "观察 C":
         day_rows = [r for r in day_rows if _tier(r) == "C"]
 
     # ===== 板块行业筛选（来自首页「今日热门板块」点击跳转，query param 传递） =====
@@ -79,97 +124,86 @@ try:
             if sector in industry or (industry and industry in sector):
                 matched.append(r)
         if not matched:
-            st.warning(f"当日候选池中没有行业包含「{sector}」的候选股"
-                       f"（候选行业字段来自个股基本信息，可能与板块名称不完全一致）。")
+            render.msg_card("warn", f"当日候选池中没有行业包含「{sector}」的候选股",
+                            "候选行业字段来自个股基本信息，可能与板块名称不完全一致，可清除筛选后浏览全部候选。")
         day_rows = matched
 
     # 可建仓置顶：A→B→C，组内按 rank 升序
     day_rows.sort(key=lambda r: (_SORT.get(_tier(r), 3), int(r.get("rank") or 999)))
 
-    # 懒加载：长列表首屏只渲染前 20 条，点击「加载更多」增量展示（避免一次性渲染大量详情卡顿）；
-    # 分页进度随日期/筛选条件各自独立记录，切换条件自动回到首屏
-    BATCH = 20
-    vis_key = f"_cand_visible_{date}_{filter_opt}_{sector}"
-    visible = st.session_state.get(vis_key, BATCH)
-    day_rows_show = day_rows[:visible]
-
-    # 主表：评级（颜色区分）/股票/标的类型/一句话核心理由/生成时间
-    summary = pd.DataFrame([{
-        "评级": TIER_LABEL.get(_tier(r), "未评级"),
-        "股票": render.stock_label(r["stock_code"], r["stock_name"]),
-        "类型": (r.get("detail") or {}).get("stock_type", ""),
-        "核心理由": (r.get("reasons") or [""])[0] or ((r.get("detail") or {}).get("meso_view") or ""),
-        "生成时间": str(r.get("created_at") or "")[:16],
-    } for r in day_rows_show])
-    styled = summary.style.map(
-        lambda v: f"color: {TIER_COLOR.get(v, '#9CA3AF')}", subset=["评级"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    for r in day_rows_show:
+    def _cand_detail(r: dict, _i: int) -> None:
         label = render.stock_label(r["stock_code"], r["stock_name"])
         detail = r.get("detail") or {}
         tier = _tier(r)
-        focus = detail.get("focus_type", "")
+        tier_label = TIER_LABEL.get(tier, "未评级")
+        dot = TIER_DOT.get(tier, "mute")
         stock_type = detail.get("stock_type", "")
-        with st.expander(f"#{r.get('rank', '-')} {label}　{TIER_ICON.get(tier, '')}"
-                         f"{TIER_LABEL.get(tier, '未评级')}"
-                         + (f"　[{focus}]" if focus else "")
-                         + (f"　· {stock_type}" if stock_type else "")):
-            render.time_text("本轮挖掘执行时间", r.get("created_at"))
+        reasons = r.get("reasons") or []
+        core = reasons[0] if reasons else (detail.get("meso_view") or "")
+        subtitle = "　·　".join(x for x in (stock_type, core) if x)
+        meta = f"生成 {str(r.get('created_at') or '')[:16]}"
+        # API 行不含 ORM id：用 代码+日期+rank 组成稳定唯一键（同日同股已按最新版去重）
+        key = f"cand_{r['stock_code']}_{r['trade_date']}_{r.get('rank')}"
+        if render.list_item_toggle(key, f"#{r.get('rank', '-')} {label}　{tier_label}",
+                                   subtitle=subtitle, dot=dot, meta=meta):
+            with st.container(border=True):
+                render.trace_line("本轮挖掘执行时间", r.get("created_at"),
+                                  source="行情快照 + LLM 研判", confidence=detail.get("confidence"))
+                with st.container(border=True):
+                    render.section_title("候选理由")
+                    if reasons:
+                        for i, reason in enumerate(reasons, 1):
+                            st.markdown(f"{i}. {reason}")
+                    else:
+                        st.markdown("（该轮未输出）")
+                with st.container(border=True):
+                    render.section_title("技术面研判（威科夫/量价/K线形态/谐波交叉验证）")
+                    st.markdown(detail.get("tech_view") or detail.get("meso_view")
+                                or "（该轮未输出，可重新触发挖掘生成）")
+                with st.container(border=True):
+                    render.section_title("量价与资金结论（主力动向/量能结构）")
+                    st.markdown(detail.get("volume_analysis") or "（无）")
+                with st.container(border=True):
+                    render.section_title("关键价位（支撑位/压力位/建议关注区间）")
+                    st.markdown(detail.get("price_levels") or "（未输出）")
+                with st.container(border=True):
+                    render.section_title("核心风险点（≥2 项）")
+                    risks = detail.get("risks") or []
+                    if risks:
+                        for i, risk in enumerate(risks, 1):
+                            st.markdown(f"{i}. {risk}")
+                    else:
+                        st.markdown("（无）")
+                with st.container(border=True):
+                    render.section_title("操作建议（标的类型 + 关注类型 + 参考仓位）")
+                    focus = detail.get("focus_type", "")
+                    st.markdown(f"- 标的类型：{stock_type or '（未输出）'}（威科夫阶段定位，参考权重）")
+                    st.markdown(f"- 关注类型：{focus or '观察'}")
+                    hint = detail.get("position_hint") or ""
+                    st.markdown(f"- 参考建议：{hint}" if hint else "- 参考建议：（该轮未输出）")
+                with st.container(border=True):
+                    render.section_title("三维验证（宏观 / 中观 / 微观）")
+                    st.markdown(f"- 宏观：{detail.get('macro_view', '（无）')}")
+                    st.markdown(f"- 中观：{detail.get('meso_view', '（无）')}")
+                    st.markdown(f"- 微观：{detail.get('micro_view', '（无）')}")
+                with st.container(border=True):
+                    render.section_title("风险初判")
+                    risk_notice = r.get("risk_notice") or []
+                    if risk_notice:
+                        for risk in risk_notice:
+                            st.markdown(f"- {risk}")
+                    else:
+                        st.markdown("（无）")
+                code, name = r["stock_code"], r["stock_name"]
+                if st.button("生成建仓方案", key=f"plan_{code}_{r['trade_date']}"):
+                    render.submit_task("position", {"stock_code": code, "stock_name": name},
+                                       label="建仓方案生成")
+                render.raw_json_expander(
+                    {"reasons": r.get("reasons"), "risk_notice": r.get("risk_notice"),
+                     "detail": detail},
+                    key=f"raw_cand_{code}_{r['trade_date']}")
 
-            st.markdown("**候选理由**")
-            for i, reason in enumerate(r.get("reasons") or [], 1):
-                st.markdown(f"{i}. {reason}")
-
-            st.markdown("**技术面研判**（威科夫/量价/K线形态/谐波交叉验证，含体系支撑依据）")
-            st.markdown(detail.get("tech_view") or detail.get("meso_view") or "（该轮未输出，可重新触发挖掘生成）")
-
-            st.markdown("**量价与资金结论**（主力动向/量能结构）")
-            st.markdown(detail.get("volume_analysis") or "（无）")
-
-            st.markdown("**关键价位**（支撑位/压力位/建议关注区间）")
-            st.markdown(detail.get("price_levels") or "（未输出）")
-
-            st.markdown("**核心风险点**（≥2 项）")
-            risks = detail.get("risks") or []
-            if risks:
-                for i, risk in enumerate(risks, 1):
-                    st.markdown(f"{i}. {risk}")
-            else:
-                st.markdown("（无）")
-
-            st.markdown("**操作建议**（标的类型 + 关注类型 + 参考仓位）")
-            st.markdown(f"- 标的类型：{stock_type or '（未输出）'}"
-                        f"（威科夫阶段定位，参考权重）")
-            hint = detail.get("position_hint") or ""
-            st.markdown(f"- 关注类型：{focus or '观察'}")
-            st.markdown(f"- 参考建议：{hint}" if hint else "- 参考建议：（该轮未输出）")
-
-            with st.expander("三维分析（宏观/中观/微观）", expanded=False):
-                st.markdown(f"- 宏观：{detail.get('macro_view', '（无）')}")
-                st.markdown(f"- 中观：{detail.get('meso_view', '（无）')}")
-                st.markdown(f"- 微观：{detail.get('micro_view', '（无）')}")
-            st.markdown("**风险初判**")
-            risk_notice = r.get("risk_notice") or []
-            if risk_notice:
-                for risk in risk_notice:
-                    st.markdown(f"- {risk}")
-            else:
-                st.markdown("（无）")
-
-            code, name = r["stock_code"], r["stock_name"]
-            if st.button("生成建仓方案", key=f"plan_{code}_{r['trade_date']}"):
-                render.submit_task("position", {"stock_code": code, "stock_name": name},
-                                   label="建仓方案生成")
-            render.raw_json_expander(
-                {"reasons": r.get("reasons"), "risk_notice": r.get("risk_notice"),
-                 "detail": detail},
-                key=f"raw_cand_{code}_{r['trade_date']}")
-
-    if len(day_rows) > visible:
-        if st.button(f"加载更多候选（已显示 {visible} / {len(day_rows)}）",
-                     key=f"load_more_{vis_key}"):
-            st.session_state[vis_key] = visible + BATCH
-            st.rerun()
-except Exception as exc:
-    st.error(f"候选池获取失败: {exc}")
+    # 详情懒加载：首屏 20 条，点「加载更多」增量展示；切换日期/筛选自动回首屏
+    render.record_list(day_rows, _cand_detail, batch=20,
+                       key=f"_cand_vis_{date}_{filter_opt}_{sector}",
+                       empty_text="当日无候选：可切换日期，或点击上方「手动触发每日挖掘」重新生成。")

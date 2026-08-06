@@ -296,6 +296,29 @@ def list_scores(code: Optional[str] = None, date: Optional[str] = None, limit: i
     return repo.list_scores(code, date, limit)
 
 
+@router.get("/stocks/names")
+def stock_names(codes: str = ""):
+    """批量补名（只读）：基于行情源实时名称反查，不写库、不动任务体系。
+    查不到/异常返回 {}；name 为空或等于代码的项丢弃（缺省键）。"""
+    code_list = sorted({c.strip() for c in codes.split(",")
+                        if c.strip() and len(c.strip()) == 6})[:50]
+    if not code_list:
+        return {}
+    from app.datasource.fallback import get_datasource
+
+    try:
+        quotes = get_datasource().fetch_spot_quotes_batch(code_list)
+    except Exception as exc:  # noqa: BLE001 数据源异常（断路器/限流）静默降级
+        logger.warning("批量补名失败: %s", exc)
+        return {}
+    out = {}
+    for code, q in quotes.items():
+        name = (q.get("name") or "").strip()
+        if name and name != code:
+            out[code] = name
+    return out
+
+
 @router.post("/score/{code}")
 def trigger_score(code: str, body: Optional[CodeBody] = None):
     """手动触发单股打分（异步提交，立即返回任务ID，不阻塞页面）"""
@@ -366,6 +389,8 @@ def exit_holding(hid: int, body: ExitBody):
     holding = repo.get_holding(hid)
     if holding is None or holding.status != "holding":
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
+    if body.shares % 100 != 0:
+        raise HTTPException(status_code=400, detail="卖出股数必须为 100 的整数倍")
     if body.shares > holding.shares:
         raise HTTPException(status_code=400, detail="卖出股数超过持仓")
 
@@ -380,6 +405,70 @@ def exit_holding(hid: int, body: ExitBody):
         task = _submit_task("review", {"holding_id": hid, "exit_date": body.trade_date})
         result["review_task_id"] = task["task_id"]
     return result
+
+
+class AddSharesBody(BaseModel):
+    """手动加仓录入（系统不做任何下单，仅记录人工执行结果）"""
+    price: float = Field(gt=0)
+    shares: int = Field(gt=0)
+    trade_date: str
+    note: str = ""
+
+
+class CostAdjustBody(BaseModel):
+    """手动成本修正（人工核对实盘成本后录入，原因必填留痕）"""
+    cost_price: float = Field(gt=0)
+    reason: str
+
+
+@router.post("/holdings/{hid}/add")
+def add_shares(hid: int, body: AddSharesBody):
+    """手动加仓：加权成本重算 + C3 止损（成本×0.92，知识库红线）联动 + buy 流水留痕"""
+    holding = repo.get_holding(hid)
+    if holding is None or holding.status != "holding":
+        raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
+    if body.shares % 100 != 0:
+        raise HTTPException(status_code=400, detail="加仓股数必须为 100 的整数倍")
+
+    old_shares = holding.shares
+    new_shares = old_shares + body.shares
+    new_entry = round((holding.entry_price * old_shares + body.price * body.shares)
+                      / new_shares, 4)
+    new_stop = round(new_entry * 0.92, 2)
+    repo.add_trade(hid, holding.stock_code, "buy", body.price, body.shares,
+                   body.trade_date, body.note)
+    repo.update_holding(hid, shares=new_shares, entry_price=new_entry,
+                        cost=round(new_entry * new_shares, 2), stop_loss=new_stop)
+    return {"holding_id": hid, "shares": new_shares, "cost_price": new_entry,
+            "stop_loss": new_stop, "added_shares": body.shares}
+
+
+@router.post("/holdings/{hid}/cost")
+def adjust_cost(hid: int, body: CostAdjustBody):
+    """手动成本修正：成本联动 C3 止损重算，adjust 流水留痕（原因必填）"""
+    holding = repo.get_holding(hid)
+    if holding is None or holding.status != "holding":
+        raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
+    if not (body.reason or "").strip():
+        raise HTTPException(status_code=400, detail="成本修正必须填写原因")
+
+    new_stop = round(body.cost_price * 0.92, 2)
+    repo.add_trade(hid, holding.stock_code, "adjust", body.cost_price, holding.shares,
+                   time.strftime("%Y-%m-%d"), f"成本修正：{body.reason.strip()}")
+    repo.update_holding(hid, entry_price=body.cost_price,
+                        cost=round(body.cost_price * holding.shares, 2), stop_loss=new_stop)
+    return {"holding_id": hid, "cost_price": body.cost_price, "stop_loss": new_stop}
+
+
+@router.get("/holdings/{hid}/trades")
+def holding_trades(hid: int):
+    """操作流水（只读）：加仓/减仓/清仓/成本修正记录，最新在前（K223 可追溯）"""
+    rows = repo.get_trades(hid)
+    rows.sort(key=lambda r: (r.created_at, r.id), reverse=True)
+    return [{"id": r.id, "holding_id": r.holding_id, "stock_code": r.stock_code,
+             "side": r.side, "price": r.price, "shares": r.shares,
+             "amount": r.amount, "trade_date": r.trade_date, "note": r.note,
+             "created_at": str(r.created_at)} for r in rows]
 
 
 @router.post("/holdings/{hid}/monitor")

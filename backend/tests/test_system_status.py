@@ -97,15 +97,21 @@ def test_list_endpoints_return_created_at():
 
 
 def test_home_dashboard_renders():
-    """首页 5 模块看板渲染冒烟（需后端在跑）"""
+    """首页看板渲染冒烟：3 Tab（运行状态/今日概览/性能统计）+ 分区卡片 + 任务记录（需后端在跑）"""
     sys.path.insert(0, _STREAMLIT_DIR)  # 供首页 import api_client/render
     at = AppTest.from_file(r"D:\self\streamlit\app.py", default_timeout=180)
     at.run()
     assert not at.exception, f"首页渲染异常: {at.exception}"
+    tabs = [t.label for t in at.tabs]
+    for name in ("运行状态", "今日概览", "性能统计"):
+        assert name in tabs, f"首页缺少 Tab: {name}"
     subs = [s.value for s in at.subheader]
-    for name in ("系统运行状态", "今日操作提示", "持仓与操作建议", "今日候选与建仓机会",
-                 "近期复盘动态", "紧急告警日志"):
+    for name in ("系统服务", "定时任务调度", "任务执行记录"):
         assert name in subs, f"首页缺少模块: {name}"
+    exp = [e.label for e in at.expander]
+    for name in ("今日操作提示（市况五维）", "持仓与操作建议", "紧急告警日志",
+                 "今日热门板块", "今日候选与建仓机会", "近期复盘动态"):
+        assert name in exp, f"首页缺少分区: {name}"
     body = "\n".join(str(m.value) for m in at.markdown)
     assert "当前数据更新于" in body, "首页顶部缺少整体更新时间"
     assert not at.error, f"首页存在报错元素: {[e.value for e in at.error]}"
