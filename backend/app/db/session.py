@@ -57,6 +57,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_review_result_columns()
     _ensure_stock_candidate_detail()
+    _ensure_trade_record_columns()
     _ensure_indexes()
 
 
@@ -113,6 +114,29 @@ def _ensure_review_result_columns(eng=None) -> None:
             for col, ddl in additions.items():
                 try:
                     conn.exec_driver_sql(f"ALTER TABLE review_result ADD COLUMN {col} {ddl}")
+                except Exception:  # noqa: BLE001 列已存在
+                    pass
+
+
+def _ensure_trade_record_columns(eng=None) -> None:
+    """幂等补齐 trade_record.before/after_shares 列（手动操作前后持仓变化留痕，K223；
+    仅增量加列，不重建表不丢数据；旧数据为 NULL，展示层兼容）"""
+    eng = eng or engine
+    additions = {
+        "before_shares": "INTEGER",
+        "after_shares": "INTEGER",
+    }
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(trade_record)")}
+            for col, ddl in additions.items():
+                if col not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE trade_record ADD COLUMN {col} {ddl}")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            for col, ddl in additions.items():
+                try:
+                    conn.exec_driver_sql(f"ALTER TABLE trade_record ADD COLUMN {col} {ddl}")
                 except Exception:  # noqa: BLE001 列已存在
                     pass
 

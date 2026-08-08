@@ -460,6 +460,31 @@ def update_holding(holding_id: int, **fields) -> None:
         _invalidate("holding")
 
 
+def record_holding_trade(holding_id: int, *, side: str, price: float, shares: int,
+                         trade_date: str, note: str,
+                         before_shares: int | None = None,
+                         after_shares: int | None = None,
+                         holding_fields: dict | None = None) -> int:
+    """事务化持仓操作写入（手动加仓/减仓/清仓/成本修正共用）：
+    操作流水 + 持仓字段更新在单 session 一次 commit，失败整体回滚，保证流水与持仓
+    状态一致（K223 留痕与事实一致）。仅数据存取，业务计算（加权成本/C3 等）由调用方
+    算好后经 holding_fields 传入。返回流水 id。"""
+    with SessionLocal() as db:
+        row = db.get(Holding, holding_id)
+        if row is None:
+            raise ValueError("持仓不存在")
+        db.add(TradeRecord(holding_id=holding_id, stock_code=row.stock_code, side=side,
+                           price=price, shares=shares, amount=round(price * shares, 2),
+                           trade_date=trade_date, note=note,
+                           before_shares=before_shares, after_shares=after_shares))
+        if holding_fields:
+            for k, v in holding_fields.items():
+                setattr(row, k, v)
+        db.commit()
+        _invalidate("holding")
+        return row.id
+
+
 def get_active_holdings() -> list[Holding]:
     with SessionLocal() as db:
         return list(db.execute(

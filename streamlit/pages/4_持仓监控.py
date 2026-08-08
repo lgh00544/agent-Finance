@@ -206,7 +206,8 @@ def _position_warnings(code: str, mv_new: float, mv_total_new: float,
 
 
 def _trades_block(hid: int) -> None:
-    """持仓操作流水（只读，最新在前）：加仓/减仓/清仓/成本修正，可追溯（K223）"""
+    """持仓操作流水（只读，最新在前）：加仓/减仓/清仓/成本修正，可追溯（K223）。
+    流水含操作前后股数（before/after_shares，旧数据为 None 时省略）。"""
     try:
         trades = api.holding_trades(hid)
     except Exception as exc:
@@ -219,7 +220,12 @@ def _trades_block(hid: int) -> None:
     for t in trades:
         side = _SIDE_LABEL.get(t.get("side"), t.get("side"))
         note = f"　{t.get('note')}" if t.get("note") else ""
-        st.markdown(f"- **{side}**　{t.get('shares')} 股 @ {t.get('price')}　"
+        b, a = t.get("before_shares"), t.get("after_shares")
+        if b is not None and a is not None and b != a:
+            shares_txt = f"{b:,} → {a:,} 股"
+        else:
+            shares_txt = f"{t.get('shares')} 股"
+        st.markdown(f"- **{side}**　{shares_txt} @ {t.get('price')}　"
                     f"日期 {t.get('trade_date')}{note}")
         render.time_text("记录时间", t.get("created_at"))
 
@@ -276,7 +282,7 @@ def _operation_card(g: dict, total_capital: float, total_market_value: float) ->
                    "触发信号自动推送飞书并记录告警日志；收盘后 15:00-15:30 做收盘数据校验。"
                    "卖出决策由 SellAgent 独立研判，人工按需触发。")
     st.divider()
-    _operation_panel(g, total_capital, total_market_value)
+    _operation_panel(g, total_capital, total_market_value, pfx="det")
     with st.container(border=True):
         render.section_title("操作流水（加仓/减仓/清仓/成本修正，可追溯）")
         _trades_block(hid)
@@ -287,16 +293,20 @@ _OP_PANEL_KEYS = ("optype", "addp", "adds", "addd", "addn",
                   "closep", "closed", "closen", "closeck", "costp", "costr")
 
 
-def _clear_op_state(hid: int) -> None:
-    """操作成功后清理面板输入（避免 rerun 后 widget 值与新边界冲突，如减仓后股数上限变小）"""
+def _clear_op_state(hid: int, pfx: str = "") -> None:
+    """操作成功后清理面板输入（避免 rerun 后 widget 值与新边界冲突，如减仓后股数上限变小）；
+    pfx 为面板 key 前缀（卡片行面板 "row" / 详情面板 "det"），两处面板互不干扰"""
     for k in _OP_PANEL_KEYS:
-        st.session_state.pop(f"{k}_{hid}", None)
+        st.session_state.pop(f"{pfx}{k}_{hid}", None)
 
 
-def _operation_panel(g: dict, total_capital: float, total_market_value: float) -> None:
+def _operation_panel(g: dict, total_capital: float, total_market_value: float,
+                     pfx: str = "") -> None:
     """手动持仓操作编辑：记录加仓/记录减仓/记录清仓/编辑成本。
     股数严格 100 整数倍（K32-3）；C3 止损=成本×0.92 自动重算（知识库红线）；
-    超限/涨跌幅仅黄色警告不阻断，确认后执行并留痕；所有操作不触发实盘交易。"""
+    超限/涨跌幅仅黄色警告不阻断，确认后执行并留痕；所有操作不触发实盘交易。
+    pfx 为 widget key 前缀：卡片行快捷面板传 "row"，详情内面板传 "det"（或默认），
+    两处面板可同时展开互不冲突。"""
     r = g["current"]
     hid = r["id"]
     code = r["stock_code"]
@@ -308,20 +318,31 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
     base = weighted or cur_entry
 
     st.markdown("**持仓操作（手动同步实盘，系统不自动下单）**")
+    # 风控档位最后更新标注（K223 可追溯：最新一次加仓/成本修正的时间与原因）
+    try:
+        _t = api.holding_trades(hid)
+    except Exception:  # noqa: BLE001 流水拉取失败不阻塞操作面板
+        _t = []
+    _adj = next((x for x in _t if x.get("side") in ("buy", "adjust")), None)
+    if _adj:
+        st.caption(f"风控档位最后更新：{str(_adj.get('created_at') or '')[:16]}"
+                   f"（{_adj.get('note') or '加仓/成本调整'}）")
+    else:
+        st.caption("风控档位自建仓后未调整，C3 = 成本 × 0.92 为初始值（建仓记录永久保留可追溯）")
     op = st.selectbox("选择操作类型", ("记录加仓", "记录减仓", "记录清仓", "编辑成本"),
-                      key=f"optype_{hid}")
+                      key=f"{pfx}optype_{hid}")
 
     if op == "记录加仓":
         c1, c2 = st.columns(2)
         with c1:
-            with st.container(key=f"fld_add_price_{hid}"):
+            with st.container(key=f"{pfx}fld_add_price_{hid}"):
                 add_price = st.number_input("成交价格 *", min_value=0.0, step=0.01,
-                                            key=f"addp_{hid}")
+                                            key=f"{pfx}addp_{hid}")
             add_shares = st.number_input("操作股数 *（100 整数倍）", min_value=0, step=100,
-                                         key=f"adds_{hid}")
+                                         key=f"{pfx}adds_{hid}")
         with c2:
-            add_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"addd_{hid}")
-            add_note = st.text_input("操作备注（可选）", key=f"addn_{hid}")
+            add_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}addd_{hid}")
+            add_note = st.text_input("操作备注（可选）", key=f"{pfx}addn_{hid}")
 
         errs = {}
         if add_price <= 0:
@@ -366,7 +387,7 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
                  "tone": "warn" if pos_pct is not None and pos_pct > C2_CAP_PCT else "mute"},
             ])
 
-        if st.button("确认加仓（仅记录，不触发实盘交易）", key=f"btnadd_{hid}",
+        if st.button("确认加仓（仅记录，不触发实盘交易）", key=f"{pfx}btnadd_{hid}",
                      disabled=bool(errs) or add_price <= 0 or add_shares <= 0):
             note = add_note or ""
             if warns:
@@ -375,7 +396,7 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
                 api.holding_add(hid, {"price": float(add_price), "shares": int(add_shares),
                                       "trade_date": add_date or _today_str(), "note": note})
                 st.toast("加仓已记录：加权成本与 C3 止损等风控档位已自动重算")
-                _clear_op_state(hid)
+                _clear_op_state(hid, pfx)
                 st.rerun()
             except Exception as exc:
                 render.msg_card("err", "加仓记录失败", "请核对输入后重试。", detail=exc)
@@ -383,14 +404,14 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
     elif op == "记录减仓":
         c1, c2 = st.columns(2)
         with c1:
-            with st.container(key=f"fld_red_price_{hid}"):
+            with st.container(key=f"{pfx}fld_red_price_{hid}"):
                 red_price = st.number_input("成交价格 *", min_value=0.0, step=0.01,
-                                            key=f"redp_{hid}")
+                                            key=f"{pfx}redp_{hid}")
             red_shares = st.number_input("减仓股数 *（100 整数倍，≤ 持仓）", min_value=0,
-                                         max_value=cur_shares, step=100, key=f"reds_{hid}")
+                                         max_value=cur_shares, step=100, key=f"{pfx}reds_{hid}")
         with c2:
-            red_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"redd_{hid}")
-            red_note = st.text_input("操作备注（可选）", key=f"redn_{hid}")
+            red_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}redd_{hid}")
+            red_note = st.text_input("操作备注（可选）", key=f"{pfx}redn_{hid}")
 
         errs = {}
         if red_price <= 0:
@@ -415,7 +436,7 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
                  "tone": "up" if lock > 0 else "down"},
             ])
 
-        if st.button("确认减仓（仅记录，不触发实盘交易）", key=f"btnred_{hid}",
+        if st.button("确认减仓（仅记录，不触发实盘交易）", key=f"{pfx}btnred_{hid}",
                      disabled=bool(errs) or red_price <= 0 or red_shares <= 0):
             try:
                 result = api.exit_holding(hid, {"price": float(red_price),
@@ -423,7 +444,7 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
                                                 "trade_date": red_date or _today_str(),
                                                 "note": red_note})
                 st.toast(f"减仓已记录，剩余 {result['remain_shares']} 股")
-                _clear_op_state(hid)
+                _clear_op_state(hid, pfx)
                 st.rerun()
             except Exception as exc:
                 render.msg_card("err", "减仓记录失败", "请核对输入后重试。", detail=exc)
@@ -431,12 +452,12 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
     elif op == "记录清仓":
         c1, c2 = st.columns(2)
         with c1:
-            with st.container(key=f"fld_close_price_{hid}"):
+            with st.container(key=f"{pfx}fld_close_price_{hid}"):
                 close_price = st.number_input("成交价格 *", min_value=0.0, step=0.01,
-                                              key=f"closep_{hid}")
-            close_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"closed_{hid}")
+                                              key=f"{pfx}closep_{hid}")
+            close_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}closed_{hid}")
         with c2:
-            close_note = st.text_input("清仓原因（可选）", key=f"closen_{hid}")
+            close_note = st.text_input("清仓原因（可选）", key=f"{pfx}closen_{hid}")
         errs = {}
         if close_price <= 0:
             errs["close_price"] = "成交价格必须大于 0"
@@ -451,8 +472,8 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
                  "tone": "up" if final_pnl > 0 else "down"},
             ])
         confirm = st.checkbox("确认清仓：该标的将移入历史持仓，C3 风控与监控自动停止",
-                              key=f"closeck_{hid}")
-        if st.button("确认清仓（仅记录，不触发实盘交易）", key=f"btnclose_{hid}",
+                              key=f"{pfx}closeck_{hid}")
+        if st.button("确认清仓（仅记录，不触发实盘交易）", key=f"{pfx}btnclose_{hid}",
                      disabled=bool(errs) or close_price <= 0 or not confirm):
             try:
                 result = api.exit_holding(hid, {"price": float(close_price),
@@ -462,7 +483,7 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
                 extra = (f"，复盘任务已提交（{result['review_task_id']}）"
                          if result.get("review_task_id") else "")
                 st.toast(f"已清仓并移入历史持仓{extra}")
-                _clear_op_state(hid)
+                _clear_op_state(hid, pfx)
                 st.rerun()
             except Exception as exc:
                 render.msg_card("err", "清仓记录失败", "请核对输入后重试。", detail=exc)
@@ -470,12 +491,12 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
     else:  # 编辑成本
         c1, c2 = st.columns(2)
         with c1:
-            with st.container(key=f"fld_cost_price_{hid}"):
+            with st.container(key=f"{pfx}fld_cost_price_{hid}"):
                 cost_price = st.number_input("修正后成本价 *", min_value=0.0, step=0.01,
-                                             key=f"costp_{hid}")
+                                             key=f"{pfx}costp_{hid}")
         with c2:
-            with st.container(key=f"fld_cost_reason_{hid}"):
-                cost_reason = st.text_input("修正原因 *（必填留痕）", key=f"costr_{hid}")
+            with st.container(key=f"{pfx}fld_cost_reason_{hid}"):
+                cost_reason = st.text_input("修正原因 *（必填留痕）", key=f"{pfx}costr_{hid}")
         errs = {}
         if cost_price <= 0:
             errs["cost_price"] = "成本价必须大于 0"
@@ -496,13 +517,13 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float) -
                  "tone": "mute"},
             ])
 
-        if st.button("确认修正成本（仅记录，不触发实盘交易）", key=f"btncost_{hid}",
+        if st.button("确认修正成本（仅记录，不触发实盘交易）", key=f"{pfx}btncost_{hid}",
                      disabled=bool(errs) or cost_price <= 0):
             try:
                 api.holding_cost(hid, {"cost_price": float(cost_price),
                                        "reason": cost_reason.strip()})
                 st.toast("成本已修正，C3 止损与全部风控档位已自动重算")
-                _clear_op_state(hid)
+                _clear_op_state(hid, pfx)
                 st.rerun()
             except Exception as exc:
                 render.msg_card("err", "成本修正失败", "请核对输入后重试。", detail=exc)
@@ -573,8 +594,14 @@ try:
                         f"止损 {c.get('stop_loss') or '—'} / 止盈 {c.get('take_profit') or '—'}"
                         f" / 目标仓位 {c.get('target_pct') or '—'}%")
                 key = f"hold_{c['id']}"
-                if render.list_item_toggle(key, label, subtitle="　·　".join(sub_parts),
-                                           dot="info", meta=meta):
+                show_op, opened = render.list_item_toggle_actions(
+                    key, label, subtitle="　·　".join(sub_parts), dot="info", meta=meta,
+                    actions=("持仓操作", "查看详情"))
+                if show_op:
+                    with st.container(border=True):
+                        render.section_title(f"持仓操作 {label}")
+                        _operation_panel(g, total_capital, total_market_value, pfx="row")
+                if opened:
                     with st.container(border=True):
                         with st.container(border=True):
                             render.section_title("历史明细（数据库原始记录）")

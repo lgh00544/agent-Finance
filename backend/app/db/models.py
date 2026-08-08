@@ -115,12 +115,14 @@ class TradeRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     holding_id: Mapped[int] = mapped_column(Integer, index=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
-    side: Mapped[str] = mapped_column(String(8))                     # buy/sell
+    side: Mapped[str] = mapped_column(String(8))                     # buy/sell/adjust
     price: Mapped[float] = mapped_column(Float)
     shares: Mapped[int] = mapped_column(Integer)
     amount: Mapped[float] = mapped_column(Float)                     # 成交金额
     trade_date: Mapped[str] = mapped_column(String(10))
     note: Mapped[str] = mapped_column(Text, default="")
+    before_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 操作前股数（K223 留痕）
+    after_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)   # 操作后股数（K223 留痕）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

@@ -99,7 +99,8 @@ def test_list_endpoints_return_created_at():
 def test_home_dashboard_renders():
     """首页看板渲染冒烟：3 Tab（运行状态/今日概览/性能统计）+ 分区卡片 + 任务记录（需后端在跑）"""
     sys.path.insert(0, _STREAMLIT_DIR)  # 供首页 import api_client/render
-    at = AppTest.from_file(r"D:\self\streamlit\app.py", default_timeout=180)
+    at = AppTest.from_file(str(Path(__file__).resolve().parents[2] / "streamlit" / "app.py"),
+                           default_timeout=180)
     at.run()
     assert not at.exception, f"首页渲染异常: {at.exception}"
     tabs = [t.label for t in at.tabs]

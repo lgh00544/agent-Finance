@@ -402,7 +402,8 @@ def add_holding(body: HoldingBody):
 
 @router.post("/holdings/{hid}/exit")
 def exit_holding(hid: int, body: ExitBody):
-    """记录卖出：股数清零则标记 exited 并自动触发 ReviewAgent 复盘"""
+    """记录卖出：股数清零则标记 exited 并自动触发 ReviewAgent 复盘。
+    流水与持仓更新单事务写入（K223 留痕与事实一致）。"""
     holding = repo.get_holding(hid)
     if holding is None or holding.status != "holding":
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
@@ -411,14 +412,17 @@ def exit_holding(hid: int, body: ExitBody):
     if body.shares > holding.shares:
         raise HTTPException(status_code=400, detail="卖出股数超过持仓")
 
-    repo.add_trade(hid, holding.stock_code, "sell", body.price, body.shares,
-                   body.trade_date, body.note)
     remain = holding.shares - body.shares
-    repo.update_holding(hid, shares=remain)
+    fields = {"shares": remain}
+    if remain == 0:
+        fields["status"] = "exited"
+    repo.record_holding_trade(hid, side="sell", price=body.price, shares=body.shares,
+                              trade_date=body.trade_date, note=body.note,
+                              before_shares=holding.shares, after_shares=remain,
+                              holding_fields=fields)
 
     result = {"holding_id": hid, "remain_shares": remain, "review_task_id": None}
     if remain == 0:
-        repo.update_holding(hid, status="exited")
         task = _submit_task("review", {"holding_id": hid, "exit_date": body.trade_date})
         result["review_task_id"] = task["task_id"]
     return result
@@ -440,7 +444,8 @@ class CostAdjustBody(BaseModel):
 
 @router.post("/holdings/{hid}/add")
 def add_shares(hid: int, body: AddSharesBody):
-    """手动加仓：加权成本重算 + C3 止损（成本×0.92，知识库红线）联动 + buy 流水留痕"""
+    """手动加仓：加权成本重算 + C3 止损（成本×0.92，知识库红线）联动 + buy 流水留痕。
+    流水与持仓更新单事务写入。"""
     holding = repo.get_holding(hid)
     if holding is None or holding.status != "holding":
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
@@ -452,17 +457,20 @@ def add_shares(hid: int, body: AddSharesBody):
     new_entry = round((holding.entry_price * old_shares + body.price * body.shares)
                       / new_shares, 4)
     new_stop = round(new_entry * 0.92, 2)
-    repo.add_trade(hid, holding.stock_code, "buy", body.price, body.shares,
-                   body.trade_date, body.note)
-    repo.update_holding(hid, shares=new_shares, entry_price=new_entry,
-                        cost=round(new_entry * new_shares, 2), stop_loss=new_stop)
+    repo.record_holding_trade(hid, side="buy", price=body.price, shares=body.shares,
+                              trade_date=body.trade_date, note=body.note,
+                              before_shares=old_shares, after_shares=new_shares,
+                              holding_fields={"shares": new_shares, "entry_price": new_entry,
+                                              "cost": round(new_entry * new_shares, 2),
+                                              "stop_loss": new_stop})
     return {"holding_id": hid, "shares": new_shares, "cost_price": new_entry,
             "stop_loss": new_stop, "added_shares": body.shares}
 
 
 @router.post("/holdings/{hid}/cost")
 def adjust_cost(hid: int, body: CostAdjustBody):
-    """手动成本修正：成本联动 C3 止损重算，adjust 流水留痕（原因必填）"""
+    """手动成本修正：成本联动 C3 止损重算，adjust 流水留痕（原因必填）。
+    流水与持仓更新单事务写入。"""
     holding = repo.get_holding(hid)
     if holding is None or holding.status != "holding":
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
@@ -470,27 +478,35 @@ def adjust_cost(hid: int, body: CostAdjustBody):
         raise HTTPException(status_code=400, detail="成本修正必须填写原因")
 
     new_stop = round(body.cost_price * 0.92, 2)
-    repo.add_trade(hid, holding.stock_code, "adjust", body.cost_price, holding.shares,
-                   time.strftime("%Y-%m-%d"), f"成本修正：{body.reason.strip()}")
-    repo.update_holding(hid, entry_price=body.cost_price,
-                        cost=round(body.cost_price * holding.shares, 2), stop_loss=new_stop)
+    repo.record_holding_trade(hid, side="adjust", price=body.cost_price,
+                              shares=holding.shares, trade_date=time.strftime("%Y-%m-%d"),
+                              note=f"成本修正：{body.reason.strip()}",
+                              before_shares=holding.shares, after_shares=holding.shares,
+                              holding_fields={"entry_price": body.cost_price,
+                                              "cost": round(body.cost_price * holding.shares, 2),
+                                              "stop_loss": new_stop})
     return {"holding_id": hid, "cost_price": body.cost_price, "stop_loss": new_stop}
 
 
 @router.get("/holdings/{hid}/trades")
 def holding_trades(hid: int):
-    """操作流水（只读）：加仓/减仓/清仓/成本修正记录，最新在前（K223 可追溯）"""
+    """操作流水（只读）：加仓/减仓/清仓/成本修正记录，最新在前（K223 可追溯）；
+    before/after_shares 为操作前后持仓股数（旧数据为 None，展示层兼容）"""
     rows = repo.get_trades(hid)
     rows.sort(key=lambda r: (r.created_at, r.id), reverse=True)
     return [{"id": r.id, "holding_id": r.holding_id, "stock_code": r.stock_code,
              "side": r.side, "price": r.price, "shares": r.shares,
              "amount": r.amount, "trade_date": r.trade_date, "note": r.note,
+             "before_shares": r.before_shares, "after_shares": r.after_shares,
              "created_at": str(r.created_at)} for r in rows]
 
 
 @router.post("/holdings/{hid}/monitor")
 def trigger_monitor(hid: int):
-    """立即执行一次持仓监控"""
+    """立即执行一次持仓监控（仅限当前有效持仓；已清仓标的不再监控）"""
+    holding = repo.get_holding(hid)
+    if holding is None or holding.status != "holding":
+        raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
     try:
         result = graph_router.run_monitor(hid)
     except Exception as exc:  # noqa: BLE001

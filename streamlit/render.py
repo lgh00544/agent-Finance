@@ -465,7 +465,8 @@ def record_list(items: list, render_fn, batch: int = 20, key: str = "rl",
 def list_item(key: str, title: str, subtitle: str = "", dot: str = "mute",
               meta: str = "", actions: tuple[str, ...] = ("查看详情",)) -> int:
     """企业级列表行：左=状态圆点+主标题(加粗)+副标题(灰色小字)，右=辅助信息+操作按钮组；
-    行高统一、分割线极淡。返回被点击操作按钮的下标（-1 表示无点击）。"""
+    行高统一、分割线极淡。返回被点击操作按钮的下标（-1 表示无点击）。
+    actions 多于 1 个时按钮横向等分（避免竖排过高）。"""
     with st.container(key=f"lrow_{key}", border=True):
         c1, c2 = st.columns([4.2, 1.5], vertical_alignment="center")
         with c1:
@@ -481,22 +482,45 @@ def list_item(key: str, title: str, subtitle: str = "", dot: str = "mute",
             if meta:
                 st.markdown(f'<div class="item-meta">{meta}</div>', unsafe_allow_html=True)
             clicked = -1
-            for i, label in enumerate(actions):
-                if st.button(label, key=f"act_{key}_{i}", use_container_width=True):
-                    clicked = i
+            if len(actions) > 1:
+                cols = st.columns(len(actions))
+                for i, (col, label) in enumerate(zip(cols, actions)):
+                    with col:
+                        if st.button(label, key=f"act_{key}_{i}", use_container_width=True):
+                            clicked = i
+            else:
+                for i, label in enumerate(actions):
+                    if st.button(label, key=f"act_{key}_{i}", use_container_width=True):
+                        clicked = i
             return clicked
+
+
+def list_item_toggle_actions(key: str, title: str, subtitle: str = "", dot: str = "mute",
+                             meta: str = "",
+                             actions: tuple[str, ...] = ("查看详情",)) -> tuple[bool, bool]:
+    """列表行 + 操作按钮组 + 「查看详情」展开管理，两个展开状态互不干扰：
+    actions 末位按钮 = 查看详情（open_{key}），其余按钮 = 操作面板（op_{key}）。
+    返回 (操作面板是否展开, 详情是否展开)，调用方按各自状态渲染对应内容。"""
+    opened = st.session_state.get(f"open_{key}", False)
+    op_state = st.session_state.get(f"op_{key}", False)
+    clicked = list_item(key, title, subtitle, dot, meta, actions)
+    if clicked == len(actions) - 1:  # 末位 = 查看详情
+        opened = not opened
+        st.session_state[f"open_{key}"] = opened
+        st.rerun()
+    elif clicked >= 0:               # 其余按钮 = 操作类
+        op_state = not op_state
+        st.session_state[f"op_{key}"] = op_state
+        st.rerun()
+    return st.session_state.get(f"op_{key}", False), st.session_state.get(f"open_{key}", False)
 
 
 def list_item_toggle(key: str, title: str, subtitle: str = "", dot: str = "mute",
                      meta: str = "") -> bool:
     """列表行 + 「查看详情」展开管理：点击自动切换展开/收起，返回当前是否展开；
     调用方在返回 True 时渲染详情卡片。"""
-    opened = st.session_state.get(f"open_{key}", False)
-    if list_item(key, title, subtitle, dot, meta, ("查看详情",)) == 0:
-        opened = not opened
-        st.session_state[f"open_{key}"] = opened
-        st.rerun()
-    return st.session_state.get(f"open_{key}", False)
+    _, opened = list_item_toggle_actions(key, title, subtitle, dot, meta, ("查看详情",))
+    return opened
 
 
 def section_title(text: str) -> None:

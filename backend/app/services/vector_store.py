@@ -53,29 +53,49 @@ class VectorStore:
             self._client = None
 
     def _ensure_collection(self) -> None:
-        from qdrant_client.models import (Distance, QuantizationType, ScalarQuantization,
-                                          ScalarQuantizationConfig, VectorParams)
+        from qdrant_client.models import Distance, VectorParams
+
+        # 向量维度跟随 embedding 模型：siliconflow=bge-m3(1024 维)，本地=bge-small-zh(512 维)
+        target_dim = 1024 if settings.embedding_provider == "siliconflow" else 512
 
         collections = [c.name for c in self._client.get_collections().collections]
+        if COLLECTION in collections:
+            try:
+                existing_dim = self._client.get_collection(COLLECTION).config.params.vectors.size
+                if existing_dim != target_dim:
+                    logger.warning(
+                        "向量集合维度 %s 与当前 embedding 模型 %s 不匹配，删除重建（需重新索引）",
+                        existing_dim, target_dim)
+                    self._client.delete_collection(COLLECTION)
+                    collections = [c.name for c in self._client.get_collections().collections]
+            except Exception as exc:  # noqa: BLE001 查询失败不阻断，走创建流程
+                logger.warning("向量集合维度检查失败: %s", exc)
         if COLLECTION not in collections:
-            # bge-m3 为 1024 维；本地 bge-small-zh 为 512 维，按首个写入向量定维
             # 本地文件模式默认启用 INT8 标量量化压缩（qdrant_compression=true），减少磁盘占用；
-            # 旧版 qdrant-client 不支持 compression 参数时自动降级重试
+            # qdrant-client 1.18.0 的 QuantizationType 导出缺失（类在 http.models 中），
+            # 不支持时降级为不压缩创建集合（不阻断向量检索）；低版本无 compression 参数同理
             compression = None
             if settings.qdrant_compression:
-                compression = ScalarQuantization(
-                    scalar=ScalarQuantizationConfig(type=QuantizationType.INT8,
-                                                    always_ram=True, quantile=0.99))
+                try:
+                    from qdrant_client.models import (QuantizationType, ScalarQuantization,
+                                                      ScalarQuantizationConfig)
+                    compression = ScalarQuantization(
+                        scalar=ScalarQuantizationConfig(type=QuantizationType.INT8,
+                                                        always_ram=True, quantile=0.99))
+                except ImportError:
+                    logger.warning("qdrant-client 无 QuantizationType，跳过 INT8 压缩")
+            create_kwargs: dict = {
+                "collection_name": COLLECTION,
+                "vectors_config": VectorParams(size=target_dim, distance=Distance.COSINE),
+            }
+            if compression is not None:
+                create_kwargs["compression"] = compression
             try:
-                self._client.create_collection(
-                    collection_name=COLLECTION,
-                    vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
-                    compression=compression,
-                )
+                self._client.create_collection(**create_kwargs)
             except TypeError:  # 旧版本无 compression 参数
                 self._client.create_collection(
                     collection_name=COLLECTION,
-                    vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+                    vectors_config=VectorParams(size=target_dim, distance=Distance.COSINE),
                 )
 
     # ---------------- 索引 ----------------
