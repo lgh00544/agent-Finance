@@ -147,18 +147,21 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
 
 
 def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: float,
-                batches: list, stop_loss: float, take_profit: float, rationale: str) -> int:
+                batches: list, stop_loss: float, take_profit: float, rationale: str,
+                detail: dict | None = None) -> int:
+    """detail: v3.0 白盒扩展（dimensions/final_advice/market_regime），可选；旧调用零影响"""
     with SessionLocal() as db:
         row = PositionPlan(stock_code=stock_code, stock_name=stock_name, plan_date=plan_date,
                            total_pct=total_pct, batches=batches, stop_loss=stop_loss,
-                           take_profit=take_profit, rationale=rationale)
+                           take_profit=take_profit, rationale=rationale, detail=detail)
         db.add(row)
         db.commit()
         db.refresh(row)
         _invalidate("plan")
-        # 推理留痕：position 分批区间/止损止盈/总仓 + 建仓逻辑说明
+        # 推理留痕：position 分批区间/止损止盈/总仓 + 建仓逻辑说明 + v3.0 维度归因
         reasoning_trace.trace_plan(stock_code, stock_name, plan_date, total_pct,
-                                   batches, stop_loss, take_profit, rationale, row.id)
+                                   batches, stop_loss, take_profit, rationale, row.id,
+                                   detail=detail)
         return row.id
 
 
@@ -663,6 +666,7 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "total_pct": r.total_pct, "batches": r.batches,
                                            "stop_loss": r.stop_loss, "take_profit": r.take_profit,
                                            "rationale": r.rationale,
+                                           "detail": r.detail or {},
                                            "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("plan", {"code": code, "limit": limit}, _load)
@@ -847,13 +851,17 @@ def get_agent_suggestions(review_id: int | None = None,
         return list(db.execute(stmt).scalars().all())
 
 
-def update_agent_suggestion_status(suggestion_id: int, status: str) -> AgentSuggestion | None:
-    """人工审核动作：approved / rejected（严格禁止系统自动修改，仅人工调用）"""
+def update_agent_suggestion_status(suggestion_id: int, status: str,
+                                   reason: str = "") -> AgentSuggestion | None:
+    """人工审核动作：approved / rejected（严格禁止系统自动修改，仅人工调用）；
+    reason 为驳回原因（审核留痕，驳回时必填由前端约束，此处仅落库）"""
     with SessionLocal() as db:
         row = db.get(AgentSuggestion, suggestion_id)
         if row is None:
             return None
         row.status = status
+        if status == "rejected" and reason:
+            row.reject_reason = reason.strip()
         db.commit()
         db.refresh(row)
         return row

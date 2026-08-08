@@ -147,10 +147,15 @@ with rows_area:
         # API 行不含 ORM id：用 代码+日期+rank 组成稳定唯一键（同日同股已按最新版去重）
         key = f"cand_{r['stock_code']}_{r['trade_date']}_{r.get('rank')}"
         if render.list_item_toggle(key, f"#{r.get('rank', '-')} {label}　{tier_label}",
-                                   subtitle=subtitle, dot=dot, meta=meta):
+                                   subtitle=subtitle, dot=dot, meta=meta, scope="cand"):
             with st.container(border=True):
                 render.trace_line("本轮挖掘执行时间", r.get("created_at"),
                                   source="行情快照 + LLM 研判", confidence=detail.get("confidence"))
+                # v3.0 白盒维度归因：维度数组 + 综合评估（主结论，置顶展示）
+                with st.container(border=True):
+                    render.section_title("维度归因（五维白盒，主结论）")
+                    render.dimension_bars(detail.get("dimensions"),
+                                          final_advice=detail.get("final_advice"))
                 with st.container(border=True):
                     render.section_title("候选理由")
                     if reasons:
@@ -245,6 +250,9 @@ with rows_area:
                     key=f"raw_cand_{code}_{r['trade_date']}")
 
     # 详情懒加载：首屏 20 条，点「加载更多」增量展示；切换日期/筛选自动回首屏
+    cand_keys = [f"cand_{r['stock_code']}_{r['trade_date']}_{r.get('rank')}" for r in day_rows]
+    render.batch_fold_bar("cand", cand_keys,
+                          label="点击行内「查看详情」展开完整研判（维度归因/理由/风险/操作建议）。")
     render.record_list(day_rows, _cand_detail, batch=20,
                        key=f"_cand_vis_{date}_{filter_opt}_{sector}",
                        empty_text="当日无候选：可切换日期，或点击上方「手动触发每日挖掘」重新生成。")

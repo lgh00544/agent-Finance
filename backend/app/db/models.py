@@ -83,6 +83,7 @@ class PositionPlan(Base):
     stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（LLM 输出）
     take_profit: Mapped[float] = mapped_column(Float, default=0.0)   # 止盈参考价（LLM 输出）
     rationale: Mapped[str] = mapped_column(Text, default="")         # 建仓逻辑（LLM 输出）
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # v3.0 白盒扩展（dimensions/final_advice/market_regime）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -297,6 +298,7 @@ class AgentSuggestion(Base):
     reason: Mapped[str] = mapped_column(Text, default="")              # 建议理由
     evidence: Mapped[str] = mapped_column(Text, default="")            # 事实依据
     status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/approved/rejected
+    reject_reason: Mapped[str] = mapped_column(Text, default="")        # 人工驳回原因（审核留痕）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 

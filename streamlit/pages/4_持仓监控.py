@@ -62,10 +62,12 @@ def _signal_time(label: str, time_str: str | None, signal: dict) -> None:
 
 
 def render_sell_decision(d: dict) -> None:
-    """卖出决策 → 自然语言分段"""
+    """卖出决策 → 自然语言分段（v3.0：维度归因 + 综合评估置顶，旧数据缺省自动跳过）"""
     action = ACTION_MAP.get(d.get("action"), d.get("action"))
     conf = CONF_MAP.get(d.get("confidence"), d.get("confidence"))
     st.markdown(f"**卖出决策：{action}**（置信度 {conf}）")
+    # v3.0 白盒维度归因：维度数组 + 综合评估（主结论）
+    render.dimension_bars(d.get("dimensions"), final_advice=d.get("final_advice"))
     if d.get("reasons"):
         st.markdown("**研判依据**")
         for i, r in enumerate(d["reasons"], 1):
@@ -273,6 +275,9 @@ def _operation_card(g: dict, total_capital: float, total_market_value: float) ->
                     conf = CONF_MAP.get(d.get("confidence"), d.get("confidence"))
                     st.markdown(f"- **{action}**（置信度 {conf}）："
                                 f"{d.get('exit_price_zone') or d.get('risk_warning') or ''}")
+                    # v3.0 综合评估摘要（主结论；旧数据缺省跳过）
+                    if d.get("final_advice"):
+                        st.markdown(f"　{d['final_advice']}")
                     render.time_text("信号生成时间", h["created_at"],
                                      highlight=d.get("action") != "hold"
                                      or d.get("severity") in ("warning", "critical"))
@@ -558,7 +563,8 @@ try:
                             f"{view['quote_error']}；行情字段暂以「—」展示，请稍后手动刷新重试。"
                             "持仓记录本身不受影响。")
         if not rows:
-            st.info("暂无持仓。在页面底部录入已人工建仓的标的。")
+            render.empty_state("暂无持仓。在页面底部录入已人工建仓的标的。",
+                               icon="📭")
         else:
             groups = _dedupe_and_merge(rows)
             total_capital = view.get("total_capital") or 0.0
@@ -596,7 +602,7 @@ try:
                 key = f"hold_{c['id']}"
                 show_op, opened = render.list_item_toggle_actions(
                     key, label, subtitle="　·　".join(sub_parts), dot="info", meta=meta,
-                    actions=("持仓操作", "查看详情"))
+                    actions=("持仓操作", "查看详情"), scope="hold")
                 if show_op:
                     with st.container(border=True):
                         render.section_title(f"持仓操作 {label}")
@@ -610,28 +616,59 @@ try:
                             st.caption("明细为数据库原始记录（包含被自动忽略的重复录入），仅查看不删除；"
                                        "合并行的行情计算基于加权平均成本与总股数。")
                         with st.container(border=True):
+                            render.section_title("止盈与仓位计划（与系统概览同源，自动留痕）")
+                            try:
+                                tp_plans = {p["holding_id"]: p
+                                            for p in api.take_profit_plan().get("rows") or []}
+                            except Exception:  # noqa: BLE001 计划接口失败降级提示
+                                tp_plans = {}
+                            _tp_shown = False
+                            for r in g["records"]:
+                                tp = tp_plans.get(r["id"])
+                                if tp:
+                                    _tp_shown = True
+                                    render.position_plan_card(
+                                        f"tp_{r['id']}",
+                                        render.stock_label(c["stock_code"], c["stock_name"]),
+                                        tp)
+                            if not _tp_shown:
+                                st.caption("止盈计划暂不可用（计算服务未就绪），"
+                                           "可稍后重试或手动刷新行情。")
+                        with st.container(border=True):
                             _operation_card(g, total_capital, total_market_value)
 
+            hold_keys = [f"hold_{g['current']['id']}" for g in groups]
+            render.batch_fold_bar("hold", hold_keys,
+                                  label="点击行内「持仓操作/查看详情」展开对应面板。")
             render.record_list(groups, _group_detail, batch=20, key="_hold_list_vis",
                                empty_text="无当前持仓。")
 
     with tab_alert:
         try:
-            render.alert_list(api.alerts(), key="hold_alert_list",
-                              empty_text="暂无告警记录。持仓监控在交易时段每 3 分钟自动运行。")
+            alert_rows = api.alerts()
+            if alert_rows:
+                alert_keys = [f"hold_alert_list_{r['id']}" for r in alert_rows]
+                render.batch_fold_bar("hold_alert", alert_keys,
+                                      label="点击行内「查看详情」展开完整告警内容。")
+            render.alert_list(alert_rows, key="hold_alert_list",
+                              empty_text="暂无告警记录。持仓监控在交易时段每 3 分钟自动运行。",
+                              scope="hold_alert")
         except Exception as exc:
-            render.error_card("告警记录加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
-                              detail=exc, retry_key="retry_hold_alerts")
+            render.dismissible_error("告警记录加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
+                                     detail=exc, retry_key="retry_hold_alerts",
+                                     dismiss_key="hold_alert")
 
     with tab_hist:
         try:
             exited = api.holdings(status="exited")
         except Exception as exc:
-            render.error_card("历史持仓加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
-                              detail=exc, retry_key="retry_exited")
+            render.dismissible_error("历史持仓加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
+                                     detail=exc, retry_key="retry_exited",
+                                     dismiss_key="exit_list")
             exited = []
         if not exited:
-            st.info("暂无已离场持仓。在「当前持仓」详情中录入人工卖出后自动归档到此。")
+            render.empty_state("暂无已离场持仓。在「当前持仓」详情中录入人工卖出后自动归档到此。",
+                               icon="📭")
         else:
             def _exit_detail(r: dict, _i: int) -> None:
                 label = render.stock_label(r["stock_code"], r["stock_name"])
@@ -640,7 +677,8 @@ try:
                        + (f" · 备注：{r.get('note')}" if r.get("note") else ""))
                 meta = f"离场时间 {str(r.get('created_at') or '')[:16]}"
                 key = f"exit_{r['id']}"
-                if render.list_item_toggle(key, label, subtitle=sub, dot="mute", meta=meta):
+                if render.list_item_toggle(key, label, subtitle=sub, dot="mute", meta=meta,
+                                           scope="exit"):
                     with st.container(border=True):
                         render.trace_line("记录时间", r.get("created_at"))
                         with st.container(border=True):
@@ -653,11 +691,14 @@ try:
                             _trades_block(r["id"])
                         st.caption("复盘结论见「交易复盘」页（录入卖出后自动生成）。")
 
+            exit_keys = [f"exit_{r['id']}" for r in exited]
+            render.batch_fold_bar("exit", exit_keys,
+                                  label="点击行内「查看详情」展开离场记录与操作流水。")
             render.record_list(exited, _exit_detail, batch=20, key="_exit_list_vis",
                                empty_text="暂无历史持仓。")
 except Exception as exc:
-    render.error_card("持仓数据加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
-                      detail=exc, retry_key="retry_holdings")
+    render.dismissible_error("持仓数据加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
+                             detail=exc, retry_key="retry_holdings", dismiss_key="hold_main")
 
 # ============ 截图识别快速录入（OCR 仅文字识别回填，必须人工核对后入库）============
 st.subheader("截图识别快速录入")

@@ -109,10 +109,11 @@ def test_home_dashboard_renders():
     subs = [s.value for s in at.subheader]
     for name in ("系统服务", "定时任务调度", "任务执行记录"):
         assert name in subs, f"首页缺少模块: {name}"
-    exp = [e.label for e in at.expander]
+    # 一级折叠模块（全系统折叠规范：fold_module 箭头标题按钮，兼容原生 expander）
+    mod_labels = [b.label for b in at.button] + [e.label for e in at.expander]
     for name in ("今日操作提示（市况五维）", "持仓与操作建议", "紧急告警日志",
                  "今日热门板块", "今日候选与建仓机会", "近期复盘动态"):
-        assert name in exp, f"首页缺少分区: {name}"
+        assert any(name in lb for lb in mod_labels), f"首页缺少一级折叠模块: {name}"
     body = "\n".join(str(m.value) for m in at.markdown)
     assert "当前数据更新于" in body, "首页顶部缺少整体更新时间"
     assert not at.error, f"首页存在报错元素: {[e.value for e in at.error]}"

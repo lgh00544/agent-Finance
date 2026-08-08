@@ -6,9 +6,18 @@ from pydantic import BaseModel, Field
 
 
 # ================= DiscoverAgent 潜力发掘 =================
+class DiscoverDimension(BaseModel):
+    """v3.0 白盒维度归因：单维度结论（dimensions 数组元素）"""
+    dim: str = Field(description="维度名（固定五维）：基本面/技术趋势/资金/游资/舆情/风险/行业景气")
+    score: float = Field(default=0, ge=0, le=100, description="该维度支持度评分 0-100")
+    verdict: str = Field(default="中性", description="该维度结论三态：支持/中性/风险")
+    advice: str = Field(default="", description="该维度针对性建议（1 句话）")
+
+
 class DiscoverCandidate(BaseModel):
-    """v2.0 输出格式强制升级：代码+全称成对、K202 信心度档位、三维分析、量能判定、
-    核心风险（≥2 项）、关注类型、标的类型标识；禁止仅输出代码与理由。"""
+    """v3.0 输出格式强制升级：白盒维度归因框架（dimensions 数组 + final_advice 主结论）+
+    代码+全称成对、K202 信心度档位、三维分析、量能判定、核心风险（≥2 项）、关注类型、
+    标的类型标识；旧字段（macro/meso/micro/volume/tech）降为补充说明。"""
     stock_code: str = Field(description="6 位股票代码")
     stock_name: str = Field(description="股票全称（与代码成对出现）")
     reason: str = Field(description="候选理由（结合量能/趋势/行业热度/基本面预期的研判）")
@@ -21,14 +30,18 @@ class DiscoverCandidate(BaseModel):
         pattern="^(谨慎观察|建议关注|强烈推荐)$",
         description="K202 信心度档位：谨慎观察/建议关注/强烈推荐")
     confidence_pct: float = Field(ge=0, le=100, description="信心度百分比参考")
-    macro_view: str = Field(description="宏观维度核心判断（大盘/政策/周期）")
-    meso_view: str = Field(description="中观维度核心判断（日线/量价/形态）")
-    micro_view: str = Field(description="微观维度核心判断（分时/盘口/当日资金）")
-    volume_analysis: str = Field(description="量能判定：资金结构、主力动向结论")
+    dimensions: list[DiscoverDimension] = Field(default_factory=list,
+        description="维度归因数组（v3.0 主结论）：五维逐项 {dim/score/verdict/advice}")
+    final_advice: str = Field(default="",
+        description="综合评估（v3.0 主结论）：「综合评估：N/5 维支持，结论，止损-8%，主要风险…」")
+    macro_view: str = Field(description="宏观维度核心判断（补充说明）")
+    meso_view: str = Field(description="中观维度核心判断（补充说明）")
+    micro_view: str = Field(description="微观维度核心判断（补充说明）")
+    volume_analysis: str = Field(description="量能判定：资金结构、主力动向结论（补充说明）")
     risks: list[str] = Field(min_length=2, description="核心风险清单（至少 2 项）")
     focus_type: str = Field(pattern="^(低吸|突破|观察)$", description="关注类型：低吸/突破/观察")
     tech_view: str = Field(default="",
-        description="技术面研判（威科夫/量价/K线形态/谐波至少两套体系交叉验证，标注体系与支撑依据）")
+        description="技术面研判（威科夫/量价/K线形态/谐波至少两套体系交叉验证，标注体系与支撑依据，补充说明）")
     price_levels: str = Field(default="", description="关键价位（支撑位/压力位/建议关注区间）")
     position_hint: str = Field(default="", description="操作建议（低吸/突破/观望 + 参考仓位建议）")
     rule_refs: list[str] = Field(default_factory=list,
@@ -55,9 +68,11 @@ class MarketConditionOutput(BaseModel):
 
 # ================= ScoreAgent 多维打分 =================
 class ScoreDimension(BaseModel):
-    name: str = Field(description="维度名：基本面/技术趋势/资金流向/舆情风险/行业景气")
+    """v3.0 白盒维度归因：单维度结论（资金流向维度内部体现游资信号）"""
+    dim: str = Field(description="维度名（固定五维）：基本面/技术趋势/资金流向/舆情风险/行业景气")
     score: int = Field(ge=0, le=100, description="该维度得分 0-100")
-    comment: str = Field(description="该维度研判依据（引用具体数据）")
+    verdict: str = Field(default="中性", description="该维度结论三态：支持/中性/风险")
+    advice: str = Field(default="", description="该维度针对性建议（1 句话，引用具体数据）")
 
 
 class ScoreOutput(BaseModel):
@@ -65,9 +80,10 @@ class ScoreOutput(BaseModel):
     stock_name: str
     score: int = Field(ge=0, le=100, description="综合得分 0-100")
     grade: str = Field(pattern="^[ABC]$", description="综合评级 A/B/C")
-    dimensions: list[ScoreDimension] = Field(description="五个维度评分明细")
+    dimensions: list[ScoreDimension] = Field(description="五个维度评分明细（dim/score/verdict/advice）")
     risk_list: list[str] = Field(description="风险清单（减持/质押/立案/业绩暴雷/估值过高等）")
-    summary: str = Field(description="整体研判结论（两三句话）")
+    final_advice: str = Field(default="",
+        description="综合评估（v3.0）：「综合评估：N/5 维支持，总分 XX 分（X 级），结论，止损-8%，主要风险…」")
 
 
 # ================= PositionAgent 仓位规划 =================
@@ -86,6 +102,10 @@ class PositionOutput(BaseModel):
     stop_loss: float = Field(gt=0, description="初始止损参考价")
     take_profit: float = Field(gt=0, description="止盈参考价")
     rationale: str = Field(description="建仓逻辑说明")
+    dimensions: list[DiscoverDimension] = Field(default_factory=list,
+        description="维度归因数组（v3.0 主结论）：五维逐项 {dim/score/verdict/advice}")
+    final_advice: str = Field(default="",
+        description="综合评估（v3.0 主结论）：「综合评估：N/5 维支持，可分批建仓，总仓位 X%，止损-8%，主要风险…」")
 
 
 # ================= MonitorAgent 持仓监控 =================
@@ -109,6 +129,10 @@ class SellOutput(BaseModel):
     exit_price_zone: str = Field(description="建议卖出价格区间或触发条件（如 '反弹至 26.5 附近' / '跌破 24.8 离场'）")
     risk_warning: str = Field(description="继续持有的主要风险提示")
     check_list: list[str] = Field(description="人工卖出前需核对事项（仓位/税费/资金安排等）")
+    dimensions: list[DiscoverDimension] = Field(default_factory=list,
+        description="维度归因数组（v3.0 主结论）：五维逐项 {dim/score/verdict/advice}")
+    final_advice: str = Field(default="",
+        description="综合评估（v3.0 主结论）：「综合评估：N/5 维偏离，建议动作，止损位（成本×0.92），主要风险…」")
 
 
 # ================= ReviewAgent 卖出复盘 =================

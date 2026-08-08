@@ -40,6 +40,12 @@ def test_discover_mapping_and_rule_refs():
         "price_levels": "支撑 10 / 压力 12", "position_hint": "回踩低吸",
         "confidence_tier": "建议关注", "confidence_pct": 72.0,
         "rule_refs": ["K8 量价硬检查", "K202 信心度"],
+        # v3.0 白盒维度归因
+        "dimensions": [
+            {"dim": "基本面", "score": 70, "verdict": "支持", "advice": "估值合理"},
+            {"dim": "资金/游资", "score": 60, "verdict": "中性", "advice": "无游资数据"},
+        ],
+        "final_advice": "综合评估：1/5 维支持，可低吸建仓，止损-8%",
     }
     reasoning_trace.trace_candidate(
         "600101", "测试股101", "2026-08-05",
@@ -53,28 +59,35 @@ def test_discover_mapping_and_rule_refs():
     assert "风险1" in t.risk_reasoning and "风险初判B" in t.risk_reasoning
     assert t.rule_refs == "K8 量价硬检查, K202 信心度"
     assert "拉升初期-突破型" in t.final_conclusion
+    # v3.0：final_conclusion 含综合评估原文与维度结论摘要
+    assert "综合评估：1/5 维支持" in t.final_conclusion
+    assert '"资金/游资": "中性"' in t.final_conclusion
     assert t.confidence == pytest.approx(0.72)
     assert t.data_source
 
 
 def test_score_mapping_dimension_split():
     detail = {
-        "技术趋势": {"score": 85, "comment": "均线多头排列"},
-        "舆情风险": {"score": 60, "comment": "负面舆情较少"},
-        "资金流向": {"score": 80, "comment": "主力连续净流入"},
-        "基本面": {"score": 70, "comment": "业绩稳定增长"},
+        # v3.0 白盒结构：verdict + advice
+        "技术趋势": {"score": 85, "verdict": "支持", "advice": "均线多头排列"},
+        "舆情风险": {"score": 60, "verdict": "中性", "advice": "负面舆情较少"},
+        "资金流向": {"score": 80, "verdict": "支持",
+                     "advice": "主力连续净流入，游资席位净买 2000 万（一线游资）"},
+        "基本面": {"score": 70, "verdict": "支持", "advice": "业绩稳定增长"},
+        # 旧数据兼容：comment 结构仍可留痕
         "行业景气": {"score": 75, "comment": "行业景气上行"},
-        "summary": "综合评分 78",
+        "final_advice": "综合评估：3/5 维支持，总分 78 分（B 级），可低吸建仓，止损-8%",
     }
     reasoning_trace.trace_score("600102", "测试股102", "2026-08-05",
                                 78.0, "B", detail, ["减持风险"])
     reasoning_trace.flush()
     t = _trace("600102", "score")
     assert "均线多头排列" in t.technical_reasoning and "负面舆情较少" in t.technical_reasoning
-    assert "主力连续净流入" in t.capital_reasoning
+    assert "主力连续净流入" in t.capital_reasoning and "游资席位净买" in t.capital_reasoning
     assert "业绩稳定增长" in t.fundamental_reasoning and "行业景气上行" in t.fundamental_reasoning
     assert "减持风险" in t.risk_reasoning
-    assert '"score": 78.0' in t.final_conclusion and "综合评分 78" in t.final_conclusion
+    assert '"score": 78.0' in t.final_conclusion
+    assert "综合评估：3/5 维支持" in t.final_conclusion
 
 
 def test_plan_alert_review_sell_mapping():

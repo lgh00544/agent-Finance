@@ -110,9 +110,13 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         model_level=ModelLevel.DEEP,
     )
 
+    # v3.0 白盒维度归因：detail 保持 {维度名: {score, verdict, advice}} dict 形状（前端泛化推导兼容），
+    # 另附 final_advice 综合评估；游资信号在「资金流向」维度的 verdict/advice 中体现
     repo.upsert_score(
         code, name, today, float(output.score), output.grade,
-        {d.name: {"score": d.score, "comment": d.comment} for d in output.dimensions},
+        {d.dim: {"score": d.score, "verdict": d.verdict, "advice": d.advice}
+         for d in output.dimensions}
+        | {"final_advice": output.final_advice},
         output.risk_list,
     )
     state["score_result"] = output.model_dump()

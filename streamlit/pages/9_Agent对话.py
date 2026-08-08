@@ -19,6 +19,7 @@ import time
 import streamlit as st
 
 import api_client as api
+import chat_cards
 import render
 
 render.apply_global_theme()
@@ -255,40 +256,12 @@ with right:
             elif task and task.get("status") in ("pending", "running"):
                 st.info(f"识别处理中（任务 {ltid}，大图可能需要 1-2 分钟）……")
 
-    # ================= 对话历史（统一列表行范式） =================
+    # ================= 对话历史（单轮对话单元：问答绑定 + 展开/收起） =================
     with tab_history:
-        st.markdown(f"**{meta['name']} 对话历史**（最新在前，可回溯每次提问/调教/学习）")
+        st.markdown(f"**{meta['name']} 对话历史**（最新在前，每条「提问+回答」绑定为一轮，"
+                    "默认完整展示，可单条/批量收起展开）")
         try:
             history = api.chat_history(sel, limit=50)
         except Exception:  # noqa: BLE001
             history = []
-        if not history:
-            st.caption("暂无历史记录。")
-        TAG_LABEL = {"qa": "提问", "rule": "调教", "learn": "学习"}
-        TAG_DOT = {"qa": "info", "rule": "warn", "learn": "ok"}
-        VERDICT_LABEL = {"adopted": "采纳", "partial": "部分采纳", "maintained": "维持原规则"}
-
-        def _hist_detail(h: dict, _i: int) -> None:
-            icon = "🙋" if h["role"] == "user" else "🤖"
-            mtype = h["message_type"]
-            tag = TAG_LABEL.get(mtype, mtype)
-            title = f"{icon} [{tag}]"
-            if mtype == "rule" and h.get("verdict"):
-                title += f"　裁决：{VERDICT_LABEL.get(h['verdict'], h['verdict'])}"
-            if h.get("knowledge_id"):
-                title += f"　知识条目 #{h['knowledge_id']}"
-            body = str(h.get("content") or "")
-            subtitle = body[:60] + ("…" if len(body) > 60 else "")
-            key = f"hist_{sel}_{h.get('id', str(h.get('created_at')))}"
-            if render.list_item_toggle(key, title, subtitle=subtitle,
-                                       dot=TAG_DOT.get(mtype, "mute"),
-                                       meta=str(h.get("created_at") or "")[:16]):
-                with st.container(border=True):
-                    st.markdown(body[:800] + ("\n……（内容过长已截断）" if len(body) > 800 else ""))
-                    if h.get("meta") and h["meta"].get("confidence"):
-                        st.caption(f"信心度：{h['meta']['confidence']}/100")
-                    if h.get("meta") and h["meta"].get("sources"):
-                        st.caption("依据来源：" + "；".join(str(s) for s in h["meta"]["sources"]))
-
-        render.record_list(history, _hist_detail, batch=20,
-                           key=f"_chat_hist_{sel}", empty_text="暂无历史记录。")
+        chat_cards.render_history(sel, history)

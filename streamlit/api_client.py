@@ -246,8 +246,8 @@ def approve_suggestion(sid: int) -> dict:
     return _post(f"/api/agent-suggestions/{sid}/approve")
 
 
-def reject_suggestion(sid: int) -> dict:
-    return _post(f"/api/agent-suggestions/{sid}/reject")
+def reject_suggestion(sid: int, reason: str = "") -> dict:
+    return _post(f"/api/agent-suggestions/{sid}/reject", {"reason": reason} if reason else None)
 
 
 def knowledge() -> list:
@@ -271,6 +271,12 @@ def reviews(code: str | None = None, limit: int | None = None) -> list:
     if limit is not None:
         params["limit"] = limit
     return _get("/api/reviews", params or None)
+
+
+def take_profit_plan(force: bool = False) -> dict:
+    """全部持仓的分档止盈/仓位管理计划（与持仓监控页同源，纯计算零 LLM）"""
+    return _get("/api/holdings/take-profit-plan",
+                {"force": "1"} if force else None)
 
 
 def adopt_review(rid: int) -> dict:

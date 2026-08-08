@@ -96,6 +96,16 @@ def _money(value) -> str:
         return "—"
 
 
+# ============ 持仓与操作建议：单标的 4 固定信息模块（与持仓监控页同源） ============
+
+
+def _render_position_plan(key: str, label: str, h: dict, plan: dict, sig: dict | None) -> None:
+    """单只持仓：4 固定信息模块渲染（共享 render.position_plan_card）；
+    核心操作建议优先取最新 LLM 信号动作，缺省按状态标签推导。"""
+    action = ACTION_MAP.get((sig or {}).get("action"), "") if sig else ""
+    render.position_plan_card(key, label, plan, core_action=action)
+
+
 # ============ 3 个 Tab：运行状态 / 今日概览 / 性能统计 ============
 tab_status, tab_overview, tab_perf = st.tabs(["运行状态", "今日概览", "性能统计"])
 
@@ -121,98 +131,169 @@ with tab_status:
 
 # ---------------- Tab 2：今日概览 ----------------
 with tab_overview:
-    # 核心指标卡：候选数 / 持仓数 / 告警数 / 今日盈亏 / 市况评分
-    try:
-        cands = _module("candidates") or []
-        holds = _module("holdings") or []
-        alerts = _module("alerts") or []
-        acc = st.session_state.get("_bar_account") or {}
-        pnl = acc.get("pnl_amount")
-        pnl_txt = f"{_money(pnl)}" + (f"（{acc.get('pnl_pct', 0)}%）" if pnl is not None else "")
-        metrics = [
-            {"label": "今日候选", "value": len(cands), "sub": "最新一轮候选池", "tone": "ok"},
-            {"label": "当前持仓", "value": len(holds), "sub": "有效持仓标的", "tone": "info"},
-            {"label": "告警记录", "value": len(alerts), "sub": "全部信号记录", "tone": "warn"},
-            {"label": "今日盈亏", "value": pnl_txt, "sub": "账户实时估算", "tone": _pnl_tone(pnl)},
-        ]
+    # 模块1：顶部数据概览组（5 张指标卡：候选/持仓/告警/盈亏/市况评分）
+    with render.fold_module("ov_overview", "顶部数据概览",
+                            meta="账户实时估算 · 数据源：行情快照 + LLM 研判",
+                            default_open=True):
         try:
-            mc = _module("market_condition")
-            if mc:
-                band = str(mc.get("band") or "")
-                tone = "up" if "强" in band else ("down" if "弱" in band else "warn")
-                metrics.append({"label": "市况评分", "value": f"{mc['total_score']} 分",
-                                "sub": f"{band} · 候选池上限 {mc['cap']} 只", "tone": tone})
-        except Exception:
-            pass  # 市况缺失不影响其余指标卡
-        render.stat_cards(metrics)
-    except Exception as exc:
-        _fail("核心指标", exc)
+            cands = _module("candidates") or []
+            holds = _module("holdings") or []
+            alerts = _module("alerts") or []
+            acc = st.session_state.get("_bar_account") or {}
+            pnl = acc.get("pnl_amount")
+            pnl_txt = f"{_money(pnl)}" + (f"（{acc.get('pnl_pct', 0)}%）" if pnl is not None else "")
+            metrics = [
+                {"label": "今日候选", "value": len(cands), "sub": "最新一轮候选池", "tone": "ok"},
+                {"label": "当前持仓", "value": len(holds), "sub": "有效持仓标的", "tone": "info"},
+                {"label": "告警记录", "value": len(alerts), "sub": "全部信号记录", "tone": "warn"},
+                {"label": "今日盈亏", "value": pnl_txt, "sub": "账户实时估算", "tone": _pnl_tone(pnl)},
+            ]
+            try:
+                mc = _module("market_condition")
+                if mc:
+                    band = str(mc.get("band") or "")
+                    tone = "up" if "强" in band else ("down" if "弱" in band else "warn")
+                    metrics.append({"label": "市况评分", "value": f"{mc['total_score']} 分",
+                                    "sub": f"{band} · 候选池上限 {mc['cap']} 只", "tone": tone})
+            except Exception:
+                pass  # 市况缺失不影响其余指标卡
+            render.stat_cards(metrics)
+        except Exception as exc:
+            _fail("核心指标", exc)
 
-    # 今日操作提示（v2.0 市况评分详情）
-    with st.expander("今日操作提示（市况五维）", expanded=True):
+    # 全局批量操作区（模块1 下方）：一键收起/展开今日概览全部 7 个模块
+    _MOD_KEYS = ("ov_overview", "ov_market", "ov_positions", "ov_alerts",
+                 "ov_sectors", "ov_cands", "ov_reviews")
+    _m1, _m2, _m3 = st.columns([1.1, 1.1, 4], vertical_alignment="center")
+    with _m1:
+        if st.button("全部展开", key="ov_open_all", use_container_width=True):
+            for k in _MOD_KEYS:
+                st.session_state[f"mod_{k}"] = True
+            st.toast("全部模块已展开")
+            st.rerun()
+    with _m2:
+        if st.button("全部收起", key="ov_fold_all", use_container_width=True):
+            for k in _MOD_KEYS:
+                st.session_state[f"mod_{k}"] = False
+            st.toast("全部模块已收起，仅保留标题栏")
+            st.rerun()
+    with _m3:
+        st.caption("模块默认展开，点击标题栏可单独收起/展开；刷新页面恢复默认。")
+
+    # 模块2：今日操作提示（市况五维）——折叠后标题栏仍显示总分
+    _mc = None
+    try:
+        _mc = _module("market_condition")
+    except Exception:
+        _mc = None
+    _mc_meta = ""
+    if _mc:
+        _mc_meta = (f"市况评分 {_mc['total_score']} 分 · {_mc.get('band', '')}"
+                    f" · 候选池上限 {_mc['cap']} 只")
+    with render.fold_module("ov_market", "今日操作提示（市况五维）",
+                            meta=_mc_meta, default_open=True):
         try:
-            mc = _module("market_condition")
-            if not mc:
+            if not _mc:
                 render.empty_state("暂无市况评分。每日挖掘运行时自动生成市况评分，"
                                    "也可点击顶部「手动触发每日挖掘」。", icon="📈")
             else:
-                st.markdown(f"**市况评分 {mc['total_score']} 分（{mc.get('band', '')}，"
-                            f"候选池上限 {mc['cap']} 只）**")
-                dims = mc.get("dims") or {}
+                dims = _mc.get("dims") or {}
                 dim_labels = [("index", "指数位置"), ("sector", "板块结构"), ("money", "资金方向"),
                               ("sentiment", "情绪指标"), ("risk", "风险维度")]
                 cols = st.columns(len(dim_labels))
                 for col, (key, label) in zip(cols, dim_labels):
                     with col:
                         st.metric(label, dims.get(key, "—"))
-                st.markdown(mc.get("summary", ""))
-                render.trace_line("市况评分生成时间", mc.get("created_at"), source="LLM 生成")
+                st.markdown(_mc.get("summary", ""))
+                render.trace_line("市况评分生成时间", _mc.get("created_at"), source="LLM 生成")
         except Exception as exc:
             _fail("今日操作提示", exc)
 
-    # 持仓与操作建议（最新 LLM 信号）
-    with st.expander("持仓与操作建议", expanded=True):
+    # 模块3：持仓与操作建议（分档止盈 + 仓位管理，独立计算服务；与持仓监控页 100% 同源）
+    holdings = []
+    plan_by_hid: dict = {}
+    latest_by_code: dict = {}
+    try:
+        holdings = _module("holdings") or []
+        for a in _module("alerts") or []:
+            latest_by_code.setdefault(a["stock_code"], a)
         try:
-            holdings = _module("holdings")
+            tp_plans = api.take_profit_plan().get("rows") or []
+        except Exception:  # noqa: BLE001 止盈计划接口失败降级为 LLM 信号展示
+            tp_plans = []
+        plan_by_hid = {p["holding_id"]: p for p in tp_plans if p.get("holding_id")}
+    except Exception:
+        pass
+    with render.fold_module(
+            "ov_positions", "持仓与操作建议",
+            meta=f"持仓 {len(holdings)} 只 · 与持仓监控页同源",
+            default_open=True,
+            batch=("ovpos", [f"ovpos_{h['id']}" for h in holdings]) if holdings else None):
+        try:
             if not holdings:
                 render.empty_state("暂无持仓。在「持仓监控」页录入已人工建仓的标的。", icon="💼")
             else:
-                latest_by_code = {}
-                for a in _module("alerts"):
-                    latest_by_code.setdefault(a["stock_code"], a)
+                st.caption("止盈位/仓位建议由独立计算服务生成（与持仓监控页同源，零 LLM 消耗），"
+                           "每次计算自动写入推理留痕供纠察追溯；⚠️ 所有建议仅作参考，"
+                           "最终交易由人工判断。")
                 for h in holdings:
+                    key = f"ovpos_{h['id']}"
                     label = render.stock_label(h["stock_code"], h["stock_name"])
+                    plan = plan_by_hid.get(h["id"])
                     sig = latest_by_code.get(h["stock_code"])
-                    if sig:
-                        urgent = sig["severity"] in ("warning", "critical") or sig["action"] != "hold"
-                        st.markdown(f"{_sev_icon(sig)} **{label}** `{sig['alert_type']}` "
-                                    f"建议: **{ACTION_MAP.get(sig['action'], sig['action'])}**\n\n"
-                                    f"{sig['message']}")
-                        render.trace_line("信号生成时间", sig["created_at"], source="LLM 生成",
-                                          confidence=sig.get("confidence"), highlight=urgent)
+                    if plan:
+                        _render_position_plan(key, label, h, plan, sig)
                     else:
-                        st.markdown(f"- **{label}**：暂无最新信号（监控在交易时段自动运行）")
+                        # 降级：止盈计划不可用时回退最新 LLM 信号展示
+                        if sig:
+                            urgent = sig["severity"] in ("warning", "critical") or sig["action"] != "hold"
+                            st.markdown(f"{_sev_icon(sig)} **{label}** `{sig['alert_type']}` "
+                                        f"建议: **{ACTION_MAP.get(sig['action'], sig['action'])}**\n\n"
+                                        f"{sig['message']}")
+                            render.trace_line("信号生成时间", sig["created_at"], source="LLM 生成",
+                                              confidence=sig.get("confidence"), highlight=urgent)
+                        else:
+                            st.markdown(f"- **{label}**：暂无最新信号（监控在交易时段自动运行）")
         except Exception as exc:
             _fail("持仓与操作建议", exc)
 
-    # 紧急告警日志（有紧急信号时默认展开）
+    # 模块4：紧急告警日志（单条告警 = 二级折叠项，默认摘要）
     urgent_alerts = []
     try:
         urgent_alerts = [a for a in _module("alerts")[:20] if a["action"] != "hold"]
     except Exception:
         pass
-    with st.expander("紧急告警日志", expanded=bool(urgent_alerts)):
+    with render.fold_module(
+            "ov_alerts", "紧急告警日志",
+            meta=f"紧急信号 {len(urgent_alerts)} 条 · 实时推送飞书",
+            default_open=bool(urgent_alerts),
+            batch=("oval", [f"oval_{a['id']}" for a in urgent_alerts]) if urgent_alerts else None):
         try:
             if urgent_alerts:
                 render.time_text("告警统计时间范围",
                                  f"{urgent_alerts[0]['created_at'][:16]} ~ "
                                  f"{urgent_alerts[-1]['created_at'][:16]}")
+                _SEV_DOT = {"critical": "err", "warning": "warn", "info": "info"}
                 for a in urgent_alerts[:3]:
-                    urgent = a["severity"] in ("warning", "critical")
+                    key = f"oval_{a['id']}"
                     label = render.stock_label(a["stock_code"], a["stock_name"])
-                    st.markdown(f"{_sev_icon(a)} **{label}** `{a['alert_type']}` "
-                                f"建议: **{ACTION_MAP.get(a['action'], a['action'])}**\n\n{a['message']}")
-                    render.time_text("告警触发时间", a["created_at"], highlight=urgent)
+                    sev = a.get("severity") or "info"
+                    if render.list_item_toggle(
+                            key, f"{label} · {a.get('alert_type', '')}",
+                            subtitle=str(a.get("message") or "")[:90],
+                            dot=_SEV_DOT.get(sev, "mute"),
+                            meta=f"触发 {str(a.get('created_at') or '')[:16]}",
+                            default_open=False, scope="oval"):
+                        with st.container(border=True):
+                            st.markdown(a["message"])
+                            act = a.get("action")
+                            if act:
+                                st.markdown(f"- **处置建议**：{ACTION_MAP.get(act, act)}")
+                            if a.get("signal"):
+                                st.markdown("**LLM 研判结论**")
+                                render.render_dict(a.get("signal"))
+                            render.time_text("告警触发时间", a.get("created_at"),
+                                             highlight=sev in ("warning", "critical"))
             else:
                 render.empty_state("暂无紧急告警。持仓监控在交易时段自动运行，"
                                    "触发信号实时推送飞书。", icon="🛡️")
@@ -258,11 +339,11 @@ with tab_overview:
                     st.query_params["sector"] = b["board_name"]
                     st.switch_page("pages/1_每日候选池.py")
 
-    with st.expander("今日热门板块"):
+    with render.fold_module("ov_sectors", "今日热门板块", default_open=False):
         hot_sector_board()
 
-    # 今日候选与建仓机会（次要信息，默认收纳）
-    with st.expander("今日候选与建仓机会"):
+    # 模块6：今日候选与建仓机会（次要信息，默认收纳）
+    with render.fold_module("ov_cands", "今日候选与建仓机会", default_open=False):
         try:
             cands = _module("candidates")
             if cands:
@@ -291,8 +372,8 @@ with tab_overview:
         except Exception as exc:
             _fail("今日候选与建仓机会", exc)
 
-    # 近期复盘动态（次要信息，默认收纳）
-    with st.expander("近期复盘动态"):
+    # 模块7：近期复盘动态（次要信息，默认收纳）
+    with render.fold_module("ov_reviews", "近期复盘动态", default_open=False):
         try:
             revs = _module("reviews")
             if revs:

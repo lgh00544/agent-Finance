@@ -139,6 +139,18 @@ def _line(*parts) -> str:
     return "\n".join(str(p) for p in parts if p)
 
 
+def _dim_text(v: dict) -> str:
+    """维度详情 → 留痕文本：v3.0 verdict/advice 优先，旧数据 comment 兜底"""
+    if isinstance(v, dict):
+        verdict = str(v.get("verdict") or "").strip()
+        advice = str(v.get("advice") or "").strip()
+        comment = str(v.get("comment") or "").strip()
+        if verdict or advice:
+            return _line(f"{verdict}：{advice}" if verdict and advice else (verdict or advice))
+        return comment
+    return ""
+
+
 def trace_candidate(stock_code: str, stock_name: str, trade_date: str,
                     reasons: list, risk_notice: list, snapshot: dict,
                     detail: dict, created_at=None) -> None:
@@ -160,6 +172,10 @@ def trace_candidate(stock_code: str, stock_name: str, trade_date: str,
             "position_hint": detail.get("position_hint", ""),
             "confidence_tier": detail.get("confidence_tier", ""),
             "reasons": reasons,
+            # v3.0 白盒维度归因：综合评估原文 + 各维度结论摘要（dim → verdict）
+            "final_advice": detail.get("final_advice", ""),
+            "dimensions": {d.get("dim", ""): d.get("verdict", "")
+                           for d in (detail.get("dimensions") or []) if isinstance(d, dict)},
         }),
         "confidence": _conf(detail.get("confidence_pct")),
         "data_source": "行情快照 + LLM 研判",
@@ -169,9 +185,10 @@ def trace_candidate(stock_code: str, stock_name: str, trade_date: str,
 
 def trace_score(stock_code: str, stock_name: str, trade_date: str,
                 score: float, grade: str, detail: dict, risk_list: list) -> None:
-    """ScoreAgent：五维分项研判 = dimensions[].comment，按维度归入技术/资金/基本面"""
+    """ScoreAgent：五维分项研判 = dimensions[].verdict/advice（旧数据 comment 兜底），
+    按维度归入技术/资金/基本面；v3.0 final_advice 进 final_conclusion"""
     detail = detail or {}
-    by_name = {name: v.get("comment", "") for name, v in detail.items() if isinstance(v, dict)}
+    by_name = {name: _dim_text(v) for name, v in detail.items() if isinstance(v, dict)}
     submit({
         "stock_code": stock_code, "stock_name": stock_name,
         "source_module": "score", "generate_date": trade_date,
@@ -182,7 +199,7 @@ def trace_score(stock_code: str, stock_name: str, trade_date: str,
         "risk_reasoning": _line(*(risk_list or [])),
         "rule_refs": "",
         "final_conclusion": _j({"score": score, "grade": grade,
-                                "summary": detail.get("summary", "")}),
+                                "final_advice": detail.get("final_advice", "")}),
         "confidence": 0.0,
         "data_source": "行情/财务/资金流/新闻原始数据 + LLM 五维打分",
         "ext_info": "",
@@ -191,8 +208,11 @@ def trace_score(stock_code: str, stock_name: str, trade_date: str,
 
 def trace_plan(stock_code: str, stock_name: str, plan_date: str,
                total_pct: float, batches: list, stop_loss: float,
-               take_profit: float, rationale: str, plan_id: int) -> None:
-    """PositionAgent：结论=分批区间/止损止盈/总仓；推理=建仓逻辑说明"""
+               take_profit: float, rationale: str, plan_id: int,
+               detail: dict | None = None) -> None:
+    """PositionAgent：结论=分批区间/止损止盈/总仓；推理=建仓逻辑说明；
+    detail: v3.0 白盒（dimensions/final_advice/market_regime）"""
+    detail = detail or {}
     submit({
         "stock_code": stock_code, "stock_name": stock_name,
         "source_module": "position", "generate_date": plan_date,
@@ -203,7 +223,11 @@ def trace_plan(stock_code: str, stock_name: str, plan_date: str,
         "risk_reasoning": "",
         "rule_refs": "",
         "final_conclusion": _j({"total_pct": total_pct, "stop_loss": stop_loss,
-                                "take_profit": take_profit, "plan_id": plan_id}),
+                                "take_profit": take_profit, "plan_id": plan_id,
+                                "final_advice": detail.get("final_advice", ""),
+                                "dimensions": {d.get("dim", ""): d.get("verdict", "")
+                                               for d in (detail.get("dimensions") or [])
+                                               if isinstance(d, dict)}}),
         "confidence": 0.0,
         "data_source": "评分 + 大盘指数原始K线 + 资金约束 + LLM 方案",
         "ext_info": "",
@@ -253,7 +277,8 @@ def trace_review(stock_code: str, stock_name: str, exit_date: str,
 
 
 def trace_sell(stock_code: str, stock_name: str, trade_date: str, decision: dict) -> None:
-    """SellAgent：推理=决策依据；结论=动作/置信度/离场区间"""
+    """SellAgent：推理=决策依据；结论=动作/置信度/离场区间 + v3.0 维度归因
+    （final_advice 主结论 + dimensions dim→verdict 摘要；旧数据缺省为空）"""
     decision = decision or {}
     submit({
         "stock_code": stock_code, "stock_name": stock_name,
@@ -267,7 +292,11 @@ def trace_sell(stock_code: str, stock_name: str, trade_date: str, decision: dict
         "final_conclusion": _j({"action": decision.get("action", ""),
                                 "confidence": decision.get("confidence", ""),
                                 "exit_price_zone": decision.get("exit_price_zone", ""),
-                                "check_list": decision.get("check_list", [])}),
+                                "check_list": decision.get("check_list", []),
+                                "final_advice": decision.get("final_advice", ""),
+                                "dimensions": {d.get("dim", ""): d.get("verdict", "")
+                                               for d in (decision.get("dimensions") or [])
+                                               if isinstance(d, dict)}}),
         "confidence": 0.0,
         "data_source": "持仓实时行情/近期监控信号 + LLM 卖出决策",
         "ext_info": "",

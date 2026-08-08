@@ -105,26 +105,33 @@ with tab_list:
             filter_tag = st.selectbox("按适用 Agent 过滤", ["全部"] + AGENTS, key="_kb_filter")
             if filter_tag != "全部":
                 rows = [r for r in rows if r["agent_tag"] == filter_tag]
-            st.caption(f"共 {len(rows)} 条知识（保存/删除立即生效）")
+            with render.fold_module(
+                    "kb_list", "知识条目",
+                    meta=f"共 {len(rows)} 条 · 保存/删除立即生效",
+                    default_open=True,
+                    batch=("kb", [f"kb_{r['id']}" for r in rows]) if rows else None):
+                if not rows:
+                    st.caption("当前过滤条件下无匹配条目。")
+                else:
+                    def _kb_detail(r: dict, _i: int) -> None:
+                        key = f"kb_{r['id']}"
+                        if render.list_item_toggle(key, r["title"],
+                                                   subtitle=f"适用 {r['agent_tag']} · "
+                                                            f"{str(r.get('created_at') or '')[:16]}",
+                                                   dot="info", meta=str(r.get("created_at") or "")[:16],
+                                                   scope="kb"):
+                            with st.container(border=True):
+                                render.trace_line("创建时间", r.get("created_at"))
+                                with st.container(border=True):
+                                    render.section_title("知识正文")
+                                    st.markdown(r["content"])
+                                if st.button("删除该条目", key=f"del_{r['id']}"):
+                                    api.delete_knowledge(r["id"])
+                                    st.success("已删除，对应 Agent 的缓存将自动失效。")
+                                    st.rerun()
 
-            def _kb_detail(r: dict, _i: int) -> None:
-                key = f"kb_{r['id']}"
-                if render.list_item_toggle(key, r["title"],
-                                           subtitle=f"适用 {r['agent_tag']} · "
-                                                    f"{str(r.get('created_at') or '')[:16]}",
-                                           dot="info", meta=str(r.get("created_at") or "")[:16]):
-                    with st.container(border=True):
-                        render.trace_line("创建时间", r.get("created_at"))
-                        with st.container(border=True):
-                            render.section_title("知识正文")
-                            st.markdown(r["content"])
-                        if st.button("删除该条目", key=f"del_{r['id']}"):
-                            api.delete_knowledge(r["id"])
-                            st.success("已删除，对应 Agent 的缓存将自动失效。")
-                            st.rerun()
-
-            render.record_list(rows, _kb_detail, batch=20, key=f"_kb_list_vis_{filter_tag}",
-                               empty_text="无匹配的知识条目。")
+                    render.record_list(rows, _kb_detail, batch=20, key=f"_kb_list_vis_{filter_tag}",
+                                       empty_text="无匹配的知识条目。")
     except Exception as exc:
-        render.error_card("知识库读取失败", "请确认后端服务运行正常后点击「重试」刷新。",
-                          detail=exc, retry_key="retry_kb")
+        render.dismissible_error("知识库读取失败", "请确认后端服务运行正常后点击「重试」刷新。",
+                                 detail=exc, retry_key="retry_kb", dismiss_key="kb_list")

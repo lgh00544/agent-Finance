@@ -7,7 +7,8 @@ from sqlalchemy import create_engine, select
 
 from app.db import repo
 from app.db.models import ReviewResult
-from app.db.session import SessionLocal, _ensure_review_result_columns, init_db
+from app.db.session import (SessionLocal, _ensure_agent_suggestion_columns,
+                            _ensure_review_result_columns, init_db)
 from agent_prompts import review_prompt
 
 
@@ -158,3 +159,57 @@ def test_legacy_table_migration_adds_columns_idempotent(tmp_path):
         assert row[0] == "旧数据", "迁移不应丢数据"
         assert row[1] == "pending", "迁移默认状态应为待审核"
         assert row[2] == 1, "迁移默认迭代次数应为 1"
+
+
+# ==================== 策略闭环建议：驳回原因留痕 ====================
+
+def _insert_agent_suggestion(review_id: int = 1) -> int:
+    return repo.insert_agent_suggestion(
+        review_id=review_id, target_agent="discover", rule_name="换手率阈值",
+        current_value="15%", suggested_value="12%",
+        reason="测试理由", evidence="测试依据", target_kind="profile")
+
+
+def test_suggestion_reject_persists_reason():
+    """驳回带原因 → 落库留痕，可追溯"""
+    sid = _insert_agent_suggestion()
+    row = repo.update_agent_suggestion_status(sid, "rejected", reason="与硬性规则冲突")
+    assert row.status == "rejected"
+    assert row.reject_reason == "与硬性规则冲突"
+
+
+def test_suggestion_approve_does_not_write_reason():
+    """采纳不写驳回原因；驳回不带原因保持空串（旧客户端兼容）"""
+    sid = _insert_agent_suggestion(review_id=2)
+    repo.update_agent_suggestion_status(sid, "approved")
+    assert repo.get_agent_suggestion(sid).reject_reason == ""
+
+    sid2 = _insert_agent_suggestion(review_id=3)
+    repo.update_agent_suggestion_status(sid2, "rejected")
+    assert repo.get_agent_suggestion(sid2).reject_reason == ""
+
+
+def test_agent_suggestion_table_migration_adds_column_idempotent(tmp_path):
+    """旧结构 agent_suggestion（无 reject_reason 列）→ 增量补列，数据不丢，可重复执行"""
+    eng = create_engine(f"sqlite:///{tmp_path / 'legacy_sug.db'}")
+    with eng.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE agent_suggestion ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER, "
+            "target_agent VARCHAR(16), target_kind VARCHAR(16), rule_name VARCHAR(128), "
+            "current_value TEXT, suggested_value TEXT, reason TEXT, evidence TEXT, "
+            "status VARCHAR(16), created_at DATETIME, updated_at DATETIME)")
+        conn.exec_driver_sql(
+            "INSERT INTO agent_suggestion (review_id, target_agent, rule_name) "
+            "VALUES (1, 'discover', '旧建议')")
+
+    _ensure_agent_suggestion_columns(eng)
+    _ensure_agent_suggestion_columns(eng)  # 幂等：第二次不报错
+
+    with eng.connect() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(agent_suggestion)")}
+        assert "reject_reason" in cols, "迁移后缺少 reject_reason 列"
+        row = conn.exec_driver_sql("SELECT rule_name, reject_reason "
+                                   "FROM agent_suggestion").fetchone()
+        assert row[0] == "旧建议", "迁移不应丢数据"
+        assert row[1] == "", "迁移默认驳回原因为空"

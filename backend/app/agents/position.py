@@ -88,6 +88,10 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
         code, name, today, float(output.total_pct),
         [b.model_dump() for b in output.batches],
         float(output.stop_loss), float(output.take_profit), output.rationale,
+        # v3.0 白盒维度归因：dimensions + final_advice + market_regime（顺带落库修复现状丢失）
+        detail={"dimensions": [d.model_dump() for d in output.dimensions],
+                "final_advice": output.final_advice,
+                "market_regime": output.market_regime},
     )
     state["position_plan"] = {**output.model_dump(), "plan_id": plan_id}
     state["stage"] = "plan_position"

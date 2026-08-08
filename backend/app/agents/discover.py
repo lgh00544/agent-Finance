@@ -451,6 +451,9 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         detail = {
             "confidence_tier": cand.confidence_tier, "confidence_pct": cand.confidence_pct,
             "stock_type": cand.stock_type,
+            # v3.0 白盒维度归因（主结论）：dimensions 数组 + final_advice 综合评估
+            "dimensions": [d.model_dump() for d in cand.dimensions],
+            "final_advice": cand.final_advice,
             "macro_view": cand.macro_view, "meso_view": cand.meso_view,
             "micro_view": cand.micro_view, "volume_analysis": cand.volume_analysis,
             "risks": cand.risks, "focus_type": cand.focus_type,

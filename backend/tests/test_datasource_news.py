@@ -153,3 +153,47 @@ def test_llm_final_nonempty_still_replaces(monkeypatch):
     out = discover.llm_final(state)
     assert out["candidates"][0]["stock_code"] == "600519"
     assert replaced == [({"600519"}, "2026-08-05")]  # 有结果才替换
+
+
+def test_llm_final_detail_contains_dimensions_and_final_advice(monkeypatch):
+    """v3.0 白盒落库闭环：llm_final 组装的 detail 必须含 dimensions 数组 + final_advice 综合评估"""
+    from app.agents.schemas import DiscoverCandidate, DiscoverDimension
+
+    cand = DiscoverCandidate(
+        stock_code="600519", stock_name="贵州茅台", reason="量价健康",
+        risk_notice="估值偏高", stock_type="吸筹末期-优选型",
+        confidence_tier="建议关注", confidence_pct=72.0,
+        dimensions=[
+            DiscoverDimension(dim="基本面", score=72, verdict="支持", advice="估值合理"),
+            DiscoverDimension(dim="技术趋势", score=65, verdict="中性", advice="量能不足"),
+            DiscoverDimension(dim="资金/游资", score=60, verdict="中性",
+                              advice="主力净流入，无游资席位数据"),
+            DiscoverDimension(dim="舆情/风险", score=75, verdict="支持", advice="无利空"),
+            DiscoverDimension(dim="行业景气", score=70, verdict="支持", advice="板块向好"),
+        ],
+        final_advice="综合评估：3/5 维支持，可低吸建仓，止损-8%，主要风险…",
+        macro_view="m", meso_view="e", micro_view="s",
+        volume_analysis="v", risks=["风险A", "风险B"], focus_type="低吸")
+    captured = {}
+
+    def _fake_upsert(*a, **k):
+        # upsert_candidate 的 detail 是第 8 个位置参数（snapshot, detail 之后为 kwargs 兜底）
+        captured["detail"] = a[7] if len(a) > 7 else k.get("detail")
+
+    state = {"shortlist": [cand.model_dump()], "enrichment": {}, "data_enrichment": {},
+             "market_cap": 10, "trade_date": "2026-08-05",
+             "universe": [{"code": "600519", "name": "贵州茅台"}]}
+    monkeypatch.setattr(discover, "agent_call",
+                        lambda **k: DiscoverOutput(market_summary="测试市况", candidates=[cand]))
+    monkeypatch.setattr(discover.repo, "upsert_candidate", _fake_upsert)
+    monkeypatch.setattr(discover.repo, "replace_day_candidates", lambda codes, date: 0)
+
+    discover.llm_final(state)
+    detail = captured["detail"]
+    assert len(detail["dimensions"]) == 5
+    assert detail["dimensions"][0] == {"dim": "基本面", "score": 72.0,
+                                       "verdict": "支持", "advice": "估值合理"}
+    assert detail["dimensions"][2]["dim"] == "资金/游资"
+    assert detail["final_advice"].startswith("综合评估：3/5 维支持")
+    # 旧字段保留为补充说明
+    assert detail["tech_view"] == "" and detail["position_hint"] == ""

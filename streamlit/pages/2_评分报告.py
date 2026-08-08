@@ -48,47 +48,48 @@ def _score_detail_card(r: dict) -> None:
             render.stat_cards([{"label": "综合分", "value": r["score"]}])
             render.badge(f"{grade} 级" if grade else "未评级", badge_tone)
 
-        # 分区一：五维分项评分（结构为 {维度: {score, comment}} 的字段才进表）
-        with st.container(border=True):
-            render.section_title("五维分项评分")
+        # 分区一：五维分项评分（结构为 {维度: {score, verdict/advice}} 的字段才进表；
+        # v3.0 白盒：verdict 结论 + advice 建议；旧数据 comment 兼容兜底）
+        with render.fold_module(f"score_dims_{r['id']}", "五维分项评分", default_open=True):
             dims = {k: v for k, v in d.items() if isinstance(v, dict) and "score" in v}
             if dims:
                 dim_df = pd.DataFrame([
                     {"维度": name, "得分": v.get("score", ""),
-                     "研判依据": v.get("comment", "")} for name, v in dims.items()
+                     "结论": v.get("verdict", ""),
+                     "研判依据": v.get("advice") or v.get("comment", "")}
+                    for name, v in dims.items()
                 ])
                 st.dataframe(dim_df, width="stretch", hide_index=True)
             else:
                 st.markdown("（该轮未输出分项明细）")
+            # v3.0 综合评估（主结论，高亮展示；旧数据缺省不渲染）
+            if d.get("final_advice"):
+                render.dimension_bars(None, final_advice=d.get("final_advice"))
 
         # 分区二：候选研判附属区（评分记录内嵌候选结论时展示；缺失则整段不渲染）
-        if d.get("confidence_tier"):
-            with st.container(border=True):
-                render.section_title("K202 信心度检查")
-                st.markdown(f"- 信心度档位：{d['confidence_tier']}"
-                            + (f"（参考 {d.get('confidence_pct')}%）"
-                               if d.get("confidence_pct") else ""))
-        if d.get("stock_type"):
-            with st.container(border=True):
-                render.section_title("派发期校验（标的类型定位）")
-                st.markdown(f"- {d['stock_type']}")
-        if any(d.get(k) for k in ("macro_view", "meso_view", "micro_view")):
-            with st.container(border=True):
-                render.section_title("三维验证（宏观 / 中观 / 微观）")
-                st.markdown(f"- 宏观：{d.get('macro_view') or '（无）'}")
-                st.markdown(f"- 中观：{d.get('meso_view') or '（无）'}")
-                st.markdown(f"- 微观：{d.get('micro_view') or '（无）'}")
-        if d.get("position_hint") or d.get("focus_type"):
-            with st.container(border=True):
-                render.section_title("操作建议")
-                if d.get("focus_type"):
-                    st.markdown(f"- 关注类型：{d['focus_type']}")
-                if d.get("position_hint"):
-                    st.markdown(f"- 参考建议：{d['position_hint']}")
+        if (d.get("confidence_tier") or d.get("stock_type")
+                or any(d.get(k) for k in ("macro_view", "meso_view", "micro_view"))
+                or d.get("position_hint") or d.get("focus_type")):
+            with render.fold_module(f"score_extra_{r['id']}", "事实依据与操作建议（附属研判）",
+                                    default_open=False):
+                if d.get("confidence_tier"):
+                    st.markdown(f"- **K202 信心度检查**：{d['confidence_tier']}"
+                                + (f"（参考 {d.get('confidence_pct')}%）"
+                                   if d.get("confidence_pct") else ""))
+                if d.get("stock_type"):
+                    st.markdown(f"- **派发期校验（标的类型定位）**：{d['stock_type']}")
+                if any(d.get(k) for k in ("macro_view", "meso_view", "micro_view")):
+                    st.markdown(f"- **三维验证**：宏观 {d.get('macro_view') or '（无）'}；"
+                                f"中观 {d.get('meso_view') or '（无）'}；"
+                                f"微观 {d.get('micro_view') or '（无）'}")
+                if d.get("position_hint") or d.get("focus_type"):
+                    if d.get("focus_type"):
+                        st.markdown(f"- **关注类型**：{d['focus_type']}")
+                    if d.get("position_hint"):
+                        st.markdown(f"- **参考建议**：{d['position_hint']}")
 
-        # 分区三：风险清单
-        with st.container(border=True):
-            render.section_title("风险清单")
+        # 分区三：风险清单（三级详情区，默认收起）
+        with render.fold_module(f"score_risk_{r['id']}", "风险提示", default_open=False):
             risks = r.get("risk_list") or []
             if risks:
                 for risk in risks:

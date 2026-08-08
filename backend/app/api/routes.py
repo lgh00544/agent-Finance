@@ -567,6 +567,10 @@ class RejectReviewBody(BaseModel):
     reason: str = Field(min_length=1, description="驳回原因（必填，至少 1 个字符）")
 
 
+class RejectSuggestionBody(BaseModel):
+    reason: str = Field(default="", description="驳回原因（审核留痕，可空以兼容旧客户端）")
+
+
 @router.post("/reviews/{rid}/adopt")
 def adopt_review_suggestion(rid: int):
     """采纳复盘给出的交易偏好优化建议 → 更新 sys_trade_profile"""
@@ -687,6 +691,7 @@ def list_agent_suggestions(status: Optional[str] = None, target_agent: Optional[
              "target_kind": s.target_kind, "rule_name": s.rule_name,
              "current_value": s.current_value, "suggested_value": s.suggested_value,
              "reason": s.reason, "evidence": s.evidence, "status": s.status,
+             "reject_reason": s.reject_reason or "",
              "created_at": str(s.created_at)} for s in suggestions]
 
 
@@ -731,15 +736,28 @@ def approve_agent_suggestion(sid: int):
 
 
 @router.post("/agent-suggestions/{sid}/reject")
-def reject_agent_suggestion(sid: int):
-    """人工审核：驳回建议（不修改任何配置）"""
+def reject_agent_suggestion(sid: int, body: RejectSuggestionBody | None = None):
+    """人工审核：驳回建议（不修改任何配置）；reason 为驳回原因，落库留痕（审核可追溯）"""
     suggestion = repo.get_agent_suggestion(sid)
     if suggestion is None:
         raise HTTPException(status_code=404, detail="建议不存在")
     if suggestion.status != "pending":
         raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
-    repo.update_agent_suggestion_status(sid, "rejected")
-    return {"rejected": True, "suggestion_id": sid}
+    reason = (body.reason if body else "") or ""
+    repo.update_agent_suggestion_status(sid, "rejected", reason=reason)
+    return {"rejected": True, "suggestion_id": sid, "reason": reason}
+
+
+# ================= 持仓止盈/仓位管理计划（独立计算服务，与持仓监控页同源） =================
+@router.get("/holdings/take-profit-plan")
+def take_profit_plan(force: bool = False):
+    """全部持仓的分档止盈 + 阶梯止损 + 仓位管理计划（纯计算，零 LLM 调用）。
+    行情/参考止损止盈来自 build_holding_view()（与持仓监控页同一函数）100% 同源；
+    结果按 代码+日期 缓存 10 分钟，force=true 击穿（手动刷新）；
+    每次计算自动写推理留痕（source_module='position_monitor'），并顺带检查
+    「接近止盈/止盈触发」告警（独立去重通道，不改监控循环）。"""
+    from app.services.take_profit import build_plans
+    return build_plans(force=force)
 
 
 # ================= 其他 =================

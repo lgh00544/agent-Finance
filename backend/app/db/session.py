@@ -58,6 +58,8 @@ def init_db() -> None:
     _ensure_review_result_columns()
     _ensure_stock_candidate_detail()
     _ensure_trade_record_columns()
+    _ensure_agent_suggestion_columns()
+    _ensure_position_plan_detail()
     _ensure_indexes()
 
 
@@ -139,6 +141,39 @@ def _ensure_trade_record_columns(eng=None) -> None:
                     conn.exec_driver_sql(f"ALTER TABLE trade_record ADD COLUMN {col} {ddl}")
                 except Exception:  # noqa: BLE001 列已存在
                     pass
+
+
+def _ensure_agent_suggestion_columns(eng=None) -> None:
+    """幂等补齐 agent_suggestion.reject_reason 列（人工驳回原因留痕；
+    仅增量加列，不重建表不丢数据；旧数据默认空串）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(agent_suggestion)")}
+            if "reject_reason" not in existing:
+                conn.exec_driver_sql("ALTER TABLE agent_suggestion ADD COLUMN reject_reason TEXT DEFAULT ''")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql("ALTER TABLE agent_suggestion ADD COLUMN reject_reason TEXT DEFAULT ''")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _ensure_position_plan_detail(eng=None) -> None:
+    """幂等补齐 position_plan.detail 列（v3.0 白盒扩展：dimensions/final_advice/market_regime；
+    仅增量加列，不重建表不丢数据；旧数据为 NULL，展示层兼容）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(position_plan)")}
+            if "detail" not in existing:
+                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN detail JSON")
+        else:
+            try:
+                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN detail JSON")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
 
 
 def get_session() -> Session:

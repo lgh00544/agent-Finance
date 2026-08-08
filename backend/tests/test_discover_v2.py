@@ -40,6 +40,15 @@ def _valid_candidate() -> dict:
         "risk_notice": "估值偏高",
         "stock_type": "吸筹末期-优选型",
         "confidence_tier": "建议关注", "confidence_pct": 72.0,
+        # v3.0 白盒维度归因（主结论）
+        "dimensions": [
+            {"dim": "基本面", "score": 72, "verdict": "支持", "advice": "估值合理"},
+            {"dim": "技术趋势", "score": 65, "verdict": "中性", "advice": "量能不足"},
+            {"dim": "资金/游资", "score": 60, "verdict": "中性", "advice": "无游资数据"},
+            {"dim": "舆情/风险", "score": 75, "verdict": "支持", "advice": "无利空"},
+            {"dim": "行业景气", "score": 70, "verdict": "支持", "advice": "板块向好"},
+        ],
+        "final_advice": "综合评估：3/5 维支持，可低吸建仓，止损-8%，主要风险…",
         "macro_view": "宏观判断", "meso_view": "中观判断", "micro_view": "微观判断",
         "volume_analysis": "主力小幅流入", "risks": ["风险A", "风险B"],
         "focus_type": "低吸",
@@ -50,6 +59,25 @@ def test_discover_candidate_v2_valid():
     c = DiscoverCandidate(**_valid_candidate())
     assert c.confidence_tier in ("谨慎观察", "建议关注", "强烈推荐")
     assert c.focus_type in ("低吸", "突破", "观察")
+
+
+def test_discover_candidate_dimensions_parsed():
+    """v3.0：dimensions 数组正确解析（dim/score/verdict/advice），final_advice 原文保留"""
+    c = DiscoverCandidate(**_valid_candidate())
+    assert len(c.dimensions) == 5
+    dims = {d.dim: d for d in c.dimensions}
+    assert set(dims) == {"基本面", "技术趋势", "资金/游资", "舆情/风险", "行业景气"}
+    assert dims["基本面"].score == 72 and dims["基本面"].verdict == "支持"
+    assert dims["资金/游资"].advice == "无游资数据"
+    assert c.final_advice.startswith("综合评估：3/5 维支持")
+
+
+def test_discover_candidate_dimensions_default_empty():
+    """兼容：旧 LLM 输出（无 dimensions/final_advice）解析为默认值，不抛错"""
+    data = _valid_candidate()
+    del data["dimensions"], data["final_advice"]
+    c = DiscoverCandidate(**data)
+    assert c.dimensions == [] and c.final_advice == ""
 
 
 def test_discover_candidate_requires_two_risks():

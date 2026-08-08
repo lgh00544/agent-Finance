@@ -56,8 +56,14 @@ try:
             if render.list_item_toggle(key, label, subtitle=subtitle, dot=dot, meta=meta):
                 with st.container(border=True):
                     render.trace_line("方案生成时间", r.get("created_at"), source="LLM 生成")
+                    # v3.0 白盒维度归因：维度数组 + 综合评估（主结论，置顶展示；旧数据缺省自动跳过）
+                    with st.container(border=True):
+                        render.section_title("维度归因（五维白盒，主结论）")
+                        render.dimension_bars((r.get("detail") or {}).get("dimensions"),
+                                              final_advice=(r.get("detail") or {}).get("final_advice"))
                     with st.container(border=True):
                         render.section_title("市场强弱判断与建仓逻辑")
+                        st.markdown((r.get("detail") or {}).get("market_regime") or "（无）")
                         st.markdown(r["rationale"] or "（无）")
                     with st.container(border=True):
                         render.section_title("仓位与风控参考")

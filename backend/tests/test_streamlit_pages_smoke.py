@@ -268,11 +268,12 @@ def test_knowledge_page_tabs():
 
 
 def test_review_page_expander():
-    """交易复盘页：策略闭环建议区折叠容器存在（待审核条数实时展示）"""
+    """交易复盘页：策略闭环建议区一级折叠模块存在（待审核条数实时展示）"""
     at = AppTest.from_file(str(PAGES_DIR / "5_交易复盘.py"), default_timeout=180)
     at.run()
     assert not at.exception, f"5_交易复盘.py 渲染异常: {at.exception}"
-    assert any("策略闭环" in e.label for e in at.expander), "缺少策略闭环建议区"
+    labels = [b.label for b in at.button] + [e.label for e in at.expander]
+    assert any("策略闭环" in lb for lb in labels), "缺少策略闭环建议区折叠模块"
 
 
 def test_enterprise_list_components():

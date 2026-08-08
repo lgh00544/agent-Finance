@@ -24,9 +24,24 @@ try:
     if not rows:
         render.empty_state("暂无告警记录。持仓监控在交易时段每 3 分钟自动运行。")
     else:
+        # 级别/类型筛选：数据全量在手，纯前端过滤零后端改动
+        _LV = {"all": "全部级别", "critical": "严重", "warning": "警告", "info": "提示"}
+        lv = st.selectbox("按级别筛选", list(_LV), format_func=lambda v: _LV[v], key="_al_lv")
+        types = sorted({str(r.get("alert_type") or "未知") for r in rows})
+        tp = st.selectbox("按类型筛选", ["全部类型"] + types, key="_al_tp")
+        filtered = [r for r in rows
+                    if (lv == "all" or str(r.get("severity") or "") == lv)
+                    and (tp == "全部类型" or str(r.get("alert_type") or "") == tp)]
         render.time_text("告警统计时间范围",
                          f"{rows[0]['created_at'][:16]} ~ {rows[-1]['created_at'][:16]}")
-        render.alert_list(rows, key="alert_page", empty_text="无匹配的告警记录。")
+        if not filtered:
+            st.caption("当前筛选条件下无匹配告警。")
+        else:
+            alert_keys = [f"alert_page_{r['id']}" for r in filtered]
+            render.batch_fold_bar("alert", alert_keys,
+                                  label="点击行内「查看详情」展开完整告警原因与处置建议。")
+            render.alert_list(filtered, key="alert_page", empty_text="无匹配的告警记录。",
+                              scope="alert")
 except Exception as exc:
-    render.error_card("告警日志加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
-                      detail=exc, retry_key="retry_alerts")
+    render.dismissible_error("告警日志加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
+                             detail=exc, retry_key="retry_alerts", dismiss_key="alert_page")

@@ -208,15 +208,49 @@ def _require_agent(agent: str) -> dict:
     return meta
 
 
+# ==================== 持仓止盈/仓位建议注入（与持仓监控页/系统概览同源） ====================
+_HOLDING_KEYWORDS = ("持仓", "止盈", "止损", "减仓", "加仓", "仓位", "卖出", "锁利", "离场")
+
+
+def _holding_context() -> str:
+    """当前持仓的分档止盈+止损+仓位建议摘要（复用独立计算服务，10 分钟缓存；
+    计算失败返回空串，绝不阻塞对话主流程）"""
+    try:
+        from app.services.take_profit import build_plans
+        plans = build_plans().get("rows") or []
+    except Exception as exc:  # noqa: BLE001 注入失败不阻塞
+        logger.warning("持仓止盈上下文注入失败: %s", exc)
+        return ""
+    if not plans:
+        return ""
+    lines = ["【当前持仓止盈与仓位建议（与持仓监控页同源，仅供参考，交易必须人工决策）】"]
+    for p in plans:
+        lines.append(
+            f"- {p['stock_name']}({p['stock_code']})：状态={p.get('status', '持有观察')}；"
+            f"第一止盈位={p.get('tp1')}（触发减仓1/3锁利）第二止盈位={p.get('tp2')}；"
+            f"C3止损={p.get('c3_stop')}（成本×0.92）；单票仓位"
+            f"{p.get('single_pct') if p.get('single_pct') is not None else '—'}%"
+            f"（C1上限30%）；"
+            f"加仓条件：{p.get('add_condition') or '当前不满足'}；"
+            f"减仓条件：{p.get('reduce_condition') or '除止盈分档外暂无'}")
+    return "\n".join(lines)
+
+
 def ask_agent(agent: str, question: str) -> dict:
-    """文字提问答疑：agent_call 固定段序注入知识，ttl=0 不命中缓存（交互即时性）"""
+    """文字提问答疑：agent_call 固定段序注入知识，ttl=0 不命中缓存（交互即时性）；
+    问题涉及持仓操作时自动注入分档止盈/止损/仓位建议（与页面格式一致，零改动 Agent 调度）"""
     meta = _require_agent(agent)
     if not question or not question.strip():
         raise ValueError("问题不能为空")
+    user_prompt = _chat_user_prompt(question.strip(), meta)
+    if any(kw in question for kw in _HOLDING_KEYWORDS):
+        ctx = _holding_context()
+        if ctx:
+            user_prompt = f"{user_prompt}\n\n{ctx}"
     key = f"chat:{agent}:{hashlib.md5(question.strip().encode('utf-8')).hexdigest()[:10]}"
     answer = common.agent_call(
         agent=agent, cache_key=key, system_prompt=_CHAT_SYSTEM_PROMPT,
-        user_prompt=_chat_user_prompt(question.strip(), meta),
+        user_prompt=user_prompt,
         schema=ChatAnswer, ttl_seconds=0, model_level=ModelLevel.DEEP)
     sources_text = "；".join(s for s in answer.sources if s) or "未标注具体来源"
     payload = {"answer": answer.answer, "confidence": answer.confidence,

@@ -4,7 +4,9 @@
 后端存储与 LLM 交互保持结构化 JSON 不变，仅在此层做渲染转换。
 时间统一展示格式 YYYY-MM-DD HH:mm（北京时间），浅色小字标注数据生成/检测时间。
 """
+import contextlib
 import json
+from collections.abc import Iterator
 
 import streamlit as st
 
@@ -271,6 +273,70 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
 .trace-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
               margin-bottom: 4px; }
 .trace-meta { font-size: 12px; color: var(--text-mute); }
+/* ===== Agent 对话历史：单轮对话单元卡片 ===== */
+/* 顶部徽章行：类型/状态徽章 + 弱化时间小字 */
+.chat-top-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+                  font-size: 12px; color: var(--text-dim); }
+.chat-top-chips .t { color: var(--text-mute); }
+/* 提问区：右对齐 + 浅一级背景，模拟用户发送视角（key 前缀 chat_q_） */
+[class*="st-key-chat_q_"] {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 4px 0 10px;
+  margin-left: auto;
+  max-width: 94%;
+}
+[class*="st-key-chat_q_"] p { margin: 0; }
+/* 收起态摘要：首行文字 + 底部渐隐遮罩，直观提示内容未完全展示 */
+.chat-preview {
+  font-size: 13px; color: var(--text-dim); line-height: 1.7;
+  padding: 8px 12px; margin: 4px 0;
+  border: 1px dashed var(--border); border-radius: 8px;
+  max-height: 64px; overflow: hidden;
+  -webkit-mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
+  mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
+}
+/* 底部辅助信息：弱化小字，不抢占核心内容注意力 */
+.chat-foot { font-size: 12px; color: var(--text-mute); margin-top: 6px; }
+/* ===== 维度归因条（v3.0 白盒框架）：维度名 + 评分条 + 结论色点 + 建议文本 ===== */
+.dim-summary { margin: 0.3rem 0 0.6rem; }
+.dim-block { margin: 0.45rem 0; }
+.dim-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.dim-name { color: var(--text); font-weight: 600; min-width: 5.5em; white-space: nowrap; }
+.dim-track { flex: 1; height: 8px; background: var(--bg-input); border: 1px solid var(--border);
+             border-radius: 4px; overflow: hidden; }
+.dim-fill { height: 100%; border-radius: 4px; transition: width 0.3s ease; }
+.dim-score { font-size: 12px; color: var(--text-dim); min-width: 2.8em; text-align: right; }
+.dim-verdict { font-size: 11px; padding: 0 0.45rem; border-radius: 3px; font-weight: 600;
+               white-space: nowrap; }
+.dim-verdict.support { color: var(--up); background: rgba(239, 68, 68, 0.12);
+                       border: 1px solid rgba(239, 68, 68, 0.35); }
+.dim-verdict.neutral { color: var(--text-dim); background: rgba(156, 163, 175, 0.12);
+                       border: 1px solid var(--border); }
+.dim-verdict.risk { color: var(--warn); background: rgba(245, 158, 11, 0.12);
+                    border: 1px solid rgba(245, 158, 11, 0.35); }
+.dim-advice { font-size: 12px; color: var(--text-dim); line-height: 1.6;
+              margin: 2px 0 0 5.5em; }
+/* 综合评估高亮卡（v3.0 主结论） */
+.advice-card { border: 1px solid var(--primary-dim); border-left: 3px solid var(--primary);
+               background: rgba(59, 130, 246, 0.06); border-radius: 8px;
+               padding: 10px 14px; margin: 0.5rem 0; }
+.advice-card .advice-title { font-size: 12px; color: var(--info); font-weight: 600; }
+.advice-card .advice-body { font-size: 14px; color: var(--text); line-height: 1.7; margin-top: 4px; }
+/* ===== 通用折叠规范：一级模块卡片（对齐对话历史页卡片标准，无自定义样式） ===== */
+/* 主标题按钮：加粗 + 主色高亮（箭头随状态翻转 ▾/▸；与对话历史卡片同款文字按钮） */
+[class*="st-key-foldbtn_"] button {
+  background: transparent !important; border: none !important;
+  box-shadow: none !important; text-align: left; padding: 2px 0;
+  color: var(--primary) !important; font-size: 15px; font-weight: 700;
+  transition: color 0.2s ease;
+}
+[class*="st-key-foldbtn_"] button:hover { color: #60a5fa; }
+.fold-meta { font-size: 12px; color: var(--text-dim); text-align: left;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fold-meta .up { color: var(--up); } .fold-meta .down { color: var(--down); }
 </style>
 """
 
@@ -497,11 +563,18 @@ def list_item(key: str, title: str, subtitle: str = "", dot: str = "mute",
 
 def list_item_toggle_actions(key: str, title: str, subtitle: str = "", dot: str = "mute",
                              meta: str = "",
-                             actions: tuple[str, ...] = ("查看详情",)) -> tuple[bool, bool]:
+                             actions: tuple[str, ...] = ("查看详情",),
+                             default_open: bool = False,
+                             scope: str | None = None) -> tuple[bool, bool]:
     """列表行 + 操作按钮组 + 「查看详情」展开管理，两个展开状态互不干扰：
     actions 末位按钮 = 查看详情（open_{key}），其余按钮 = 操作面板（op_{key}）。
-    返回 (操作面板是否展开, 详情是否展开)，调用方按各自状态渲染对应内容。"""
-    opened = st.session_state.get(f"open_{key}", False)
+    返回 (操作面板是否展开, 详情是否展开)，调用方按各自状态渲染对应内容。
+    scope = 批量操作前缀：存在 grpdef_<scope> 时以其作为未操作项的默认展开态
+    （配合 batch_fold_bar 的「全部展开/全部收起」，新加载项自动跟随组状态）。"""
+    default = st.session_state.get(f"grpdef_{scope}") if scope else None
+    if default is None:
+        default = default_open
+    opened = st.session_state.get(f"open_{key}", default)
     op_state = st.session_state.get(f"op_{key}", False)
     clicked = list_item(key, title, subtitle, dot, meta, actions)
     if clicked == len(actions) - 1:  # 末位 = 查看详情
@@ -512,20 +585,201 @@ def list_item_toggle_actions(key: str, title: str, subtitle: str = "", dot: str 
         op_state = not op_state
         st.session_state[f"op_{key}"] = op_state
         st.rerun()
-    return st.session_state.get(f"op_{key}", False), st.session_state.get(f"open_{key}", False)
+    return st.session_state.get(f"op_{key}", False), st.session_state.get(f"open_{key}", default)
 
 
 def list_item_toggle(key: str, title: str, subtitle: str = "", dot: str = "mute",
-                     meta: str = "") -> bool:
+                     meta: str = "", default_open: bool = False,
+                     scope: str | None = None) -> bool:
     """列表行 + 「查看详情」展开管理：点击自动切换展开/收起，返回当前是否展开；
-    调用方在返回 True 时渲染详情卡片。"""
-    _, opened = list_item_toggle_actions(key, title, subtitle, dot, meta, ("查看详情",))
+    调用方在返回 True 时渲染详情卡片。
+    scope 传入批量操作前缀后，默认展开态跟随该组「全部展开/全部收起」的组默认值
+    （grpdef_<scope>，批量操作后新加载项自动跟随，刷新页面恢复 default_open）。"""
+    _, opened = list_item_toggle_actions(key, title, subtitle, dot, meta, ("查看详情",),
+                                         default_open=default_open, scope=scope)
     return opened
+
+
+@contextlib.contextmanager
+def fold_module(scope: str, title: str, meta: str = "", default_open: bool = True,
+                batch: tuple[str, list] | None = None) -> Iterator[bool]:
+    """一级模块卡片（全系统折叠规范，100% 对齐对话历史页卡片标准）：
+    独立圆角卡片 + 顶部操作栏（左=折叠箭头+主标题(加粗主色高亮，点击整体收起)
+    + 辅助说明弱化小字，右=「收起 ▲/展开 ▼」文字按钮，与对话历史卡片一致）；
+    batch=(prefix, keys) 时标题栏下方渲染模块内「全部展开/全部收起」；
+    默认展开；会话内状态保留，刷新恢复默认。
+    调用方模式：`with render.fold_module(scope, title, meta=...) as opened: 内容...`。"""
+    sid = f"mod_{scope}"
+    opened = st.session_state.get(sid, default_open)
+    with st.container(border=True, key=f"foldcard_{scope}"):
+        h1, h2 = st.columns([5, 1.2], vertical_alignment="center")
+        with h1:
+            arrow = "▾" if opened else "▸"
+            if st.button(f"{arrow} {title}", key=f"foldbtn_{scope}",
+                         use_container_width=True):
+                st.session_state[sid] = not opened
+                st.rerun()
+            if meta:
+                st.markdown(f'<div class="fold-meta">{meta}</div>', unsafe_allow_html=True)
+        with h2:
+            if st.button("收起 ▲" if opened else "展开 ▼", key=f"foldtg_{scope}",
+                         use_container_width=True):
+                st.session_state[sid] = not opened
+                st.rerun()
+        if batch:
+            prefix, keys = batch
+            batch_fold_bar(prefix, keys, label="")
+        yield opened
+
+
+def batch_fold_bar(prefix: str, keys: list[str], label: str = "",
+                   default_open: bool = False) -> None:
+    """二级列表批量操作栏（全系统折叠规范）：「全部展开 / 全部收起」一键切换；
+    同时写入组默认态 grpdef_<prefix>，之后新加载的列表项自动跟随批量状态；
+    刷新页面恢复 default_open。"""
+    c1, c2, c3 = st.columns([1.1, 1.1, 4], vertical_alignment="center")
+    with c1:
+        if st.button("全部展开", key=f"fold_open_{prefix}", use_container_width=True):
+            for k in keys:
+                st.session_state[f"open_{k}"] = True
+            st.session_state[f"grpdef_{prefix}"] = True
+            st.toast(f"已全部展开（{len(keys)} 项）")
+            st.rerun()
+    with c2:
+        if st.button("全部收起", key=f"fold_close_{prefix}", use_container_width=True):
+            for k in keys:
+                st.session_state[f"open_{k}"] = False
+            st.session_state[f"grpdef_{prefix}"] = False
+            st.toast(f"已全部收起（{len(keys)} 项，仅保留摘要）")
+            st.rerun()
+    with c3:
+        if label:
+            st.caption(label)
+
+
+def dismissible_error(title: str, message: str = "", detail=None,
+                      retry_key: str = "", dismiss_key: str = "err",
+                      retry_label: str = "重试") -> None:
+    """可收起错误条（全系统折叠规范）：模块底部错误提示 + 「重试」+ 一键收起；
+    收起后显示一条极弱提示与「重新显示」入口，不占用核心视觉区域。
+    dismiss_key 同模块稳定值，刷新页面后自动重新展示。"""
+    if st.session_state.get(f"err_hide_{dismiss_key}"):
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.caption("模块加载失败提示已收起。")
+        with c2:
+            if st.button("重新显示", key=f"err_show_{dismiss_key}"):
+                st.session_state.pop(f"err_hide_{dismiss_key}", None)
+                st.rerun()
+        return
+    actions = ()
+    if retry_key:
+        actions = ((retry_key, retry_label),)
+    actions += ((f"err_x_{dismiss_key}", "收起"),)
+    c_left, c_right = st.columns([5.5, 1.2], vertical_alignment="center")
+    with c_left:
+        msg_card("err", title, message, detail=detail)
+    with c_right:
+        for key, label in actions:
+            if st.button(label, key=key, use_container_width=True):
+                if key == f"err_x_{dismiss_key}":
+                    st.session_state[f"err_hide_{dismiss_key}"] = True
+                st.rerun()
 
 
 def section_title(text: str) -> None:
     """详情分区小标题（左侧主色竖条 + 统一字号）"""
     st.markdown(f'<div class="section-title">{text}</div>', unsafe_allow_html=True)
+
+
+# ================= 持仓止盈/仓位计划卡片（与系统概览/持仓监控页共用，同源展示） =================
+_TP_STATUS_TONE = {"持有观察": "info", "接近止盈": "warn", "接近止损": "err", "减仓预警": "err"}
+_TP_GREEN = "#10B981"   # 止盈位（绿，与全站 ok/down 色一致）
+_TP_RED = "#EF4444"     # 止损位（红，与全站 up/err 色一致）
+_TP_ACTION_DEFAULT = {"接近止损": "减仓/清仓", "减仓预警": "减仓", "接近止盈": "准备减仓",
+                      "持有观察": "持有"}
+
+
+def position_plan_card(key: str, label: str, plan: dict,
+                       core_action: str = "", compact: bool = False) -> None:
+    """单只持仓的止盈/仓位计划卡片（4 固定信息模块，与系统概览页同源）：
+    标的头部（状态标签 + 异动标记 + 核心操作建议）→ 核心点位一行（默认直接展示）
+    → 底部补充（时间/数据源/降级标注）→ 展开详情（分档止盈计划/止损与风控规则/
+    仓位管理指引/计算依据说明）。展开态与批量栏共用 open_{key}。"""
+    status = plan.get("status") or "持有观察"
+    tone = _TP_STATUS_TONE.get(status, "info")
+    action = core_action or _TP_ACTION_DEFAULT.get(status, "持有")
+    anomaly = plan.get("anomaly")
+    folded = not st.session_state.get(f"open_{key}", False)
+    tl, tr = st.columns([5, 1.1], vertical_alignment="center")
+    with tl:
+        st.markdown(f'<div class="item-main"><span class="badge badge-{tone}">{status}</span>'
+                    f'<span class="item-title">{label}</span>'
+                    + (f'<span class="badge badge-warn">异动更新</span>' if anomaly else "")
+                    + "</div>", unsafe_allow_html=True)
+    with tr:
+        if st.button("展开 ▼" if folded else "收起 ▲", key=f"tp_tg_{key}",
+                     use_container_width=True):
+            st.session_state[f"open_{key}"] = not st.session_state.get(f"open_{key}", False)
+            st.rerun()
+    parts = [f'<span style="color:{_TP_GREEN};font-weight:600">🟢 第一止盈位 '
+             f'{plan.get("tp1") or "—"} 元</span>（触发减仓 1/3 锁利）',
+             f'<span style="color:{_TP_GREEN};font-weight:600">🟢 第二止盈位 '
+             f'{plan.get("tp2") or "—"} 元</span>（触发再减仓 1/3）',
+             f'<span style="color:{_TP_RED};font-weight:600">🔴 止损位 '
+             f'{plan.get("current_stop") or "—"} 元</span>（C3 硬止损线）',
+             f'<span style="color:var(--text-dim)">📊 当前仓位 {plan.get("shares") or "—"} 股'
+             f' / 占总仓位 {plan.get("single_pct") if plan.get("single_pct") is not None else "—"}%'
+             "</span>"]
+    st.markdown("　".join(parts), unsafe_allow_html=True)
+    st.markdown(f'<div class="trace-line">核心操作建议：**{action}**'
+                f'　·　{plan.get("calc_time", "")}　·　数据源：与持仓监控同源'
+                + ('　·　K线降级模式（网络受限，固定比例估算）' if plan.get("degraded") else "")
+                + "</div>", unsafe_allow_html=True)
+    if folded:
+        return
+    with st.container(border=True):
+        section_title("分档止盈计划")
+        st.markdown(f"1. **第一目标止盈位 {plan.get('tp1') or '—'} 元**："
+                    "取「近期前高压力位」与「成本+8~10%」较低值；触发条件：放量突破/触及前高；"
+                    "操作：减仓 1/3 锁定部分利润，止损线上移至成本价 "
+                    f"{plan.get('ladder_stop_1') or '—'} 元")
+        st.markdown(f"2. **第二目标止盈位 {plan.get('tp2') or '—'} 元**："
+                    "黄金分割扩展位（0.618）与前期重要压力位共振；"
+                    "操作：再减仓 1/3，剩余仓位移动止盈持有")
+        st.markdown(f"3. **终极止盈规则**：{plan.get('trailing_note')}；"
+                    f"当前移动止盈线 {plan.get('trailing_line') or '—'} 元，跌破全部止盈离场")
+    with st.container(border=True):
+        section_title("止损与风控规则")
+        st.markdown(f"- 初始 C3 止损位：成本 × 0.92 = **{plan.get('c3_stop') or '—'} 元**"
+                    "（硬止损线，跌破无条件离场）；当前生效止损 "
+                    f"**{plan.get('current_stop') or '—'} 元**")
+        st.markdown(f"- 阶梯止损上移：到达第一止盈位后止损上移至成本价 "
+                    f"（{plan.get('ladder_stop_1') or '—'} 元）；到达第二止盈位后上移至第一止盈位 "
+                    f"（{plan.get('ladder_stop_2') or '—'} 元）")
+    with st.container(border=True):
+        section_title("仓位管理指引")
+        st.markdown(f"- 当前持仓：{plan.get('shares') or '—'} 股，成本 "
+                    f"{plan.get('cost') or '—'} 元，单票仓位 "
+                    f"{plan.get('single_pct') if plan.get('single_pct') is not None else '—'}%"
+                    f"（C1 单票上限 {plan.get('c1_cap_pct', 30)}%，"
+                    f"{'符合' if plan.get('c1_ok') else '**超限需减仓**'}）")
+        if plan.get("total_pct") is not None:
+            st.markdown(f"- 总仓位约束：当前整体仓位 {plan['total_pct']}%"
+                        f"（C2 总仓上限 {plan.get('c2_cap_pct', 60)}%"
+                        f"，{'符合' if plan['total_pct'] <= plan.get('c2_cap_pct', 60) else '**超限**'}）")
+        st.markdown(f"- 加仓条件：{plan.get('add_condition') or '（当前不满足加仓前提）'}")
+        st.markdown(f"- 减仓条件：{plan.get('reduce_condition') or '（除止盈分档外暂无波段减仓触发）'}")
+    with st.container(border=True):
+        section_title("计算依据说明")
+        st.markdown("- 止盈位计算逻辑：基于前期高点压力位、黄金分割位（0.618）、"
+                    "成本加 8%~10% 保守区间综合得出，并结合量能/板块热度/游资动向动态调整")
+        st.markdown("- 仓位建议依据：基于标的走势、市况评分与 C1 单票上限 / C2 总仓上限红线")
+        st.markdown("- 引用规则：C1 单票仓位上限 30% / C2 总仓位上限 60% / C3 硬止损（成本×0.92）"
+                    "/ 分档锁利与移动止盈 / 波段操作（跌破 MA10 且量能放大先减半）——"
+                    "对应知识库风控与止盈仓位规则条目")
+        st.caption("计算结果已写入推理留痕（source_module=position_monitor），"
+                   "纠察/复盘 Agent 可追溯验证；建议仅作参考，最终交易由人工判断。")
 
 
 def stat_cards(items: list[dict]) -> None:
@@ -537,6 +791,58 @@ def stat_cards(items: list[dict]) -> None:
         cards.append(f'<div class="stat-card"><div class="stat-label">{it["label"]}</div>'
                      f'<div class="stat-value {tone}">{it["value"]}</div>{sub}</div>')
     st.markdown(f'<div class="stat-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+# ================= 维度归因白盒展示（v3.0） =================
+_DIM_VERDICT_CLS = {"支持": "support", "中性": "neutral", "风险": "risk"}
+_DIM_FILL_COLOR = {"支持": "#ef4444", "中性": "#9ca3af", "风险": "#f59e0b"}
+
+
+def dimension_bars(dimensions: list[dict], final_advice: str | None = None) -> None:
+    """维度归因白盒展示（v3.0 主结论）：每维 = 维度名 + 评分条（score/100）+ verdict 色点 + advice；
+    自动统计「N/5 维支持」徽章；final_advice 用高亮卡展示。纯展示层映射，无任何研判语义；
+    兼容旧数据（缺 dimensions 时仅展示 final_advice，两者都缺则不渲染）。"""
+    dims = [d for d in (dimensions or []) if isinstance(d, dict)]
+    if not dims:
+        if final_advice:
+            _advice_card(final_advice)
+        return
+    support_n = 0
+    rows = []
+    for d in dims:
+        dim = str(d.get("dim") or d.get("name") or "维度")
+        try:
+            score = float(d.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        score = max(0.0, min(100.0, score))
+        verdict = str(d.get("verdict") or "中性")
+        advice = str(d.get("advice") or "")
+        if verdict == "支持":
+            support_n += 1
+        vcls = _DIM_VERDICT_CLS.get(verdict, "neutral")
+        color = _DIM_FILL_COLOR.get(verdict, "#9ca3af")
+        width = f"{score:.0f}%"
+        advice_html = f'<div class="dim-advice">{advice}</div>' if advice else ""
+        rows.append(
+            f'<div class="dim-block"><div class="dim-head">'
+            f'<span class="dim-name">{dim}</span>'
+            f'<span class="dim-track"><span class="dim-fill" '
+            f'style="width:{width};background:{color}"></span></span>'
+            f'<span class="dim-score">{score:.0f}</span>'
+            f'<span class="dim-verdict {vcls}">{verdict}</span></div>{advice_html}</div>')
+    support_html = (f'<span class="badge badge-info">{support_n}/{len(dims)} 维支持</span>'
+                    if dims else "")
+    st.markdown(f'<div class="dim-summary">{support_html}</div>{"".join(rows)}',
+                unsafe_allow_html=True)
+    if final_advice:
+        _advice_card(final_advice)
+
+
+def _advice_card(final_advice: str) -> None:
+    """综合评估高亮卡（v3.0 主结论）"""
+    st.markdown(f'<div class="advice-card"><div class="advice-title">综合评估（主结论）</div>'
+                f'<div class="advice-body">{final_advice}</div></div>', unsafe_allow_html=True)
 
 
 def svc_cards(connections: list[dict]) -> None:
@@ -555,9 +861,10 @@ def svc_cards(connections: list[dict]) -> None:
 
 
 def alert_list(rows: list[dict], key: str = "alert_list",
-               empty_text: str = "暂无告警记录。") -> None:
+               empty_text: str = "暂无告警记录。", scope: str | None = None) -> None:
     """告警行列表（统一范式，供告警日志页与持仓监控页共用）：
-    严重度圆点（严重红/警告橙/一般蓝）+ 股票代码+名称+类型 + 消息摘要 + 时间+推送状态 + 查看详情"""
+    严重度圆点（严重红/警告橙/一般蓝）+ 股票代码+名称+类型 + 消息摘要 + 时间+推送状态 + 查看详情；
+    scope 传入批量操作前缀后，展开态跟随「全部展开/全部收起」组默认值。"""
     SEV_DOT = {"critical": "err", "warning": "warn", "info": "info"}
     ACTION_MAP = {"hold": "持有", "reduce": "减仓", "exit": "清仓"}
 
@@ -569,7 +876,8 @@ def alert_list(rows: list[dict], key: str = "alert_list",
         meta = (f'{str(a.get("created_at") or "")[:16]}　'
                 f'飞书推送 {"✅" if a.get("pushed") else "—"}')
         if list_item_toggle(f"{key}_{a['id']}", f"{label} · {a.get('alert_type', '')}",
-                            subtitle=msg, dot=SEV_DOT.get(sev, "mute"), meta=meta):
+                            subtitle=msg, dot=SEV_DOT.get(sev, "mute"), meta=meta,
+                            scope=scope):
             with st.container(border=True):
                 trace_line("告警触发时间", a["created_at"], source="LLM 生成",
                            confidence=(a.get("signal") or {}).get("confidence"),

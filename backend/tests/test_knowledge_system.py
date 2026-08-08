@@ -92,6 +92,11 @@ def _cand(stock_type: str) -> dict:
         "stock_code": "600519", "stock_name": "贵州茅台", "reason": "量价健康",
         "risk_notice": "估值偏高", "stock_type": stock_type,
         "confidence_tier": "建议关注", "confidence_pct": 72.0,
+        "dimensions": [
+            {"dim": "基本面", "score": 70, "verdict": "支持", "advice": "估值合理"},
+            {"dim": "资金/游资", "score": 60, "verdict": "中性", "advice": "无游资数据"},
+        ],
+        "final_advice": "综合评估：2/5 维支持，可低吸建仓，止损-8%",
         "macro_view": "宏观判断", "meso_view": "中观判断", "micro_view": "微观判断",
         "volume_analysis": "主力小幅流入", "risks": ["风险A", "风险B"],
         "focus_type": "低吸",
