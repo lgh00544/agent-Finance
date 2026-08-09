@@ -14,7 +14,9 @@ qdrant-client==1.18.0
 akshare==1.18.81
 # pandas 3.0.x：兼容 Python 3.14（本机 dev 直跑）与 3.11（容器），akshare 1.18.81 已适配
 pandas==3.0.5
-numpy==2.5.1
+# numpy 锁定 2.3.5：paddlex 3.7.x（paddleocr 依赖）要求 numpy<2.4，而 pandas 3.0.5/qdrant-client 要求 >=2.3.3，
+# 2.3.5 同时满足两者；勿升到 2.4+（会触发全新安装 ResolutionImpossible 冲突）
+numpy==2.3.5
 
 # LLM（DeepSeek OpenAI 兼容端点）
 openai==1.99.0
