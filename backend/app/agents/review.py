@@ -15,6 +15,7 @@ from app.datasource.base import DataSource
 from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
+from app.services import reasoning_trace
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,28 @@ def collect_review(state: StockAgentState) -> StockAgentState:
     alerts = repo.get_alerts_by_code(code, limit=30)
     signal_rows = [{"date": a.created_at.strftime("%Y-%m-%d %H:%M"), "type": a.alert_type,
                     "severity": a.severity, "action": a.action, "message": a.message} for a in alerts]
+    # 游资信号历史（留痕 source_module='hot_money'）：失败标的回溯当时游资信号的成败依据
+    import json as _json
+
+    hm_traces = repo.list_traces(code=code, module="hot_money", limit=10)
+    hm_signals = []
+    for t in hm_traces:
+        try:
+            concl = _json.loads(t.get("final_conclusion") or "{}")
+        except (ValueError, TypeError):
+            concl = {}
+        try:
+            cap = _json.loads(t.get("capital_reasoning") or "{}")
+        except (ValueError, TypeError):
+            cap = {}
+        hm_signals.append({
+            "generate_date": t.get("generate_date"),
+            "seat": cap.get("seat_name") or "", "actor": cap.get("actor") or "",
+            "net_buy": cap.get("lhb_1d_net_buy"),
+            "multi_source_verified": bool(concl.get("multi_source_verified")),
+            "confidence": concl.get("confidence"),
+            "risk_note": t.get("risk_reasoning") or "",
+        })
     sell_decisions = repo.get_sell_decisions_by_code(code, limit=10)
     sell_rows = [{"date": s.created_at.strftime("%Y-%m-%d %H:%M"),
                   "action": (s.decision or {}).get("action"),
@@ -90,12 +113,14 @@ def collect_review(state: StockAgentState) -> StockAgentState:
                   "risk_list": score_row.risk_list if score_row else []},
         "monitor_signals": signal_rows,
         "sell_decisions": sell_rows,
+        "hot_money_signals": hm_signals,  # 游资信号历史（复盘闭环回溯依据，无数据为空列表）
         "hold_days": hold_days,
         "pnl_pct": pnl_pct,
         "price_stats": price_stats,
     }
     state["trace"] = [*state.get("trace", []),
-                      f"复盘数据聚合: 持有{hold_days}天 盈亏{pnl_pct}% 信号{len(signal_rows)}条 卖出决策{len(sell_rows)}条"]
+                      f"复盘数据聚合: 持有{hold_days}天 盈亏{pnl_pct}% 信号{len(signal_rows)}条 "
+                      f"卖出决策{len(sell_rows)}条 游资信号{len(hm_signals)}条"]
     return state
 
 
@@ -147,10 +172,19 @@ def llm_review(state: StockAgentState) -> StockAgentState:
             item.current_value, item.suggested_value, item.reason, item.evidence,
             target_kind=item.target_kind)
         suggestion_count += 1
+    # 游资复盘闭环留痕：失败标的回溯游资信号结论（source_module='hot_money_review'，
+    # 只留痕不改任何配置；无游资信号可回溯时 LLM 输出 null 跳过）
+    hm_reviewed = False
+    if getattr(output, "hot_money_review", None):
+        reasoning_trace.trace_hot_money_review(code, name, today, dict(output.hot_money_review))
+        hm_reviewed = True
     state["stage"] = "exit_review"
     state["trace"] = [*state.get("trace", []),
-                      f"复盘完成: review_id={review_id} 优化建议{suggestion_count}条(待人工审核)"]
-    logger.info("复盘完成 %s: review_id=%s 建议%s条", code, review_id, suggestion_count)
+                      f"复盘完成: review_id={review_id} 优化建议{suggestion_count}条(待人工审核)"
+                      + (f" 游资信号回溯已留痕（{output.hot_money_review.get('classification') or ''}）"
+                         if hm_reviewed else " 游资信号回溯无")]
+    logger.info("复盘完成 %s: review_id=%s 建议%s条 游资回溯%s", code, review_id,
+                suggestion_count, "已留痕" if hm_reviewed else "无")
     return state
 
 

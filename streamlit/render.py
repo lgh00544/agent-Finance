@@ -325,18 +325,11 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
                padding: 10px 14px; margin: 0.5rem 0; }
 .advice-card .advice-title { font-size: 12px; color: var(--info); font-weight: 600; }
 .advice-card .advice-body { font-size: 14px; color: var(--text); line-height: 1.7; margin-top: 4px; }
-/* ===== 通用折叠规范：一级模块卡片（对齐对话历史页卡片标准，无自定义样式） ===== */
-/* 主标题按钮：加粗 + 主色高亮（箭头随状态翻转 ▾/▸；与对话历史卡片同款文字按钮） */
-[class*="st-key-foldbtn_"] button {
-  background: transparent !important; border: none !important;
-  box-shadow: none !important; text-align: left; padding: 2px 0;
-  color: var(--primary) !important; font-size: 15px; font-weight: 700;
-  transition: color 0.2s ease;
-}
-[class*="st-key-foldbtn_"] button:hover { color: #60a5fa; }
-.fold-meta { font-size: 12px; color: var(--text-dim); text-align: left;
-             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.fold-meta .up { color: var(--up); } .fold-meta .down { color: var(--down); }
+/* ===== 通用折叠规范：一级模块卡片（对齐对话历史页卡片标准） ===== */
+/* 模块标题：加粗主色高亮居左（与模块内容左边界对齐，禁止居中） */
+.fold-title { font-size: 15px; font-weight: 700; color: var(--primary); }
+/* 卡片紧凑内边距：减少标题栏无效空白，纵向更紧凑 */
+[class*="st-key-foldcard_"] { padding-top: 12px; padding-bottom: 14px; }
 </style>
 """
 
@@ -604,23 +597,19 @@ def list_item_toggle(key: str, title: str, subtitle: str = "", dot: str = "mute"
 def fold_module(scope: str, title: str, meta: str = "", default_open: bool = True,
                 batch: tuple[str, list] | None = None) -> Iterator[bool]:
     """一级模块卡片（全系统折叠规范，100% 对齐对话历史页卡片标准）：
-    独立圆角卡片 + 顶部操作栏（左=折叠箭头+主标题(加粗主色高亮，点击整体收起)
-    + 辅助说明弱化小字，右=「收起 ▲/展开 ▼」文字按钮，与对话历史卡片一致）；
+    独立圆角卡片 + 顶部操作栏（左=模块主标题加粗主色高亮居左 + 辅助说明弱化小字，
+    右=「收起 ▲/展开 ▼」轻量文字按钮，与对话历史页按钮同款）；
     batch=(prefix, keys) 时标题栏下方渲染模块内「全部展开/全部收起」；
     默认展开；会话内状态保留，刷新恢复默认。
     调用方模式：`with render.fold_module(scope, title, meta=...) as opened: 内容...`。"""
     sid = f"mod_{scope}"
     opened = st.session_state.get(sid, default_open)
     with st.container(border=True, key=f"foldcard_{scope}"):
-        h1, h2 = st.columns([5, 1.2], vertical_alignment="center")
+        h1, h2 = st.columns([5, 1.1], vertical_alignment="center")
         with h1:
-            arrow = "▾" if opened else "▸"
-            if st.button(f"{arrow} {title}", key=f"foldbtn_{scope}",
-                         use_container_width=True):
-                st.session_state[sid] = not opened
-                st.rerun()
-            if meta:
-                st.markdown(f'<div class="fold-meta">{meta}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="chat-top-chips"><span class="fold-title">{title}</span>'
+                        + (f'<span class="t">{meta}</span>' if meta else "")
+                        + "</div>", unsafe_allow_html=True)
         with h2:
             if st.button("收起 ▲" if opened else "展开 ▼", key=f"foldtg_{scope}",
                          use_container_width=True):

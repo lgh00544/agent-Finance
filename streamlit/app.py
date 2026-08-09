@@ -18,12 +18,13 @@ pages = st.navigation({
     ],
     "持仓风控": [
         st.Page("pages/4_持仓监控.py", title="持仓监控", icon="🛡️"),
-        st.Page("pages/7_告警日志.py", title="告警日志", icon="🚨"),
+        st.Page("pages/5_游资追踪.py", title="游资追踪", icon="🐉"),
+        st.Page("pages/8_告警日志.py", title="告警日志", icon="🚨"),
     ],
     "策略沉淀": [
-        st.Page("pages/5_交易复盘.py", title="交易复盘", icon="🔁"),
-        st.Page("pages/8_交易知识库.py", title="交易知识库", icon="📚"),
-        st.Page("pages/9_Agent对话.py", title="Agent 对话", icon="💬"),
+        st.Page("pages/6_交易复盘.py", title="交易复盘", icon="🔁"),
+        st.Page("pages/9_交易知识库.py", title="交易知识库", icon="📚"),
+        st.Page("pages/10_Agent对话.py", title="Agent 对话", icon="💬"),
     ],
 })
 pages.run()

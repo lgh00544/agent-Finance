@@ -60,6 +60,8 @@ def init_db() -> None:
     _ensure_trade_record_columns()
     _ensure_agent_suggestion_columns()
     _ensure_position_plan_detail()
+    _ensure_position_plan_source()
+    _ensure_hot_money_profile_columns()
     _ensure_indexes()
 
 
@@ -143,6 +145,23 @@ def _ensure_trade_record_columns(eng=None) -> None:
                     pass
 
 
+def _ensure_position_plan_source(eng=None) -> None:
+    """幂等补齐 position_plan.source 列（计划来源标记 candidate/manual；
+    仅增量加列，不重建表不丢数据；旧数据默认 manual）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(position_plan)")}
+            if "source" not in existing:
+                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN source VARCHAR(16) DEFAULT 'manual'")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN source VARCHAR(16) DEFAULT 'manual'")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
 def _ensure_agent_suggestion_columns(eng=None) -> None:
     """幂等补齐 agent_suggestion.reject_reason 列（人工驳回原因留痕；
     仅增量加列，不重建表不丢数据；旧数据默认空串）"""
@@ -158,6 +177,29 @@ def _ensure_agent_suggestion_columns(eng=None) -> None:
                 conn.exec_driver_sql("ALTER TABLE agent_suggestion ADD COLUMN reject_reason TEXT DEFAULT ''")
             except Exception:  # noqa: BLE001 列已存在
                 pass
+
+
+def _ensure_hot_money_profile_columns(eng=None) -> None:
+    """幂等补齐 hot_money_profile 游资复盘列（win_rate_5d 胜率事实 / last_review_at 迭代时间；
+    仅增量加列，不重建表不丢数据；旧数据为 NULL/空串，展示层 .get() 兼容）"""
+    eng = eng or engine
+    additions = {
+        "win_rate_5d": "FLOAT",
+        "last_review_at": "VARCHAR(16) DEFAULT ''",
+    }
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(hot_money_profile)")}
+            for col, ddl in additions.items():
+                if col not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE hot_money_profile ADD COLUMN {col} {ddl}")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            for col, ddl in additions.items():
+                try:
+                    conn.exec_driver_sql(f"ALTER TABLE hot_money_profile ADD COLUMN {col} {ddl}")
+                except Exception:  # noqa: BLE001 列已存在
+                    pass
 
 
 def _ensure_position_plan_detail(eng=None) -> None:

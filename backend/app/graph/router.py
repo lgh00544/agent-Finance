@@ -43,11 +43,45 @@ def run_score(code: str, stock_name: str = "", trade_date: str | None = None) ->
     return graph.invoke(state)
 
 
-def run_position(code: str, stock_name: str = "", trade_date: str | None = None) -> StockAgentState:
-    """单股建仓方案"""
+# B 级建仓计划缓存时长（分级缓存：B 级 30 分钟，A 级实时计算）
+_PLAN_CACHE_TTL_30M = 1800
+
+
+def run_position(code: str, stock_name: str = "", trade_date: str | None = None,
+                 source: str = "manual") -> StockAgentState:
+    """单股建仓方案（数据同源联动 + 分级缓存 + 来源标记）：
+    1) 标的来源唯一：仅最新综合评级 ≥B 的标的可生成；无评分 → 自动先跑一次
+       ScoreAgent 再判级；C 级及以下（或无评级）→ 抛「评级不足」错误，禁止生成；
+    2) 分级缓存：B 级 30 分钟缓存（当日已有计划且 30 分钟内直接复用，零 LLM 调用）；
+       A 级实时计算，每次重新生成；
+    3) 同一标的同一交易日仅保留最新一份（repo.insert_plan 去重）；
+    4) source 来源标记：candidate=每日候选池联动 / manual=手动生成。"""
+    from app.db import repo
+
+    today = trade_date or time.strftime("%Y-%m-%d")
+    score_row = repo.get_latest_score(code)
+    if score_row is None:
+        logger.info("建仓标的无评分，自动先执行评分: %s", code)
+        run_score(code, stock_name, today)
+        score_row = repo.get_latest_score(code)
+    grade = (score_row.grade or "") if score_row else ""
+    if not score_row or grade not in ("A", "B"):
+        cur = grade or "无评级"
+        raise ValueError(f"评级不足（当前 {cur}），暂不生成建仓计划；仅 B 级及以上评级标的可生成，"
+                         f"可先在「评分报告」页完成/确认评分")
+    if grade == "B":
+        existing = repo.get_latest_plan(code)
+        if existing is not None and existing.plan_date == today:
+            age = (time.time() - existing.created_at.timestamp()) if existing.created_at else 9999.0
+            if age < _PLAN_CACHE_TTL_30M:
+                logger.info("建仓计划命中 B 级 30 分钟缓存: %s plan_id=%s age=%.0fs",
+                            code, existing.id, age)
+                return _new_state(stock_code=code, stock_name=stock_name or code,
+                                  trade_date=today,
+                                  position_plan={"plan_id": existing.id, "cached": True})
     graph = get_graph("position")
-    state = _new_state(stock_code=code, stock_name=stock_name or code,
-                       trade_date=trade_date or time.strftime("%Y-%m-%d"))
+    state = _new_state(stock_code=code, stock_name=stock_name or code, trade_date=today,
+                       plan_source=source)
     return graph.invoke(state)
 
 
@@ -127,8 +161,9 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
     def _score_one(cand: dict) -> dict | None:
         try:
             res = run_score(cand["stock_code"], cand["stock_name"], date_key)
-            return {"code": cand["stock_code"],
-                    "score": (res.get("score_result") or {}).get("score")}
+            return {"code": cand["stock_code"], "name": cand.get("stock_name") or "",
+                    "score": (res.get("score_result") or {}).get("score"),
+                    "grade": (res.get("score_result") or {}).get("grade")}
         except Exception as exc:  # noqa: BLE001 单股失败不阻塞其他
             logger.error("打分失败 %s: %s", cand["stock_code"], exc)
             return None
@@ -148,4 +183,25 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
                 scores.append(item)
     logger.info("批量打分完成: %s/%s（并行模式: %s）", len(scores), len(candidates),
                 len(candidates) >= _PARALLEL_SCORE_MIN)
-    return {"candidates": len(candidates), "scored": len(scores)}
+
+    # 三级同源联动：B 级及以上候选自动生成建仓计划（run_position 内含 B 级 30min 缓存
+    # 与 C 级门槛，同一套算法无两套标准；单股失败不阻塞主链路）
+    bplus = [s for s in scores if (s.get("grade") or "") in ("A", "B")]
+
+    def _plan_one(item: dict) -> int:
+        try:
+            res = run_position(item["code"], item.get("name", ""), date_key, source="candidate")
+            return 1 if res.get("position_plan") else 0
+        except Exception as exc:  # noqa: BLE001 单股计划失败不阻塞其他
+            logger.warning("建仓计划生成失败 %s: %s", item["code"], exc)
+            return 0
+
+    plans_made = 0
+    if bplus:
+        if len(bplus) >= _PARALLEL_SCORE_MIN:
+            with ThreadPoolExecutor(max_workers=min(_PARALLEL_SCORE_MAX, len(bplus))) as pool:
+                plans_made = sum(pool.map(_plan_one, bplus))
+        else:
+            plans_made = sum(_plan_one(i) for i in bplus)
+    logger.info("建仓计划联动完成: B+ 候选 %s 只，生成 %s 份", len(bplus), plans_made)
+    return {"candidates": len(candidates), "scored": len(scores), "plans": plans_made}

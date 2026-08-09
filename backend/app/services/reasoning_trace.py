@@ -257,6 +257,67 @@ def trace_alert(stock_code: str, stock_name: str, trade_date: str,
     })
 
 
+def trace_hot_money(stock_code: str, stock_name: str, trade_date: str,
+                    flows: list, agg: dict) -> None:
+    """游资维度留痕（source_module='hot_money'，跨模块联查一次拿到全研判）：
+    事实=龙虎榜流水聚合 JSON；结论=游资映射/口径净买/多源校验标记；风险=置信度不足标注"""
+    agg = agg or {}
+    submit({
+        "stock_code": stock_code, "stock_name": stock_name,
+        "source_module": "hot_money", "generate_date": trade_date,
+        "fact_basis": _j(flows),
+        "technical_reasoning": "",
+        "capital_reasoning": _j({
+            "actor": agg.get("actor", ""), "tier": agg.get("tier", ""),
+            "seat_name": agg.get("seat_name", ""),
+            "lhb_1d_net_buy": agg.get("lhb_1d_net_buy"),
+            "lhb_3d_net_buy": agg.get("lhb_3d_net_buy"),
+        }),
+        "fundamental_reasoning": "",
+        "risk_reasoning": agg.get("note", ""),
+        "rule_refs": "K226/K227/K189",
+        "final_conclusion": _j({
+            "multi_source_verified": bool(agg.get("multi_source_verified")),
+            "confidence": agg.get("confidence"),
+            "sources": agg.get("sources", []),
+            "candidate_actor": agg.get("candidate_actor"),
+            "second_source": agg.get("second_source", ""),  # K227 诚实标注第二源现状
+            "lhb_date": agg.get("lhb_date", ""),  # 实际生效的龙虎榜交易日（T+1 回退）
+        }),
+        "confidence": float(agg.get("confidence") or 0.0),
+        "data_source": "龙虎榜流水 + 游资档案聚合（多源校验）",
+        "ext_info": "",
+    })
+
+
+def trace_hot_money_review(stock_code: str, stock_name: str, exit_date: str,
+                           review: dict) -> None:
+    """游资复盘闭环留痕（source_module='hot_money_review'，与 hot_money 联查：
+    失败标的回溯当时游资信号 → 归类（K189/K227）→ 信号有效性 → 权重建议。
+    事实=回溯依据；资金推理=归类+有效性与权重建议；结论=是否有效。"""
+    review = review or {}
+    submit({
+        "stock_code": stock_code, "stock_name": stock_name,
+        "source_module": "hot_money_review", "generate_date": exit_date,
+        "fact_basis": str(review.get("basis") or ""),
+        "technical_reasoning": "",
+        "capital_reasoning": _j({
+            "classification": review.get("classification", ""),
+            "weight_suggestion": review.get("weight_suggestion", ""),
+        }),
+        "fundamental_reasoning": "",
+        "risk_reasoning": "",
+        "rule_refs": "K189/K226/K227",
+        "final_conclusion": _j({
+            "signal_effective": bool(review.get("signal_effective")),
+            "classification": review.get("classification", ""),
+        }),
+        "confidence": 0.0,
+        "data_source": "历史游资信号留痕 + 实际走势 vs 大盘 + LLM 复盘归类",
+        "ext_info": "",
+    })
+
+
 def trace_review(stock_code: str, stock_name: str, exit_date: str,
                  plan_vs_actual: dict, lesson: str, feedback: dict) -> None:
     """ReviewAgent：事实=计划兑现对比；推理=经验教训；结论=反馈与偏好微调"""

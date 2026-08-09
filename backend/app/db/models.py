@@ -83,7 +83,8 @@ class PositionPlan(Base):
     stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（LLM 输出）
     take_profit: Mapped[float] = mapped_column(Float, default=0.0)   # 止盈参考价（LLM 输出）
     rationale: Mapped[str] = mapped_column(Text, default="")         # 建仓逻辑（LLM 输出）
-    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # v3.0 白盒扩展（dimensions/final_advice/market_regime）
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # v3.0 白盒扩展（dimensions/final_advice/market_regime/quant）
+    source: Mapped[str] = mapped_column(String(16), default="manual", index=True)  # candidate/manual（来源标记）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -322,4 +323,56 @@ class AgentChatMessage(Base):
     verdict: Mapped[str] = mapped_column(String(16), default="")  # adopted/partial/maintained（rule 类型）
     knowledge_id: Mapped[int] = mapped_column(Integer, nullable=True)  # 沉淀知识条目 ID
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class HotMoneyProfile(Base):
+    """游资档案（基础字典，低频更新；席位消歧：一席位只映射一个主力游资）
+
+    co_seats: 协同游资关联（JSON），与 seat_code 唯一约束解耦——同一主力游资的
+    协同席位用该字段表达，不占用独立 seat_code 唯一映射。
+    源文件席位名仅为示例（base_file/游资大佬追踪体系），真实席位以龙虎榜为准，
+    种子数据只作模糊匹配参考。
+    """
+    __tablename__ = "hot_money_profile"
+    __table_args__ = (UniqueConstraint("seat_code", name="uq_hot_money_seat"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_name: Mapped[str] = mapped_column(String(32), index=True)   # 游资名（赵老哥/章盟主…）
+    seat_code: Mapped[str] = mapped_column(String(64))                # 营业部名称（唯一映射）
+    tier: Mapped[str] = mapped_column(String(8), default="观察")       # 一线/二线/观察
+    style_tags: Mapped[list] = mapped_column(JSON, default=list)      # 操作风格标签（高位接力/题材龙头…）
+    good_themes: Mapped[list] = mapped_column(JSON, default=list)     # 擅长题材
+    co_seats: Mapped[list] = mapped_column(JSON, default=list)        # 协同游资/协同席位（不破坏 seat_code 唯一性）
+    source: Mapped[str] = mapped_column(String(16), default="手动")    # 手动/LLM识别/同花顺
+    win_rate_5d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 信号后5日上涨胜率（代码统计事实，非人工判定）
+    last_review_at: Mapped[str] = mapped_column(String(16), default="")      # 最近一次胜率迭代时间 YYYY-MM-DD HH:mm
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class LhbOriginalFlow(Base):
+    """龙虎榜原始流水（口径硬隔离：lhb_type='1d'单日 / '3d'三日累计，防 K227 误读）
+
+    confidence: 数据置信度（官方龙虎榜=1.0 / 第三方=0.8 / 社区=0.5）；
+    多源校验在 services/hot_money.py 完成（≥2 源且差值<10% 采信，否则标置信度不足仅参考）。
+    注入 LLM 时字段强制带口径后缀（lhb_1d_net_buy / lhb_3d_net_buy），LLM 不得自行推导口径。
+    """
+    __tablename__ = "lhb_original_flow"
+    __table_args__ = (
+        Index("ix_lhb_date_code_type", "trade_date", "stock_code", "lhb_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)   # YYYY-MM-DD
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    lhb_type: Mapped[str] = mapped_column(String(4), default="1d")    # 1d=单日 / 3d=三日累计
+    disclosure_reason: Mapped[str] = mapped_column(String(64), default="")  # 涨跌幅偏离/换手率/振幅/连续涨停…
+    seat_name: Mapped[str] = mapped_column(String(64), default="")    # 营业部名称
+    buy_amt: Mapped[float] = mapped_column(Float, default=0.0)
+    sell_amt: Mapped[float] = mapped_column(Float, default=0.0)
+    net_buy: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)     # 官方=1.0/第三方=0.8/社区=0.5
+    source: Mapped[str] = mapped_column(String(16), default="eastmoney")  # sse/szse/eastmoney
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

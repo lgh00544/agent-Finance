@@ -68,12 +68,21 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("行业板块拉取失败，跳过: %s", exc)
 
+    # 游资聚合数据（阶段3：龙虎榜流水聚合，口径后缀字段；无数据 None，LLM 保持标中性）
+    hm_agg = None
+    try:
+        from app.services import hot_money as hot_money_svc
+        hm_agg = hot_money_svc.aggregate_for_stock(code, state.get("stock_name") or "", today)
+    except Exception as exc:  # noqa: BLE001 游资聚合失败不阻塞打分
+        logger.warning("游资聚合失败（降级跳过）: %s", exc)
+
     state["basic_info"] = {"stock_code": code, "trade_date": today,
                            "industry_spot": industry_rows}
     state["tech_index"] = indicators
     state["finance_data"] = fin_rows
     state["news_report"] = news_rows
     state["fund_flow_rows"] = ff_rows
+    state["hot_money"] = hm_agg
     state["risk_notice"] = []
     state["trace"] = [*state.get("trace", []),
                       f"聚合完成: K线{len(kline)}行 财务{len(fin_rows)}期 资金流{len(ff_rows)}日 新闻{len(news_rows)}条"]
@@ -98,11 +107,13 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "资金流向": state.get("fund_flow_rows") or [],
         "新闻公告": state.get("news_report") or [],
         "行业板块行情": (state.get("basic_info") or {}).get("industry_spot", [])[:15],
+        # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
+        "游资聚合": state.get("hot_money"),
     }
 
     output = agent_call(
         agent="score",
-        cache_key=f"{code}:{today}",
+        cache_key=f"{code}:{today}:h{repo.hot_money_fingerprint()}",
         system_prompt=score_prompt.SYSTEM_PROMPT,
         user_prompt=score_prompt.build_user_prompt(_compact(data_pack), preference_text),
         schema=ScoreOutput,

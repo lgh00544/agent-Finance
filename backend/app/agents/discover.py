@@ -423,14 +423,27 @@ def llm_final(state: StockAgentState) -> StockAgentState:
                         ("；".join(f"{n.get('title')}({n.get('published_at')})" for n in news) or "（无相关新闻）"))
     news_text = "\n".join(news_ctx) if news_ctx else "（无）"
 
+    # 游资聚合数据注入（阶段3）：逐候选聚合龙虎榜流水 → 注入文本段（无数据返回空，LLM 保持标中性）
+    hm_aggs = {}
     date_key = state.get("trade_date", _today())
+    try:
+        from app.services import hot_money as hot_money_svc
+        for cand in shortlist:
+            agg = hot_money_svc.aggregate_for_stock(cand["stock_code"], cand["stock_name"], date_key)
+            if agg:
+                hm_aggs[cand["stock_code"]] = agg
+    except Exception as exc:  # noqa: BLE001 游资数据聚合失败不阻塞挖掘主链路
+        logger.warning("游资聚合失败（降级跳过）: %s", exc)
+    hm_text = hot_money_svc.build_hot_money_context(hm_aggs, date_key) if hm_aggs else ""
+
     cap = state.get("market_cap")
     output = agent_call(
         agent="discover_final",
-        cache_key=f"final:v2:{date_key}",
+        cache_key=f"final:v2:{date_key}:h{repo.hot_money_fingerprint()}",
         system_prompt=discover_prompt.SYSTEM_PROMPT,
         user_prompt=discover_prompt.build_final_prompt(
-            table, news_text, cap=cap, market_note=_market_note(state)),
+            table, news_text, cap=cap, market_note=_market_note(state),
+            hot_money_context=hm_text),
         schema=DiscoverOutput,
         ttl_seconds=86400,
         model_level=ModelLevel.DEEP,

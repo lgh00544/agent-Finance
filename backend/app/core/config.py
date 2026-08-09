@@ -141,6 +141,20 @@ class Settings(BaseSettings):
     mairui_licence: str = ""  # 证书密钥（仅从环境变量 MAIRUI_LICENCE 读取，禁止硬编码入库）
     mairui_base_url: str = "https://api.mairuiapi.com"
 
+    # ---------- 龙虎榜数据源（游资维度，可选；T+1 16:30 后拉前一日） ----------
+    # 龙虎榜流水落 lhb_original_flow 表，多源校验在 services/hot_money.py：
+    # 同一(日期,标的,口径)至少 2 源且差值 < verify_threshold% 才采信，否则标"数据置信度不足"仅参考。
+    dragon_tiger_enable: bool = False      # 总开关 DRAGON_TIGER_ENABLE（关闭时抓取方法返回空）
+    dragon_tiger_hour: int = 16            # T+1 定时拉取小时
+    dragon_tiger_minute: int = 30          # T+1 定时拉取分钟
+    dragon_tiger_verify_threshold: float = 10.0  # 多源校验差值阈值（%），超过则标置信度不足
+    # 第二龙虎榜数据源开关 DRAGON_TIGER_SECOND_SOURCE：
+    #   auto = 自动探测可用第二源（当前：同花顺直连需 JS hexin-v token 不可用、
+    #          新浪每日明细无金额明细 → 仅东财可用，诚实标注"采信待第二源"，不伪造第二源数据 K227）；
+    #   sina = 新浪（仅上榜确认，无金额，不参与金额采信）；
+    #   none = 明确只用东财单源（置信度不足降级保留）。
+    dragon_tiger_second_source: str = "auto"
+
     # ---------- 存储空间维护（低频自动清理，防无限堆积）----------
     news_retention_days: int = 90        # 新闻/公告保留周期（天），超期自动清理（关键分析数据不清理）
     db_maintenance_enabled: bool = True  # 定时空间维护总开关（SQLite VACUUM + 超期数据清理）

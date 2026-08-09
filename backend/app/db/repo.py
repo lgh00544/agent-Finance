@@ -13,8 +13,9 @@ from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog, Holding,
-    MarketCondition, NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult,
-    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord, _now,
+    HotMoneyProfile, LhbOriginalFlow, MarketCondition, NewsArticle, PositionPlan,
+    PrivateKnowledge, ReviewResult, SellDecision, StockCandidate, StockScore,
+    TradeProfile, TradeRecord, _now,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -148,12 +149,20 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
 
 def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: float,
                 batches: list, stop_loss: float, take_profit: float, rationale: str,
-                detail: dict | None = None) -> int:
-    """detail: v3.0 白盒扩展（dimensions/final_advice/market_regime），可选；旧调用零影响"""
+                detail: dict | None = None, source: str = "manual") -> int:
+    """detail: v3.0 白盒扩展（dimensions/final_advice/market_regime/freshness/quant），可选；
+    旧调用零影响。去重规则：同一标的同一交易日仅保留最新一份（旧记录删除，
+    新记录 id 保持最新），杜绝列表重复冗余。source: candidate=每日候选池联动 / manual=手动生成。"""
     with SessionLocal() as db:
+        stale = db.execute(select(PositionPlan).where(
+            PositionPlan.stock_code == stock_code, PositionPlan.plan_date == plan_date)
+        ).scalars().all()
+        for s in stale:
+            db.delete(s)
         row = PositionPlan(stock_code=stock_code, stock_name=stock_name, plan_date=plan_date,
                            total_pct=total_pct, batches=batches, stop_loss=stop_loss,
-                           take_profit=take_profit, rationale=rationale, detail=detail)
+                           take_profit=take_profit, rationale=rationale, detail=detail,
+                           source=source if source in ("candidate", "manual") else "manual")
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -667,6 +676,7 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "stop_loss": r.stop_loss, "take_profit": r.take_profit,
                                            "rationale": r.rationale,
                                            "detail": r.detail or {},
+                                           "source": r.source or "manual",
                                            "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("plan", {"code": code, "limit": limit}, _load)
@@ -908,3 +918,190 @@ def list_chat_messages(agent: str, limit: int = 50) -> list[dict]:
              "content": r.content, "verdict": r.verdict, "knowledge_id": r.knowledge_id,
              "meta": r.meta or {}, "created_at": str(r.created_at)}
             for r in rows]
+
+
+# ================= 游资档案（hot_money_profile，低频字典） =================
+
+def upsert_hot_money_profile(actor_name: str, seat_code: str, tier: str = "观察",
+                             style_tags: list | None = None, good_themes: list | None = None,
+                             co_seats: list | None = None, source: str = "手动") -> int:
+    """按 seat_code 幂等 upsert 游资档案（一席位一主力游资）"""
+    with SessionLocal() as db:
+        row = db.execute(select(HotMoneyProfile).where(
+            HotMoneyProfile.seat_code == seat_code)).scalar_one_or_none()
+        if row is None:
+            row = HotMoneyProfile(actor_name=actor_name, seat_code=seat_code, tier=tier,
+                                  style_tags=style_tags or [], good_themes=good_themes or [],
+                                  co_seats=co_seats or [], source=source)
+            db.add(row)
+        else:
+            row.actor_name = actor_name
+            row.tier = tier
+            row.style_tags = style_tags or row.style_tags or []
+            row.good_themes = good_themes or row.good_themes or []
+            row.co_seats = co_seats or row.co_seats or []
+            row.source = source
+        db.commit()
+        db.refresh(row)
+        _invalidate("hot_money")
+        return row.id
+
+
+def seed_default_hot_money_profiles() -> int:
+    """初始游资档案种子（幂等：按 seat_code 已存在则跳过）。
+    ⚠️ 席位名仅作模糊匹配参考（源文件示例），真实席位以抓到的龙虎榜为准。"""
+    seeds = [
+        # (游资名, 席位名, 梯队, 风格标签, 擅长题材)
+        ("赵老哥", "中信证券上海分公司", "一线",
+         ["高位接力", "题材龙头"], ["次新", "科技"]),
+        ("章盟主", "国泰君安证券上海分公司", "一线",
+         ["趋势跟随", "大市值票"], ["蓝筹", "白马"]),
+        ("孙哥", "中信证券杭州延安路", "一线",
+         ["打板", "情绪票"], ["连板", "题材"]),
+        ("欢乐海", "华泰证券深圳益田路荣超商务中心", "一线",
+         ["低吸", "首板"], ["题材轮动"]),
+        ("佛山系", "光大证券佛山绿景路", "二线",
+         ["反包", "超跌反弹"], ["低价股"]),
+        ("炒股养家", "华鑫证券上海分公司", "二线",
+         ["趋势", "波段"], ["科技", "新能源"]),
+        ("宁波桑田路", "国盛证券宁波桑田路", "二线",
+         ["打板", "接力"], ["次新", "军工"]),
+    ]
+    n = 0
+    for actor, seat, tier, tags, themes in seeds:
+        try:
+            upsert_hot_money_profile(actor, seat, tier, tags, themes,
+                                     source="手动·种子参考")
+            n += 1
+        except Exception:  # noqa: BLE001 单条种子失败不阻断（如席位冲突）
+            logger.warning("游资种子写入失败: %s/%s", actor, seat)
+    return n
+
+
+def list_hot_money_profiles() -> list[dict]:
+    """全部游资档案（模糊匹配用；含游资复盘胜率统计字段）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            rows = db.execute(select(HotMoneyProfile)
+                              .order_by(HotMoneyProfile.id)).scalars().all()
+        return [{"id": r.id, "actor_name": r.actor_name, "seat_code": r.seat_code,
+                 "tier": r.tier, "style_tags": r.style_tags or [],
+                 "good_themes": r.good_themes or [], "co_seats": r.co_seats or [],
+                 "source": r.source, "win_rate_5d": r.win_rate_5d,
+                 "last_review_at": r.last_review_at or "",
+                 "updated_at": str(r.updated_at)}
+                for r in rows]
+
+    return _dbq("hot_money", {}, _load)
+
+
+def get_profile_by_actor(actor_name: str) -> dict | None:
+    """游资名 → 档案（精确匹配，未命中 None）；权重迭代建议应用用"""
+    name = (actor_name or "").strip()
+    if not name:
+        return None
+    for p in list_hot_money_profiles():
+        if p["actor_name"] == name:
+            return p
+    return None
+
+
+def update_profile_win_rate(profile_id: int, win_rate_5d: float | None,
+                            last_review_at: str) -> None:
+    """胜率迭代事实落库：win_rate_5d（信号后5日上涨胜率，代码统计事实）+
+    last_review_at（迭代时间）。只写统计事实，不改 tier——降/升档必须经人工审核。"""
+    with SessionLocal() as db:
+        row = db.execute(select(HotMoneyProfile).where(
+            HotMoneyProfile.id == profile_id)).scalar_one_or_none()
+        if row is None:
+            return
+        row.win_rate_5d = win_rate_5d
+        row.last_review_at = last_review_at
+        db.commit()
+        _invalidate("hot_money")
+
+
+def get_profile_by_seat(seat_name: str) -> dict | None:
+    """席位 → 游资档案：先精确匹配，再停用词归一化后包含模糊匹配；未命中返回 None。
+    真实龙虎榜席位名带「股份有限公司/证券营业部」等后缀（如 中信证券股份有限公司上海分公司），
+    种子席位名为简写（中信证券上海分公司）——归一化后即可命中。"""
+    seat = (seat_name or "").strip()
+    if not seat:
+        return None
+    for p in list_hot_money_profiles():
+        if p["seat_code"] == seat:
+            return p
+    # 停用词归一化：去掉公司/营业部常见后缀词，保留主体（如 中信证券股份有限公司上海分公司
+    # → 中信 上海分公司），种子与真实席位都归一化后做包含匹配
+    norm = _normalize_seat(seat)
+    for p in list_hot_money_profiles():
+        p_norm = _normalize_seat(p.get("seat_code") or "")
+        if p_norm and (p_norm in norm or norm in p_norm):
+            return p
+    return None
+
+
+def _normalize_seat(seat: str) -> str:
+    """席位名停用词归一化（模糊匹配辅助，非市场判断）"""
+    for word in ("股份有限公司", "有限责任公司", "证券营业部", "营业部", "证券", "分公司"):
+        seat = seat.replace(word, "")
+    return seat.strip()
+
+
+# ================= 龙虎榜原始流水（lhb_original_flow，口径硬隔离） =================
+
+def insert_lhb_flows(rows: list[dict]) -> int:
+    """批量插入龙虎榜流水（rows: trade_date/stock_code/stock_name/lhb_type/
+    disclosure_reason/seat_name/buy_amt/sell_amt/net_buy/confidence/source）"""
+    if not rows:
+        return 0
+    with SessionLocal() as db:
+        for r in rows:
+            db.add(LhbOriginalFlow(
+                trade_date=r["trade_date"], stock_code=r["stock_code"],
+                stock_name=r.get("stock_name", ""), lhb_type=r.get("lhb_type", "1d"),
+                disclosure_reason=r.get("disclosure_reason", ""),
+                seat_name=r.get("seat_name", ""),
+                buy_amt=float(r.get("buy_amt") or 0.0), sell_amt=float(r.get("sell_amt") or 0.0),
+                net_buy=float(r.get("net_buy") or 0.0),
+                confidence=float(r.get("confidence") or 1.0),
+                source=r.get("source", "eastmoney")))
+        db.commit()
+        _invalidate("lhb")
+    return len(rows)
+
+
+def list_lhb_flows(trade_date: str | None = None, stock_code: str | None = None,
+                   lhb_type: str | None = None, seat_name: str | None = None,
+                   limit: int = 2000) -> list[dict]:
+    """龙虎榜流水查询（按 日期/标的/口径/席位 过滤；游资信号回溯用 seat_name）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(LhbOriginalFlow).order_by(LhbOriginalFlow.id.desc())
+            if trade_date:
+                stmt = stmt.where(LhbOriginalFlow.trade_date == trade_date)
+            if stock_code:
+                stmt = stmt.where(LhbOriginalFlow.stock_code == stock_code)
+            if lhb_type:
+                stmt = stmt.where(LhbOriginalFlow.lhb_type == lhb_type)
+            if seat_name:
+                stmt = stmt.where(LhbOriginalFlow.seat_name == seat_name)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+        return [{"id": r.id, "trade_date": r.trade_date, "stock_code": r.stock_code,
+                 "stock_name": r.stock_name, "lhb_type": r.lhb_type,
+                 "disclosure_reason": r.disclosure_reason, "seat_name": r.seat_name,
+                 "buy_amt": r.buy_amt, "sell_amt": r.sell_amt, "net_buy": r.net_buy,
+                 "confidence": r.confidence, "source": r.source,
+                 "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("lhb", {"trade_date": trade_date, "stock_code": stock_code,
+                        "lhb_type": lhb_type, "seat_name": seat_name, "limit": limit}, _load)
+
+
+def hot_money_fingerprint() -> str:
+    """游资数据指纹（供 LLM cache_key 并入，防缓存吞新数据）：
+    龙虎榜流水的最近写入时间 + 行数；无数据返回 '0'"""
+    with SessionLocal() as db:
+        n = db.execute(select(func.count()).select_from(LhbOriginalFlow)).scalar_one()
+        last = db.execute(select(func.max(LhbOriginalFlow.created_at))).scalar_one()
+    return f"{n}:{last.strftime('%Y%m%d%H%M%S') if last else '0'}"

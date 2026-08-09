@@ -149,7 +149,7 @@ def test_daily_pipeline_parallel_large_batch(monkeypatch):
     result = router.run_daily_pipeline("2026-08-05")
     elapsed = time.monotonic() - t0
 
-    assert result == {"candidates": 5, "scored": 5}
+    assert result == {"candidates": 5, "scored": 5, "plans": 0}
     assert state["done"] == 5
     assert state["max_active"] >= 2, "大标的池必须并发执行（并行模式未生效）"
     assert elapsed < 1.2, "并行应显著快于串行（5×0.3s 串行 ≥1.5s）"
@@ -179,7 +179,7 @@ def test_daily_pipeline_serial_small_batch(monkeypatch):
     monkeypatch.setattr(router, "run_discover", _fake_discover)
     monkeypatch.setattr(router, "run_score", _fake_run_score)
     result = router.run_daily_pipeline("2026-08-05")
-    assert result == {"candidates": 2, "scored": 2}
+    assert result == {"candidates": 2, "scored": 2, "plans": 0}
     assert state["max_active"] == 1, "小标的池保持串行（单 Agent 模式）"
 
 
@@ -202,5 +202,5 @@ def test_parallel_result_consistency(monkeypatch):
     monkeypatch.setattr(router, "run_discover", _fake_discover)
     monkeypatch.setattr(router, "run_score", _fake_run_score)
     result = router.run_daily_pipeline("2026-08-05")
-    assert result == {"candidates": 5, "scored": 5}
+    assert result == {"candidates": 5, "scored": 5, "plans": 0}
     assert seen == {c["stock_code"]: c["stock_name"] for c in candidates}  # 无串扰

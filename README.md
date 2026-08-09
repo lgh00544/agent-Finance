@@ -429,6 +429,20 @@ MiniMax M3 作为**可选多模态引擎**接入系统，用于持仓截图 OCR 
 
 > 层级关系：层级 1 管"参数"（够用），层级 2 管"风格与哲学"（进阶），层级 2.5 管"私有战法 + 硬性底线"（即时生效），层级 3 让系统从你的真实盈亏中持续自我进化（长期打磨，全程人工把关）。
 
+## 游资体系（阶段 3：真实数据链 + 自进化 + 可采信 + 可看）
+
+**数据链**：东财龙虎榜直连（datacenter API，vendored 免 akshare 坑）→ `lhb_original_flow` 表（席位级流水 + 股票级净买，口径硬隔离 `1d/3d`）→ `hot_money_profile` 游资档案（席位唯一映射，种子为模糊匹配参考，真实席位以龙虎榜为准）→ 注入 Discover/Score/Position/Monitor/Sell 四环节（平行维度补充加权，绝不压倒其他四维，详见 `global_base_prompt.md` 游资红线铁律）。
+
+**多源采信（K227 诚实）**：同一(日期,标的,口径)的净买额，≥2 数据源且差值 <10% → `confidence 0.9` 采信纳入评分；仅单源或差值 ≥10% → `confidence 0.5`"数据置信度不足"仅参考，输出如实标注。**第二源现状**：新浪每日明细接口无金额明细（仅上榜确认）、同花顺直连需 JS hexin-v token（本环境不可用）——系统如实标注"当前仅东财可用、采信待第二源"，不伪造第二源数据；第二源接入后校验逻辑自动升级（`DRAGON_TIGER_SECOND_SOURCE=auto/sina/none`）。
+
+**复盘闭环（自进化，人工审核后生效）**：
+- 提示词层（`review_prompt.py` 游资复盘规则）：止损/不及预期标的回溯当时游资信号，归类为 游资诱多/对倒骗局（K189）/ 主力方向偏差 / 数据口径误读（K227）/ 信号有效，评估"该游资该笔信号是否有效"（买入后 N 日 vs 大盘），结论留痕 `ai_reasoning_trace`（source_module=`hot_money_review`）；
+- 代码侧（`services/hot_money_review.py`）：统计各游资"信号后5日跑赢沪深300"胜率落库（`hot_money_profile.win_rate_5d/last_review_at`），胜率 <40% 生成降档建议（一线→二线→观察，标注"谨慎/反向参考"）、≥60% 升档建议、样本 <3 不产建议——**只生成建议（agent_suggestion pending），必须经人工审核（approved）后才可应用档位**，系统绝不自动改权重。
+
+**游资追踪页**（`streamlit/pages/5_游资追踪.py`，监控后第一页）：游资档案（可搜索，含 5 日胜率）/ 今日龙虎榜（按日筛选，口径/数据源/置信度如实展示）/ 游资席位监控（流水×档案关联，净买方向 + 命中真实席位）/ 研判留痕（source_module=hot_money，跨模块联查）。
+
+**启用方式**：`.env` 设置 `DRAGON_TIGER_ENABLE=true`（调度每日 16:30 T+1 拉取），或手动 `python backend/scripts/fetch_dragon_tiger.py [YYYY-MM-DD]`。监管红线：人工执行、不自动下单；游资平行维度不压倒其他四维；严禁改动 C1/C2/C3 风控。
+
 ## 目录结构
 
 ```
@@ -438,16 +452,16 @@ backend/
     core/            配置与日志（APP_ENV / DB_BACKEND / CACHE_BACKEND / QDRANT_MODE 开关）
     db/              ORM 模型 + repo.py（唯一数据网关）+ 会话
     cache.py         缓存网关（默认内存 / 可选 Redis）
-    datasource/      akshare 主源（超时/重试/东财→新浪降级/列名兼容）+ 麦蕊增强源（可选，默认关闭）
+    datasource/      akshare 主源（超时/重试/东财→新浪降级/列名兼容）+ 麦蕊增强源（可选）+ 龙虎榜源（东财直连，游资维度）
     llm/             DeepSeek 结构化输出（json_object + pydantic + 重试）+ Embedding
     agents/          六 Agent 节点 + common.py（统一调教接口：HARD_RULES/偏好/知识注入）
     graph/           StockAgentState + 6 个 StateGraph + 图间编排
-    services/        indicator（纯数学指标）/ vector_store（向量网关）/ multimodal（MiniMax 可选多模态，默认关闭）/ feishu / ocr
+    services/        indicator（纯数学指标）/ vector_store（向量网关）/ multimodal（MiniMax 可选多模态，默认关闭）/ feishu / ocr / hot_money（游资聚合+多源校验）/ hot_money_review（胜率迭代+档位建议）/ plan_quant（仓位量化）
     scheduler/       APScheduler 定时任务（Asia/Shanghai）
     api/             REST API（仅数据存取 + 手动触发，零 SQL 直连）
   tests/             pytest：过滤/指标/LLM 解析/状态流转/调教闭环/DB/页面渲染
   scripts/           dev_run.py 启动 / smoke_test.py 全链路冒烟
-streamlit/           Streamlit 展示面板（纯展示，无二次判断，8 个页面）
+streamlit/           Streamlit 展示面板（纯展示，无二次判断，10 个页面）
 docker-compose.yml   backend + streamlit 两服务
 .env.example        全部配置项模板（含中文注释）
 data/                dev.db / qdrant_storage/ / logs（本地文件存储，复制即迁移）

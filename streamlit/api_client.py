@@ -279,6 +279,49 @@ def take_profit_plan(force: bool = False) -> dict:
                 {"force": "1"} if force else None)
 
 
+# ================= 游资追踪 =================
+
+def hot_money_profiles(q: str = "", tier: str = "") -> list:
+    """游资档案列表（名称/席位/梯队/风格/擅长题材/5日胜率）；q=模糊搜索、tier=档位过滤"""
+    params = {}
+    if q:
+        params["q"] = q
+    if tier:
+        params["tier"] = tier
+    return _get("/api/hot-money/profiles", params or None)
+
+
+def hot_money_flows(date: str | None = None, code: str | None = None,
+                    lhb_type: str = "1d", limit: int = 500) -> list:
+    """龙虎榜原始流水（按日/标的/口径筛选）"""
+    params = {"limit": limit}
+    if date:
+        params["date"] = date
+    if code:
+        params["code"] = code
+    if lhb_type:
+        params["lhb_type"] = lhb_type
+    return _get("/api/hot-money/flows", params)
+
+
+def hot_money_traces(code: str | None = None, limit: int = 50) -> list:
+    """游资研判留痕（source_module='hot_money'）"""
+    params = {"limit": limit}
+    if code:
+        params["code"] = code
+    return _get("/api/hot-money/traces", params)
+
+
+def hot_money_winrate_iterate() -> dict:
+    """触发游资胜率迭代（只生成建议 pending + 统计事实落库，人工审核后生效）"""
+    return _post("/api/hot-money/win-rate-iteration")
+
+
+def hot_money_tier_apply(suggestion_id: int) -> dict:
+    """人工审核确认后应用游资档位建议（仅 approved 可执行）"""
+    return _post("/api/hot-money/tier/apply", {"suggestion_id": suggestion_id})
+
+
 def adopt_review(rid: int) -> dict:
     return _post(f"/api/reviews/{rid}/adopt")
 

@@ -32,9 +32,10 @@ PAGES = [
     "2_评分报告.py",
     "3_建仓计划.py",
     "4_持仓监控.py",
-    "5_交易复盘.py",
-    "7_告警日志.py",
-    "8_交易知识库.py",
+    "5_游资追踪.py",
+    "6_交易复盘.py",
+    "8_告警日志.py",
+    "9_交易知识库.py",
 ]
 
 _TITLES = {
@@ -42,9 +43,10 @@ _TITLES = {
     "2_评分报告.py": "评分报告（ScoreAgent）",
     "3_建仓计划.py": "建仓计划（PositionAgent）",
     "4_持仓监控.py": "持仓监控（MonitorAgent）",
-    "5_交易复盘.py": "交易复盘（ReviewAgent）",
-    "7_告警日志.py": "告警日志（MonitorAgent）",
-    "8_交易知识库.py": "交易知识库（统一调教·私有战法）",
+    "5_游资追踪.py": "游资追踪（Hot Money）",
+    "6_交易复盘.py": "交易复盘（ReviewAgent）",
+    "8_告警日志.py": "告警日志（MonitorAgent）",
+    "9_交易知识库.py": "交易知识库（统一调教·私有战法）",
 }
 
 
@@ -223,13 +225,13 @@ def test_score_page_master_detail_linkage():
     assert first not in _detail_text(), "详情区应只展示当前选中行"
 
 
-# ================= Agent 对话页（9_Agent对话.py） =================
+# ================= Agent 对话页（10_Agent对话.py） =================
 
 def test_agent_chat_page_renders():
     """Agent 对话页渲染：标题 / 左侧 Agent 导航列表（radio 高亮）/ 四个交互标签 / 历史区"""
-    at = AppTest.from_file(str(PAGES_DIR / "9_Agent对话.py"), default_timeout=180)
+    at = AppTest.from_file(str(PAGES_DIR / "10_Agent对话.py"), default_timeout=180)
     at.run()
-    assert not at.exception, f"9_Agent对话.py 渲染异常: {at.exception}"
+    assert not at.exception, f"10_Agent对话.py 渲染异常: {at.exception}"
     assert at.title[0].value == "Agent 专属对话（调教 · 答疑 · 知识沉淀）"
     tabs = [t.label for t in at.tabs]
     for name in ("文字提问", "规则调教", "多模态学习", "对话历史"):
@@ -254,25 +256,42 @@ def test_holding_page_tabs():
         assert name in tabs, f"缺少标签页: {name}"
 
 
+def test_hot_money_page_renders():
+    """游资追踪页渲染：标题 / 五大折叠模块标题（权重迭代/档案/龙虎榜/席位监控/留痕）"""
+    at = AppTest.from_file(str(PAGES_DIR / "5_游资追踪.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"5_游资追踪.py 渲染异常: {at.exception}"
+    assert at.title[0].value == "游资追踪（Hot Money）"
+    # fold_module 标题渲染为 markdown（折叠开关是「收起/展开」按钮），按标题文本断言
+    texts = " ".join(str(m.value) for m in at.markdown)
+    for name in ("游资胜率迭代（自进化 · 人工审核后生效）",
+                 "游资档案", "龙虎榜原始流水（今日/按日筛选）",
+                 "游资席位监控（最近操作追踪）",
+                 "游资研判留痕（ai_reasoning_trace · 跨模块联查）"):
+        assert name in texts, f"缺少折叠模块标题: {name}"
+    assert any("收起" in b.label or "展开" in b.label for b in at.button), "缺少折叠开关按钮"
+
+
 def test_knowledge_page_tabs():
     """交易知识库页顶部 Tab 操作区：新增条目 / 批量导入 / 知识条目"""
-    at = AppTest.from_file(str(PAGES_DIR / "8_交易知识库.py"), default_timeout=180)
+    at = AppTest.from_file(str(PAGES_DIR / "9_交易知识库.py"), default_timeout=180)
     at.run()
-    assert not at.exception, f"8_交易知识库.py 渲染异常: {at.exception}"
+    assert not at.exception, f"9_交易知识库.py 渲染异常: {at.exception}"
     tabs = [t.label for t in at.tabs]
     for name in ("新增条目", "批量导入", "知识条目"):
         assert name in tabs, f"缺少标签页: {name}"
-    src = (PAGES_DIR / "8_交易知识库.py").read_text(encoding="utf-8")
+    src = (PAGES_DIR / "9_交易知识库.py").read_text(encoding="utf-8")
     assert src.count('st.form("') >= 2  # 新增 + 批量导入表单
     assert "按适用 Agent 过滤" in [s.label for s in at.selectbox]
 
 
 def test_review_page_expander():
     """交易复盘页：策略闭环建议区一级折叠模块存在（待审核条数实时展示）"""
-    at = AppTest.from_file(str(PAGES_DIR / "5_交易复盘.py"), default_timeout=180)
+    at = AppTest.from_file(str(PAGES_DIR / "6_交易复盘.py"), default_timeout=180)
     at.run()
-    assert not at.exception, f"5_交易复盘.py 渲染异常: {at.exception}"
+    assert not at.exception, f"6_交易复盘.py 渲染异常: {at.exception}"
     labels = [b.label for b in at.button] + [e.label for e in at.expander]
+    labels += [str(m.value) for m in at.markdown]
     assert any("策略闭环" in lb for lb in labels), "缺少策略闭环建议区折叠模块"
 
 
@@ -302,8 +321,8 @@ def test_navigation_app_groups():
     for group in ("系统概览", "选股决策", "持仓风控", "策略沉淀"):
         assert group in src, f"缺少导航分组: {group}"
     for page in ("0_系统概览.py", "1_每日候选池.py", "2_评分报告.py", "3_建仓计划.py",
-                 "4_持仓监控.py", "5_交易复盘.py", "7_告警日志.py", "8_交易知识库.py",
-                 "9_Agent对话.py"):
+                 "4_持仓监控.py", "5_游资追踪.py", "6_交易复盘.py", "8_告警日志.py",
+                 "9_交易知识库.py", "10_Agent对话.py"):
         assert page in src, f"导航未挂载页面: {page}"
 
 
@@ -345,14 +364,14 @@ def test_no_bare_st_error_in_pages():
 
 def test_field_error_usage_in_forms():
     """表单字段校验页面统一使用 fld_ 容器 + field_error 原位标记 + field_summary 汇总条"""
-    pages = ["3_建仓计划.py", "4_持仓监控.py", "5_交易复盘.py", "8_交易知识库.py"]
+    pages = ["3_建仓计划.py", "4_持仓监控.py", "6_交易复盘.py", "9_交易知识库.py"]
     for name in pages:
         src = (PAGES_DIR / name).read_text(encoding="utf-8")
         assert 'render.field_error(' in src, f"{name} 缺少原位字段错误标记"
         assert 'render.get_field_error(' in src, f"{name} 缺少字段错误读取"
     # 汇总条：提交校验表单需展示错误汇总（不整段报错）
     assert "field_summary" in (PAGES_DIR / "4_持仓监控.py").read_text(encoding="utf-8")
-    assert "field_summary" in (PAGES_DIR / "8_交易知识库.py").read_text(encoding="utf-8")
+    assert "field_summary" in (PAGES_DIR / "9_交易知识库.py").read_text(encoding="utf-8")
 
 
 def test_top_bar_sidebar_adapt_css():

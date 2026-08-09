@@ -59,8 +59,17 @@ def collect_quote(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 新闻失败不阻塞监控
         logger.warning("监控新闻拉取失败 %s: %s", code, exc)
 
+    # 游资聚合数据（阶段3：龙虎榜流水聚合；无数据 None，LLM 保持标中性）
+    hm_agg = None
+    try:
+        from app.services import hot_money as hot_money_svc
+        hm_agg = hot_money_svc.aggregate_for_stock(code, state.get("stock_name") or "", today)
+    except Exception as exc:  # noqa: BLE001 游资聚合失败不阻塞监控
+        logger.warning("监控游资聚合失败（降级跳过）: %s", exc)
+
     state["tech_index"] = indicators
     state["news_report"] = news_rows
+    state["hot_money"] = hm_agg
     state["trace"] = [*state.get("trace", []),
                       f"行情聚合: {indicators.get('latest_date')}"
                       + ("（实时价不可用，用日K收盘兜底）" if stale else "")]
@@ -129,6 +138,8 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         "实时行情": real_time_block,
         "最新指标": {k: v for k, v in indicators.items() if k != "recent_klines"},
         "近期K线": indicators.get("recent_klines", [])[-15:],
+        # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
+        "游资聚合": state.get("hot_money"),
     }
     news_context = "\n".join(
         f"{n.get('published_at')} {n.get('title')}" for n in (state.get("news_report") or [])) or "（无）"

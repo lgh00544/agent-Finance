@@ -56,7 +56,8 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "score": ("单股评分",
               lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
     "position": ("分批建仓方案",
-                 lambda p: graph_router.run_position(p.get("stock_code", ""), p.get("stock_name", ""))),
+                 lambda p: graph_router.run_position(p.get("stock_code", ""), p.get("stock_name", ""),
+                                                     source=p.get("source", "manual"))),
     "sell_decision": ("卖出决策",
                       lambda p: graph_router.run_sell_decision(p.get("holding_id"))),
     "monitor_all": ("全量持仓实时监控",
@@ -758,6 +759,61 @@ def take_profit_plan(force: bool = False):
     「接近止盈/止盈触发」告警（独立去重通道，不改监控循环）。"""
     from app.services.take_profit import build_plans
     return build_plans(force=force)
+
+
+# ================= 游资追踪（游资档案 / 龙虎榜流水 / 留痕 / 权重迭代） =================
+@router.get("/hot-money/profiles")
+def hot_money_profiles(q: str = "", tier: str = ""):
+    """游资档案列表（名称/席位/梯队/风格/擅长题材/5日胜率），
+    q=名称或席位模糊搜索、tier=档位过滤；纯读不写"""
+    rows = repo.list_hot_money_profiles()
+    q = (q or "").strip()
+    tier = (tier or "").strip()
+    if q:
+        rows = [p for p in rows if q in (p.get("actor_name") or "")
+                or q in (p.get("seat_code") or "")]
+    if tier:
+        rows = [p for p in rows if p.get("tier") == tier]
+    return rows
+
+
+@router.get("/hot-money/flows")
+def hot_money_flows(date: Optional[str] = None, code: Optional[str] = None,
+                    lhb_type: str = "1d", limit: int = 500):
+    """龙虎榜原始流水（按日/标的/口径筛选），游资追踪页数据源（纯读）"""
+    return repo.list_lhb_flows(trade_date=date, stock_code=code,
+                               lhb_type=lhb_type, limit=limit)
+
+
+@router.get("/hot-money/traces")
+def hot_money_traces(code: Optional[str] = None, limit: int = 50):
+    """游资研判留痕（source_module='hot_money'，跨模块联查一次拿到全研判）"""
+    return repo.list_traces(code=code, module="hot_money", limit=limit)
+
+
+@router.post("/hot-money/win-rate-iteration")
+def hot_money_win_rate_iteration():
+    """游资胜率迭代（代码侧统计 + 建议生成，需真实行情回溯，耗时较长）：
+    ⚠️ 只生成建议（agent_suggestion 落 pending）与统计事实（win_rate_5d/last_review_at），
+    任何降/升档与权重调整必须经人工审核确认后才生效。"""
+    from app.services import hot_money_review
+
+    return hot_money_review.run_win_rate_iteration()
+
+
+class TierApplyBody(BaseModel):
+    suggestion_id: int
+
+
+@router.post("/hot-money/tier/apply")
+def hot_money_tier_apply(body: TierApplyBody):
+    """人工审核确认后应用游资档位建议（仅 approved 状态可执行，代码绝不自动改权重生效）"""
+    from app.services import hot_money_review
+
+    try:
+        return hot_money_review.apply_tier_suggestion(body.suggestion_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 # ================= 其他 =================

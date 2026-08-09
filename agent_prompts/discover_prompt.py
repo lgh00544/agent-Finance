@@ -126,13 +126,15 @@ def build_user_prompt(stock_table: str, market_context: str, market_note: str = 
 
 
 def build_final_prompt(stock_table: str, news_context: str, cap: int | None = None,
-                       market_note: str = "") -> str:
-    """news_context: 候选股新闻/公告检索结果；cap: 当日候选池上限（v2.0 市况档位）"""
+                       market_note: str = "", hot_money_context: str = "") -> str:
+    """news_context: 候选股新闻/公告检索结果；cap: 当日候选池上限（v2.0 市况档位）；
+    hot_money_context: 候选游资聚合数据段（services/hot_money 组装，空串整段省略）"""
     cap_section = ""
     if cap is not None:
         cap_section = f"\n【当日候选池规模上限】今日候选池不得超过 {cap} 只，按优先级排序，宁缺毋滥。"
     note_section = f"\n{market_note}" if market_note else ""
-    return f"""{stock_table}{cap_section}{note_section}
+    hm_section = f"\n\n{hot_money_context}" if hot_money_context else ""
+    return f"""{stock_table}{cap_section}{note_section}{hm_section}
 
 【候选股新闻/公告检索结果】（向量检索相关资讯，用于核实基本面与风险）
 {news_context}
@@ -140,4 +142,6 @@ def build_final_prompt(stock_table: str, news_context: str, cap: int | None = No
 请基于新闻资讯与增量数据对初步候选做最后确认：剔除存在明确利空（立案/减持/质押/业绩暴雷等）、
 与基本面严重矛盾、或触发硬性规则（人工硬性锁定规则）的标的，输出最终候选列表。
 每只标的必须完整输出 v2.0 强制字段（信心度档位/三维分析/量能判定/技术面研判含体系标注/
-关键价位/操作建议/核心风险≥2项/关注类型）。"""
+关键价位/操作建议/核心风险≥2项/关注类型）。
+若有【候选游资聚合数据】：按口径后缀字段（lhb_1d_net_buy/lhb_3d_net_buy）如实纳入
+「资金/游资」维度研判；游资为平行维度只做补充加权，不压倒其他四维；置信度不足的数据仅参考并标注。"""

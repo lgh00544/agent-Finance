@@ -94,6 +94,49 @@ def monitor_job() -> None:
         cache.release_lock("monitor")
 
 
+def _is_previous_trading_day(yesterday: str) -> bool:
+    """昨天是否最近交易日（龙虎榜 T+1：16:30 后拉的是昨日数据）。
+    日历为全量静态历（1990~年末含未来日期）：取今天之前的最后一个交易日与昨天比对"""
+    try:
+        calendar = AkshareSource().fetch_trade_calendar()
+        today = time.strftime("%Y-%m-%d")
+        past = [d for d in (calendar or []) if d < today]
+        return bool(past) and past[-1] == yesterday
+    except Exception as exc:  # noqa: BLE001 日历失败时按工作日放行
+        logger.warning("交易日历获取失败，按工作日放行: %s", exc)
+        return True
+
+
+def dragon_tiger_job() -> None:
+    """龙虎榜 T+1 拉取：16:30 后抓前一日龙虎榜（游资维度数据链）。
+    抓取层纯数据（东财/新浪），研判逻辑在提示词与 services/hot_money.py，此处零判断。"""
+    if not settings.dragon_tiger_enable:
+        return
+    today = time.strftime("%Y-%m-%d")
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    if not _is_previous_trading_day(yesterday):
+        logger.info("昨日 %s 非交易日，跳过龙虎榜拉取", yesterday)
+        return
+    if not cache.acquire_lock("dragon_tiger", ttl_seconds=7200):
+        logger.info("dragon_tiger 锁被占用，跳过本次")
+        return
+    try:
+        from app.datasource.dragon_tiger_source import (fetch_dragon_tiger,
+                                                        second_source_status)
+
+        seats = fetch_dragon_tiger(yesterday)
+        logger.info("龙虎榜拉取完成 %s: 席位 %s 条", yesterday, len(seats))
+        # 第二源现状如实标注（K227 诚实：无金额第二源时单源数据保持"置信度不足仅参考"）
+        ss = second_source_status()
+        if not ss.get("available"):
+            logger.info("龙虎榜第二源现状: %s（多源采信待第二源接入）", ss.get("annotation"))
+        cache.set("job:last_lhb", today, 86400)
+    except Exception as exc:  # noqa: BLE001 抓取失败不阻塞其他任务
+        logger.error("龙虎榜拉取失败: %s", exc)
+    finally:
+        cache.release_lock("dragon_tiger")
+
+
 def maintenance_job() -> None:
     """每周空间维护（低频）：超期新闻清理 + SQLite 真空收缩 + 向量库超期索引清理。
     仅清理非核心数据（新闻原文），候选/评分/持仓/复盘等关键分析数据不清理。"""
@@ -141,6 +184,14 @@ def start_scheduler() -> None:
                       hour=settings.db_maintenance_hour, minute=settings.db_maintenance_minute,
                       id="db_maintenance", name="存储空间维护",
                       replace_existing=True, misfire_grace_time=3600)
+    # 龙虎榜 T+1 拉取（开关开启时生效；16:30 后抓前一日，游资维度数据链）
+    if settings.dragon_tiger_enable:
+        scheduler.add_job(dragon_tiger_job, "cron",
+                          day_of_week="mon-fri",
+                          hour=settings.dragon_tiger_hour,
+                          minute=settings.dragon_tiger_minute,
+                          id="dragon_tiger", name="龙虎榜T+1拉取",
+                          replace_existing=True, misfire_grace_time=3600)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")
 

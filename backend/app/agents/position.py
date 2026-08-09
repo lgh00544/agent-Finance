@@ -16,6 +16,7 @@ from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
 from app.services.indicator import compute_indicators
+from app.services import plan_quant
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,17 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
         model_level=ModelLevel.DEEP,
     )
 
+    # 分级缓存时效标签：A 级实时数据；B 级 30 分钟缓存（页面按此标注数据新鲜度）
+    grade = (state.get("score_result") or {}).get("grade") or ""
+    freshness = "realtime" if grade == "A" else "cache30m"
+    # 量化计算（纯计算零 LLM）：金额/股数（100 整数倍）/分级 C1 上限/盈亏比/资金缩减
+    indicators = (info or {}).get("indicators") or {}
+    quant = plan_quant.quantify(
+        code, name, grade,
+        [b.model_dump() for b in output.batches],
+        float(output.stop_loss), float(output.take_profit),
+        float(indicators.get("latest_close") or 0),
+        str(indicators.get("latest_date") or ""))
     plan_id = repo.insert_plan(
         code, name, today, float(output.total_pct),
         [b.model_dump() for b in output.batches],
@@ -91,7 +103,10 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
         # v3.0 白盒维度归因：dimensions + final_advice + market_regime（顺带落库修复现状丢失）
         detail={"dimensions": [d.model_dump() for d in output.dimensions],
                 "final_advice": output.final_advice,
-                "market_regime": output.market_regime},
+                "market_regime": output.market_regime,
+                "freshness": freshness,
+                "quant": quant},
+        source=state.get("plan_source") or "manual",
     )
     state["position_plan"] = {**output.model_dump(), "plan_id": plan_id}
     state["stage"] = "plan_position"

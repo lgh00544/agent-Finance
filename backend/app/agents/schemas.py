@@ -166,3 +166,6 @@ class ReviewOutput(BaseModel):
         description="对个人交易偏好档案的优化建议（可采纳/驳回）")
     agent_suggestions: list[AgentSuggestionItem] = Field(default_factory=list,
         description="对全链路各 Agent 规则/参数的优化建议（仅提案，必须人工审核确认后生效）")
+    hot_money_review: dict | None = Field(default=None,
+        description="游资信号有效性回溯结论（失败标的复盘时输出）：{classification, signal_effective, "
+                    "basis, weight_suggestion}；无游资信号可回溯时输出 null。只留痕，不直接改任何配置")

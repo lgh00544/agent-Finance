@@ -59,6 +59,14 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("卖出决策新闻拉取失败 %s: %s", code, exc)
 
+    # 游资聚合数据（阶段3：龙虎榜流水聚合，口径后缀字段；无数据 None，LLM 保持标中性）
+    hm_agg = None
+    try:
+        from app.services import hot_money as hot_money_svc
+        hm_agg = hot_money_svc.aggregate_for_stock(code, state.get("stock_name") or "", today)
+    except Exception as exc:  # noqa: BLE001 游资聚合失败不阻塞卖出决策
+        logger.warning("卖出游资聚合失败（降级跳过）: %s", exc)
+
     state["sell_input"] = {
         "holding": {"entry_date": holding.entry_date, "entry_price": holding.entry_price,
                     "shares": holding.shares, "stop_loss": holding.stop_loss,
@@ -70,6 +78,7 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
                  "take_profit": plan.take_profit if plan else 0},
         "monitor_signals": signal_rows,
         "news_titles": news_titles,
+        "hot_money": hm_agg,
     }
     state["tech_index"] = indicators
     state["trace"] = [*state.get("trace", []),
@@ -105,6 +114,8 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
         "最新指标": {k: v for k, v in (state.get("tech_index") or {}).items() if k != "recent_klines"},
         "近期K线": (state.get("tech_index") or {}).get("recent_klines", [])[-20:],
         "最新新闻标题": data["news_titles"],
+        # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
+        "游资聚合": data.get("hot_money"),
     }
 
     output = agent_call(
