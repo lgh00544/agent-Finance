@@ -9,6 +9,24 @@ from sqlalchemy import (
     JSON, Boolean, DateTime, Float, Index, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
+
+
+class SafeJSON(TypeDecorator):
+    """容错 JSON 类型：历史数据/迁移遗留可能写入空串，读取时视为 None 而非抛
+    JSONDecodeError（曾致 /api/reviews 500）。写侧行为与原生 JSON 完全一致。"""
+    impl = JSON
+    cache_ok = True
+
+    def result_processor(self, dialect, coltype):
+        impl_proc = self.impl.result_processor(dialect, coltype)
+
+        def process(value):
+            if isinstance(value, str) and not value.strip():
+                return None
+            return impl_proc(value) if impl_proc is not None else value
+
+        return process
 
 
 class Base(DeclarativeBase):
@@ -32,10 +50,10 @@ class StockCandidate(Base):
     stock_name: Mapped[str] = mapped_column(String(64))
     trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
     rank: Mapped[int] = mapped_column(Integer, default=0)            # 候选排序（LLM 输出）
-    reasons: Mapped[list] = mapped_column(JSON, default=list)        # 候选理由（LLM 输出）
-    risk_notice: Mapped[list] = mapped_column(JSON, default=list)    # 风险初判（LLM 输出）
-    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)       # 当日原始行情快照（计算层）
-    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # v2.0 输出详情（信心度/三维/量能/风险/关注类型 + 增量数据）
+    reasons: Mapped[list] = mapped_column(SafeJSON, default=list)        # 候选理由（LLM 输出）
+    risk_notice: Mapped[list] = mapped_column(SafeJSON, default=list)    # 风险初判（LLM 输出）
+    snapshot: Mapped[dict] = mapped_column(SafeJSON, default=dict)       # 当日原始行情快照（计算层）
+    detail: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # v2.0 输出详情（信心度/三维/量能/风险/关注类型 + 增量数据）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -60,7 +78,7 @@ class CandidateTrackVerify(Base):
     t5_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     t10_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_drawdown: Mapped[float | None] = mapped_column(Float, nullable=True)  # 相对基准最大回撤 %
-    verify_result: Mapped[dict] = mapped_column(JSON, default=dict)     # 周期胜负/回撤明细（见服务层）
+    verify_result: Mapped[dict] = mapped_column(SafeJSON, default=dict)     # 周期胜负/回撤明细（见服务层）
     is_finished: Mapped[int] = mapped_column(Integer, default=0)        # 0=追踪中 / 1=已到期收尾
     update_time: Mapped[str] = mapped_column(String(16), default="")    # YYYY-MM-DD HH:mm
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -74,7 +92,7 @@ class MarketCondition(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
     total_score: Mapped[int] = mapped_column(Integer)                # 0-50（LLM 五维求和）
-    dims: Mapped[dict] = mapped_column(JSON, default=dict)           # 五维明细（LLM 输出）
+    dims: Mapped[dict] = mapped_column(SafeJSON, default=dict)           # 五维明细（LLM 输出）
     cap: Mapped[int] = mapped_column(Integer)                        # 当日候选池上限（档位映射）
     summary: Mapped[str] = mapped_column(Text, default="")           # 市况综述（LLM 输出）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -91,8 +109,8 @@ class StockScore(Base):
     trade_date: Mapped[str] = mapped_column(String(10), index=True)
     score: Mapped[float] = mapped_column(Float, default=0.0)         # 0-100（LLM 输出）
     grade: Mapped[str] = mapped_column(String(4))                    # A/B/C（LLM 输出）
-    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # 五维明细（LLM 输出）
-    risk_list: Mapped[list] = mapped_column(JSON, default=list)      # 风险清单（LLM 输出）
+    detail: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # 五维明细（LLM 输出）
+    risk_list: Mapped[list] = mapped_column(SafeJSON, default=list)      # 风险清单（LLM 输出）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -106,11 +124,11 @@ class PositionPlan(Base):
     plan_date: Mapped[str] = mapped_column(String(10), index=True)
     status: Mapped[str] = mapped_column(String(16), default="proposed")  # proposed/accepted/expired
     total_pct: Mapped[float] = mapped_column(Float, default=0.0)     # 总仓位上限 %（LLM 输出）
-    batches: Mapped[list] = mapped_column(JSON, default=list)        # 分批明细（LLM 输出）
+    batches: Mapped[list] = mapped_column(SafeJSON, default=list)        # 分批明细（LLM 输出）
     stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（LLM 输出）
     take_profit: Mapped[float] = mapped_column(Float, default=0.0)   # 止盈参考价（LLM 输出）
     rationale: Mapped[str] = mapped_column(Text, default="")         # 建仓逻辑（LLM 输出）
-    detail: Mapped[dict] = mapped_column(JSON, default=dict)         # v3.0 白盒扩展（dimensions/final_advice/market_regime/quant）
+    detail: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # v3.0 白盒扩展（dimensions/final_advice/market_regime/quant）
     source: Mapped[str] = mapped_column(String(16), default="manual", index=True)  # candidate/manual（来源标记）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
@@ -166,7 +184,7 @@ class AlertLog(Base):
     severity: Mapped[str] = mapped_column(String(8), default="info")  # info/warning/critical
     message: Mapped[str] = mapped_column(Text)                       # 飞书推送文案（LLM 输出）
     action: Mapped[str] = mapped_column(String(16), default="hold")  # hold/reduce/exit（LLM 输出）
-    signal: Mapped[dict] = mapped_column(JSON, default=dict)         # 完整信号结构化输出
+    signal: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # 完整信号结构化输出
     pushed: Mapped[bool] = mapped_column(Boolean, default=False)     # 是否已推飞书
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
@@ -183,14 +201,14 @@ class ReviewResult(Base):
     exit_date: Mapped[str] = mapped_column(String(10))
     hold_days: Mapped[int] = mapped_column(Integer, default=0)
     pnl_pct: Mapped[float] = mapped_column(Float, default=0.0)       # 盈亏 %
-    plan_vs_actual: Mapped[dict] = mapped_column(JSON, default=dict) # 计划兑现度（LLM 输出）
+    plan_vs_actual: Mapped[dict] = mapped_column(SafeJSON, default=dict) # 计划兑现度（LLM 输出）
     lesson: Mapped[str] = mapped_column(Text, default="")            # 经验教训（LLM 输出）
-    feedback: Mapped[dict] = mapped_column(JSON, default=dict)       # 筛选偏好微调建议（LLM 输出）
+    feedback: Mapped[dict] = mapped_column(SafeJSON, default=dict)       # 筛选偏好微调建议（LLM 输出）
     # ---------- 建议驳回迭代（人工审核闭环） ----------
     suggest_status: Mapped[str] = mapped_column(String(16), default="pending")  # pending=待审核 / adopted=已采纳 / rejected=已驳回
     reject_reason: Mapped[str] = mapped_column(Text, default="")     # 最近一次驳回原因（必填）
     suggest_iteration: Mapped[int] = mapped_column(Integer, default=1)  # 建议迭代次数（第几版）
-    suggest_history: Mapped[list] = mapped_column(JSON, default=list)   # 迭代轨迹 [{iteration, suggestion, reject_reason}]
+    suggest_history: Mapped[list] = mapped_column(SafeJSON, default=list)   # 迭代轨迹 [{iteration, suggestion, reject_reason}]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -248,7 +266,7 @@ class AgentPreference(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     version: Mapped[int] = mapped_column(Integer, default=1)         # 版本号递增
-    content: Mapped[dict] = mapped_column(JSON, default=dict)        # 偏好内容（LLM 输出）
+    content: Mapped[dict] = mapped_column(SafeJSON, default=dict)        # 偏好内容（LLM 输出）
     source_review_id: Mapped[int] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
@@ -262,7 +280,7 @@ class TradeProfile(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     version: Mapped[int] = mapped_column(Integer, default=1)
-    content: Mapped[dict] = mapped_column(JSON, default=dict)
+    content: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
@@ -286,7 +304,7 @@ class SellDecision(Base):
     holding_id: Mapped[int] = mapped_column(Integer, index=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
     stock_name: Mapped[str] = mapped_column(String(64))
-    decision: Mapped[dict] = mapped_column(JSON, default=dict)   # 完整决策结构化输出（LLM 输出）
+    decision: Mapped[dict] = mapped_column(SafeJSON, default=dict)   # 完整决策结构化输出（LLM 输出）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -394,12 +412,12 @@ class AgentChatMessage(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     agent: Mapped[str] = mapped_column(String(16), index=True)   # discover/score/position/monitor/sell/review
-    role: Mapped[str] = mapped_column(String(8))                 # user / assistant
+    role: Mapped[str] = mapped_column(String(16))                # user / assistant
     message_type: Mapped[str] = mapped_column(String(16), default="qa")  # qa/rule/learn
     content: Mapped[str] = mapped_column(Text, default="")
     verdict: Mapped[str] = mapped_column(String(16), default="")  # adopted/partial/maintained（rule 类型）
     knowledge_id: Mapped[int] = mapped_column(Integer, nullable=True)  # 沉淀知识条目 ID
-    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    meta: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -418,9 +436,9 @@ class HotMoneyProfile(Base):
     actor_name: Mapped[str] = mapped_column(String(32), index=True)   # 游资名（赵老哥/章盟主…）
     seat_code: Mapped[str] = mapped_column(String(64))                # 营业部名称（唯一映射）
     tier: Mapped[str] = mapped_column(String(8), default="观察")       # 一线/二线/观察
-    style_tags: Mapped[list] = mapped_column(JSON, default=list)      # 操作风格标签（高位接力/题材龙头…）
-    good_themes: Mapped[list] = mapped_column(JSON, default=list)     # 擅长题材
-    co_seats: Mapped[list] = mapped_column(JSON, default=list)        # 协同游资/协同席位（不破坏 seat_code 唯一性）
+    style_tags: Mapped[list] = mapped_column(SafeJSON, default=list)      # 操作风格标签（高位接力/题材龙头…）
+    good_themes: Mapped[list] = mapped_column(SafeJSON, default=list)     # 擅长题材
+    co_seats: Mapped[list] = mapped_column(SafeJSON, default=list)        # 协同游资/协同席位（不破坏 seat_code 唯一性）
     source: Mapped[str] = mapped_column(String(16), default="手动")    # 手动/LLM识别/同花顺
     win_rate_5d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 信号后5日上涨胜率（代码统计事实，非人工判定）
     last_review_at: Mapped[str] = mapped_column(String(16), default="")      # 最近一次胜率迭代时间 YYYY-MM-DD HH:mm

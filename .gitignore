@@ -26,5 +26,14 @@ __pycache__/
 _paddlex_check/
 migration_*.zip
 
+# 本地冷备快照（sync_manager.py backup 产物，按份滚动，不入库）
+backup/
+
+# 改动前备份目录（_bak_时间戳/）
+_bak_*/
+
+# 一次性连接探测脚本（可能含数据库密码明文，严禁提交）
+_tidb_probe.py
+
 # 本地个人配置
 .claude/settings.local.json

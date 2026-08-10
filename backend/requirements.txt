@@ -7,6 +7,8 @@ pydantic-settings==2.12.0
 # ORM / 存储
 SQLAlchemy==2.0.44
 PyMySQL==1.1.2
+# TiDB/MySQL 强制 TLS 需要（pymysql ssl 握手）
+cryptography==50.0.0
 redis==6.4.0
 qdrant-client==1.18.0
 

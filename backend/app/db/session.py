@@ -24,10 +24,12 @@ def _sqlite_pragmas(dbapi_connection, connection_record):
 
 def _build_engine_url() -> str:
     if settings.db_backend == "mysql":
+        # ssl_verify_cert/identity=0：TiDB Serverless 强制 TLS 但用系统默认证书、
+        # 不校验主机名（等效 pymysql ssl={"check_hostname":False,"verify_mode":0}，已实测连通）
         return (
             f"mysql+pymysql://{settings.mysql_user}:{settings.mysql_root_password}"
             f"@{settings.mysql_host}:{settings.mysql_port}/{settings.mysql_database}"
-            "?charset=utf8mb4"
+            "?charset=utf8mb4&ssl_verify_cert=0&ssl_verify_identity=0"
         )
     # 默认：SQLite 单文件（SQLITE_PATH 便于测试隔离）
     data_dir = Path(settings.data_dir)
