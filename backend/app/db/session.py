@@ -77,6 +77,9 @@ def _ensure_indexes() -> None:
         "CREATE INDEX IF NOT EXISTS ix_review_exit_status "
         "ON review_result (exit_date, suggest_status)",
         "CREATE INDEX IF NOT EXISTS ix_suggestion_status ON agent_suggestion (status)",
+        "CREATE INDEX IF NOT EXISTS ix_rule_change_status ON rule_change (status)",
+        "CREATE INDEX IF NOT EXISTS ix_track_status "
+        "ON candidate_track_verify (is_finished, select_date)",
     ]
     with engine.begin() as conn:
         for stmt in statements:
@@ -163,20 +166,36 @@ def _ensure_position_plan_source(eng=None) -> None:
 
 
 def _ensure_agent_suggestion_columns(eng=None) -> None:
-    """幂等补齐 agent_suggestion.reject_reason 列（人工驳回原因留痕；
-    仅增量加列，不重建表不丢数据；旧数据默认空串）"""
+    """幂等补齐 agent_suggestion 列（人工驳回原因留痕 + v2 一键采纳落地信息列；
+    仅增量加列，不重建表不丢数据；旧数据 default 兼容）"""
     eng = eng or engine
+    additions = {
+        "reject_reason": "TEXT DEFAULT ''",
+        "priority": "VARCHAR(8) DEFAULT 'medium'",
+        "rule_type": "VARCHAR(8) DEFAULT 'soft'",
+        "problem_desc": "TEXT DEFAULT ''",
+        "rule_text": "TEXT DEFAULT ''",
+        "expected_effect": "TEXT DEFAULT ''",
+        "risk_note": "TEXT DEFAULT ''",
+        "file_path": "VARCHAR(255) DEFAULT ''",
+        "insert_position": "VARCHAR(32) DEFAULT ''",
+        "conflict_note": "TEXT DEFAULT ''",
+        "dedup_note": "TEXT DEFAULT ''",
+        "suggestion_source": "VARCHAR(16) DEFAULT 'llm'",
+    }
     with eng.begin() as conn:
         if eng.dialect.name == "sqlite":
             existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(agent_suggestion)")}
-            if "reject_reason" not in existing:
-                conn.exec_driver_sql("ALTER TABLE agent_suggestion ADD COLUMN reject_reason TEXT DEFAULT ''")
+            for col, ddl in additions.items():
+                if col not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE agent_suggestion ADD COLUMN {col} {ddl}")
         else:
             # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            try:
-                conn.exec_driver_sql("ALTER TABLE agent_suggestion ADD COLUMN reject_reason TEXT DEFAULT ''")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+            for col, ddl in additions.items():
+                try:
+                    conn.exec_driver_sql(f"ALTER TABLE agent_suggestion ADD COLUMN {col} {ddl}")
+                except Exception:  # noqa: BLE001 列已存在
+                    pass
 
 
 def _ensure_hot_money_profile_columns(eng=None) -> None:

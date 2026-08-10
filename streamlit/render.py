@@ -1246,3 +1246,103 @@ def trace_card(trace: dict, key: str) -> None:
             chips = "".join(f'<span class="rule-chip">{_esc(x)}</span>' for x in refs)
             st.markdown(f'<div class="rule-chips">{chips}</div>', unsafe_allow_html=True)
         raw_json_expander(trace, key=f"{key}_raw")
+
+
+# ================= 规则变更记录卡（一键采纳自动落地：变更对比 + 回滚，复盘页与记录页共用） =================
+
+_RULE_TYPE_LABEL = {"soft": "提示词软规则", "hard": "代码硬规则"}
+_RULE_PRIO_LABEL = {"high": "高优先级", "medium": "中优先级", "low": "低优先级"}
+
+
+def rule_type_label(rule_type: str) -> str:
+    return _RULE_TYPE_LABEL.get(rule_type, rule_type or "—")
+
+
+def rule_priority_label(priority: str) -> str:
+    return _RULE_PRIO_LABEL.get(priority, priority or "—")
+
+
+def rule_change_card(rc: dict, key: str) -> None:
+    """规则变更完整详情卡（全透明）：溯源行 + 变更前后对比 + 落地元数据 + 预期效果与风险；
+    status=active 时附带「一键回滚」表单（原因必填留痕）。纯展示 + 人工回滚，无任何自动判断。"""
+    active = rc.get("status") == "active"
+    with st.container(border=True):
+        render_meta = f'<span class="badge badge-{"info" if active else "warn"}">' \
+                      f'{_esc("生效中" if active else "已回滚")}</span>' \
+                      f'<span class="badge badge-info">{_esc(rule_type_label(rc.get("rule_type", "")))}</span>' \
+                      f'<span class="item-title">{_esc(rc.get("rule_name", ""))}</span>' \
+                      f'<span class="trace-meta">变更 {str(rc.get("created_at") or "")[:16]}'
+        if rc.get("operator"):
+            render_meta += f" · 操作人 {_esc(rc['operator'])}"
+        if rc.get("rollback_time"):
+            render_meta += f" · 回滚 {str(rc['rollback_time'])[:16]}"
+        render_meta += "</span>"
+        st.markdown(f'<div class="trace-head">{render_meta}</div>', unsafe_allow_html=True)
+
+        # 变更前后对比（左右分栏）
+        with st.container(border=True):
+            st.markdown("**变更对比**")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("变更前（此前生效状态）")
+                st.markdown(f"<div class='trace-layer fact'>{_esc(rc.get('before_text') or '（无）')}</div>",
+                            unsafe_allow_html=True)
+            with c2:
+                st.caption("变更后（采纳后生效内容）")
+                st.markdown(f"<div class='trace-layer tech'>{_esc(rc.get('after_text') or '（无）')}</div>",
+                            unsafe_allow_html=True)
+
+        # 落地元数据与理由（全透明，文件路径仅展示）
+        with st.container(border=True):
+            st.markdown("**落地说明**")
+            st.markdown(f"- 规则类型：{rule_type_label(rc.get('rule_type', ''))}（"
+                        f"{'全局底线，全部 Agent 无条件遵守' if rc.get('rule_type') == 'hard' else '参考权重，非死条件'}）")
+            st.markdown(f"- 归属模块：{_esc(rc.get('target_agent') or '—')} · "
+                        f"标的：{_esc(rc.get('stock_name') or rc.get('stock_code') or '—')} · "
+                        f"来源复盘 review_id={rc.get('review_id') or '—'}")
+            if rc.get("file_path"):
+                st.markdown(f"- 文件路径（仅展示元数据，系统不写源码文件）：{_esc(rc['file_path'])}")
+            if rc.get("insert_position"):
+                st.markdown(f"- 建议插入位置：{_esc(rc['insert_position'])}")
+            st.caption("落地方式：系统自动注入（规则存库，全部 Agent 下次任务自动携带，LLM 缓存自动失效）。")
+        if rc.get("reason") or rc.get("evidence"):
+            with st.container(border=True):
+                st.markdown("**建议理由与依据**")
+                if rc.get("reason"):
+                    st.markdown(f"- {_esc(rc['reason'])}")
+                if rc.get("evidence"):
+                    st.markdown(f"- 事实依据：{_esc(rc['evidence'])}")
+        if rc.get("expected_effect") or rc.get("risk_note"):
+            with st.container(border=True):
+                st.markdown("**预期效果与风险**")
+                if rc.get("expected_effect"):
+                    st.markdown(f"- 预期效果：{_esc(rc['expected_effect'])}")
+                if rc.get("risk_note"):
+                    st.markdown(f"- 风险提示：{_esc(rc['risk_note'])}")
+        if not active:
+            if rc.get("rollback_reason"):
+                st.caption(f"已回滚 · 原因：{_esc(rc['rollback_reason'])}")
+            return
+        # 一键回滚（原因必填留痕，全程可追溯）
+        with st.expander("一键回滚（恢复变更前状态）", expanded=False, key=f"{key}_rollback"):
+            with st.form(key=f"{key}_rb_form"):
+                reason = st.text_area("回滚原因（必填，多行）",
+                                      placeholder="例如：该规则与近期行情特征不匹配 / 规则过于激进，需要撤下",
+                                      key=f"{key}_rb_reason")
+                if st.form_submit_button("确认回滚并留痕", type="primary"):
+                    if not reason.strip():
+                        st.error("回滚原因不能为空")
+                    else:
+                        try:
+                            api_rollback_rule_change(rc.get("id"), reason.strip())
+                            st.success("已回滚并留痕，全部 Agent 立即停止携带该规则。")
+                            st.rerun()
+                        except Exception as exc:  # noqa: BLE001 回滚失败统一提示
+                            msg_card("err", "回滚失败", "请确认后端服务正常运行后重试。", detail=exc)
+
+
+def api_rollback_rule_change(rid: int, reason: str) -> dict:
+    """延迟导入 api_client（与 submit_task 同模式，避免顶层循环依赖）"""
+    from api_client import rollback_rule_change as _fn
+
+    return _fn(rid, reason)

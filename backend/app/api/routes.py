@@ -2,8 +2,10 @@
 REST API：仅提供数据存取与手动触发任务（无任何二次判断逻辑）
 面板等前端不内置研判，全部展示 LLM 输出结论与原始数据。
 """
+import difflib
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -71,6 +73,9 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "chat_ask": ("Agent 对话·提问答疑", lambda p: _task_chat_ask(p)),
     "chat_rule": ("Agent 对话·规则调教", lambda p: _task_chat_rule(p)),
     "chat_learn": ("Agent 对话·图片学习", lambda p: _task_chat_learn(p)),
+    "track_verify": ("候选池T+N验证", lambda p: _task_track_verify(False)),
+    "track_backfill": ("候选池T+N历史回填", lambda p: _task_track_verify(True)),
+    "track_suggest": ("选股验证建议生成", lambda p: _task_track_suggest()),
 }
 
 
@@ -82,6 +87,34 @@ def _task_monitor_all() -> dict:
                          "action": ((r.get("holding_signal") or {}).get("action")),
                          "severity": ((r.get("holding_signal") or {}).get("severity"))}
                         for r in results]}
+
+
+def _task_track_verify(backfill: bool) -> dict:
+    """候选池 T+N 验证（手动入口：每日 16:00 自动任务同链路，幂等）；
+    返回 JSON 安全摘要（统计/建议不含超长文本）"""
+    from app.services import track_verify
+
+    result = track_verify.run_verify_chain(backfill=backfill)
+    safe = {k: v for k, v in result.items() if k not in ("stats",)}
+    suggestions = result.get("suggestions") or []
+    if isinstance(suggestions, dict):  # 生成建议时返回 {suggestions, fallbacks, deduped, ...}
+        safe["suggestion_count"] = (len(suggestions.get("suggestions", []))
+                                    + len(suggestions.get("fallbacks", [])))
+        safe["deduped"] = suggestions.get("deduped", 0)
+    else:  # 无新增到期（finished_new=0 且非回填）→ 未触发建议生成
+        safe["suggestion_count"] = len(suggestions)
+        safe["deduped"] = 0
+    return safe
+
+
+def _task_track_suggest() -> dict:
+    """选股验证建议生成（手动入口：基于已存统计生成/兜底建议）"""
+    from app.services import track_verify
+
+    rows = repo.list_track_verify()
+    stats = track_verify.compute_stats(rows, period="t5")
+    anomalies = track_verify.detect_anomalies(stats)
+    return track_verify.generate_suggestions(stats, anomalies)
 
 
 def _task_chat_ask(params: dict) -> dict:
@@ -229,6 +262,37 @@ def market_indices():
     """三大指数实时行情（上证指数/深证成指/创业板指，60s 缓存防限流）；
     数据源失败返回空列表 + error 标注（前端显示「数据加载中」或上次缓存值，不抛原始报错）"""
     return market_view.index_quotes()
+
+
+@router.get("/market/indices/history")
+def market_indices_history(days: int = 90):
+    """三大指数日线历史（只读，近 N 天）：change_pct 按收盘价回算（东财接口无涨跌幅列，
+    与 discover 市况同口径）；数据源层 3600s 缓存；失败返回空 items + error 标注，不抛原始报错"""
+    import pandas as pd
+    from datetime import datetime, timedelta, timezone
+
+    from app.datasource.akshare_source import get_datasource
+
+    days = max(7, min(days, 250))
+    now = datetime.now(timezone(timedelta(hours=8)))
+    start = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    end = now.strftime("%Y-%m-%d")
+    items, err = [], None
+    try:
+        src = get_datasource()
+        for code, name in market_view.INDEX_NAMES.items():
+            df = src.fetch_index_daily(code, start, end)
+            if df is None or df.empty:
+                continue
+            df = df.sort_values("date")
+            df["change_pct"] = df["close"].pct_change() * 100
+            for _, r in df.iterrows():
+                if pd.notna(r["change_pct"]):
+                    items.append({"date": r["date"], "code": code, "name": name,
+                                  "change_pct": round(float(r["change_pct"]), 2)})
+    except Exception as exc:  # noqa: BLE001
+        err = f"指数历史获取失败（{type(exc).__name__}）"
+    return {"items": items, "error": err}
 
 
 @router.get("/market/hot-sectors")
@@ -693,6 +757,12 @@ def list_agent_suggestions(status: Optional[str] = None, target_agent: Optional[
              "current_value": s.current_value, "suggested_value": s.suggested_value,
              "reason": s.reason, "evidence": s.evidence, "status": s.status,
              "reject_reason": s.reject_reason or "",
+             "priority": s.priority or "medium", "rule_type": s.rule_type or "soft",
+             "problem_desc": s.problem_desc or "", "rule_text": s.rule_text or "",
+             "expected_effect": s.expected_effect or "", "risk_note": s.risk_note or "",
+             "file_path": s.file_path or "", "insert_position": s.insert_position or "",
+             "conflict_note": s.conflict_note or "", "dedup_note": s.dedup_note or "",
+             "suggestion_source": s.suggestion_source or "llm",
              "created_at": str(s.created_at)} for s in suggestions]
 
 
@@ -712,28 +782,23 @@ def _coerce_value(raw: str):
 def approve_agent_suggestion(sid: int):
     """人工审核：采纳建议（⚠️ 仅人工触发；系统禁止自动、无监督修改任何策略参数）
     profile 类建议 → 直接写入个人交易偏好档案（版本号+1 全部 Agent 生效）；
-    prompt 类建议 → 仅标记已采纳，并提示人工修改 agent_prompts/ 对应文件。"""
+    prompt/规则类建议 → 请走 POST /agent-suggestions/{sid}/adopt 一键采纳自动落地。"""
     suggestion = repo.get_agent_suggestion(sid)
     if suggestion is None:
         raise HTTPException(status_code=404, detail="建议不存在")
     if suggestion.status != "pending":
         raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
+    if suggestion.target_kind != "profile":
+        raise HTTPException(
+            status_code=400,
+            detail="该建议为规则类（prompt），请走 /agent-suggestions/{sid}/adopt 一键采纳自动落地")
 
-    applied = "none"
-    version = None
-    if suggestion.target_kind == "profile":
-        content = repo.get_trade_profile_content()
-        content[suggestion.rule_name] = _coerce_value(suggestion.suggested_value)
-        version = repo.update_trade_profile(content)
-        applied = "profile"
+    content = repo.get_trade_profile_content()
+    content[suggestion.rule_name] = _coerce_value(suggestion.suggested_value)
+    version = repo.update_trade_profile(content)
     repo.update_agent_suggestion_status(sid, "approved")
-    result = {"approved": True, "suggestion_id": sid, "applied": applied}
-    if version is not None:
-        result["profile_version"] = version
-    if applied == "none":
-        result["hint"] = ("该建议为提示词/硬性规则类，请人工在 agent_prompts/ 对应文件或 "
-                          "common.py 的 HARD_RULES 中按 suggested_value 修改后生效")
-    return result
+    return {"approved": True, "suggestion_id": sid, "applied": "profile",
+            "profile_version": version}
 
 
 @router.post("/agent-suggestions/{sid}/reject")
@@ -747,6 +812,129 @@ def reject_agent_suggestion(sid: int, body: RejectSuggestionBody | None = None):
     reason = (body.reason if body else "") or ""
     repo.update_agent_suggestion_status(sid, "rejected", reason=reason)
     return {"rejected": True, "suggestion_id": sid, "reason": reason}
+
+
+# ================= 一键采纳自动落地（规则存库 + agent_call 动态注入，绝不写源码文件） =================
+
+_WEAKEN_VERBS = ("放宽", "允许", "取消", "豁免", "解除", "不设", "绕过")
+
+
+class AdoptSuggestionBody(BaseModel):
+    confirm: bool = Field(default=False, description="硬规则二次确认（rule_type=hard 时必须为 True）")
+
+
+class RollbackRuleBody(BaseModel):
+    reason: str = Field(min_length=1, description="回滚原因（必填，至少 1 个字符）")
+
+
+def _normalize_rule(text: str) -> str:
+    """规则文本归一化（空白折叠 + 去尾部标点），供去重/冲突比对"""
+    return re.sub(r"\s+", "", str(text or "")).strip("。；;，,！!？? \t")
+
+
+def _validate_adopt(suggestion) -> tuple[bool, str, str]:
+    """确定性二次校验（双保险第二层，纯函数可单测）：
+    1) 与已生效规则比对：完全相同/高度相似 → 去重拦截；
+    2) 与人工硬性规则比对：疑似放宽/绕过的冲突 → 冲突拦截；相同/相似 → 去重拦截；
+    3) rule_name 命中偏好档案字段 → 引导改走 profile 通道。
+    返回 (通过, conflict_note, dedup_note)；conflict/dedup 任一非空即拦截。"""
+    from app.agents.common import HARD_RULES
+
+    norm = _normalize_rule(suggestion.rule_text)
+    if not norm:
+        return False, "", "规则正文为空，无法采纳"
+    for r in repo.get_active_rules():
+        rn = _normalize_rule(r.get("rule_text", ""))
+        if not rn:
+            continue
+        if rn == norm:
+            return False, "", (f"规则已存在：与生效规则 #{r['id']}「{r.get('rule_name', '')}」完全相同，"
+                               "无需重复采纳")
+        if difflib.SequenceMatcher(None, rn, norm).ratio() >= 0.85:
+            return False, "", (f"与生效规则 #{r['id']}「{r.get('rule_name', '')}」高度相似"
+                               "（相似度 ≥85%），请勿重复采纳")
+    for i, hard in enumerate(HARD_RULES, 1):
+        hn = _normalize_rule(hard)
+        if not hn:
+            continue
+        if difflib.SequenceMatcher(None, hn, norm).ratio() >= 0.85:
+            if any(v in norm for v in _WEAKEN_VERBS):
+                return False, (f"与人工硬性规则 #{i} 冲突：该建议疑似放宽/绕过硬性底线"
+                               f"（规则原文：{hard[:60]}…）"), ""
+            return False, "", f"与人工硬性规则 #{i} 内容相同或高度相似，规则已存在"
+    try:
+        profile_keys = set(repo.get_trade_profile_content().keys())
+    except Exception:  # noqa: BLE001 偏好读取失败不阻塞校验
+        profile_keys = set()
+    if suggestion.rule_name in profile_keys:
+        return False, "该规则名命中个人交易偏好档案字段，请改为 profile 类建议在偏好档案中修改", ""
+    return True, "", ""
+
+
+@router.post("/agent-suggestions/{sid}/adopt")
+def adopt_agent_suggestion(sid: int, body: AdoptSuggestionBody | None = None):
+    """一键采纳自动落地（⚠️ 仅人工触发；系统禁止自动、无监督修改任何策略参数）：
+    校验通过后写入 rule_change 表（status=active）→ agent_call 管道动态注入全部 Agent
+    → 版本指纹入缓存键，LLM 缓存自动失效；硬规则需二次确认（confirm=True）。
+    文件路径/插入位置仅作展示元数据，绝不写入源码文件。"""
+    confirm = (body.confirm if body else False)
+    suggestion = repo.get_agent_suggestion(sid)
+    if suggestion is None:
+        raise HTTPException(status_code=404, detail="建议不存在")
+    if suggestion.status != "pending":
+        raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
+    if suggestion.target_kind == "profile":
+        raise HTTPException(status_code=400, detail="profile 类建议请走 /approve 采纳")
+    if not (suggestion.rule_text or "").strip():
+        raise HTTPException(status_code=400,
+                            detail="该建议为旧版规则建议（无落地规则正文），不支持一键采纳；"
+                                   "可驳回后由 AI 重新生成")
+    if (suggestion.rule_type or "soft") == "hard" and not confirm:
+        raise HTTPException(status_code=400,
+                            detail="该规则为硬性规则（底层约束，全局生效），请确认后重试")
+
+    ok, conflict_note, dedup_note = _validate_adopt(suggestion)
+    if not ok:
+        repo.update_agent_suggestion_notes(sid, conflict_note, dedup_note)
+        raise HTTPException(status_code=409, detail=conflict_note or dedup_note)
+
+    change_id = repo.adopt_rule_suggestion(sid, operator="本机用户")
+    if not change_id:
+        raise HTTPException(status_code=400, detail="该建议已处理（并发冲突）")
+    return {"adopted": True, "suggestion_id": sid, "rule_change_id": change_id,
+            "applied": "injected",
+            "rule_type": suggestion.rule_type or "soft",
+            "rule_name": suggestion.rule_name,
+            "detail": "规则已写入生效表，全部 Agent 下次任务自动携带（LLM 缓存已失效）"}
+
+
+@router.get("/rule-changes")
+def list_rule_changes(status: Optional[str] = None, target_agent: Optional[str] = None,
+                      suggestion_id: Optional[int] = None, limit: int = 50):
+    """规则变更记录（一键采纳/回滚全量留痕，时间倒序；记录页数据源；
+    suggestion_id 过滤供复盘页回显某条建议的生效记录）"""
+    return repo.list_rule_changes(status, target_agent, suggestion_id, limit)
+
+
+@router.get("/rule-changes/{rid}")
+def get_rule_change_detail(rid: int):
+    """规则变更完整详情（变更前后对比/落地元数据/回滚原因）"""
+    row = repo.get_rule_change(rid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="规则变更记录不存在")
+    return row
+
+
+@router.post("/rule-changes/{rid}/rollback")
+def rollback_rule_change(rid: int, body: RollbackRuleBody):
+    """一键回滚：恢复变更前状态（status → rolled_back，原因/时间留痕，全程可追溯）"""
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="回滚原因不能为空")
+    ok = repo.rollback_rule_change(rid, reason)
+    if not ok:
+        raise HTTPException(status_code=404, detail="规则变更记录不存在或已回滚")
+    return {"rolled_back": True, "rule_change_id": rid, "reason": reason}
 
 
 # ================= 持仓止盈/仓位管理计划（独立计算服务，与持仓监控页同源） =================
@@ -814,6 +1002,59 @@ def hot_money_tier_apply(body: TierApplyBody):
         return hot_money_review.apply_tier_suggestion(body.suggestion_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ================= 候选池 T+N 验证（选股效果闭环） =================
+@router.get("/track/verify/list")
+def track_verify_list(select_date: str = "", rating: str = "", status: str = "",
+                      limit: int = 200):
+    """追踪验证行列表（默认全部；status: all/tracking/finished；纯读）"""
+    finished = None
+    if status == "tracking":
+        finished = 0
+    elif status == "finished":
+        finished = 1
+    return repo.list_track_verify(select_date=select_date, rating=rating,
+                                  is_finished=finished, limit=limit)
+
+
+@router.get("/track/verify/dates")
+def track_verify_dates(limit: int = 30):
+    """追踪验证可选日期（去重降序，页面日期筛选）"""
+    return repo.list_track_verify_dates(limit=limit)
+
+
+@router.get("/track/verify/stats")
+def track_verify_stats(period: str = "t5"):
+    """周期统计（从已存验证行纯计算，非实时行情；period: t3/t5/t10）"""
+    from app.services import track_verify
+
+    if period not in ("t3", "t5", "t10"):
+        period = "t5"
+    rows = repo.list_track_verify()
+    stats = track_verify.compute_stats(rows, period=period)
+    stats["anomalies"] = track_verify.detect_anomalies(stats)
+    return stats
+
+
+class TrackVerifyRunBody(BaseModel):
+    backfill: bool = Field(default=False,
+        description="True=历史回填（幂等，重复执行安全）；False=常规验证")
+
+
+@router.post("/track/verify/run")
+def track_verify_run(body: TrackVerifyRunBody | None = None):
+    """手动触发候选 T+N 验证（每日 16:00 自动任务同链路；提交任务即返回，
+    结果保存后可随时查询；同类型任务执行中拒绝重复提交）"""
+    backfill = bool(body.backfill) if body is not None else False
+    return _submit_task("track_backfill" if backfill else "track_verify", {})
+
+
+@router.post("/track/verify/suggest")
+def track_verify_suggest():
+    """手动触发选股验证建议生成（LLM 为主 + 模板兜底，来源强制标记；
+    建议落 pending 走人工审核闭环）"""
+    return _submit_task("track_suggest", {})
 
 
 # ================= 其他 =================

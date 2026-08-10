@@ -36,6 +36,7 @@ PAGES = [
     "6_交易复盘.py",
     "8_告警日志.py",
     "9_交易知识库.py",
+    "11_规则变更记录.py",
 ]
 
 _TITLES = {
@@ -47,12 +48,16 @@ _TITLES = {
     "6_交易复盘.py": "交易复盘（ReviewAgent）",
     "8_告警日志.py": "告警日志（MonitorAgent）",
     "9_交易知识库.py": "交易知识库（统一调教·私有战法）",
+    "11_规则变更记录.py": "规则变更记录（全透明·可回滚）",
 }
 
 
 @pytest.mark.parametrize("page", PAGES)
 def test_page_renders(page):
     at = AppTest.from_file(str(PAGES_DIR / page), default_timeout=180)
+    if page == "6_交易复盘.py":
+        # 复盘页走势归因会拉取账户总资产（全市场快照 ~1 分钟/次），测试预置跳过
+        at.session_state["_total_asset"] = 100000.0
     at.run()
     assert not at.exception, f"{page} 渲染异常: {at.exception}"
     assert at.title[0].value == _TITLES[page]
@@ -288,11 +293,108 @@ def test_knowledge_page_tabs():
 def test_review_page_expander():
     """交易复盘页：策略闭环建议区一级折叠模块存在（待审核条数实时展示）"""
     at = AppTest.from_file(str(PAGES_DIR / "6_交易复盘.py"), default_timeout=180)
+    at.session_state["_total_asset"] = 100000.0  # 预置账户总资产，避免触发全市场快照拉取（~1 分钟/次）
     at.run()
     assert not at.exception, f"6_交易复盘.py 渲染异常: {at.exception}"
     labels = [b.label for b in at.button] + [e.label for e in at.expander]
     labels += [str(m.value) for m in at.markdown]
     assert any("策略闭环" in lb for lb in labels), "缺少策略闭环建议区折叠模块"
+
+
+def test_review_page_blackbox_overview():
+    """复盘页黑盒总览（2026-08-10 黑盒化）：总览默认展开 / 策略闭环与详情默认收起 /
+    专业视图开关默认关 / 综合评级与一句话总结渲染 / 去审核直达审核区"""
+    at = AppTest.from_file(str(PAGES_DIR / "6_交易复盘.py"), default_timeout=180)
+    at.session_state["_total_asset"] = 100000.0  # 预置账户总资产，避免触发全市场快照拉取（~1 分钟/次）
+    at.run()
+    assert not at.exception, f"6_交易复盘.py 渲染异常: {at.exception}"
+    # fold 开关按钮文案：总览默认展开（收起 ▲）、策略闭环与详情默认收起（展开 ▼）
+    labels = [b.label for b in at.button]
+    assert "收起 ▲" in labels, f"本期复盘总览应默认展开: {labels}"
+    assert "展开 ▼" in labels, f"策略闭环/详情与历史记录应默认收起: {labels}"
+    # 专业视图开关存在且默认关（黑盒默认态）
+    assert at.toggle, "缺少专业视图开关"
+    assert at.toggle[0].value is False, "专业视图应默认关闭（黑盒）"
+    # 总览结论区渲染（评级四态其一 + 一句话总结；黑盒主界面必须有内容，不崩）
+    md_text = "\n".join(m.value for m in at.markdown
+                        if m.value and not m.value.lstrip().startswith("<style>"))
+    assert any(k in md_text for k in ("达标", "待优化", "异常", "样本不足")), \
+        f"综合评级未渲染: {md_text[:300]}"
+    assert "一句话总结" in md_text, "一句话总结未渲染"
+    # 统计窗口切换（近7天 → 全部）零异常
+    win = [s for s in at.selectbox if s.label == "统计窗口"]
+    if win:
+        win[0].set_value("全部")
+        at.run()
+        assert not at.exception, f"统计窗口切换后异常: {at.exception}"
+    # 去审核 → 展开策略闭环 + 筛选切待审核（无待审核建议时跳过）
+    go = [b for b in at.button if b.label == "去审核"]
+    if go:
+        go[0].click().run()
+        assert not at.exception, f"去审核后异常: {at.exception}"
+        assert at.session_state["mod_strategy_loop"] is True, "去审核后策略闭环应展开"
+        assert at.session_state["_sug_filter"] == "pending", "去审核后筛选应切待审核"
+
+
+def test_review_page_track_verify_module():
+    """复盘页「选股效果验证」模块（T+N 自动追踪）：模块标题 / 周期 selectbox 默认 T+5 /
+    三个操作按钮（手动验证·历史回填·生成建议）+ 口径说明"""
+    at = AppTest.from_file(str(PAGES_DIR / "6_交易复盘.py"), default_timeout=180)
+    at.session_state["_total_asset"] = 100000.0  # 预置账户总资产，避免触发全市场快照拉取（~1 分钟/次）
+    at.run()
+    assert not at.exception, f"6_交易复盘.py 渲染异常: {at.exception}"
+    md_text = "\n".join(m.value for m in at.markdown if m.value)
+    assert "选股效果验证（T+N 自动追踪）" in md_text, "缺少选股效果验证折叠模块"
+    period = [s for s in at.selectbox if s.label == "统计周期"]
+    assert period and period[0].value == "t5", "周期 selectbox 应存在且默认 T+5"
+    labels = [b.label for b in at.button]
+    for name in ("手动验证", "历史回填", "生成建议"):
+        assert name in labels, f"缺少操作按钮: {name}"
+    assert "每日 16:00 自动验证" in md_text, "meta 应标注每日 16:00 自动验证"
+
+
+def test_review_page_pro_view_toggle():
+    """复盘页专业视图（权限等效开关）：开启后展开详情折叠区与首条复盘详情，零异常"""
+    at = AppTest.from_file(str(PAGES_DIR / "6_交易复盘.py"), default_timeout=180)
+    at.session_state["_total_asset"] = 100000.0  # 预置账户总资产，避免触发全市场快照拉取（~1 分钟/次）
+    at.run()
+    assert not at.exception, f"6_交易复盘.py 渲染异常: {at.exception}"
+    at.session_state["pro_view"] = True
+    at.run()
+    assert not at.exception, f"专业视图开启后异常: {at.exception}"
+    # 展开「详情与历史记录」折叠区（默认收起）
+    at.session_state["mod_detail_hist"] = True
+    at.run()
+    assert not at.exception, f"展开详情折叠区后异常: {at.exception}"
+    detail = [b for b in at.button if b.label == "查看详情"]
+    if detail:  # 有复盘数据时展开首条，验证专业视图下的归因/留痕分支可渲染
+        detail[0].click().run()
+        assert not at.exception, f"专业视图下展开复盘详情异常: {at.exception}"
+
+
+def test_review_page_attribution_module():
+    """复盘页「走势变动分析」模块（2026-08-10 图表归因落地）：折叠模块默认展开 /
+    历史走势图表区存在 / 归因结果渲染（flat 或四因素卡或样本不足）/
+    框选锁定区间联动（区间头 + 重置按钮）零异常"""
+    at = AppTest.from_file(str(PAGES_DIR / "6_交易复盘.py"), default_timeout=180)
+    at.session_state["_total_asset"] = 100000.0  # 预置账户总资产，避免触发全市场快照拉取（~1 分钟/次）
+    at.run()
+    assert not at.exception, f"6_交易复盘.py 渲染异常: {at.exception}"
+    md_text = "\n".join(m.value for m in at.markdown if m.value)
+    assert "走势变动分析" in md_text, "缺少走势变动分析折叠模块"
+    assert "历史走势（累计口径）" in md_text, "缺少历史走势图表区"
+    # 归因结果四态其一（真数据全盈利 → flat 空态；有亏损 → 四因素卡；样本少 → 提示）
+    result = md_text + "\n".join(c.value for c in at.caption)
+    assert any(k in result for k in ("暂无需归因", "标的结构因素", "样本量不足")), \
+        f"归因结果未渲染: {result[:400]}"
+    # 框选区间联动（模拟图表事件写入的锁定区间）→ 区间头 + 重置按钮 + 零异常
+    at.session_state["_attr_range"] = {"start": "2026-08-01", "end": "2026-08-31", "n": 3}
+    at.run()
+    assert not at.exception, f"锁定区间后异常: {at.exception}"
+    assert "重置区间" in [b.label for b in at.button], "缺少重置区间按钮"
+    result2 = ("\n".join(m.value for m in at.markdown if m.value)
+               + "\n".join(c.value for c in at.caption))
+    assert "已锁定区间" in result2, "锁定区间头部未渲染"
 
 
 def test_enterprise_list_components():
@@ -322,7 +424,7 @@ def test_navigation_app_groups():
         assert group in src, f"缺少导航分组: {group}"
     for page in ("0_系统概览.py", "1_每日候选池.py", "2_评分报告.py", "3_建仓计划.py",
                  "4_持仓监控.py", "5_游资追踪.py", "6_交易复盘.py", "8_告警日志.py",
-                 "9_交易知识库.py", "10_Agent对话.py"):
+                 "9_交易知识库.py", "10_Agent对话.py", "11_规则变更记录.py"):
         assert page in src, f"导航未挂载页面: {page}"
 
 
@@ -518,8 +620,24 @@ def test_candidate_trace_chain():
             "留痕列表未出现且非空态/降级态（接口或渲染异常被吞）"
         pytest.skip("留痕接口暂不可用，跳过详情断言")
 
-    row_btns[0].click().run()
-    assert not at.exception, f"打开留痕详情后异常: {at.exception}"
+    # 逐条展开直到出现满足分层要求的留痕：当日首个候选的最新留痕可能是 position/alert
+    # 等仅 2 层推理的模块（discover/score 为 5 层）；详情可叠加，不足 3 层的条目收起再试下一条
+    opened_layers = []
+    while row_btns and len(opened_layers) < 3:
+        btn = row_btns.pop(0)
+        btn.click().run()
+        assert not at.exception, f"打开留痕详情后异常: {at.exception}"
+        opened_layers = [e for e in at.expander
+                         if e.label in ("事实依据（输入数据快照）", "技术面推理", "资金面推理",
+                                        "基本面推理", "风险推理")]
+        if len(opened_layers) < 3:
+            cur = [b for b in at.button if b.label == btn.label]
+            if cur:
+                cur[0].click().run()
+                assert not at.exception, f"收起留痕详情后异常: {at.exception}"
+    if len(opened_layers) < 3:
+        pytest.skip("当日首个候选的留痕推理层均不足 3 层（position/alert 等模块仅 2 层），"
+                    "跳过分层断言")
 
     # 结论卡默认展开（acceptance：先给结论）
     concl = [e for e in at.expander if "最终结论" in e.label]
@@ -527,11 +645,7 @@ def test_candidate_trace_chain():
     assert concl[0].proto.expanded is True, "结论卡未默认展开"
 
     # 推理分层折叠渲染
-    layers = [e for e in at.expander
-              if e.label in ("事实依据（输入数据快照）", "技术面推理", "资金面推理",
-                             "基本面推理", "风险推理")]
-    assert len(layers) >= 3, f"推理分层渲染不足（{len(layers)} 层）"
-    assert all(e.proto.expanded is False for e in layers), "推理层必须默认折叠"
+    assert all(e.proto.expanded is False for e in opened_layers), "推理层必须默认折叠"
 
     # 结论内容与头部徽章实际渲染（剔除 CSS 后的真实 markdown）
     md_text = "\n".join(m.value for m in at.markdown if m.value

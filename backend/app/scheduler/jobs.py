@@ -24,10 +24,10 @@ scheduler: BackgroundScheduler | None = None
 
 
 def _is_trading_day(today: str) -> bool:
-    """最近交易日是否就是今天（用 akshare 交易日历）"""
+    """今天是否交易日（akshare 交易日历为全量静态历 1990~年末，成员判定即可）"""
     try:
         calendar = AkshareSource().fetch_trade_calendar()
-        return bool(calendar) and calendar[-1] == today
+        return bool(calendar) and today in calendar
     except Exception as exc:  # noqa: BLE001 日历失败时按工作日放行
         logger.warning("交易日历获取失败，按工作日放行: %s", exc)
         return True
@@ -43,6 +43,23 @@ def _in_close_check_window(now: datetime) -> bool:
     """收盘校验窗口 15:00-15:30：非交易时段低频兜底，当天仅执行一次收盘数据校验"""
     hm = now.hour * 100 + now.minute
     return 1500 <= hm <= 1530
+
+
+def track_verify_job() -> None:
+    """候选池 T+N 验证（工作日 16:00 收盘后）：初始化新候选 → 计算 T+N →
+    到期收尾 → 统计 → 建议生成（锁在链路内部 run_verify_chain，幂等）。
+    16:00 验证的是前一日候选（当日收盘已定格）；16:10 每日挖掘入库当日候选，
+    次日 16:00 自动初始化，时序自洽。"""
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        logger.info("今天 %s 非交易日，跳过候选验证", today)
+        return
+    from app.services import track_verify
+
+    result = track_verify.run_verify_chain(backfill=False)
+    safe = {k: v for k, v in result.items() if k not in ("stats",)}
+    logger.info("候选T+N验证完成: %s", safe)
+    cache.set("job:last_track_verify", today, 86400)
 
 
 def daily_discover_job() -> None:
@@ -167,6 +184,11 @@ def start_scheduler() -> None:
     if scheduler is not None:
         return
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+    # 工作日 16:00 候选池 T+N 验证（16:10 每日挖掘之前，验证前一日候选）
+    scheduler.add_job(track_verify_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=0,
+                      id="track_verify", name="候选池T+N验证",
+                      replace_existing=True, misfire_grace_time=3600)
     # 工作日 16:10 每日挖掘
     scheduler.add_job(daily_discover_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=10,
@@ -212,4 +234,5 @@ def job_status() -> list[dict]:
                     "next_run": str(job.next_run_time) if job.next_run_time else None})
     out.append({"id": "last_discover", "name": "最近挖掘", "next_run": cache.get("job:last_discover")})
     out.append({"id": "last_monitor", "name": "最近监控", "next_run": cache.get("job:last_monitor")})
+    out.append({"id": "last_track_verify", "name": "最近候选验证", "next_run": cache.get("job:last_track_verify")})
     return out

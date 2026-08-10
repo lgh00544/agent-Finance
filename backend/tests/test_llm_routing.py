@@ -222,10 +222,12 @@ class _Version:
 
 
 def _patch_sections(monkeypatch, base="【基线】", rules="【规则】", profile="【偏好】",
-                    knowledge="【知识】", tactic="【战法知识】", tactic_ver="aA1"):
+                    knowledge="【知识】", tactic="【战法知识】", tactic_ver="aA1",
+                    rule_ver="0:0"):
     monkeypatch.setattr(common_mod.repo, "get_trade_profile", lambda: _Version())
     monkeypatch.setattr(common_mod, "_knowledge_version", lambda: "k2:5")
     monkeypatch.setattr(common_mod, "_global_base_version", lambda: "gabc")
+    monkeypatch.setattr(common_mod, "_rule_version", lambda: rule_ver)
     monkeypatch.setattr(common_mod, "global_base_prompt", lambda: base)
     monkeypatch.setattr(common_mod, "hard_rules_section", lambda: rules)
     monkeypatch.setattr(common_mod, "profile_section", lambda: profile)
@@ -258,7 +260,7 @@ def test_agent_call_section_order_fixed(monkeypatch):
                                "【分职能战法知识库】（沉淀自《潜力股发掘方法论》，全部条目为参考权重，"
                                "不是死条件；与硬性规则冲突时以硬性规则为准，动态调整须在输出中标注理由）\n"
                                "【战法知识】\n\n【专属 Prompt】")
-    assert captured["key"] == "shortlist:v2:2026-08-04:v7:k2:5:ggabc:aA1"
+    assert captured["key"] == "shortlist:v2:2026-08-04:v7:k2:5:ggabc:aA1:r0:0"
     assert captured["level"] is ModelLevel.LIGHT
 
 

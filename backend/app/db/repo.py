@@ -5,6 +5,7 @@
 import hashlib
 import json
 import logging
+import time
 from typing import Any, Callable
 
 from sqlalchemy import delete, func, select, text
@@ -12,10 +13,10 @@ from sqlalchemy import delete, func, select, text
 from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
-    AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog, Holding,
-    HotMoneyProfile, LhbOriginalFlow, MarketCondition, NewsArticle, PositionPlan,
-    PrivateKnowledge, ReviewResult, SellDecision, StockCandidate, StockScore,
-    TradeProfile, TradeRecord, _now,
+    AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
+    CandidateTrackVerify, Holding, HotMoneyProfile, LhbOriginalFlow, MarketCondition,
+    NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult, RuleChange, SellDecision,
+    StockCandidate, StockScore, TradeProfile, TradeRecord, _now,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -604,6 +605,149 @@ def list_candidate_dates(limit: int = 30) -> list[str]:
     return _dbq("candidate", {"dates": limit}, _load)
 
 
+# ==================== 候选池 T+N 验证（选股效果闭环·代码侧客观统计） ====================
+
+def upsert_track_verify(stock_code: str, stock_name: str, select_date: str,
+                        select_rating: str, base_close_price: float) -> int:
+    """初始化追踪行：同 (code, select_date) 已存在则返回既有 id（幂等，重复执行安全）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(CandidateTrackVerify).where(
+                CandidateTrackVerify.stock_code == stock_code,
+                CandidateTrackVerify.select_date == select_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = CandidateTrackVerify(stock_code=stock_code, stock_name=stock_name,
+                                       select_date=select_date, select_rating=select_rating,
+                                       base_close_price=base_close_price)
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            _invalidate("track_verify")
+        return row.id
+
+
+def update_track_verify(row_id: int, *, t3_pct=None, t5_pct=None, t10_pct=None,
+                        max_drawdown=None, verify_result: dict | None = None,
+                        is_finished: int = 0) -> None:
+    """增量更新已追踪行（未提供的参数保持原值）；update_time 取当前时间戳"""
+    with SessionLocal() as db:
+        row = db.get(CandidateTrackVerify, row_id)
+        if row is None:
+            return
+        if t3_pct is not None:
+            row.t3_pct = t3_pct
+        if t5_pct is not None:
+            row.t5_pct = t5_pct
+        if t10_pct is not None:
+            row.t10_pct = t10_pct
+        if max_drawdown is not None:
+            row.max_drawdown = max_drawdown
+        if verify_result is not None:
+            row.verify_result = verify_result
+        row.is_finished = is_finished
+        row.update_time = time.strftime("%Y-%m-%d %H:%M")
+        db.commit()
+        _invalidate("track_verify")
+
+
+def list_untracked_candidates() -> list[dict]:
+    """候选池中尚未进入追踪表的全部标的（自愈初始化数据源：无日期过滤，
+    任何一天漏跑下次运行自动补齐）；每日仅调用一次，不走 _dbq"""
+    with SessionLocal() as db:
+        stmt = (
+            select(StockCandidate, CandidateTrackVerify.id)
+            .outerjoin(
+                CandidateTrackVerify,
+                (CandidateTrackVerify.stock_code == StockCandidate.stock_code)
+                & (CandidateTrackVerify.select_date == StockCandidate.trade_date))
+            .where(CandidateTrackVerify.id.is_(None))
+            .order_by(StockCandidate.trade_date, StockCandidate.rank)
+        )
+        return [{"stock_code": c.stock_code, "stock_name": c.stock_name,
+                 "trade_date": c.trade_date, "rank": c.rank,
+                 "snapshot": c.snapshot or {}, "detail": c.detail or {}}
+                for c, _ in db.execute(stmt).all()]
+
+
+def list_track_verify(select_date: str = "", rating: str = "",
+                      is_finished: int | None = None, limit: int = 200) -> list[dict]:
+    """追踪验证行列表（按选中日+排序；60s 缓存，写后失效）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(CandidateTrackVerify).order_by(
+                CandidateTrackVerify.select_date.desc(), CandidateTrackVerify.id)
+            if select_date:
+                stmt = stmt.where(CandidateTrackVerify.select_date == select_date)
+            if rating:
+                stmt = stmt.where(CandidateTrackVerify.select_rating == rating)
+            if is_finished is not None:
+                stmt = stmt.where(CandidateTrackVerify.is_finished == is_finished)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "select_date": r.select_date, "select_rating": r.select_rating,
+                     "base_close_price": r.base_close_price, "t3_pct": r.t3_pct,
+                     "t5_pct": r.t5_pct, "t10_pct": r.t10_pct,
+                     "max_drawdown": r.max_drawdown, "verify_result": r.verify_result or {},
+                     "is_finished": r.is_finished, "update_time": r.update_time,
+                     "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("track_verify",
+                {"date": select_date, "rating": rating,
+                 "finished": is_finished, "limit": limit}, _load)
+
+
+def list_track_verify_dates(limit: int = 30) -> list[str]:
+    """追踪验证可选日期（去重降序，页面日期筛选）"""
+
+    def _load() -> list[str]:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(CandidateTrackVerify.select_date)
+                .distinct()
+                .order_by(CandidateTrackVerify.select_date.desc())
+                .limit(limit)).scalars().all()
+            return list(rows)
+
+    return _dbq("track_verify", {"dates": limit}, _load)
+
+
+def get_candidate_rating(stock_code: str, trade_date: str) -> str:
+    """候选评级解析（决策：评分 grade 优先，无则 confidence_tier 原文）：
+    ① 当日 StockScore.grade（A/B/C）→ ② 最近一次评分 grade → ③ 候选 detail.confidence_tier 原文 → ④ 空串"""
+    with SessionLocal() as db:
+        score = db.execute(
+            select(StockScore).where(StockScore.stock_code == stock_code,
+                                     StockScore.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if score is None:
+            score = db.execute(
+                select(StockScore).where(StockScore.stock_code == stock_code)
+                .order_by(StockScore.trade_date.desc()).limit(1)).scalar_one_or_none()
+        if score is not None and score.grade:
+            return score.grade.strip()
+        cand = db.execute(
+            select(StockCandidate).where(StockCandidate.stock_code == stock_code,
+                                         StockCandidate.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if cand is not None:
+            tier = (cand.detail or {}).get("confidence_tier", "")
+            if tier:
+                return str(tier).strip()
+        return ""
+
+
+def has_pending_suggestion(rule_name: str, target_agent: str) -> bool:
+    """建议去重检查：同 rule_name + target_agent 已有 pending 建议则不重复插入"""
+    with SessionLocal() as db:
+        return db.execute(
+            select(func.count()).select_from(AgentSuggestion)
+            .where(AgentSuggestion.rule_name == rule_name,
+                   AgentSuggestion.target_agent == target_agent,
+                   AgentSuggestion.status == "pending")
+        ).scalar_one() > 0
+
+
 def _backfill_stock_names(rows: list[dict]) -> list[dict]:
     """股票名称补齐（历史脏数据修复，查询层只读不写库）：
     记录名称缺失或等于代码时，按「候选池最新 → 持仓 → 新闻」顺序批量反查真实名称；
@@ -833,12 +977,22 @@ def get_sell_decisions_by_code(stock_code: str, limit: int = 20) -> list[SellDec
 def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
                             current_value: str, suggested_value: str,
                             reason: str, evidence: str,
-                            target_kind: str = "profile") -> int:
+                            target_kind: str = "profile",
+                            rule_type: str = "soft", priority: str = "medium",
+                            problem_desc: str = "", rule_text: str = "",
+                            expected_effect: str = "", risk_note: str = "",
+                            file_path: str = "", insert_position: str = "",
+                            suggestion_source: str = "llm") -> int:
     with SessionLocal() as db:
         row = AgentSuggestion(review_id=review_id, target_agent=target_agent, rule_name=rule_name,
                               current_value=current_value, suggested_value=suggested_value,
                               reason=reason, evidence=evidence,
-                              target_kind=target_kind, status="pending")
+                              target_kind=target_kind, status="pending",
+                              rule_type=rule_type, priority=priority,
+                              problem_desc=problem_desc, rule_text=rule_text,
+                              expected_effect=expected_effect, risk_note=risk_note,
+                              file_path=file_path, insert_position=insert_position,
+                              suggestion_source=suggestion_source)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -875,6 +1029,148 @@ def update_agent_suggestion_status(suggestion_id: int, status: str,
         db.commit()
         db.refresh(row)
         return row
+
+
+def update_agent_suggestion_notes(suggestion_id: int, conflict_note: str = "",
+                                  dedup_note: str = "") -> None:
+    """校验拦截回填：采纳被拦时把冲突/去重说明写回建议记录（前端直接展示原因）"""
+    with SessionLocal() as db:
+        row = db.get(AgentSuggestion, suggestion_id)
+        if row is None:
+            return
+        row.conflict_note = conflict_note
+        row.dedup_note = dedup_note
+        db.commit()
+
+
+# ==================== 复盘采纳规则（一键采纳自动落地：规则存库 + agent_call 动态注入） ====================
+
+def get_active_rules() -> list[dict]:
+    """生效中规则列表（agent_call 注入数据源；采纳/回滚后 _invalidate 失效）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(RuleChange).where(RuleChange.status == "active")
+                .order_by(RuleChange.id)).scalars().all()
+            return [{"id": r.id, "target_agent": r.target_agent, "rule_type": r.rule_type,
+                     "rule_name": r.rule_name, "rule_text": r.rule_text} for r in rows]
+
+    return _dbq("rule_change", {"active": 1}, _load)
+
+
+def rule_version() -> str:
+    """生效规则内容指纹（count+max_id）→ 入 LLM 缓存键：
+    采纳/回滚后指纹变化，当日 LLM 缓存自动失效（同 _knowledge_version 语义）"""
+    def _load() -> list:
+        with SessionLocal() as db:
+            cnt = db.execute(select(func.count()).select_from(RuleChange)
+                             .where(RuleChange.status == "active")).scalar() or 0
+            max_id = db.execute(select(func.max(RuleChange.id))).scalar() or 0
+            return [{"count": int(cnt), "max_id": int(max_id or 0)}]
+
+    rows = _dbq("rule_change", {"ver": 1}, _load)
+    row = rows[0] if rows else {}
+    return f"{row.get('count', 0)}:{row.get('max_id', 0)}"
+
+
+def list_rule_changes(status: str | None = None, target_agent: str | None = None,
+                      suggestion_id: int | None = None, limit: int = 50) -> list[dict]:
+    """规则变更记录轻量列表（记录页数据源，不含长文本；详情按需单查）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(RuleChange).order_by(RuleChange.id.desc()).limit(limit)
+            if status:
+                stmt = stmt.where(RuleChange.status == status)
+            if target_agent:
+                stmt = stmt.where(RuleChange.target_agent == target_agent)
+            if suggestion_id is not None:
+                stmt = stmt.where(RuleChange.source_suggestion_id == suggestion_id)
+            rows = db.execute(stmt).scalars().all()
+            return [{"id": r.id, "source_suggestion_id": r.source_suggestion_id,
+                     "review_id": r.review_id, "stock_code": r.stock_code,
+                     "stock_name": r.stock_name, "target_agent": r.target_agent,
+                     "rule_type": r.rule_type, "rule_name": r.rule_name,
+                     "rule_text": r.rule_text, "priority": r.priority,
+                     "status": r.status, "operator": r.operator,
+                     "created_at": str(r.created_at),
+                     "rollback_time": r.rollback_time} for r in rows]
+
+    return _dbq("rule_change", {"status": status, "agent": target_agent,
+                                "suggestion_id": suggestion_id, "limit": limit}, _load)
+
+
+def get_rule_change(rule_change_id: int) -> dict | None:
+    """规则变更完整详情（变更前后对比/回滚原因/落地元数据，供记录页展开）"""
+    def _load() -> list:
+        with SessionLocal() as db:
+            r = db.get(RuleChange, rule_change_id)
+            if r is None:
+                return []
+            return [{"id": r.id, "source_suggestion_id": r.source_suggestion_id,
+                     "review_id": r.review_id, "stock_code": r.stock_code,
+                     "stock_name": r.stock_name, "target_agent": r.target_agent,
+                     "rule_type": r.rule_type, "rule_name": r.rule_name,
+                     "rule_text": r.rule_text, "priority": r.priority,
+                     "before_text": r.before_text, "after_text": r.after_text,
+                     "reason": r.reason, "evidence": r.evidence,
+                     "expected_effect": r.expected_effect, "risk_note": r.risk_note,
+                     "file_path": r.file_path, "insert_position": r.insert_position,
+                     "status": r.status, "rollback_reason": r.rollback_reason,
+                     "rollback_time": r.rollback_time, "operator": r.operator,
+                     "created_at": str(r.created_at)}]
+
+    rows = _dbq("rule_change", {"detail": rule_change_id}, _load)
+    return rows[0] if rows else None
+
+
+def adopt_rule_suggestion(suggestion_id: int, operator: str = "") -> int:
+    """一键采纳：写 rule_change(status=active) + 建议置 approved（单事务，并发兜底复查 pending）。
+    返回 rule_change.id；建议不存在或已处理返回 0。"""
+    with SessionLocal() as db:
+        sug = db.get(AgentSuggestion, suggestion_id)
+        if sug is None or sug.status != "pending":
+            return 0
+        review = db.get(ReviewResult, sug.review_id) if sug.review_id else None
+        change = RuleChange(
+            source_suggestion_id=sug.id,
+            review_id=sug.review_id,
+            stock_code=review.stock_code if review else "",
+            stock_name=review.stock_name if review else "",
+            target_agent=sug.target_agent,
+            rule_type=sug.rule_type or "soft",
+            rule_name=sug.rule_name,
+            rule_text=sug.rule_text,
+            priority=sug.priority or "medium",
+            before_text="（此前无生效规则）",
+            after_text=sug.rule_text,
+            reason=sug.reason,
+            evidence=sug.evidence,
+            expected_effect=sug.expected_effect,
+            risk_note=sug.risk_note,
+            file_path=sug.file_path,
+            insert_position=sug.insert_position,
+            operator=operator,
+        )
+        db.add(change)
+        sug.status = "approved"
+        db.commit()
+        db.refresh(change)
+        _invalidate("rule_change")
+        return change.id
+
+
+def rollback_rule_change(rule_change_id: int, reason: str) -> bool:
+    """一键回滚：status=active → rolled_back + 原因/时间留痕；返回是否成功"""
+    with SessionLocal() as db:
+        row = db.get(RuleChange, rule_change_id)
+        if row is None or row.status != "active":
+            return False
+        row.status = "rolled_back"
+        row.rollback_reason = reason.strip()
+        row.rollback_time = _now().strftime("%Y-%m-%d %H:%M")
+        db.commit()
+        _invalidate("rule_change")
+        return True
 
 
 # ==================== 监控信号历史（ReviewAgent 复盘聚合用） ====================

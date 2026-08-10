@@ -154,7 +154,53 @@ CREATE TABLE IF NOT EXISTS agent_suggestion (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY idx_suggestion_review (review_id),
-    KEY idx_suggestion_status (status)
+    KEY idx_suggestion_status (status),
+    -- v2 一键采纳落地信息（LLM 输出；soft/hard 由代码侧校验后注入）
+    priority VARCHAR(8) NOT NULL DEFAULT 'medium',
+    rule_type VARCHAR(8) NOT NULL DEFAULT 'soft',
+    problem_desc TEXT NULL,
+    rule_text TEXT NULL,
+    expected_effect TEXT NULL,
+    risk_note TEXT NULL,
+    file_path VARCHAR(255) NULL,
+    insert_position VARCHAR(32) NULL,
+    conflict_note TEXT NULL,
+    dedup_note TEXT NULL,
+    -- 建议来源标记（llm=LLM生成 / template=确定性模板兜底，选股验证统计）
+    suggestion_source VARCHAR(16) NOT NULL DEFAULT 'llm',
+    KEY idx_suggestion_source (suggestion_source)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 复盘采纳规则变更记录（一键采纳自动落地：规则存库、agent_call 动态注入，绝不写源码文件）
+-- 与 backend/app/db/models.py 的 RuleChange 一致；file_path/insert_position 仅展示元数据
+CREATE TABLE IF NOT EXISTS rule_change (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    source_suggestion_id INT NOT NULL,
+    review_id INT NOT NULL DEFAULT 0,
+    stock_code VARCHAR(16) NOT NULL DEFAULT '',
+    stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    target_agent VARCHAR(16) NOT NULL DEFAULT '',
+    rule_type VARCHAR(8) NOT NULL DEFAULT 'soft',
+    rule_name VARCHAR(128) NOT NULL DEFAULT '',
+    rule_text TEXT NULL,
+    priority VARCHAR(8) NOT NULL DEFAULT 'medium',
+    before_text TEXT NULL,
+    after_text TEXT NULL,
+    reason TEXT NULL,
+    evidence TEXT NULL,
+    expected_effect TEXT NULL,
+    risk_note TEXT NULL,
+    file_path VARCHAR(255) NULL,
+    insert_position VARCHAR(32) NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
+    rollback_reason TEXT NULL,
+    rollback_time VARCHAR(16) NULL,
+    operator VARCHAR(32) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_rule_change_status (status),
+    KEY idx_rule_change_agent (target_agent),
+    KEY idx_rule_change_suggestion (source_suggestion_id),
+    KEY idx_rule_change_review (review_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
@@ -180,4 +226,26 @@ CREATE TABLE IF NOT EXISTS ai_reasoning_trace (
     ext_info LONGTEXT NULL,
     UNIQUE KEY uq_trace_code_date_module (stock_code, generate_date, source_module),
     KEY idx_trace_module_date (source_module, generate_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 候选池标的 T+N 自动追踪验证（选股效果闭环·代码侧客观统计）
+-- 与 backend/app/db/models.py 的 CandidateTrackVerify 一致；t3/t5/t10 不足时为 NULL 表示未到期
+CREATE TABLE IF NOT EXISTS candidate_track_verify (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL,
+    select_date VARCHAR(10) NOT NULL,
+    select_rating VARCHAR(16) NOT NULL DEFAULT '',
+    base_close_price FLOAT NOT NULL DEFAULT 0,
+    t3_pct FLOAT NULL,
+    t5_pct FLOAT NULL,
+    t10_pct FLOAT NULL,
+    max_drawdown FLOAT NULL,
+    verify_result JSON NULL,
+    is_finished INT NOT NULL DEFAULT 0,
+    update_time VARCHAR(16) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_track_code_date (stock_code, select_date),
+    KEY idx_track_code (stock_code),
+    KEY idx_track_status (is_finished, select_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

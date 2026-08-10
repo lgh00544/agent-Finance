@@ -95,6 +95,11 @@ def market_indices() -> dict:
     return _get("/api/market/indices")
 
 
+def index_history(days: int = 90) -> dict:
+    """三大指数日线历史（只读，近 N 天）：change_pct 已按收盘价回算；失败 items 空 + error 标注"""
+    return _get("/api/market/indices/history", {"days": days})
+
+
 def market_hot_sectors() -> dict:
     """今日涨幅前 5 行业板块 + 领涨龙头（代码+名称）+ 更新时间"""
     return _get("/api/market/hot-sectors")
@@ -246,8 +251,66 @@ def approve_suggestion(sid: int) -> dict:
     return _post(f"/api/agent-suggestions/{sid}/approve")
 
 
+def adopt_suggestion(sid: int, confirm: bool = False) -> dict:
+    """一键采纳自动落地（规则类建议）：硬规则需 confirm=True 二次确认"""
+    return _post(f"/api/agent-suggestions/{sid}/adopt", {"confirm": confirm})
+
+
 def reject_suggestion(sid: int, reason: str = "") -> dict:
     return _post(f"/api/agent-suggestions/{sid}/reject", {"reason": reason} if reason else None)
+
+
+def rule_changes(status: str | None = None, target_agent: str | None = None,
+                 suggestion_id: int | None = None) -> list:
+    """规则变更记录（一键采纳/回滚全量留痕，时间倒序）"""
+    params = {}
+    if status:
+        params["status"] = status
+    if target_agent:
+        params["target_agent"] = target_agent
+    if suggestion_id is not None:
+        params["suggestion_id"] = suggestion_id
+    return _get("/api/rule-changes", params or None)
+
+
+def rollback_rule_change(rid: int, reason: str) -> dict:
+    return _post(f"/api/rule-changes/{rid}/rollback", {"reason": reason})
+
+
+# ================= 候选池 T+N 验证（选股效果闭环） =================
+def track_verify_list(select_date: str = "", rating: str = "", status: str = "",
+                      limit: int = 200) -> list:
+    """追踪验证行列表（status: all/tracking/finished）"""
+    params = {}
+    if select_date:
+        params["select_date"] = select_date
+    if rating:
+        params["rating"] = rating
+    if status and status != "all":
+        params["status"] = status
+    if limit != 200:
+        params["limit"] = limit
+    return _get("/api/track/verify/list", params or None)
+
+
+def track_verify_dates(limit: int = 30) -> list:
+    """追踪验证可选日期（去重降序）"""
+    return _get("/api/track/verify/dates", {"limit": limit})
+
+
+def track_verify_stats(period: str = "t5") -> dict:
+    """周期统计（从已存验证行纯计算；period: t3/t5/t10）"""
+    return _get("/api/track/verify/stats", {"period": period})
+
+
+def run_track_verify(backfill: bool = False) -> dict:
+    """手动触发候选 T+N 验证（backfill=True 历史回填，幂等）"""
+    return _post("/api/track/verify/run", {"backfill": backfill})
+
+
+def run_track_suggest() -> dict:
+    """手动触发选股验证建议生成（LLM 为主 + 模板兜底，来源标记）"""
+    return _post("/api/track/verify/suggest")
 
 
 def knowledge() -> list:

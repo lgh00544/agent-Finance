@@ -5,6 +5,8 @@ Agent 公共工具：统一调教接口 + 统一 LLM 调用入口
 0. 全局通用知识库基线（agent_prompts/global_base_prompt.md）：所有 Agent 每次任务【最先】加载，
    A股规则 / 基准本金(36943) / 系统边界 / 技术分析执行标准 / 思考推理强制准则 / 预留扩展插槽；
 1. 硬性规则（HARD_RULES）：人工锁定的业务底线，所有 Agent 无条件遵守，LLM 不得放宽；
+1.5 复盘采纳规则（rule_change 表，一键采纳自动落地）：人工确认后由系统动态注入——
+   硬性类与 HARD_RULES 同等声明，软性类为参考权重；绝不写源码文件；
 2. 个人交易偏好档案（sys_trade_profile）：所有 Agent 自动注入，页面可视化编辑即时生效；
 3. 私有知识库（private_knowledge）：每个 Agent 启动任务时自动检索对应交易经验/战法资料注入。
 
@@ -86,6 +88,46 @@ def hard_rules_section() -> str:
         "若你的研判与硬性规则冲突，以硬性规则为准并明确说明冲突点；"
         "这些规则只能由人工修改配置后变更，你没有权限自行调整。"
     )
+
+
+def dynamic_rules_section() -> str:
+    """复盘采纳规则（一键采纳自动落地）→ prompt 注入文本：
+    硬规则与 HARD_RULES 同等声明（无条件遵守），软规则为参考权重（非死条件）；
+    规则由 DB 动态注入（rule_change 表，绝不写源码文件）。无生效规则时返回空。"""
+    try:
+        rules = repo.get_active_rules()
+    except Exception as exc:  # noqa: BLE001 规则读取失败不阻塞主链路
+        logger.warning("复盘采纳规则读取失败: %s", exc)
+        return ""
+    if not rules:
+        return ""
+    hard = [r for r in rules if r.get("rule_type") == "hard"]
+    soft = [r for r in rules if r.get("rule_type") != "hard"]
+    parts = []
+    if hard:
+        lines = "\n".join(f"{i}. {r.get('rule_text', '')}" for i, r in enumerate(hard, 1))
+        parts.append(
+            "【复盘采纳规则·硬性（人工审核后自动生效）】以下规则经人工确认后由系统自动生效，"
+            "优先级与人工硬性锁定规则等同：\n" + lines + "\n"
+            "你必须无条件遵守以上规则，不得以任何理由放宽、绕过或忽略；"
+            "若与人工硬性规则冲突，以人工硬性规则为准并说明冲突点。"
+        )
+    if soft:
+        lines = "\n".join(f"{i}. {r.get('rule_text', '')}" for i, r in enumerate(soft, 1))
+        parts.append(
+            "【复盘采纳规则·参考权重（人工审核后自动生效）】以下规则经人工确认后由系统自动生效，"
+            "作为研判参考权重（非死条件）：\n" + lines + "\n"
+            "与硬性规则冲突时以硬性规则为准，动态调整须在输出中标注理由。"
+        )
+    return "\n\n".join(parts)
+
+
+def _rule_version() -> str:
+    """复盘采纳规则指纹 → 入缓存键：采纳/回滚后当日 LLM 缓存自动失效"""
+    try:
+        return repo.rule_version()
+    except Exception:  # noqa: BLE001 指纹失败不阻塞主链路
+        return "0:0"
 
 
 def profile_section() -> str:
@@ -184,6 +226,10 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
     rules_section = hard_rules_section()
     if rules_section:
         sections.append(rules_section)
+    # 拼接位1.5 · 复盘采纳规则（一键采纳自动落地：DB 动态注入，绝不写源码文件）
+    adopted = dynamic_rules_section()
+    if adopted:
+        sections.append(adopted)
     # 拼接位2 · 个性化交易体系 = 个人交易偏好档案（动态配置）
     if with_profile:
         section = profile_section()
@@ -212,6 +258,6 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
 
     version = repo.get_trade_profile().version
     return call_llm_cached(agent,
-                           f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}:{_agent_knowledge_version(agent)}",
+                           f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}:{_agent_knowledge_version(agent)}:r{_rule_version()}",
                            sys_prompt, user_prompt, schema, ttl_seconds=ttl_seconds,
                            model_level=model_level)

@@ -165,12 +165,17 @@ def llm_review(state: StockAgentState) -> StockAgentState:
     # 偏好回流：feedback 写入档案，注入后续 Discover/Score prompt
     repo.upsert_preference(output.feedback, source_review_id=review_id)
     # 策略闭环：各 Agent 优化建议落库为 pending，必须人工审核确认后才生效
+    # （v2 一键采纳落地信息随建议持久化：rule_text/rule_type/priority/落地元数据）
     suggestion_count = 0
     for item in output.agent_suggestions:
         repo.insert_agent_suggestion(
             review_id, item.target_agent, item.rule_name,
             item.current_value, item.suggested_value, item.reason, item.evidence,
-            target_kind=item.target_kind)
+            target_kind=item.target_kind,
+            rule_type=item.rule_type, priority=item.priority,
+            problem_desc=item.problem_desc, rule_text=item.rule_text,
+            expected_effect=item.expected_effect, risk_note=item.risk_note,
+            file_path=item.file_path, insert_position=item.insert_position)
         suggestion_count += 1
     # 游资复盘闭环留痕：失败标的回溯游资信号结论（source_module='hot_money_review'，
     # 只留痕不改任何配置；无游资信号可回溯时 LLM 输出 null 跳过）

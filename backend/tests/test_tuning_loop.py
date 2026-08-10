@@ -182,7 +182,9 @@ def test_agent_call_global_base_first(monkeypatch):
     prompt = captured["system_prompt"]
     assert prompt.index("36943") < prompt.index("【卖出专项规则】")  # 基线在前
     assert "插槽" in prompt and "交叉验证" in prompt                  # 基线内容已注入
-    # 缓存键携带基线指纹 g{md5} 与战法知识指纹 a{md5}：编辑任一侧内容后 LLM 缓存自动失效
+    # 缓存键携带基线指纹 g{md5}、战法知识指纹 a{md5} 与复盘采纳规则指纹 r{...}：
+    # 编辑任一侧内容（或采纳/回滚规则）后 LLM 缓存自动失效；末位为规则指纹
     assert f":g{common_mod._global_base_version()}" in captured["cache_key"]
-    assert captured["cache_key"].endswith(f":{common_mod._agent_knowledge_version('sell')}")
+    assert f":{common_mod._agent_knowledge_version('sell')}" in captured["cache_key"]
+    assert captured["cache_key"].endswith(f":r{common_mod._rule_version()}")
     assert "派发信号" in prompt  # 战法知识库（sell.md）已注入

@@ -39,6 +39,33 @@ class StockCandidate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class CandidateTrackVerify(Base):
+    """候选池标的 T+N 自动追踪验证（选股效果闭环·代码侧客观统计）
+    口径：T+N 涨跌幅 = (选中日后第 N 个交易日收盘 / 选中日收盘基准 − 1) × 100；
+    最大回撤 = 相对 base_close_price 的区间最低收盘回撤（services/track_verify.py 注释）。
+    is_finished: 0=追踪中 / 1=已到期收尾（T+10 数据齐全即收尾）。"""
+    __tablename__ = "candidate_track_verify"
+    __table_args__ = (
+        UniqueConstraint("stock_code", "select_date", name="uq_track_code_date"),
+        Index("ix_track_status", "is_finished", "select_date"),  # 未完成遍历 + 日期排序
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    select_date: Mapped[str] = mapped_column(String(10), index=True)  # 选中日 YYYY-MM-DD
+    select_rating: Mapped[str] = mapped_column(String(16), default="")  # A/B/C 或 confidence_tier 原文
+    base_close_price: Mapped[float] = mapped_column(Float, default=0.0)  # 选中日收盘基准价
+    t3_pct: Mapped[float | None] = mapped_column(Float, nullable=True)   # T+3 涨跌幅 %（不足=null）
+    t5_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t10_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown: Mapped[float | None] = mapped_column(Float, nullable=True)  # 相对基准最大回撤 %
+    verify_result: Mapped[dict] = mapped_column(JSON, default=dict)     # 周期胜负/回撤明细（见服务层）
+    is_finished: Mapped[int] = mapped_column(Integer, default=0)        # 0=追踪中 / 1=已到期收尾
+    update_time: Mapped[str] = mapped_column(String(16), default="")    # YYYY-MM-DD HH:mm
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class MarketCondition(Base):
     """每日市况评分（v2.0 Discover 前置步骤）：LLM 五维打分 + 代码档位映射候选池上限"""
     __tablename__ = "market_condition"
@@ -302,6 +329,56 @@ class AgentSuggestion(Base):
     reject_reason: Mapped[str] = mapped_column(Text, default="")        # 人工驳回原因（审核留痕）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    # ---------- 建议质量增强（一键采纳自动落地 v2，LLM 输出完整落地信息） ----------
+    priority: Mapped[str] = mapped_column(String(8), default="medium")   # 高/中/低 high/medium/low
+    rule_type: Mapped[str] = mapped_column(String(8), default="soft")    # soft=提示词软规则 / hard=代码硬规则
+    problem_desc: Mapped[str] = mapped_column(Text, default="")   # 当前问题说明（场景缺陷 + 触发案例）
+    rule_text: Mapped[str] = mapped_column(Text, default="")      # 优化后完整规则条文（可直接落地生效）
+    expected_effect: Mapped[str] = mapped_column(Text, default="")  # 预期效果（量化指标）
+    risk_note: Mapped[str] = mapped_column(Text, default="")      # 规则生效副作用与注意事项
+    file_path: Mapped[str] = mapped_column(String(255), default="")  # 应归属文件（仅展示元数据，不写文件）
+    insert_position: Mapped[str] = mapped_column(String(32), default="")  # 建议插入位置（仅展示元数据）
+    conflict_note: Mapped[str] = mapped_column(Text, default="")   # 代码侧冲突校验拦截说明（非空=拦截）
+    dedup_note: Mapped[str] = mapped_column(Text, default="")      # 代码侧去重校验拦截说明（非空=拦截）
+    suggestion_source: Mapped[str] = mapped_column(String(16), default="llm", index=True)  # llm=LLM生成 / template=确定性模板兜底（选股验证统计）
+
+
+class RuleChange(Base):
+    """复盘采纳规则变更记录（一键采纳自动落地：规则存库、agent_call 动态注入）
+
+    采纳 = 写入一条 status=active 的记录 → 所有 Agent 下次任务自动携带（版本指纹入缓存键
+    → LLM 缓存自动失效）；回滚 = 状态置 rolled_back + 原因留痕，全程可追溯。
+    file_path/insert_position 为 LLM 声明的归属元数据，仅展示，绝不写入源码文件。
+    """
+    __tablename__ = "rule_change"
+    __table_args__ = (
+        Index("ix_rule_change_status", "status"),
+        Index("ix_rule_change_agent", "target_agent"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_suggestion_id: Mapped[int] = mapped_column(Integer, index=True)  # 来源建议（agent_suggestion.id）
+    review_id: Mapped[int] = mapped_column(Integer, index=True, default=0)  # 来源复盘
+    stock_code: Mapped[str] = mapped_column(String(16), default="")
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    target_agent: Mapped[str] = mapped_column(String(16), default="")  # discover/score/position/monitor/sell/review
+    rule_type: Mapped[str] = mapped_column(String(8), default="soft")  # soft/hard
+    rule_name: Mapped[str] = mapped_column(String(128), default="")    # 规则名称
+    rule_text: Mapped[str] = mapped_column(Text, default="")           # 生效的完整规则条文
+    priority: Mapped[str] = mapped_column(String(8), default="medium")
+    before_text: Mapped[str] = mapped_column(Text, default="")   # 采纳前生效规则摘要（变更对比）
+    after_text: Mapped[str] = mapped_column(Text, default="")    # 采纳后生效规则全文（变更对比）
+    reason: Mapped[str] = mapped_column(Text, default="")        # 建议理由
+    evidence: Mapped[str] = mapped_column(Text, default="")      # 事实依据
+    expected_effect: Mapped[str] = mapped_column(Text, default="")
+    risk_note: Mapped[str] = mapped_column(Text, default="")
+    file_path: Mapped[str] = mapped_column(String(255), default="")
+    insert_position: Mapped[str] = mapped_column(String(32), default="")
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active=生效中 / rolled_back=已回滚
+    rollback_reason: Mapped[str] = mapped_column(Text, default="")
+    rollback_time: Mapped[str] = mapped_column(String(16), default="")  # YYYY-MM-DD HH:mm
+    operator: Mapped[str] = mapped_column(String(32), default="")  # 操作人（单机自部署固定本机用户）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class AgentChatMessage(Base):

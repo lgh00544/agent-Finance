@@ -145,17 +145,38 @@ class ProfileSuggestion(BaseModel):
 
 class AgentSuggestionItem(BaseModel):
     """对指定 Agent 规则/参数的优化建议（策略闭环·复盘进化）
-    ⚠️ 任何建议仅作为提案，必须经人工审核确认后生效，禁止自动、无监督修改。"""
+    ⚠️ 任何建议仅作为提案，必须经人工审核确认后生效，禁止自动、无监督修改。
+    一键采纳自动落地 v2：prompt 类建议须给出 rule_text 完整规则条文（可落地生效），
+    由系统写入 rule_change 表经 agent_call 管道动态注入（绝不写源码文件）。"""
     target_agent: str = Field(description="建议针对的 Agent：discover/score/position/monitor/sell/review")
     target_kind: str = Field(
         pattern="^(profile|prompt)$",
-        description="生效方式：profile=可直接写入个人交易偏好档案（字段级）；"
-                    "prompt=需人工修改 agent_prompts/ 下对应提示词文件或 common.py HARD_RULES")
-    rule_name: str = Field(description="规则/参数名称（如 单票仓位上限 或 'Discover 行业热度权重'）")
-    current_value: str = Field(description="当前值")
-    suggested_value: str = Field(description="建议值")
+        description="生效方式：profile=直接写入个人交易偏好档案（字段级）；"
+                    "prompt=规则类建议，rule_text 给出完整规则条文，人工确认后由系统自动注入")
+    rule_name: str = Field(description="规则/参数名称（如 单票仓位上限 或 'Monitor 趋势破位判定标准'）")
+    current_value: str = Field(description="当前值（现有规则的现状表述）")
+    suggested_value: str = Field(description="建议值（优化要点摘要，供列表速览）")
     reason: str = Field(description="建议理由（引用本次交易落地表现）")
     evidence: str = Field(description="事实依据（如 入场逻辑与走势偏差的具体数据）")
+    # ---------- v2 一键采纳落地信息（prompt 类必填） ----------
+    rule_type: str = Field(default="soft", pattern="^(soft|hard)$",
+        description="规则类型：soft=提示词软规则（参考权重）；hard=代码硬规则（全局底线，无条件遵守）")
+    priority: str = Field(default="medium", pattern="^(high|medium|low)$",
+        description="优先级：high=高（紧急）/medium=中/low=低")
+    rule_text: str = Field(default="",
+        description="优化后的完整规则条文（可直接落地的规则原文，与 HARD_RULES/提示词规则格式一致，"
+                    "禁止『建议增加…』等无执行语义的表述；prompt 类建议必填）")
+    problem_desc: str = Field(default="",
+        description="当前问题说明（现有规则的具体缺陷精准到场景 + 本次复盘触发的案例与影响）")
+    expected_effect: str = Field(default="",
+        description="预期效果（量化：胜率/盈亏比/回撤等指标维度）与影响范围（业务环节/标的类型）")
+    risk_note: str = Field(default="",
+        description="规则生效的副作用/风险提示与注意事项")
+    file_path: str = Field(default="",
+        description="规则应归属的文件路径（如 agent_prompts/monitor_prompt.py 或 common.py HARD_RULES；"
+                    "仅展示元数据，系统绝不写源码文件）")
+    insert_position: str = Field(default="",
+        description="建议插入位置（新增/替换/补充到哪条规则之下；仅展示元数据）")
 
 
 class ReviewOutput(BaseModel):
@@ -169,3 +190,11 @@ class ReviewOutput(BaseModel):
     hot_money_review: dict | None = Field(default=None,
         description="游资信号有效性回溯结论（失败标的复盘时输出）：{classification, signal_effective, "
                     "basis, weight_suggestion}；无游资信号可回溯时输出 null。只留痕，不直接改任何配置")
+
+
+class TrackVerifyOutput(BaseModel):
+    """选股验证统计建议输出（候选池 T+N 追踪验证 Agent 输出）
+    建议仅作为提案，必须经人工审核确认后生效（走 agent_suggestions 审核闭环）"""
+    summary_note: str = Field(default="", description="本轮统计要点自评（一句话）")
+    agent_suggestions: list[AgentSuggestionItem] = Field(default_factory=list,
+        description="选股规则优化建议（基于统计事实；无显著异常时输出空列表，绝不为了输出而输出）")
