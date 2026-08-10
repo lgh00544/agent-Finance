@@ -19,7 +19,8 @@ from pydantic import BaseModel, Field
 from app.agents import common
 from app.db import repo
 from app.llm.structured import ModelLevel
-from app.services.candidate_tradeable import _effective_tier, _latest_plan_for, judge_tradeable
+from app.services.candidate_tradeable import (_effective_tier, _latest_plan_for,
+                                              ensure_tradeable, judge_tradeable)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,9 @@ _VALID_SCOPES = ("all", "tradeable", "A", "B", "C", "manual")
 class BatchAnswer(BaseModel):
     """批量验证对话「总-分」结构输出"""
     overall: str = Field(description="整体结论：对所选范围候选的一次性统一判断（是否建议建仓/当前侧重，1-2 段）")
+    confidence: int = Field(default=60, description="信心度 0-100，数据充分且明确时取高值，存疑时取低值")
+    sources: list[str] = Field(default_factory=list,
+                               description="回答依据的来源清单（候选上下文/当日市况/知识库等）")
     common_points: list[str] = Field(default_factory=list,
                                      description="共性分析：范围内多只标的共同特征/共性风险/共同关注点")
     differences: list[str] = Field(default_factory=list,
@@ -193,7 +197,8 @@ def apply_batch_adjust(batch_id: int) -> dict:
     applied = _apply_adjust(batch, names)
     after = {"items": applied}
     repo.update_batch_adjust_status(batch_id, "applied", after_snapshot=after)
-    repo._invalidate("tradeable")  # noqa: SLF001 覆盖写入后失效 tradeable 缓存
+    # 立即按 effective_tier 重判落库，保证前端计数/标签/筛选同步（幂等覆盖）
+    ensure_tradeable(batch.get("trade_date") or "")
     return {"batch_id": batch_id, "status": "applied", "applied": applied, "count": len(applied)}
 
 
@@ -214,5 +219,7 @@ def rollback_batch_adjust(batch_id: int, reason: str = "") -> dict:
     repo.update_batch_adjust_status(batch_id, "rolled_back",
                                     rollback_reason=reason.strip(),
                                     rollback_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    # 删除覆盖后立即重判落库，恢复原判定（幂等）
+    ensure_tradeable(trade_date)
     return {"batch_id": batch_id, "status": "rolled_back", "removed": removed,
             "count": len(removed), "reason": reason}

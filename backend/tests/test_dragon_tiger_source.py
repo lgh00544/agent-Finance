@@ -135,6 +135,9 @@ def test_fetch_dragon_tiger_lands_db(monkeypatch):
     from app.db import repo
     from app.db.session import init_db
 
+    # 日期已到实盘日 → 屏蔽 akshare 兜底，保持不触网（否则真实龙虎榜数据会污染断言）
+    monkeypatch.setattr(dts, "ak", None)
+
     init_db()
     before = len(repo.list_lhb_flows(trade_date="2026-08-10"))
     seats = dts.fetch_dragon_tiger("2026-08-10")

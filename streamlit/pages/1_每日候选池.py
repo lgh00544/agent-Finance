@@ -66,6 +66,9 @@ with f2:
 with f3:
     if st.button("手动触发每日挖掘", type="primary", use_container_width=True):
         render.submit_task("daily_pipeline", label="每日挖掘")
+    if st.button("批量验证对话", use_container_width=True):
+        st.session_state["_batch_open"] = True
+        st.rerun()
 st.caption("评级：A 强烈推荐 / B 建议关注 / C 谨慎观察（LLM 信心度档位映射，纯展示）")
 
 # ===== 可建仓统计卡（顶部；0 只也明确显示，接口失败降级 caption 不阻塞页面） =====
@@ -166,9 +169,15 @@ with rows_area:
         core = reasons[0] if reasons else (detail.get("meso_view") or "")
         subtitle = "　·　".join(x for x in (stock_type, core) if x)
         meta = f"生成 {str(r.get('created_at') or '')[:16]}"
+        # 可建仓状态标签（展示层，与顶部统计/筛选同源 trade_map）
+        _tb = trade_map.get(r["stock_code"]) or {}
+        _tb_label = _tb.get("label") or ""
+        _badge_cls = {"可建仓": "badge-ok", "建议关注": "badge-info", "观察": "badge-mute"}
+        _badge_html = (f'<span class="badge {_badge_cls.get(_tb_label, "badge-mute")}">'
+                       f'{_tb_label or "未判定"}</span>')
         # API 行不含 ORM id：用 代码+日期+rank 组成稳定唯一键（同日同股已按最新版去重）
         key = f"cand_{r['stock_code']}_{r['trade_date']}_{r.get('rank')}"
-        if render.list_item_toggle(key, f"#{r.get('rank', '-')} {label}　{tier_label}",
+        if render.list_item_toggle(key, f"#{r.get('rank', '-')} {label}　{tier_label}　{_badge_html}",
                                    subtitle=subtitle, dot=dot, meta=meta, scope="cand"):
             with st.container(border=True):
                 render.trace_line("本轮挖掘执行时间", r.get("created_at"),
@@ -227,6 +236,12 @@ with rows_area:
                 if st.button("生成建仓方案", key=f"plan_{code}_{r['trade_date']}"):
                     render.submit_task("position", {"stock_code": code, "stock_name": name},
                                        label="建仓方案生成")
+                if st.button("单标的追问", key=f"ask_{code}_{r['trade_date']}",
+                             use_container_width=True):
+                    st.session_state["_batch_open"] = True
+                    st.session_state["_batch_scope"] = "manual"
+                    st.session_state["_batch_codes"] = [code]
+                    st.rerun()
                 # ===== AI 研判留痕（推理链路可溯源）：按钮触发真懒加载，未点击零接口调用 =====
                 tk = f"traces_{code}_{r['trade_date']}"
                 if st.button("AI 研判留痕（推理链路可溯源）", key=f"trbtn_{key}",
@@ -275,6 +290,165 @@ with rows_area:
     cand_keys = [f"cand_{r['stock_code']}_{r['trade_date']}_{r.get('rank')}" for r in day_rows]
     render.batch_fold_bar("cand", cand_keys,
                           label="点击行内「查看详情」展开完整研判（维度归因/理由/风险/操作建议）。")
+    _empty_text = ("今日无满足可建仓判定的标的，建议观望。"
+                   if filter_opt == "可建仓 A+B"
+                   else "当日无候选：可切换日期，或点击上方「手动触发每日挖掘」重新生成。")
     render.record_list(day_rows, _cand_detail, batch=20,
                        key=f"_cand_vis_{date}_{filter_opt}_{sector}",
-                       empty_text="当日无候选：可切换日期，或点击上方「手动触发每日挖掘」重新生成。")
+                       empty_text=_empty_text)
+
+# ===== 候选池全局批量验证对话面板（只读分析 + 调整建议；确认生效才写入覆盖，可回滚） =====
+_SCOPE_LABELS = {"all": "全部候选", "tradeable": "仅可建仓", "A": "仅 A 级",
+                 "B": "仅 B 级", "C": "仅 C 级", "manual": "手动勾选"}
+
+
+def _batch_meta_by_assistant_id(mid: int) -> dict:
+    """取某条批量回答消息的完整 meta（含 adjust_plan/共性/差异/建议，结果字段只含标量）"""
+    if not mid:
+        return {}
+    try:
+        msgs = api.chat_history("discover", limit=50, message_type="batch")
+    except Exception:  # noqa: BLE001 历史读取失败只降级为空 meta
+        return {}
+    for _m in msgs:
+        if _m.get("id") == mid:
+            return _m.get("meta") or {}
+    return {}
+
+
+def _do_batch_ask(scope_val: str, codes_val: list[str], question: str, trade_date: str) -> None:
+    if not question or not question.strip():
+        render.msg_card("warn", "问题不能为空", "请输入批量验证问题后再提交。")
+        return
+    if scope_val == "manual" and not codes_val:
+        render.msg_card("warn", "未勾选标的", "手动范围需至少勾选 1 只候选。")
+        return
+    try:
+        resp = api.batch_ask(scope_val, codes_val, question.strip(), trade_date)
+        st.session_state["_batch_tid"] = resp["task_id"]
+        st.toast(f"已提交批量验证任务（{resp['task_id']}），完成后自动展示")
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001 提交失败统一提示，不向页面抛原始报错
+        render.msg_card("err", "提交失败", "未能提交批量验证任务，可稍后重试或检查后端服务。", detail=exc)
+
+
+def _batch_panel(trade_date: str, day_rows: list[dict], trade_map: dict) -> None:
+    """批量验证对话面板：范围选择 + 快捷提问 + 多行输入 → 后台任务 → 总分答案 + 调整方案确认"""
+    import chat_cards as cc
+
+    _scope_key, _codes_key = "_batch_scope", "_batch_codes"
+    with st.expander("批量验证对话（一次提问，统一研判所选范围候选）",
+                     expanded=bool(st.session_state.get("_batch_open"))):
+        st.caption("按所选范围注入候选上下文（最多 20 只）；回答按「整体结论/共性/差异/建议」总分结构，"
+                   "调整方案需人工「确认生效」后才写入候选覆盖，可回滚留痕。")
+        # ---- 范围选择（默认取自「单标的追问」/顶部按钮设置） ----
+        scope = st.session_state.get(_scope_key, "all")
+        if scope not in _SCOPE_LABELS:
+            scope = "all"
+        sel_scope = st.selectbox("提问范围", list(_SCOPE_LABELS),
+                                 index=list(_SCOPE_LABELS).index(scope),
+                                 format_func=lambda s: _SCOPE_LABELS[s])
+        st.session_state[_scope_key] = sel_scope
+        manual_codes: list[str] = []
+        if sel_scope == "manual":
+            opts = {r["stock_code"]: r["stock_name"] for r in day_rows}
+            default_codes = [c for c in (st.session_state.get(_codes_key) or []) if c in opts]
+            picked = st.multiselect("手动勾选标的（最多 20 只）", options=list(opts),
+                                    default=default_codes[:20],
+                                    format_func=lambda c: f"{opts.get(c, c)}（{c}）")
+            manual_codes = picked[:20]
+            st.session_state[_codes_key] = manual_codes
+        # ---- 快捷提问 ----
+        qk = "_batch_quick"
+        c1, c2, c3, c4 = st.columns(4)
+        quick_q = ""
+        with c1:
+            if st.button("吸筹逻辑是否合理", key=f"{qk}_abs", use_container_width=True):
+                quick_q = "这批候选的吸筹逻辑是否合理？吸筹阶段是否真实，有无明显分歧或证伪点？"
+        with c2:
+            if st.button("共性风险", key=f"{qk}_risk", use_container_width=True):
+                quick_q = "这批候选存在哪些共性风险？请重点提示需要人工复核的高风险项。"
+        with c3:
+            if st.button("评级松紧", key=f"{qk}_tier", use_container_width=True):
+                quick_q = "当前评级（A/B/C）松紧是否合理？是否有评级与质量明显不匹配的标的？"
+        with c4:
+            if st.button("遗漏优质标的", key=f"{qk}_miss", use_container_width=True):
+                quick_q = "这批候选中是否遗漏了值得提升关注度的优质标的？"
+        if quick_q:
+            st.session_state["_batch_q_input"] = quick_q
+            _do_batch_ask(sel_scope, manual_codes, quick_q, trade_date)
+        # ---- 多行输入 + 提交 ----
+        with st.form("batch_ask_form"):
+            st.text_area("验证问题（多行；可改用上方快捷提问）", height=80,
+                         key="_batch_q_input",
+                         placeholder="如：这批候选当前是否适合分批建仓？优先顺序如何？")
+            submitted = st.form_submit_button("提交批量验证（后台处理，约需 30-90 秒）", type="primary")
+        if submitted:
+            _do_batch_ask(sel_scope, manual_codes,
+                          st.session_state.get("_batch_q_input", ""), trade_date)
+        # ---- 结果展示（总-分结构 + 调整方案确认） ----
+        tid = st.session_state.get("_batch_tid")
+        if tid:
+            try:
+                task = api.task_detail(tid)
+            except Exception:  # noqa: BLE001 轮询失败按未完成处理，页面不崩
+                task = None
+            if task and task.get("status") == "done" and task.get("result"):
+                r = task["result"]
+                meta = _batch_meta_by_assistant_id(r.get("assistant_msg_id"))
+                with st.container(border=True):
+                    st.markdown(f"**整体结论**（范围：{_SCOPE_LABELS.get(r.get('scope', ''), r.get('scope', ''))}"
+                                f" · 注入 {r.get('count', 0)} 只 · 信心 {r.get('confidence', 0)}/100）")
+                    st.markdown(r.get("answer", ""))
+                    for _title, _k in (("共性分析", "common_points"), ("差异说明", "differences"),
+                                       ("调整建议", "suggestions")):
+                        _items = meta.get(_k) or []
+                        if _items:
+                            st.markdown(f"**{_title}**")
+                            for _it in _items:
+                                st.markdown(f"- {_it}")
+                    if r.get("sources"):
+                        render.trace_line("依据来源", source=str(r["sources"]))
+                    bid = int(r.get("batch_id") or 0)
+                    plan = meta.get("adjust_plan") or []
+                    if bid and plan:
+                        st.markdown("**调整方案（仅建议，确认生效后才写入候选覆盖）**")
+                        for p in plan:
+                            _nm = (trade_map.get(p.get("stock_code"), {})
+                                   .get("stock_name", p.get("stock_code")))
+                            st.markdown(f"- {_nm}（{p.get('stock_code')}）："
+                                        f"{p.get('new_tier', '')} / {p.get('new_label', '')}"
+                                        f" —— {p.get('reason', '')}（{p.get('evidence', '')}）")
+                        if st.button("确认生效（写入候选覆盖，可回滚）", key=f"apply_batch_{bid}",
+                                     type="primary"):
+                            try:
+                                res = api.apply_batch_adjust(bid)
+                                st.toast(f"已生效 {res.get('count', 0)} 条调整，可回滚")
+                                st.session_state.pop("_batch_tid", None)
+                                st.rerun()
+                            except Exception as exc:  # noqa: BLE001
+                                render.msg_card("err", "确认生效失败", "写入失败，可稍后重试。", detail=exc)
+                    elif bid:
+                        render.msg_card("info", "本次回答未生成调整方案",
+                                        "未提出需要确认的调整建议，仅展示分析结果。")
+                    if st.button("清空本次回答", key=f"clear_batch_{tid}"):
+                        st.session_state.pop("_batch_tid", None)
+                        st.rerun()
+            elif task and task.get("status") == "failed":
+                render.msg_card("err", "批量验证失败", "后台处理未完成，可重新提交。",
+                                detail=task.get("error", ""))
+                st.session_state.pop("_batch_tid", None)
+            elif task and task.get("status") in ("pending", "running"):
+                st.info(f"批量验证处理中（任务 {tid}），完成后自动展示……")
+        # ---- 批量对话历史（回溯留痕） ----
+        try:
+            _msgs = api.chat_history("discover", limit=30, message_type="batch")
+        except Exception:  # noqa: BLE001 历史失败只降级，不阻塞面板
+            _msgs = []
+        if _msgs:
+            st.markdown("**批量对话历史（可追溯）**")
+            for _u in cc.pair_messages(_msgs)[:8]:
+                cc.render_conversation_unit("discover", _u)
+
+
+_batch_panel(date, day_rows, trade_map)

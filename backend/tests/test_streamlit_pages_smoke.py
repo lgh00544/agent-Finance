@@ -78,7 +78,9 @@ def test_candidate_page_interactives():
         for err in ("后端服务连接失败", "数据库查询失败", "请求超时", "数据解析失败", "加载失败"):
             assert err not in md_text, f"API 正常时页面不应显示错误卡片: {md_text[:200]}"
         # 列表行（#N 代码 名称）或空状态说明必须出现其一；两者皆无 = 列表被异常吞掉
-        row_or_empty = re.search(r"#\d+\s+\d{6}\s+\S+", md_text) or "当日无候选" in md_text
+        row_or_empty = (re.search(r"#\d+\s+\d{6}\s+\S+", md_text)
+                        or "当日无候选" in md_text
+                        or "今日无满足可建仓判定的标的" in md_text)   # 可建仓 A+B 档空态文案
         assert row_or_empty, "候选列表既无渲染行也无空状态说明（可能被异常吞掉转错误卡片）"
 
     _assert_list_state()
@@ -655,3 +657,80 @@ def test_candidate_trace_chain():
         "结论卡内容未渲染"
     assert 'class="badge badge-info"' in md_text, "留痕头部徽章未渲染"
     assert 'class="trace-layer' in md_text, "推理层内容未渲染"
+
+
+# ================= 候选池可建仓明确化 + 批量验证对话（Request C） =================
+
+def _zero_tradeable(date=None, limit=200):
+    return {"date": date or "2099-01-01", "count": 0, "plan_candidate_count": 0,
+            "total": 0, "items": []}
+
+
+def test_candidate_page_tradeable_stat_cards_zero(monkeypatch):
+    """顶部统计卡：可建仓 0 只也明确显示，且带「建议观望」说明（不空白/不隐藏）"""
+    import api_client
+    monkeypatch.setattr(api_client, "candidate_tradeable", _zero_tradeable)
+    at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"候选池页渲染异常: {at.exception}"
+    md = "\n".join(m.value for m in at.markdown if m.value)
+    assert "今日可建仓标的" in md, "顶部统计卡未渲染（今日可建仓标的）"
+    assert "可自动生成建仓计划的标的" in md, "顶部统计卡未渲染（可自动生成建仓计划的标的）"
+    assert "建议观望" in md, "可建仓 0 只时必须明确提示建议观望"
+
+
+def test_candidate_page_batch_panel_opens(monkeypatch):
+    """批量验证对话：顶部按钮可展开面板，范围下拉/快捷提问/多行输入齐备"""
+    import api_client
+    monkeypatch.setattr(api_client, "candidate_tradeable", _zero_tradeable)
+    at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"候选池页渲染异常: {at.exception}"
+    # 顶部按钮存在
+    assert any(b.label == "批量验证对话" for b in at.button), \
+        f"缺少「批量验证对话」按钮: {[b.label for b in at.button]}"
+    # 点击展开面板
+    next(b for b in at.button if b.label == "批量验证对话").click()
+    at.run()
+    assert not at.exception, f"展开批量面板后异常: {at.exception}"
+    assert any(s.label == "提问范围" for s in at.selectbox), "批量面板未渲染「提问范围」下拉"
+    labels = [b.label for b in at.button]
+    for q in ("吸筹逻辑是否合理", "共性风险", "评级松紧", "遗漏优质标的"):
+        assert q in labels, f"批量面板缺少快捷提问按钮: {q}"
+    assert any(t.label == "验证问题（多行；可改用上方快捷提问）" for t in at.text_area), \
+        "批量面板缺少多行输入"
+
+
+def test_candidate_page_tradeable_filter_and_badges(monkeypatch):
+    """「可建仓 A+B」筛选按 is_tradeable 过滤且三档文案不变；可建仓为空时给空态文案"""
+    import api_client
+    monkeypatch.setattr(api_client, "candidate_tradeable", _zero_tradeable)
+    at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"候选池页渲染异常: {at.exception}"
+    assert at.segmented_control[0].options == ["全部候选", "可建仓 A+B", "观察 C"]
+    at.segmented_control[0].set_value("可建仓 A+B")
+    at.run()
+    assert not at.exception, f"切「可建仓 A+B」后异常: {at.exception}"
+    md = "\n".join(m.value for m in at.markdown if m.value)
+    assert "今日无满足可建仓判定的标的" in md, "可建仓 0 只筛选结果必须给空态提示，不得空白"
+
+
+def test_plan_page_caption_tradeable_link(monkeypatch):
+    """建仓计划页 caption 联动「今日可自动生成建仓计划的标的 X 只」（0 也明确显示）"""
+    import api_client
+    _fake_plans = [{
+        "id": 1, "stock_code": "600001", "stock_name": "测试股",
+        "plan_date": "2099-01-01", "status": "proposed", "total_pct": 20,
+        "batches": [], "stop_loss": "", "take_profit": "", "rationale": "",
+        "detail": {}, "source": "candidate", "created_at": "2099-01-01 00:00"}]
+    monkeypatch.setattr(api_client, "plans", lambda code=None, limit=None: _fake_plans)
+    monkeypatch.setattr(api_client, "candidate_tradeable",
+                        lambda date=None, limit=200: {"date": "2099-01-01", "count": 0,
+                                                      "plan_candidate_count": 3,
+                                                      "total": 0, "items": []})
+    at = AppTest.from_file(str(PAGES_DIR / "3_建仓计划.py"), default_timeout=180)
+    at.run()
+    assert not at.exception, f"建仓计划页渲染异常: {at.exception}"
+    caps = " ".join(c.value for c in at.caption)
+    assert "可自动生成建仓计划的标的 3 只" in caps, f"caption 未联动数量: {caps}"

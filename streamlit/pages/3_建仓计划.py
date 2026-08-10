@@ -113,7 +113,14 @@ if rows:
         source_sel = st.selectbox("来源筛选", ["全部来源", "每日候选池", "手动生成"],
                                   key="_plan_source_sel")
     with f4:
-        st.caption(f"共 {len(rows)} 条计划 · 仅 B 级及以上标的可生成（后端强校验）")
+        _plan_cap_txt = ""
+        try:
+            _tv = api.candidate_tradeable(limit=100)
+            _plan_cap_txt = (f" · 今日可自动生成建仓计划的标的 "
+                             f"{int(_tv.get('plan_candidate_count') or 0)} 只")
+        except Exception:  # noqa: BLE001 联动数字失败仅降级，不影响计划展示
+            _plan_cap_txt = ""
+        st.caption(f"共 {len(rows)} 条计划 · 仅 B 级及以上标的可生成（后端强校验）{_plan_cap_txt}")
     if date_sel != "全部日期":
         rows = [r for r in rows if str(r.get("plan_date") or "") == date_sel]
     if grade_sel != "全部评级":
