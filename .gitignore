@@ -24,6 +24,7 @@ __pycache__/
 
 # 运行产物与缓存
 _paddlex_check/
+migration_*.zip
 
 # 本地个人配置
 .claude/settings.local.json
