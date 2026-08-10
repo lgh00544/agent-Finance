@@ -428,6 +428,73 @@ class HotMoneyProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
+class CandidateTradeable(Base):
+    """候选池可建仓标记（每日落库·历史可追溯；硬性三条件 code 判定，口径见 services/candidate_tradeable.py）
+    三条件：c1=评级 A/B、c2=有建仓方案且现价∈首仓区间、c3=无重大利空（HARD_RULES + LLM risks 清单）。
+    label: 可建仓 / 建议关注 / 观察；block_reason 记录未命中原因（无方案/买点未到/现价缺失/重大利空）。"""
+    __tablename__ = "candidate_tradeable"
+    __table_args__ = (
+        UniqueConstraint("stock_code", "trade_date", name="uq_tradeable_code_date"),
+        Index("ix_tradeable_date", "trade_date", "is_tradeable"),  # 按日统计可建仓数
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
+    tier: Mapped[str] = mapped_column(String(8), default="")        # A/B/C（effective，含人工覆盖）
+    is_tradeable: Mapped[int] = mapped_column(Integer, default=0)   # 1=可建仓 / 0=否
+    label: Mapped[str] = mapped_column(String(16), default="建议关注")  # 可建仓/建议关注/观察
+    plan_exists: Mapped[int] = mapped_column(Integer, default=0)    # 1=有建仓方案
+    price_zone: Mapped[str] = mapped_column(String(64), default="") # 首仓买入区间原文
+    current_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 判定用现价
+    cond_grade: Mapped[int] = mapped_column(Integer, default=0)     # 1=评级达标
+    cond_price: Mapped[int] = mapped_column(Integer, default=0)     # 1=买点在区间内
+    cond_risk: Mapped[int] = mapped_column(Integer, default=0)      # 1=无重大利空
+    block_reason: Mapped[str] = mapped_column(Text, default="")     # 未命中原因（可读文本）
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)        # 判定快照（区间/现价/来源）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class CandidateAdjust(Base):
+    """候选评级/标签人工覆盖（批量对话「确认生效」写入；不改 detail JSON，可回滚）
+    生效后 ensure_tradeable 以 tier_override 作为 effective_tier 重判；回滚即删除本行。"""
+    __tablename__ = "candidate_adjust"
+    __table_args__ = (UniqueConstraint("stock_code", "trade_date", name="uq_adjust_code_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
+    tier_override: Mapped[str] = mapped_column(String(8), default="")  # 覆盖后的 A/B/C
+    label_override: Mapped[str] = mapped_column(String(16), default="")  # 覆盖后的展示标签
+    reason: Mapped[str] = mapped_column(Text, default="")            # 调整理由（LLM 输出）
+    operator: Mapped[str] = mapped_column(String(32), default="")    # 操作人
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class BatchAdjust(Base):
+    """批量对话调整留痕（状态机 pending→applied→rolled_back，全程可追溯）
+    adjust_plan: [{stock_code, new_tier, new_label, reason, evidence}]（LLM 输出）；
+    before/after_snapshot: 应用前后该批候选 effective 快照（对比留痕）。"""
+    __tablename__ = "batch_adjust"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope: Mapped[str] = mapped_column(String(16), default="all")    # all/tradeable/A/B/C/manual
+    scope_codes: Mapped[list] = mapped_column(JSON, default=list)    # 提问范围标的清单
+    question: Mapped[str] = mapped_column(Text, default="")          # 触发调整的提问
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # 关联候选批次日期
+    adjust_plan: Mapped[list] = mapped_column(JSON, default=list)    # 调整方案（LLM 输出）
+    before_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)  # 应用前 effective 快照
+    after_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)   # 应用后 effective 快照
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/applied/rolled_back
+    rollback_reason: Mapped[str] = mapped_column(Text, default="")
+    rollback_time: Mapped[str] = mapped_column(String(16), default="")  # YYYY-MM-DD HH:mm
+    operator: Mapped[str] = mapped_column(String(32), default="")    # 操作人
+    chat_user_msg_id: Mapped[int] = mapped_column(Integer, default=0)  # 关联 agent_chat_message.id
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class LhbOriginalFlow(Base):
     """龙虎榜原始流水（口径硬隔离：lhb_type='1d'单日 / '3d'三日累计，防 K227 误读）
 

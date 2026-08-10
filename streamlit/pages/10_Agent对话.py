@@ -178,9 +178,22 @@ with right:
                     "提炼核心知识点并建议标签；**确认（可修正标签）后才写入知识库**。")
         st.markdown("> 识别引擎：MiniMax 多模态优先，失败自动降级本地 PaddleOCR。图片上限 15MB。")
         uploaded = st.file_uploader("选择图片（jpg/png）", type=["jpg", "jpeg", "png"])
-        if uploaded is not None and st.button("开始识别与提炼", type="primary"):
+        ltid = st.session_state.get("_chat_learn_tid")
+        task = None
+        if ltid:
             try:
-                resp = api.chat_learn(sel, uploaded.getvalue(), uploaded.name)
+                task = api.task_detail(ltid)
+            except Exception:  # noqa: BLE001
+                task = None
+        busy = bool(task and task.get("status") in ("pending", "running"))
+        desc = st.text_area("补充说明（可选，≤500字；可描述图片关键要点，识别时辅助聚焦）",
+                            key="_chat_learn_desc", height=90, max_chars=500,
+                            placeholder="例如：这是某标的周线放量突破形态，重点提炼突破信号与止损位…",
+                            disabled=busy)
+        st.caption(f"已输入 {len(desc)}/500 字")
+        if uploaded is not None and st.button("开始识别与提炼", type="primary", disabled=busy):
+            try:
+                resp = api.chat_learn(sel, uploaded.getvalue(), uploaded.name, description=desc)
                 st.session_state["_chat_learn_tid"] = resp["task_id"]
                 st.toast(f"已提交识别任务（{resp['task_id']}），完成后可预览提炼结果")
                 time.sleep(1)
@@ -188,16 +201,14 @@ with right:
             except Exception as exc:  # noqa: BLE001
                 render.msg_card("err", "提交失败", "未能提交识别任务，可稍后重试或检查后端服务。",
                                 detail=exc)
-        ltid = st.session_state.get("_chat_learn_tid")
         if ltid:
-            try:
-                task = api.task_detail(ltid)
-            except Exception:  # noqa: BLE001
-                task = None
             if task and task.get("status") == "done" and task.get("result"):
                 r = task["result"]
                 with st.container(border=True):
                     st.markdown(f"**识别与提炼结果**（引擎：{r.get('engine', 'minimax')}）")
+                    r_desc = r.get("description") or ""
+                    if r_desc:
+                        st.markdown(f"**用户补充说明**：{r_desc}")
                     st.markdown(f"**确认摘要**：{r.get('summary', '')}")
                     try:
                         points = json.loads(r.get("points_json") or "[]")

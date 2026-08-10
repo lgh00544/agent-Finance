@@ -177,6 +177,18 @@ _LEARN_MM_PROMPT = (
     "用中文输出，条理清晰。"
 )
 
+def _learn_description_section(description: str) -> str:
+    """辅助文本描述 → 提示串补充节（空描述返回空串，保持现状完全一致）。
+    图片为主、文字为辅：文字明确提及内容优先覆盖提炼；与图片冲突以图片为准，注明差异。"""
+    desc = (description or "").strip()
+    if not desc:
+        return ""
+    return ("\n\n【用户补充说明（文字辅助，图片为主、文字为辅）】\n"
+            f"用户补充说明：{desc}\n"
+            "要求：优先覆盖文字明确提及的要点；若文字与图片内容冲突，以图片为准，"
+            "并在对应知识点 content 末尾注明『（与图片描述存在差异，以图片为准）』。")
+
+
 _LEARN_STRUCTURE_SYSTEM = """你是知识整理助手：将多模态识别出的原始文本整理为结构化知识点，用于沉淀到 Agent 知识库。
 
 要求：
@@ -295,18 +307,21 @@ def rule_feedback(agent: str, proposal: str) -> dict:
     return payload
 
 
-def learn_from_image(agent: str, image_bytes: bytes, filename: str = "upload.png") -> dict:
+def learn_from_image(agent: str, image_bytes: bytes, filename: str = "upload.png",
+                     description: str = "") -> dict:
     """多模态上传学习：MiniMax 识别（失败降级本地 PaddleOCR）→ DeepSeek 提炼知识点并建议标签。
-    仅返回确认摘要，不落库；由 confirm_learn 在用户确认/修正标签后写入知识库。"""
+    支持可选辅助文本描述（≤500字，图片为主、文字为辅）：描述非空时注入识别与提炼提示，
+    冲突以图片为准并注明差异；空描述行为与旧版完全一致。仅返回确认摘要，不落库。"""
     meta = _require_agent(agent)
-    raw_text = _extract_image_text(image_bytes, filename)
+    raw_text = _extract_image_text(image_bytes, filename, description)
     if not raw_text or not raw_text.strip():
         raise ValueError("图片识别结果为空，请更换更清晰的图片重试")
     key = f"learn:{agent}:{hashlib.md5(raw_text.encode('utf-8')).hexdigest()[:10]}"
     extract = common.agent_call(
         agent=agent, cache_key=key, system_prompt=_LEARN_STRUCTURE_SYSTEM,
         user_prompt=(f"以下为从图片中识别出的原始文本（可能含识别噪声）：\n\n{raw_text[:6000]}\n\n"
-                     f"请整理为结构化知识点，建议沉淀目标为 {agent} 知识库。"),
+                     f"请整理为结构化知识点，建议沉淀目标为 {agent} 知识库。"
+                     f"{_learn_description_section(description)}"),
         schema=LearnExtract, ttl_seconds=0, model_level=ModelLevel.DEEP)
 
     points = []
@@ -323,8 +338,11 @@ def learn_from_image(agent: str, image_bytes: bytes, filename: str = "upload.png
     payload = {"summary": extract.summary or f"共提炼 {len(points)} 个知识点",
                "points_json": json.dumps(points, ensure_ascii=False),
                "raw_text": raw_text[:2000],
-               "engine": _LAST_ENGINE}
-    _record(agent, "user", f"[多模态学习] 上传图片：{filename}（识别引擎：{_LAST_ENGINE}）", "learn")
+               "engine": _LAST_ENGINE,
+               "description": description}
+    user_meta = {"description": description} if description else {}
+    _record(agent, "user", f"[多模态学习] 上传图片：{filename}（识别引擎：{_LAST_ENGINE}）", "learn",
+            meta=user_meta)
     _record(agent, "assistant", payload["summary"], "learn",
             meta={"point_count": len(points), "points": points})
     return payload
@@ -333,14 +351,16 @@ def learn_from_image(agent: str, image_bytes: bytes, filename: str = "upload.png
 _LAST_ENGINE = "minimax"
 
 
-def _extract_image_text(image_bytes: bytes, filename: str) -> str:
-    """图片文本识别：MiniMax 多模态优先，失败/未配置降级本地 PaddleOCR"""
+def _extract_image_text(image_bytes: bytes, filename: str, description: str = "") -> str:
+    """图片文本识别：MiniMax 多模态优先（补充说明非空时并入提示），失败/未配置降级本地 PaddleOCR"""
     global _LAST_ENGINE
     from app.services.multimodal import get_multimodal_client
     try:
         client = get_multimodal_client()
         if client is not None:
-            text = client.analyze_image(image_bytes, _LEARN_MM_PROMPT, max_tokens=4096)
+            text = client.analyze_image(image_bytes,
+                                        _LEARN_MM_PROMPT + _learn_description_section(description),
+                                        max_tokens=4096)
             if text and text.strip():
                 _LAST_ENGINE = "minimax"
                 return _clean_mm_text(text)

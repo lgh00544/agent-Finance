@@ -129,7 +129,7 @@ def test_learn_two_phase_flow(monkeypatch):
     """识别提炼返回确认摘要（不落库）；确认后才写入知识库"""
     added = []
     monkeypatch.setattr(agent_chat, "_extract_image_text",
-                        lambda b, f: "放量突破：收盘站稳前高3日视为有效突破。")
+                        lambda *a, **k: "放量突破：收盘站稳前高3日视为有效突破。")
     monkeypatch.setattr(common, "agent_call", _fake_learn_extract())
     monkeypatch.setattr(repo, "add_knowledge",
                         lambda title, content, agent_tag: added.append(title) or 11)
@@ -157,16 +157,133 @@ def test_learn_confirm_saves(monkeypatch):
 
 def test_learn_empty_extract_raises(monkeypatch):
     """识别文本为空 → 明确报错提示"""
-    monkeypatch.setattr(agent_chat, "_extract_image_text", lambda b, f: "")
+    monkeypatch.setattr(agent_chat, "_extract_image_text", lambda *a, **k: "")
     with pytest.raises(ValueError, match="识别结果为空"):
         agent_chat.learn_from_image("review", b"x", "a.png")
 
 
 def test_learn_points_empty_raises(monkeypatch):
     """识别有文本但提炼无有效知识点 → 明确报错"""
-    monkeypatch.setattr(agent_chat, "_extract_image_text", lambda b, f: "some text")
+    monkeypatch.setattr(agent_chat, "_extract_image_text", lambda *a, **k: "some text")
     def _call(*args, **kw):
         return agent_chat.LearnExtract(summary="s", points=[])
     monkeypatch.setattr(common, "agent_call", _call)
     with pytest.raises(ValueError, match="未能从图片中提炼"):
         agent_chat.learn_from_image("sell", b"x", "a.png")
+
+
+# ================= 多模态学习·辅助文本描述 =================
+
+def test_learn_description_section_helper():
+    """补充说明节纯函数：非空返回含「图片为主、文字为辅 + 冲突以图片为准」指令；空串保持原样"""
+    assert agent_chat._learn_description_section("") == ""
+    assert agent_chat._learn_description_section("   ") == ""
+    section = agent_chat._learn_description_section("这是周线放量突破形态")
+    assert "用户补充说明" in section
+    assert "图片为主、文字为辅" in section
+    assert "以图片为准" in section
+    assert "这是周线放量突破形态" in section
+
+
+def test_learn_description_injected_into_prompts(monkeypatch):
+    """描述非空：透传 _extract_image_text（MiniMax 提示增强）且结构化提炼 user_prompt 含补充说明节"""
+    captured = {}
+
+    def _spy_extract(image_bytes, filename, description=""):
+        captured["desc"] = description
+        return "放量突破：收盘站稳前高3日视为有效突破。"
+
+    def _spy_agent_call(*args, **kw):
+        captured["user_prompt"] = kw.get("user_prompt", "")
+        return agent_chat.LearnExtract(
+            summary="1 个知识点", points=[agent_chat.LearnPoint(title="放量突破确认", content="x")])
+
+    monkeypatch.setattr(agent_chat, "_extract_image_text", _spy_extract)
+    monkeypatch.setattr(common, "agent_call", _spy_agent_call)
+    result = agent_chat.learn_from_image("discover", b"fake-img", "kline.png",
+                                         description="重点关注突破确认信号")
+    assert captured["desc"] == "重点关注突破确认信号"
+    assert "用户补充说明" in captured["user_prompt"]
+    assert "重点关注突破确认信号" in captured["user_prompt"]
+    assert "以图片为准" in captured["user_prompt"]
+    assert result["description"] == "重点关注突破确认信号"
+
+
+def test_learn_description_empty_backward_compat(monkeypatch):
+    """描述为空：不透传描述、提炼提示不含补充说明节，行为与旧版一致（向后兼容）"""
+    captured = {}
+
+    def _spy_extract(image_bytes, filename, description=""):
+        captured["desc"] = description
+        return "放量突破：收盘站稳前高3日视为有效突破。"
+
+    def _spy_agent_call(*args, **kw):
+        captured["user_prompt"] = kw.get("user_prompt", "")
+        return agent_chat.LearnExtract(
+            summary="1 个知识点", points=[agent_chat.LearnPoint(title="放量突破确认", content="x")])
+
+    monkeypatch.setattr(agent_chat, "_extract_image_text", _spy_extract)
+    monkeypatch.setattr(common, "agent_call", _spy_agent_call)
+    agent_chat.learn_from_image("discover", b"fake-img", "kline.png")
+    assert captured["desc"] == ""
+    assert "用户补充说明" not in captured["user_prompt"]
+    assert "图片为主、文字为辅" not in captured["user_prompt"]
+
+
+def test_learn_description_in_history_meta(monkeypatch):
+    """描述非空：用户历史消息 meta.description 落库；空描述不写该字段（旧数据兼容）"""
+    calls = []
+
+    def _spy_add_chat_message(agent, role, content, message_type, verdict="",
+                              knowledge_id=None, meta=None):
+        calls.append({"role": role, "meta": meta or {}})
+        return len(calls)
+
+    monkeypatch.setattr(agent_chat, "_extract_image_text", lambda *a, **k: "some text")
+    monkeypatch.setattr(common, "agent_call", _fake_learn_extract())
+    monkeypatch.setattr(repo, "add_chat_message", _spy_add_chat_message)
+
+    agent_chat.learn_from_image("discover", b"x", "a.png", description="补充形态描述")
+    user_calls = [c for c in calls if c["role"] == "user"]
+    assert user_calls and user_calls[0]["meta"].get("description") == "补充形态描述"
+
+    calls.clear()
+    agent_chat.learn_from_image("discover", b"x", "a.png")
+    user_calls = [c for c in calls if c["role"] == "user"]
+    assert user_calls and "description" not in user_calls[0]["meta"]
+
+
+def test_chat_learn_route_description(monkeypatch):
+    """/agent-chat/learn：description Form 参数透传到任务参数；超 500 字返回 400"""
+    import asyncio
+    import os
+    from io import BytesIO
+
+    from fastapi import HTTPException, UploadFile
+
+    from app.api.routes import chat_learn
+
+    captured = {}
+
+    def _fake_submit(kind, params):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"task_id": "t", "kind": kind}
+
+    monkeypatch.setattr("app.api.routes._submit_task", _fake_submit)
+
+    result = asyncio.run(chat_learn(
+        "discover", UploadFile(file=BytesIO(b"img"), filename="k.png"),
+        description="放量突破形态"))
+    assert captured["kind"] == "chat_learn"
+    assert captured["params"]["description"] == "放量突破形态"
+    assert result == {"task_id": "t", "kind": "chat_learn"}
+    if captured["params"].get("tmp_path") and os.path.exists(captured["params"]["tmp_path"]):
+        os.unlink(captured["params"]["tmp_path"])
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(chat_learn(
+            "discover", UploadFile(file=BytesIO(b"img"), filename="k.png"),
+            description="x" * 501))
+    assert exc.value.status_code == 400
+    assert "上限 500" in exc.value.detail

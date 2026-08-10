@@ -18,7 +18,8 @@ import streamlit as st
 
 # ==================== 问答配对（纯函数，可单测） ====================
 
-_TYPE_LABEL = {"qa": ("提问", "info"), "rule": ("调教", "warn"), "learn": ("学习", "ok")}
+_TYPE_LABEL = {"qa": ("提问", "info"), "rule": ("调教", "warn"), "learn": ("学习", "ok"),
+               "batch": ("批量验证", "info")}
 _VERDICT_LABEL = {"adopted": "采纳", "partial": "部分采纳", "maintained": "维持原规则"}
 _VERDICT_TONE = {"adopted": "ok", "partial": "warn", "maintained": "info"}
 
@@ -168,6 +169,11 @@ def render_conversation_unit(agent: str, unit: dict) -> None:
         if unit["user"]:
             with st.container(key=f"chat_q_{key}"):
                 st.markdown(unit["user"]["content"])
+            if unit["kind"] == "learn":
+                u_desc = (unit["user"].get("meta") or {}).get("description") or ""
+                if u_desc:
+                    st.markdown(f'<div class="learn-desc"><b>用户补充说明</b>：{_esc(u_desc)}</div>',
+                                unsafe_allow_html=True)
 
         # ---- 回答区 ----
         if unit["status"] == "orphan":

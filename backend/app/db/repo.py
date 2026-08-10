@@ -14,7 +14,8 @@ from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
-    CandidateTrackVerify, Holding, HotMoneyProfile, LhbOriginalFlow, MarketCondition,
+    BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable, Holding,
+    HotMoneyProfile, LhbOriginalFlow, MarketCondition,
     NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult, RuleChange, SellDecision,
     StockCandidate, StockScore, TradeProfile, TradeRecord, _now,
 )
@@ -99,6 +100,17 @@ def replace_day_candidates(codes: set[str], trade_date: str) -> int:
         return removed
 
 
+def get_candidate_snapshot(stock_code: str, trade_date: str) -> dict | None:
+    """某候选当日行情快照（现价判定用；只读 snapshot 列，不影响候选列表契约）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(StockCandidate).where(
+                StockCandidate.stock_code == stock_code,
+                StockCandidate.trade_date == trade_date)
+        ).scalar_one_or_none()
+        return dict(row.snapshot or {}) if row else None
+
+
 # ==================== 市况评分（v2.0 Discover 前置步骤） ====================
 
 def upsert_market_condition(trade_date: str, total_score: int, dims: dict,
@@ -128,6 +140,172 @@ def get_latest_market_condition() -> dict | None:
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
+
+
+# ==================== 候选池可建仓标记（每日落库·历史可追溯） ====================
+
+def upsert_candidate_tradeable(stock_code: str, stock_name: str, trade_date: str, tier: str,
+                               is_tradeable: int, label: str, plan_exists: int, price_zone: str,
+                               current_price: float | None, cond_grade: int, cond_price: int,
+                               cond_risk: int, block_reason: str, detail: dict) -> None:
+    """按 code+date 幂等 upsert 当日可建仓判定（覆盖更新，口径见 services/candidate_tradeable.py）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(CandidateTradeable).where(
+                CandidateTradeable.stock_code == stock_code,
+                CandidateTradeable.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = CandidateTradeable(stock_code=stock_code, stock_name=stock_name,
+                                     trade_date=trade_date)
+            db.add(row)
+        row.tier, row.is_tradeable, row.label = tier, is_tradeable, label
+        row.plan_exists, row.price_zone, row.current_price = plan_exists, price_zone, current_price
+        row.cond_grade, row.cond_price, row.cond_risk = cond_grade, cond_price, cond_risk
+        row.block_reason, row.detail = block_reason, detail
+        db.commit()
+        _invalidate("tradeable")
+
+
+def list_candidate_tradeable(trade_date: str | None = None, limit: int = 200) -> list[dict]:
+    """当日/任意日期可建仓判定行（最新在前；历史可追溯查询）"""
+
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(CandidateTradeable).order_by(CandidateTradeable.id.desc())
+            if trade_date:
+                stmt = stmt.where(CandidateTradeable.trade_date == trade_date)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"stock_code": r.stock_code, "stock_name": r.stock_name,
+                     "trade_date": r.trade_date, "tier": r.tier,
+                     "is_tradeable": r.is_tradeable, "label": r.label,
+                     "plan_exists": r.plan_exists, "price_zone": r.price_zone,
+                     "current_price": r.current_price, "cond_grade": r.cond_grade,
+                     "cond_price": r.cond_price, "cond_risk": r.cond_risk,
+                     "block_reason": r.block_reason, "detail": r.detail or {},
+                     "created_at": str(r.created_at)} for r in rows]
+
+    return _dbq("tradeable", {"date": trade_date, "limit": limit}, _load)
+
+
+def has_tradeable_rows(trade_date: str) -> bool:
+    """当日是否已有可建仓判定落库（无则需懒补算）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(CandidateTradeable.id).where(
+                CandidateTradeable.trade_date == trade_date).limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+
+
+# ==================== 候选评级/标签人工覆盖（批量对话确认生效·可回滚） ====================
+
+def list_candidate_adjusts(trade_date: str | None = None) -> list[dict]:
+    """当日人工覆盖记录（effective_tier 判定用）"""
+    with SessionLocal() as db:
+        stmt = select(CandidateAdjust)
+        if trade_date:
+            stmt = stmt.where(CandidateAdjust.trade_date == trade_date)
+        rows = db.execute(stmt).scalars().all()
+        return [{"stock_code": r.stock_code, "stock_name": r.stock_name,
+                 "trade_date": r.trade_date, "tier_override": r.tier_override,
+                 "label_override": r.label_override, "reason": r.reason,
+                 "operator": r.operator, "created_at": str(r.created_at)} for r in rows]
+
+
+def upsert_candidate_adjust(stock_code: str, stock_name: str, trade_date: str,
+                            tier_override: str, label_override: str, reason: str,
+                            operator: str = "") -> None:
+    """写入/更新覆盖（幂等）；回滚即删除该行恢复原判定"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(CandidateAdjust).where(
+                CandidateAdjust.stock_code == stock_code,
+                CandidateAdjust.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = CandidateAdjust(stock_code=stock_code, stock_name=stock_name,
+                                  trade_date=trade_date)
+            db.add(row)
+        row.tier_override, row.label_override = tier_override, label_override
+        row.reason, row.operator = reason, operator
+        db.commit()
+        _invalidate("tradeable")
+
+
+def delete_candidate_adjust(stock_code: str, trade_date: str) -> bool:
+    """回滚：删除覆盖记录恢复原判定"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(CandidateAdjust).where(
+                CandidateAdjust.stock_code == stock_code,
+                CandidateAdjust.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            return False
+        db.delete(row)
+        db.commit()
+        _invalidate("tradeable")
+        return True
+
+
+# ==================== 批量对话调整留痕（pending→applied→rolled_back） ====================
+
+def add_batch_adjust(scope: str, scope_codes: list, question: str, trade_date: str,
+                     adjust_plan: list, before_snapshot: dict,
+                     chat_user_msg_id: int, operator: str = "") -> int:
+    with SessionLocal() as db:
+        row = BatchAdjust(scope=scope, scope_codes=scope_codes, question=question,
+                          trade_date=trade_date, adjust_plan=adjust_plan,
+                          before_snapshot=before_snapshot, after_snapshot={},
+                          status="pending", operator=operator,
+                          chat_user_msg_id=chat_user_msg_id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def get_batch_adjust(batch_id: int) -> dict | None:
+    with SessionLocal() as db:
+        r = db.get(BatchAdjust, batch_id)
+        if r is None:
+            return None
+        return {"id": r.id, "scope": r.scope, "scope_codes": r.scope_codes,
+                "question": r.question, "trade_date": r.trade_date,
+                "adjust_plan": r.adjust_plan, "before_snapshot": r.before_snapshot,
+                "after_snapshot": r.after_snapshot, "status": r.status,
+                "rollback_reason": r.rollback_reason, "rollback_time": r.rollback_time,
+                "operator": r.operator, "chat_user_msg_id": r.chat_user_msg_id,
+                "created_at": str(r.created_at)}
+
+
+def update_batch_adjust_status(batch_id: int, status: str, after_snapshot: dict | None = None,
+                               rollback_reason: str = "", rollback_time: str = "") -> None:
+    with SessionLocal() as db:
+        row = db.get(BatchAdjust, batch_id)
+        if row is None:
+            return
+        row.status = status
+        if after_snapshot is not None:
+            row.after_snapshot = after_snapshot
+        if rollback_reason:
+            row.rollback_reason = rollback_reason
+        if rollback_time:
+            row.rollback_time = rollback_time
+        db.commit()
+
+
+def list_batch_adjusts(limit: int = 50) -> list[dict]:
+    """批量调整记录（最新在前，供追溯）"""
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(BatchAdjust).order_by(BatchAdjust.id.desc()).limit(limit)).scalars().all()
+        return [{"id": r.id, "scope": r.scope, "scope_codes": r.scope_codes,
+                 "question": r.question, "trade_date": r.trade_date,
+                 "adjust_plan": r.adjust_plan, "status": r.status,
+                 "rollback_reason": r.rollback_reason, "rollback_time": r.rollback_time,
+                 "operator": r.operator, "created_at": str(r.created_at)} for r in rows]
 
 
 def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float,
@@ -1200,15 +1378,16 @@ def add_chat_message(agent: str, role: str, content: str, message_type: str = "q
         return row.id
 
 
-def list_chat_messages(agent: str, limit: int = 50) -> list[dict]:
-    """某 Agent 的对话历史（最新在前）"""
+def list_chat_messages(agent: str, limit: int = 50, message_type: str | None = None) -> list[dict]:
+    """某 Agent 的对话历史（最新在前）；message_type 可选过滤（如 batch=批量对话）"""
     from app.db.models import AgentChatMessage
 
     with SessionLocal() as db:
         stmt = (select(AgentChatMessage)
-                .where(AgentChatMessage.agent == agent)
-                .order_by(AgentChatMessage.id.desc())
-                .limit(min(limit, 200)))
+                .where(AgentChatMessage.agent == agent))
+        if message_type:
+            stmt = stmt.where(AgentChatMessage.message_type == message_type)
+        stmt = stmt.order_by(AgentChatMessage.id.desc()).limit(min(limit, 200))
         rows = list(db.execute(stmt).scalars().all())
     return [{"id": r.id, "agent": r.agent, "role": r.role, "message_type": r.message_type,
              "content": r.content, "verdict": r.verdict, "knowledge_id": r.knowledge_id,

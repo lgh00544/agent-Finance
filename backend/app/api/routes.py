@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.agents.review import llm_rethink_suggestion
@@ -73,6 +73,7 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "chat_ask": ("Agent 对话·提问答疑", lambda p: _task_chat_ask(p)),
     "chat_rule": ("Agent 对话·规则调教", lambda p: _task_chat_rule(p)),
     "chat_learn": ("Agent 对话·图片学习", lambda p: _task_chat_learn(p)),
+    "batch_ask": ("候选池批量验证对话", lambda p: _task_batch_ask(p)),
     "track_verify": ("候选池T+N验证", lambda p: _task_track_verify(False)),
     "track_backfill": ("候选池T+N历史回填", lambda p: _task_track_verify(True)),
     "track_suggest": ("选股验证建议生成", lambda p: _task_track_suggest()),
@@ -144,13 +145,25 @@ def _task_chat_learn(params: dict) -> dict:
             image_bytes = f.read()
         return agent_chat.learn_from_image(str(params.get("agent", "")),
                                            image_bytes,
-                                           str(params.get("filename", "upload.png")))
+                                           str(params.get("filename", "upload.png")),
+                                           str(params.get("description", "")))
     finally:
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _task_batch_ask(params: dict) -> dict:
+    """候选池批量验证对话（只读分析 + 调整建议留痕；调整须人工确认生效）"""
+    from app.services import batch_chat
+
+    return batch_chat.ask_batch(str(params.get("scope", "all")),
+                                params.get("codes") or [],
+                                str(params.get("question", "")),
+                                str(params.get("date", "") or time.strftime("%Y-%m-%d")),
+                                operator=str(params.get("operator", "")))
 
 
 def _submit_task(kind: str, params: dict) -> dict:
@@ -354,6 +367,16 @@ def list_candidates(date: Optional[str] = None, limit: int = 50):
 def candidate_dates(limit: int = 30):
     """候选池可选日期（去重降序）：页面默认仅加载最新一天，切换日期再按需查询"""
     return {"dates": repo.list_candidate_dates(limit)}
+
+
+@router.get("/candidates/tradeable")
+def candidates_tradeable(date: Optional[str] = None, limit: int = 200):
+    """当日可建仓判定视图（只读；当日缺判定记录时懒补算）：
+    {date, count(可建仓数), plan_candidate_count(可自动生成建仓计划数), total, items}"""
+    from app.services import candidate_tradeable
+
+    trade_date = date or time.strftime("%Y-%m-%d")
+    return candidate_tradeable.tradeable_view(trade_date, limit)
 
 
 @router.get("/scores")
@@ -1076,12 +1099,12 @@ def chat_agents():
 
 
 @router.get("/agent-chat/history")
-def chat_history(agent: str, limit: int = 50):
-    """某 Agent 的对话历史（最新在前，可回溯每次提问/调教/学习）"""
+def chat_history(agent: str, limit: int = 50, message_type: Optional[str] = None):
+    """某 Agent 的对话历史（最新在前，可回溯每次提问/调教/学习/批量对话）"""
     if agent not in chat_service.AGENT_TAGS:
         raise HTTPException(status_code=400,
                             detail=f"未知 Agent: {agent}（可选：{'/'.join(chat_service.AGENT_TAGS)}）")
-    return repo.list_chat_messages(agent, limit)
+    return repo.list_chat_messages(agent, limit, message_type)
 
 
 class ChatAskBody(BaseModel):
@@ -1093,6 +1116,52 @@ class ChatAskBody(BaseModel):
 def chat_ask(body: ChatAskBody):
     """文字提问答疑（异步：提交任务后轮询结果；答案标注依据来源与信心度）"""
     return _submit_task("chat_ask", {"agent": body.agent, "question": body.question})
+
+
+class BatchAskBody(BaseModel):
+    scope: str = Field(description="提问范围：all/tradeable/A/B/C/manual")
+    codes: list[str] = Field(default_factory=list, description="manual 范围时的标的代码列表")
+    question: str = Field(min_length=1, description="批量验证问题")
+    date: str = Field(default="", description="候选日期（留空取今日）")
+
+
+@router.post("/agent-chat/batch-ask")
+def batch_ask(body: BatchAskBody):
+    """候选池批量验证对话（异步）：按范围注入候选上下文 →「总-分」结构化回答 + 调整建议；
+    仅分析不改数据，调整须人工「确认生效」后写入 candidate_adjust。"""
+    return _submit_task("batch_ask", {"scope": body.scope, "codes": body.codes,
+                                      "question": body.question, "date": body.date})
+
+
+class BatchAdjustApplyBody(BaseModel):
+    batch_id: int = Field(description="批量调整记录 id")
+    operator: str = Field(default="", description="操作人")
+
+
+@router.post("/agent-chat/batch-adjust/apply")
+def batch_adjust_apply(body: BatchAdjustApplyBody):
+    """确认生效：pending→applied，将 adjust_plan 写入 candidate_adjust（覆盖展示层判定，可回滚）"""
+    from app.services import batch_chat
+
+    try:
+        return batch_chat.apply_batch_adjust(body.batch_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class BatchAdjustRollbackBody(BaseModel):
+    reason: str = Field(default="", description="回滚原因")
+
+
+@router.post("/agent-chat/batch-adjust/{batch_id}/rollback")
+def batch_adjust_rollback(batch_id: int, body: BatchAdjustRollbackBody):
+    """回滚：applied→rolled_back，删除本次覆盖恢复原判定；留原因与时间"""
+    from app.services import batch_chat
+
+    try:
+        return batch_chat.rollback_batch_adjust(batch_id, body.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 class ChatRuleBody(BaseModel):
@@ -1108,14 +1177,18 @@ def chat_rule(body: ChatRuleBody):
 
 
 @router.post("/agent-chat/learn")
-async def chat_learn(agent: str, file: UploadFile = File(...)):
+async def chat_learn(agent: str, file: UploadFile = File(...),
+                     description: str = Form(default="")):
     """多模态上传学习（异步）：MiniMax 识别（失败降级 PaddleOCR）→ 提炼知识点与标签
-    → 返回确认摘要（未落库）；确认/修正标签后调用 learn/confirm 落库。"""
+    → 返回确认摘要（未落库）；确认/修正标签后调用 learn/confirm 落库。
+    可选辅助文本描述（≤500字，图片为主、文字为辅），空描述完全兼容旧行为。"""
     import tempfile
 
     if agent not in chat_service.AGENT_TAGS:
         raise HTTPException(status_code=400,
                             detail=f"未知 Agent: {agent}（可选：{'/'.join(chat_service.AGENT_TAGS)}）")
+    if len(description) > 500:
+        raise HTTPException(status_code=400, detail="补充说明过长（上限 500 字）")
     image_bytes = await file.read()
     if len(image_bytes) > 15 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="图片过大（上限 15MB）")
@@ -1124,7 +1197,8 @@ async def chat_learn(agent: str, file: UploadFile = File(...)):
     with os.fdopen(fd, "wb") as f:
         f.write(image_bytes)
     return _submit_task("chat_learn", {"agent": agent, "tmp_path": tmp_path,
-                                       "filename": file.filename or "upload.png"})
+                                       "filename": file.filename or "upload.png",
+                                       "description": description})
 
 
 class ChatLearnConfirmBody(BaseModel):

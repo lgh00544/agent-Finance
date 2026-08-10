@@ -68,6 +68,27 @@ with f3:
         render.submit_task("daily_pipeline", label="每日挖掘")
 st.caption("评级：A 强烈推荐 / B 建议关注 / C 谨慎观察（LLM 信心度档位映射，纯展示）")
 
+# ===== 可建仓统计卡（顶部；0 只也明确显示，接口失败降级 caption 不阻塞页面） =====
+tradeable_view = None
+trade_map: dict[str, dict] = {}
+try:
+    tradeable_view = api.candidate_tradeable(date=date, limit=200)
+    for _it in (tradeable_view.get("items") or []):
+        trade_map[_it["stock_code"]] = _it
+except Exception as exc:  # noqa: BLE001 统计卡失败仅降级提示，不阻塞候选浏览
+    st.caption("可建仓判定暂不可用（不影响候选浏览与筛选），可稍后刷新重试。")
+if tradeable_view:
+    t_count = int(tradeable_view.get("count") or 0)
+    p_count = int(tradeable_view.get("plan_candidate_count") or 0)
+    render.stat_cards([
+        {"label": "今日可建仓标的", "value": t_count,
+         "sub": "评级≥B 且现价在首仓区间且无重大利空", "tone": "ok" if t_count > 0 else "mute"},
+        {"label": "可自动生成建仓计划的标的", "value": p_count,
+         "sub": "评级 A/B 且暂无建仓方案", "tone": "info"},
+    ])
+    if t_count == 0:
+        render.msg_card("warn", "今日可建仓标的 0 只", "今日无符合买入条件的标的，建议观望。")
+
 # ===== 当日候选：接口失败 → 缓存降级（灰色弱化）或分类报错卡片 =====
 try:
     rows = api.candidates(date=date, limit=300)
@@ -106,7 +127,8 @@ with rows_area:
         return TIER_MAP.get(t, "")
 
     if filter_opt == "可建仓 A+B":
-        day_rows = [r for r in day_rows if _tier(r) in ("A", "B")]
+        day_rows = [r for r in day_rows
+                    if (trade_map.get(r["stock_code"]) or {}).get("is_tradeable") == 1]
     elif filter_opt == "观察 C":
         day_rows = [r for r in day_rows if _tier(r) == "C"]
 

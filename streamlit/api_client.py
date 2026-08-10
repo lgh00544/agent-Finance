@@ -127,6 +127,15 @@ def candidate_dates(limit: int = 30) -> list:
     return (_get("/api/candidates/dates", {"limit": limit}) or {}).get("dates") or []
 
 
+def candidate_tradeable(date: str | None = None, limit: int = 200) -> dict:
+    """当日可建仓判定视图（只读）：{date, count, plan_candidate_count, total, items}
+    count=可建仓数（0 也明确返回），plan_candidate_count=可自动生成建仓计划的标的数"""
+    params = {"limit": limit}
+    if date:
+        params["date"] = date
+    return _get("/api/candidates/tradeable", params)
+
+
 def traces(code: str | None = None, date: str | None = None,
            module: str | None = None, limit: int = 50) -> list:
     """推理留痕轻量列表（不含长文本，毫秒级；详情按需单查）"""
@@ -415,9 +424,29 @@ def chat_agents() -> list:
     return _get("/api/agent-chat/agents")
 
 
-def chat_history(agent: str, limit: int = 50) -> list:
-    """某 Agent 的对话历史（最新在前）"""
-    return _get("/api/agent-chat/history", {"agent": agent, "limit": limit})
+def chat_history(agent: str, limit: int = 50, message_type: str | None = None) -> list:
+    """某 Agent 的对话历史（最新在前）；message_type 可选过滤（batch=批量验证对话）"""
+    params = {"agent": agent, "limit": limit}
+    if message_type:
+        params["message_type"] = message_type
+    return _get("/api/agent-chat/history", params)
+
+
+def batch_ask(scope: str, codes: list, question: str, date: str = "") -> dict:
+    """候选池批量验证对话（异步任务，返回 task_id）：
+    按范围（all/tradeable/A/B/C/manual）注入候选上下文 →「总-分」回答 + 调整建议"""
+    return _post("/api/agent-chat/batch-ask",
+                 {"scope": scope, "codes": codes, "question": question, "date": date})
+
+
+def apply_batch_adjust(batch_id: int) -> dict:
+    """确认生效：将批量对话调整方案写入 candidate_adjust（覆盖展示层判定，可回滚）"""
+    return _post("/api/agent-chat/batch-adjust/apply", {"batch_id": batch_id})
+
+
+def rollback_batch_adjust(batch_id: int, reason: str = "") -> dict:
+    """回滚：删除本次覆盖恢复原判定"""
+    return _post(f"/api/agent-chat/batch-adjust/{batch_id}/rollback", {"reason": reason})
 
 
 def chat_ask(agent: str, question: str) -> dict:
@@ -430,11 +459,13 @@ def chat_rule(agent: str, proposal: str) -> dict:
     return _post("/api/agent-chat/rules", {"agent": agent, "proposal": proposal})
 
 
-def chat_learn(agent: str, image_bytes: bytes, filename: str) -> dict:
-    """多模态上传学习（异步任务；结果含确认摘要与建议知识点，确认后才落库）"""
+def chat_learn(agent: str, image_bytes: bytes, filename: str, description: str = "") -> dict:
+    """多模态上传学习（异步；结果含确认摘要与建议知识点，确认后才落库）。
+    description 为可选辅助文本描述（≤500字，图片为主、文字为辅）"""
     resp = requests.post(f"{API_BASE}/api/agent-chat/learn",
                          params={"agent": agent},
-                         files={"file": (filename, image_bytes)}, timeout=60)
+                         files={"file": (filename, image_bytes)},
+                         data={"description": description}, timeout=60)
     resp.raise_for_status()
     return resp.json()
 

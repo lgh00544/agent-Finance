@@ -300,6 +300,11 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
 }
 /* 底部辅助信息：弱化小字，不抢占核心内容注意力 */
 .chat-foot { font-size: 12px; color: var(--text-mute); margin-top: 6px; }
+/* 多模态学习·用户补充说明：弱化信息块，与提问原文区分 */
+.learn-desc { font-size: 12px; color: var(--text-dim); line-height: 1.6;
+  padding: 6px 10px; margin: 4px 0;
+  border: 1px dashed var(--border); border-radius: 6px; background: var(--bg-input); }
+.learn-desc b { color: var(--text); }
 /* ===== 维度归因条（v3.0 白盒框架）：维度名 + 评分条 + 结论色点 + 建议文本 ===== */
 .dim-summary { margin: 0.3rem 0 0.6rem; }
 .dim-block { margin: 0.45rem 0; }
