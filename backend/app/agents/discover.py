@@ -22,13 +22,29 @@ logger = logging.getLogger(__name__)
 
 _TABLE_COLS = ["code", "name", "price", "change_pct", "amount", "volume_ratio", "turnover_rate",
                "pe_dynamic", "pb", "total_mv", "circ_mv", "pct_change_60d", "pct_change_ytd"]
-# v2.0 增量数据列（候选富化后追加在初筛 13 列之后，随原始数据交给 LLM 研判）
-_ENRICH_COLS = ["industry", "pct_change_5d", "dist_52w_high_pct", "intraday_narrow_pct",
+# 威科夫相对结构列（初选阶段全量计算，随初筛表一并交给 LLM：只看相对位置/形态，不做任何阈值过滤）：
+#   dist_52w_high_pct 距52周高点%  /  pos_52w 52周区间位置%  /  ma20_pos_pct·ma60_pos_pct 现价对均线%
+#   vol_5_20 5日均量÷20日均量（放/缩量相对变化）  /  pct_change_5d 5日斜率（与 60d 对照判阶段）
+_WYCKOFF_COLS = ["dist_52w_high_pct", "pos_52w", "ma20_pos_pct", "ma60_pos_pct",
+                 "vol_5_20", "pct_change_5d"]
+_TABLE_COLS = [*_TABLE_COLS, *_WYCKOFF_COLS]
+# v2.0 增量数据列（候选富化后追加在初筛列之后，随原始数据交给 LLM 研判；
+# pct_change_5d/dist_52w_high_pct 已并入初筛威科夫列，此处不重复）
+_ENRICH_COLS = ["industry", "intraday_narrow_pct",
                 "super_large_net", "large_net", "medium_net", "small_net",
                 "main_net_3d", "main_net_5d", "main_net_10d",
                 "holder_change_pct", "inst_hold_pct"]
 _MONEY_COLS = {"super_large_net", "large_net", "medium_net", "small_net",
                "main_net_3d", "main_net_5d", "main_net_10d"}
+
+# 候选增量采集/新闻检索并行阈值与上限（参考 router._PARALLEL_SCORE 模式；
+# 数据源限流器按 kind 全局锁串行化发起频率，并发只重叠网络往返，勿开过高）
+_PARALLEL_MIN = 3
+_PARALLEL_MAX = 8
+
+# 初筛表金额列统一亿/万压缩（原始整数 10+ 字符/值 → 5 字符内；信息不减，
+# 大幅缩减 LLM 输入体积，规避 DeepSeek 长输入偶发空响应，见 README 风险提示）
+_MONEY_FMT_COLS = {"amount", "total_mv", "circ_mv"}
 
 
 def apply_hard_filter(spot: pd.DataFrame, suspended_codes: set[str],
@@ -212,25 +228,108 @@ def _market_context(source: DataSource) -> str:
     return "\n".join(lines) if lines else "（市场数据暂不可用）"
 
 
+def _cell_text(col: str, value) -> str:
+    """单元格文本：金额列亿/万压缩，其余原样（纯展示格式，不含任何判断）"""
+    if value is None:
+        return ""
+    if col in _MONEY_FMT_COLS:
+        return _fmt_money(value)
+    return str(value)
+
+
 def _table_text(records: list[dict]) -> str:
-    """数据表压缩为文本（保留全部原始数值，供 LLM 研判）"""
+    """数据表压缩为文本（金额列亿/万格式，信息不减体积更小，供 LLM 研判）"""
     if not records:
         return "（无数据）"
     header = ",".join(_TABLE_COLS)
     rows = []
     for r in records:
-        vals = [str(r.get(c, "") if r.get(c) is not None else "") for c in _TABLE_COLS]
+        vals = [_cell_text(c, r.get(c)) for c in _TABLE_COLS]
         rows.append(",".join(vals))
     return "\n".join([header, *rows])
 
 
+def _wyckoff_columns(source: DataSource, code: str) -> dict:
+    """威科夫相对结构列（单股纯数学，零判断）：距52周高低/区间位置/MA20·MA60相对位置/
+    量能相对对比/5日斜率。只喂数据不做过滤；单股失败或样本不足返回空 dict 不阻塞。"""
+    out: dict = {}
+    try:
+        kline = source.fetch_daily_kline(code, _days_ago(400), _today())
+        if kline is None or kline.empty:
+            return out
+        kline = kline.dropna(subset=["close"]).reset_index(drop=True)
+        if len(kline) < 6:
+            return out
+        close = float(kline.iloc[-1]["close"])
+        high52 = float(kline["high"].max())
+        low52 = float(kline["low"].min())
+        out["dist_52w_high_pct"] = round((close / high52 - 1) * 100, 2) if high52 else None
+        if high52 > low52:
+            out["pos_52w"] = round((close - low52) / (high52 - low52) * 100, 1)
+        if len(kline) >= 20:
+            ma20 = float(kline["close"].tail(20).mean())
+            out["ma20_pos_pct"] = round((close / ma20 - 1) * 100, 2) if ma20 else None
+        if len(kline) >= 60:
+            ma60 = float(kline["close"].tail(60).mean())
+            out["ma60_pos_pct"] = round((close / ma60 - 1) * 100, 2) if ma60 else None
+        if "volume" in kline.columns and len(kline) >= 20:
+            v5 = float(kline["volume"].tail(5).mean())
+            v20 = float(kline["volume"].tail(20).mean())
+            out["vol_5_20"] = round(v5 / v20, 2) if v20 else None
+        out["pct_change_5d"] = round((close / float(kline.iloc[-6]["close"]) - 1) * 100, 2)
+    except Exception as exc:  # noqa: BLE001 单股失败留空，不阻塞
+        logger.warning("候选 %s 威科夫列计算失败: %s", code, exc)
+    return out
+
+
+def _fill_wyckoff_columns(source: DataSource, universe: list[dict]) -> None:
+    """初筛表威科夫列前置：对全部候选补算相对结构列（只喂数据，不做阈值过滤）。
+    并发拉日K（限流器按 kind 全局锁控制发起频率，网络往返并行；日K 3600s 缓存
+    后续 enrich_data 直接复用，不重复请求）；单股失败留空不阻塞。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _work(u: dict) -> tuple[str, dict]:
+        code = str(u.get("code") or "")
+        return code, _wyckoff_columns(source, code)
+
+    if len(universe) < _PARALLEL_MIN:
+        for u in universe:
+            u.update(_work(u)[1])
+        return
+    with ThreadPoolExecutor(max_workers=min(_PARALLEL_MAX, len(universe))) as pool:
+        futures = [pool.submit(_work, u) for u in universe]
+        for fut in as_completed(futures):
+            code, cols = fut.result()
+            for u in universe:
+                if str(u.get("code")) == code:
+                    u.update(cols)
+                    break
+    logger.info("威科夫相对结构列计算完成: %s 只", len(universe))
+
+
+def _merge_universe_fields(shortlist: list[dict], universe: list[dict]) -> None:
+    """LLM 初选输出合并全市场快照字段（行情 13 列 + 威科夫列）：
+    v3.0 schema 后 LLM 输出不含行情字段，终选表需补全原始数值；
+    仅补 LLM 输出缺失的列，不覆盖 LLM 自带字段。"""
+    uni_map = {str(u.get("code")): u for u in universe}
+    for cand in shortlist:
+        u = uni_map.get(str(cand.get("stock_code"))) or {}
+        cand["code"] = cand.get("stock_code")
+        cand["name"] = cand.get("stock_name")
+        for col in _TABLE_COLS:
+            if cand.get(col) is None and u.get(col) is not None:
+                cand[col] = u.get(col)
+
+
 def llm_shortlist(state: StockAgentState) -> StockAgentState:
-    """节点2：LLM 从初筛表中挑选波段潜力候选"""
+    """节点2：LLM 从初筛表中挑选波段潜力候选
+    （初选前为全表补算威科夫相对结构列——只喂数据不做过滤，LLM 才能判断吸筹末期/拉升初期）"""
     universe = state.get("universe") or []
     if not universe:
         return state
 
     source = get_datasource()
+    _fill_wyckoff_columns(source, universe)
     date_key = state.get("trade_date", _today())
     output = agent_call(
         agent="discover",
@@ -240,24 +339,32 @@ def llm_shortlist(state: StockAgentState) -> StockAgentState:
             _table_text(universe), _market_context(source), _market_note(state)),
         schema=DiscoverOutput,
         ttl_seconds=86400,
-        model_level=ModelLevel.LIGHT,
+        # 初选用深度模型：初筛 300 只 × 19 列（含威科夫列）输入约 50k tokens，
+        # flash 上下文/输出预算在长输入下必空响应（README 风险提示已记录；
+        # 13 列时代已边缘，加威科夫列后 24 连败实测确认）。chat 上下文大 2-4 倍，
+        # 初选仅 1 次调用，速度差 1-2 分钟换稳定输出，缓存键按模型隔离不冲突。
+        model_level=ModelLevel.DEEP,
     )
     shortlist = [c.model_dump() for c in output.candidates]
+    _merge_universe_fields(shortlist, universe)  # 补全行情+威科夫列，终选表复用
     state["shortlist"] = shortlist
-    state["trace"] = [*state.get("trace", []), f"LLM 初选: {len(shortlist)}只"]
+    state["trace"] = [*state.get("trace", []),
+                      f"LLM 初选: {len(shortlist)}只（威科夫列 {len(_WYCKOFF_COLS)} 项前置）"]
     logger.info("LLM 初选 %s 只: %s", len(shortlist),
                 [c["stock_code"] for c in shortlist])
     return state
 
 
 def enrich_news(state: StockAgentState) -> StockAgentState:
-    """节点3：候选股新闻检索（落库 + 向量索引 + 语义检索）【刚性代码逻辑】"""
+    """节点3：候选股新闻检索（落库 + 向量索引 + 语义检索）【刚性代码逻辑】
+    并发拉新闻+add_news 落库（repo 每调用独立 SessionLocal，线程安全）；
+    向量索引/语义检索串行执行（Qdrant 共享客户端并发写有风险），先拉完再统一索引。"""
     source = get_datasource()
     vector_store = get_vector_store()
-    enrichment: dict[str, list[dict]] = {}
-    for cand in state.get("shortlist") or []:
-        code = cand["stock_code"]
-        name = cand["stock_name"]
+    shortlist = state.get("shortlist") or []
+
+    def _fetch_news(cand: dict) -> tuple[str, list[dict]]:
+        code, name = cand["stock_code"], cand["stock_name"]
         try:
             news_df = source.fetch_news(code)
             stored = []
@@ -273,15 +380,39 @@ def enrich_news(state: StockAgentState) -> StockAgentState:
                 if is_new:
                     stored.append({"title": title, "content": content[:500],
                                    "published_at": str(row.get("published_at") or "")})
+            return code, stored
+        except Exception as exc:  # noqa: BLE001 单股新闻失败不阻塞
+            logger.warning("候选 %s 新闻拉取失败: %s", code, exc)
+            return code, []
+
+    # 并发拉取 + 落库（保持输入顺序）
+    fetched: dict[str, list[dict]] = {}
+    if len(shortlist) >= _PARALLEL_MIN:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_PARALLEL_MAX, len(shortlist))) as pool:
+            for code, stored in pool.map(_fetch_news, shortlist):
+                fetched[code] = stored
+    else:
+        for cand in shortlist:
+            code, stored = _fetch_news(cand)
+            fetched[code] = stored
+
+    # 串行：向量索引 + 语义检索（Qdrant 并发写风险，务必串行）
+    enrichment: dict[str, list[dict]] = {}
+    for cand in shortlist:
+        code = cand["stock_code"]
+        name = cand["stock_name"]
+        try:
+            stored = fetched.get(code) or []
             if stored:
                 vector_store.index_news(code, stored)
             related = vector_store.search_related(code, f"{name} 业绩 风险 公告 新闻", top_k=5)
             enrichment[code] = related or stored[:5]
-        except Exception as exc:  # noqa: BLE001 单股新闻失败不阻塞
-            logger.warning("候选 %s 新闻检索失败: %s", code, exc)
-            enrichment[code] = []
+        except Exception as exc:  # noqa: BLE001 单股向量检索失败不阻塞
+            logger.warning("候选 %s 新闻向量检索失败: %s", code, exc)
+            enrichment[code] = fetched.get(code, [])[:5]
     state["enrichment"] = enrichment
-    state["trace"] = [*state.get("trace", []), "新闻检索完成"]
+    state["trace"] = [*state.get("trace", []), f"新闻检索完成（并行 {len(shortlist)} 只）"]
     return state
 
 
@@ -372,7 +503,7 @@ def _final_table_text(shortlist: list[dict], data_enrichment: dict) -> str:
     rows = []
     for r in shortlist:
         extra = data_enrichment.get(r.get("code")) or {}
-        vals = ["" if r.get(c) is None else str(r.get(c)) for c in _TABLE_COLS]
+        vals = [_cell_text(c, r.get(c)) for c in _TABLE_COLS]
         for c in _ENRICH_COLS:
             v = extra.get(c)
             if v is None or v == "":
@@ -387,23 +518,39 @@ def _final_table_text(shortlist: list[dict], data_enrichment: dict) -> str:
 
 def enrich_data(state: StockAgentState) -> StockAgentState:
     """节点3.5：候选股增量数据采集（资金结构/主力动向/股东面/52周区间）
-    【刚性代码逻辑】只采集原始数据 + 纯数学计算，不判断；单股失败不阻塞"""
+    【刚性代码逻辑】只采集原始数据 + 纯数学计算，不判断；单股失败不阻塞。
+    候选 ≥3 只线程池并发（上限 8）：只并行拉数据+计算，不碰 DB/向量库；
+    结果按 shortlist 原顺序重建，LLM 看到的行序不变。"""
     source = get_datasource()
     inst_map: dict = {}
     try:
         inst_map = source.fetch_institute_hold_map()
     except Exception as exc:  # noqa: BLE001 机构持股全景失败不阻塞
         logger.warning("机构持股全景拉取失败，跳过: %s", exc)
-    enriched: dict[str, dict] = {}
-    for cand in state.get("shortlist") or []:
+    shortlist = state.get("shortlist") or []
+
+    def _work(cand: dict) -> tuple[str, dict]:
         code = cand["stock_code"]
         try:
-            enriched[code] = _enrich_candidate_data(source, inst_map, code, cand.get("stock_name", ""))
+            return code, _enrich_candidate_data(source, inst_map, code,
+                                                cand.get("stock_name", ""))
         except Exception as exc:  # noqa: BLE001 单股失败不阻塞
             logger.warning("候选 %s 增量数据采集失败: %s", code, exc)
-            enriched[code] = {}
+            return code, {}
+
+    enriched: dict[str, dict] = {}
+    if len(shortlist) >= _PARALLEL_MIN:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_PARALLEL_MAX, len(shortlist))) as pool:
+            for code, data in pool.map(_work, shortlist):  # map 保持输入顺序
+                enriched[code] = data
+    else:
+        for cand in shortlist:
+            code, data = _work(cand)
+            enriched[code] = data
     state["data_enrichment"] = enriched
-    state["trace"] = [*state.get("trace", []), "候选增量数据采集完成"]
+    state["trace"] = [*state.get("trace", []),
+                      f"候选增量数据采集完成（并行 {len(shortlist)} 只）"]
     return state
 
 
