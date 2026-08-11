@@ -89,8 +89,42 @@ def resolve_scope(scope: str, codes: list | None, date: str) -> tuple[list[dict]
     return filtered[:_SCOPE_CAP], note
 
 
+def _fmt_amt(value) -> str:
+    """金额友好格式（元 → 亿/万）；None/非数值 → ''（纯展示格式化，不含判断）"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if abs(v) >= 1e8:
+        return f"{v / 1e8:.2f}亿"
+    if abs(v) >= 1e4:
+        return f"{v / 1e4:.1f}万"
+    return f"{v:.0f}"
+
+
+def _fund_direction_text(enriched: dict) -> str:
+    """候选资金方向文本（透传 detail.enriched 主力/大单净额等字段，严格当日有效）；
+    无当日资金数据 → 统一标注「当日资金数据暂不可用」，不携带任何历史/占位值"""
+    parts = []
+    for label, key in (("主力3日", "main_net_3d"), ("主力5日", "main_net_5d"),
+                       ("主力10日", "main_net_10d"), ("超大单", "super_large_net"),
+                       ("大单", "large_net")):
+        val = _fmt_amt((enriched or {}).get(key))
+        if val:
+            parts.append(f"{label}={val}")
+    if not parts:
+        return "当日资金数据暂不可用"
+    inst = (enriched or {}).get("inst_hold_pct")
+    if inst not in (None, ""):
+        parts.append(f"机构持股={inst}%")
+    ind = (enriched or {}).get("industry")
+    if ind:
+        parts.append(f"行业={ind}")
+    return "；".join(parts)
+
+
 def _candidate_table_text(judged: list[dict]) -> str:
-    """候选上下文压缩为紧凑文本（代码/名称/评级/现价/首仓区间/判定标签/原因/风险前2）"""
+    """候选上下文压缩为紧凑文本（代码/名称/评级/现价/首仓区间/判定标签/资金方向/原因/风险前2）"""
     if not judged:
         return "（范围内无候选）"
     lines = []
@@ -98,11 +132,12 @@ def _candidate_table_text(judged: list[dict]) -> str:
         price = f"{r['current_price']:.2f}" if r.get("current_price") else "—"
         risks = [str(x) for x in ((r.get("detail") or {}).get("risks") or [])[:2]]
         risks = risks or [str(x) for x in (r.get("risk_notice") or [])[:2]]
+        fund = _fund_direction_text((r.get("detail") or {}).get("enriched") or {})
         lines.append(
             f"- {r.get('stock_name')}({r.get('stock_code')}) | 评级={r.get('effective_tier') or '—'} "
             f"| 现价={price} | 首仓区间={r.get('price_zone') or '无方案'} "
             f"| 判定={r.get('label') or '—'} | 原因={r.get('block_reason') or '—'} "
-            f"| 风险={('; '.join(risks)) or '—'}")
+            f"| 资金方向={fund} | 风险={('; '.join(risks)) or '—'}")
     return "\n".join(lines)
 
 

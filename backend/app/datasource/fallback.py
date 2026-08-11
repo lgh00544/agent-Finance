@@ -4,8 +4,9 @@
 设计约束（与 v2.0 补强一致）：
   - 基础数据（全市场快照/日K/新闻/行业/财务/交易日历）：仅走 akshare 主源
     （其内部已有东财→新浪双通道降级），不调用麦蕊，避免消耗配额；
-  - 高级字段（资金流/股东户数）：麦蕊优先（MAIRUI_ENABLE=true 时）→ 失败回退 akshare，
-    全程中文日志记录原因，不报错中断主链路；
+  - 高级字段（资金流/股东户数）：主源 akshare 优先（成功直接用）→ 失败/空回退麦蕊备源补齐，
+    双源均无返回空（上层标注「当日资金数据暂不可用」，不做历史降级），全程中文日志记录原因，
+    不报错中断主链路；
   - 默认关闭（MAIRUI_ENABLE=false）时 get_datasource() 直接返回 akshare 实例，
     无任何额外依赖与性能损耗，行为与之前完全一致。
 上层业务代码（Agent 节点）不感知具体数据源，只依赖本工厂（数据源抽象层规范）。
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class FallbackSource(DataSource):
-    """包装主源（akshare）+ 增强源（麦蕊，可空）：高级字段优先增强源，失败回退主源"""
+    """包装主源（akshare）+ 增强源（麦蕊，可空）：高级字段主源优先，缺失时增强源补齐"""
 
     def __init__(self, primary: AkshareSource, extra: MairuiSource | None = None) -> None:
         self._primary = primary
@@ -73,24 +74,36 @@ class FallbackSource(DataSource):
     def fetch_market_fund_flow(self) -> dict:
         return self._primary.fetch_market_fund_flow()
 
-    # ---------------- 高级字段：麦蕊优先 → akshare 回退 ----------------
+    # ---------------- 高级字段：主源 akshare 优先 → 麦蕊备源补齐 ----------------
     def fetch_fund_flow(self, code: str) -> pd.DataFrame:
-        if self._extra is not None:
-            df = self._extra.fetch_fund_flow(code)
+        # 主源成功有数据直接用；失败/空 → 麦蕊备源补齐（备源同样严格当日有效）；
+        # 双源均无 → 空表，上层统一标注「当日资金数据暂不可用」，不做历史降级。
+        try:
+            df = self._primary.fetch_fund_flow(code)
             if df is not None and not df.empty:
-                logger.info("资金流 %s 已由麦蕊提供", code)
                 return df
-            logger.warning("资金流 %s 麦蕊数据不可用，回退 akshare", code)
-        return self._primary.fetch_fund_flow(code)
+        except Exception as exc:  # noqa: BLE001 主源异常不中断，转备源
+            logger.warning("资金流 %s 主源(akshare)失败，转麦蕊备源: %s", code, exc)
+        if self._extra is not None:
+            backup = self._extra.fetch_fund_flow(code)
+            if backup is not None and not backup.empty:
+                logger.info("资金流 %s 主源缺失，已由麦蕊备源补齐", code)
+                return backup
+        return pd.DataFrame()
 
     def fetch_shareholder_detail(self, code: str) -> dict:
-        if self._extra is not None:
-            out = self._extra.fetch_shareholder_detail(code)
+        try:
+            out = self._primary.fetch_shareholder_detail(code)
             if out:
-                logger.info("股东户数 %s 已由麦蕊提供", code)
                 return out
-            logger.warning("股东户数 %s 麦蕊数据不可用，回退 akshare", code)
-        return self._primary.fetch_shareholder_detail(code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("股东户数 %s 主源(akshare)失败，转麦蕊备源: %s", code, exc)
+        if self._extra is not None:
+            backup = self._extra.fetch_shareholder_detail(code)
+            if backup:
+                logger.info("股东户数 %s 主源缺失，已由麦蕊备源补齐", code)
+                return backup
+        return {}
 
 
 def get_datasource() -> DataSource:
@@ -100,7 +113,7 @@ def get_datasource() -> DataSource:
         return primary
     try:
         extra = MairuiSource()
-        logger.info("麦蕊增强数据源已启用（MAIRUI_ENABLE=true），高级字段优先取麦蕊")
+        logger.info("麦蕊增强数据源已启用（MAIRUI_ENABLE=true），高级字段主源缺失时回退麦蕊")
         return FallbackSource(primary, extra)
     except Exception as exc:  # noqa: BLE001 装配失败不阻塞主链路
         logger.warning("麦蕊数据源装配失败，仅使用 akshare: %s", exc)

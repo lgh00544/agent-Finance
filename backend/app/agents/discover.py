@@ -440,8 +440,10 @@ def _fmt_money(value: float | None) -> str:
 
 
 def _enrich_candidate_data(source: DataSource, inst_map: dict,
-                           code: str, name: str) -> dict:
+                           code: str, name: str, trade_date: str) -> dict:
     """候选股增量数据（v2.0）：资金结构/阶段主力动向/股东面/52周区间/盘中涨幅收窄
+    资金字段严格当日有效：仅透传 trade_date 当日的资金流；当日无有效数据一律不写入
+    （读取层统一标注「当日资金数据暂不可用」，禁止 T-1 及更早历史数据降级填充）。
     【刚性代码逻辑】只做客观数据采集与纯数学计算（累计求和/区间极值/百分比），零判断"""
     out: dict = {}
     try:
@@ -467,17 +469,25 @@ def _enrich_candidate_data(source: DataSource, inst_map: dict,
         logger.warning("候选 %s 日K增量失败: %s", code, exc)
     try:
         flow = source.fetch_fund_flow(code)
-        if flow is not None and not flow.empty:
-            today = flow.iloc[-1]
-            for col, key in [("super_large_net", "super_large_net"), ("large_net", "large_net"),
-                             ("medium_net", "medium_net"), ("small_net", "small_net")]:
-                if col in flow.columns:
-                    out[key] = _num(today[col])
-            if "main_net_inflow" in flow.columns:
-                vals = flow["main_net_inflow"].dropna().astype(float)
-                out["main_net_3d"] = round(float(vals.tail(3).sum()), 2)
-                out["main_net_5d"] = round(float(vals.tail(5).sum()), 2)
-                out["main_net_10d"] = round(float(vals.tail(10).sum()), 2)
+        if flow is not None and not flow.empty and "date" in flow.columns:
+            # 严格当日有效：只取 trade_date 当日资金流；当日无有效数据 → 不写入任何资金字段，
+            # 由读取层统一标注「当日资金数据暂不可用」。禁止 T-1 及更早历史数据降级填充。
+            today = flow.loc[flow["date"].astype(str).str.slice(0, 10) == trade_date]
+            if not today.empty:
+                row = today.iloc[-1]
+                for col, key in [("super_large_net", "super_large_net"), ("large_net", "large_net"),
+                                 ("medium_net", "medium_net"), ("small_net", "small_net")]:
+                    if col in flow.columns:
+                        v = _num(row.get(col))
+                        if v is not None:  # 仅当日有效值落库，None/NaN 视为缺失不携带
+                            out[key] = v
+                # 阶段主力累计：以「当日」为主锚点的近 3/5/10 日窗口；
+                # 当日主力净流入无效则不计算（防历史数据冒充当日累计）
+                if "main_net_inflow" in flow.columns and _num(row.get("main_net_inflow")) is not None:
+                    vals = flow["main_net_inflow"].dropna().astype(float)
+                    out["main_net_3d"] = round(float(vals.tail(3).sum()), 2)
+                    out["main_net_5d"] = round(float(vals.tail(5).sum()), 2)
+                    out["main_net_10d"] = round(float(vals.tail(10).sum()), 2)
     except Exception as exc:  # noqa: BLE001
         logger.warning("候选 %s 资金流增量失败: %s", code, exc)
     try:
@@ -533,7 +543,8 @@ def enrich_data(state: StockAgentState) -> StockAgentState:
         code = cand["stock_code"]
         try:
             return code, _enrich_candidate_data(source, inst_map, code,
-                                                cand.get("stock_name", ""))
+                                                cand.get("stock_name", ""),
+                                                state.get("trade_date", _today()))
         except Exception as exc:  # noqa: BLE001 单股失败不阻塞
             logger.warning("候选 %s 增量数据采集失败: %s", code, exc)
             return code, {}

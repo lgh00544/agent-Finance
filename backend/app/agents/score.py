@@ -36,11 +36,15 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     financial = source.fetch_financial(code)
     fin_rows = financial.head(4).to_dict(orient="records") if not financial.empty else []
 
-    # 资金流（最近10日；东财接口不稳定，失败不阻塞打分）
+    # 资金流（严格当日有效：仅透传 trade_date 当日有数据时的近 10 日带日期序列；
+    # 当日无资金流 → 不携带任何历史行，LLM 按缺省处理；东财接口不稳定，失败不阻塞打分）
     ff_rows = []
     try:
         fund_flow = source.fetch_fund_flow(code)
-        ff_rows = fund_flow.tail(10).to_dict(orient="records") if not fund_flow.empty else []
+        if fund_flow is not None and not fund_flow.empty and "date" in fund_flow.columns:
+            today_rows = fund_flow.loc[fund_flow["date"].astype(str).str.slice(0, 10) == today]
+            if not today_rows.empty:
+                ff_rows = fund_flow.tail(10).to_dict(orient="records")
     except Exception as exc:  # noqa: BLE001
         logger.warning("资金流拉取失败，跳过: %s", exc)
 

@@ -170,7 +170,7 @@ def _make_flow():
 def test_enrich_candidate_data_pure_math():
     source = _FakeSource(_make_kline(), _make_flow())
     out = _enrich_candidate_data(source, {"600519": {"float_pct": 12.5}},
-                                 "600519", "贵州茅台")
+                                 "600519", "贵州茅台", "2026-07-29")
 
     assert out["industry"] == "白酒"
     # 5日涨幅 = (12.0/10.0-1)*100
@@ -196,8 +196,80 @@ def test_enrich_candidate_data_pure_math():
 def test_enrich_candidate_data_missing_fields():
     """数据缺失时字段为 None/空，不抛异常（单项失败降级）"""
     source = _FakeSource(pd.DataFrame(), pd.DataFrame(), info={}, gdhs={})
-    out = _enrich_candidate_data(source, {}, "600519", "贵州茅台")
+    out = _enrich_candidate_data(source, {}, "600519", "贵州茅台", "2026-07-29")
     assert out == {"industry": ""}
+
+
+def test_enrich_fund_flow_strict_same_day_no_fallback():
+    """严格当日有效：当日资金流全空 → 不再回退 T-1，资金字段一律缺失（读取层标「当日不可用」）"""
+    dates = ["2026-08-08", "2026-08-09", "2026-08-11"]
+    flow = pd.DataFrame({
+        "date": dates,
+        "main_net_inflow": [1e8, 2e8, float("nan")],
+        "super_large_net": [1e7, 2e7, float("nan")],
+        "large_net": [5e6, 6e6, float("nan")],
+        "medium_net": [3e6, 4e6, float("nan")],
+        "small_net": [-2e6, -1e6, float("nan")],
+    })
+    source = _FakeSource(pd.DataFrame(), flow, info={}, gdhs={})
+    out = _enrich_candidate_data(source, {}, "600519", "贵州茅台", "2026-08-11")
+    # 当日(08-11)全空 → 不得回退取 08-08/08-09 的历史值
+    assert out.get("super_large_net") is None
+    assert out.get("large_net") is None
+    assert out.get("main_net_3d") is None       # 不得用历史 1e8+2e8 求和冒充当日累计
+
+
+def test_enrich_fund_flow_same_day_only():
+    """仅当日有效：资金流含多日时只取 trade_date 当日行，累计窗口以当日为锚点"""
+    dates = ["2026-08-07", "2026-08-08", "2026-08-11"]
+    flow = pd.DataFrame({
+        "date": dates,
+        "main_net_inflow": [1e8, 2e8, 3e8],
+        "super_large_net": [1e7, 2e7, 4e7],
+        "large_net": [5e6, 6e6, 8e6],
+        "medium_net": [3e6, 4e6, 5e6],
+        "small_net": [-2e6, -1e6, 3e6],
+    })
+    source = _FakeSource(pd.DataFrame(), flow, info={}, gdhs={})
+    out = _enrich_candidate_data(source, {}, "600519", "贵州茅台", "2026-08-11")
+    assert out["super_large_net"] == 4e7       # 当日 08-11，非 08-08 的 2e7
+    assert out["large_net"] == 8e6
+    # 累计窗口以当日为锚点：tail 3 = 1e8+2e8+3e8（仅 3 日有效数据）
+    assert out["main_net_3d"] == 6e8
+    assert out["main_net_5d"] == 6e8
+    assert out["main_net_10d"] == 6e8
+
+
+def test_enrich_fund_flow_missing_trade_date_no_data():
+    """严格当日有效：资金流里没有 trade_date 当日 → 不取最新历史行，资金字段缺失"""
+    dates = ["2026-07-20", "2026-07-21", "2026-07-22"]
+    flow = pd.DataFrame({
+        "date": dates,
+        "main_net_inflow": [1e8, 2e8, 3e8],
+        "super_large_net": [1e7, 2e7, 3e7],
+        "large_net": [5e6, 6e6, 7e6],
+    })
+    source = _FakeSource(pd.DataFrame(), flow, info={}, gdhs={})
+    out = _enrich_candidate_data(source, {}, "600519", "贵州茅台", "2026-07-31")
+    assert out.get("super_large_net") is None
+    assert out.get("large_net") is None
+    assert out.get("main_net_3d") is None
+
+
+def test_enrich_fund_flow_all_nan_no_crash():
+    """资金流全行为空 → 字段为 None，不抛异常"""
+    flow = pd.DataFrame({
+        "date": ["2026-08-11"],
+        "main_net_inflow": [float("nan")],
+        "super_large_net": [float("nan")],
+        "large_net": [float("nan")],
+        "medium_net": [float("nan")],
+        "small_net": [float("nan")],
+    })
+    source = _FakeSource(pd.DataFrame(), flow, info={}, gdhs={})
+    out = _enrich_candidate_data(source, {}, "600519", "贵州茅台", "2026-08-11")
+    assert out.get("super_large_net") is None
+    assert out.get("main_net_3d") is None
 
 
 def test_final_table_text_includes_v2_columns():

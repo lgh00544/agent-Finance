@@ -118,6 +118,41 @@ def test_candidate_table_text_fields():
     assert "无重大利空" in text or "无" in text
 
 
+# ==================== 2.5 资金方向字段透传（修复：读取 detail.enriched） ====================
+
+def test_fund_direction_text_formats():
+    from app.services.batch_chat import _fund_direction_text
+    enr = {"main_net_3d": 123456789, "main_net_5d": -5000000, "main_net_10d": 0,
+           "super_large_net": 8e7, "large_net": 12000, "inst_hold_pct": 3.2, "industry": "白酒"}
+    t = _fund_direction_text(enr)
+    assert "主力3日=1.23亿" in t
+    assert "主力5日=-500.0万" in t
+    assert "超大单=8000.0万" in t
+    assert "大单=1.2万" in t
+    assert "机构持股=3.2%" in t and "行业=白酒" in t
+
+
+def test_fund_direction_text_missing_is_safe():
+    from app.services.batch_chat import _fund_direction_text
+    assert _fund_direction_text({}) == "当日资金数据暂不可用"
+    assert _fund_direction_text({"industry": "", "main_net_3d": None}) == "当日资金数据暂不可用"
+    assert _fund_direction_text(None) == "当日资金数据暂不可用"
+
+
+def test_candidate_table_text_includes_fund_direction():
+    from app.services.batch_chat import _candidate_table_text
+    rows = [{"stock_code": "600001", "stock_name": "示例股", "current_price": 23.8,
+             "effective_tier": "A", "price_zone": "现价 23.5~24.0", "label": "可建仓",
+             "block_reason": "", "risk_notice": ["无"],
+             "detail": {"enriched": {"main_net_3d": 3e8, "industry": "科技"},
+                        "risks": ["无重大利空"]}}]
+    text = _candidate_table_text(rows)
+    assert "资金方向=" in text and "主力3日=3.00亿" in text
+    # 无资金数据 → 标注当日不可用，不崩溃
+    rows2 = [dict(rows[0], detail={"enriched": {}, "risks": []})]
+    assert "资金方向=当日资金数据暂不可用" in _candidate_table_text(rows2)
+
+
 # ==================== 3. ask_batch ====================
 
 def test_ask_batch_records_messages_and_batch(monkeypatch):

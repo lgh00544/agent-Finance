@@ -2,7 +2,7 @@
 1. 数据源工厂：默认关闭返回 akshare（行为与之前完全一致）/ 启用返回降级包装
 2. 麦蕊取数解析（股东户数/成交分布 → 对齐 akshare 标准字段）
 3. 配额超限/字段缺失 → 回退不抛异常；当日缓存不二次请求
-4. 降级包装：麦蕊失败 → akshare 兜底；基础数据仅走主源
+4. 降级包装：主源 akshare 优先，失败/空 → 麦蕊备源补齐；基础数据仅走主源
 注意：每个用例使用独立股票代码，避免当日缓存键串扰。
 """
 import pandas as pd
@@ -92,12 +92,12 @@ def test_shareholder_failure_returns_empty(monkeypatch):
 # ==================== 成交分布 → 标准资金流列（/hsmy/lscjt） ====================
 
 def _lscjt_rows(days=10):
-    """模拟最近 N 天成交分布：超大单/大单/中单/小单净流入 + 主力=超大+大（纯算术）"""
+    """模拟最近 N 天成交分布（麦蕊拼音字段）：超大单/大单/小单净流入 + 主力=超大+大（纯算术）"""
     rows = []
     for i in range(days):
         rows.append({"t": f"2026-07-{25 + i:02d}",
-                     "超大单净流入": 1e7 + i * 1e7, "大单净流入": -5e6 + i * 2e6,
-                     "中单净流入": -1e7, "小单净流入": -2e7})
+                     "cddjlr": 1e7 + i * 1e7, "ddjlr": -5e6 + i * 2e6,
+                     "xdjlr": -2e7})
     return rows
 
 
@@ -144,20 +144,23 @@ def test_same_day_cache_no_second_request(monkeypatch):
     assert counter["n"] == 1
 
 
-# ==================== 降级包装（麦蕊失败 → akshare 兜底） ====================
+# ==================== 降级包装（主源 akshare 优先 → 麦蕊备源补齐） ====================
 
 class _FakePrimary(AkshareSource):
-    """测试主源：不触网，只记录被调用"""
+    """测试主源：不触网，只记录被调用；fund_flow_ok=False 模拟主源资金流缺失"""
 
-    def __init__(self):
+    def __init__(self, fund_flow_ok=True):
         self.fund_flow_calls = []
         self.shareholder_calls = []
+        self.fund_flow_ok = fund_flow_ok
 
     def fetch_trade_calendar(self):
         return ["2026-08-04"]
 
     def fetch_fund_flow(self, code):
         self.fund_flow_calls.append(code)
+        if not self.fund_flow_ok:
+            return pd.DataFrame()
         return pd.DataFrame({"date": ["2026-08-04"], "main_net_inflow": [1.0]})
 
     def fetch_shareholder_detail(self, code):
@@ -165,23 +168,51 @@ class _FakePrimary(AkshareSource):
         return {"holder_change_pct": -3.2}
 
 
-def test_fallback_mairui_empty_then_akshare(monkeypatch):
-    """麦蕊返回空（未启用配额/字段缺失）→ 回退 akshare 不报错"""
-    _mock_get(monkeypatch, lambda url: _FakeResp([]))
+def test_fallback_akshare_ok_skips_mairui(monkeypatch):
+    """主源 akshare 有资金流 → 直接用，麦蕊备源不调用（节省配额）"""
+    counter = {"n": 0}
+
+    def _responder(url):
+        counter["n"] += 1
+        return _FakeResp(_lscjt_rows())
+
+    _mock_get(monkeypatch, _responder)
     primary = _FakePrimary()
     wrapper = FallbackSource(primary, MairuiSource())
-    df = wrapper.fetch_fund_flow("600550")
-    assert not df.empty and primary.fund_flow_calls == ["600550"]
-    out = wrapper.fetch_shareholder_detail("600551")
-    assert out["holder_change_pct"] == -3.2 and primary.shareholder_calls == ["600551"]
+    df = wrapper.fetch_fund_flow("600560")
+    assert not df.empty and primary.fund_flow_calls == ["600560"]
+    assert counter["n"] == 0  # 麦蕊零调用
 
 
-def test_fallback_mairui_ok_skips_akshare(monkeypatch):
+def test_fallback_akshare_empty_then_mairui(monkeypatch):
+    """主源 akshare 返回空 → 麦蕊备源补齐（主源优先、备源兜底）"""
     _mock_get(monkeypatch, lambda url: _FakeResp(_lscjt_rows()))
-    primary = _FakePrimary()
+    primary = _FakePrimary(fund_flow_ok=False)
     wrapper = FallbackSource(primary, MairuiSource())
-    df = wrapper.fetch_fund_flow("600552")
-    assert not df.empty and primary.fund_flow_calls == []  # 未回退
+    df = wrapper.fetch_fund_flow("600561")
+    assert not df.empty and df.iloc[-1]["super_large_net"] == pytest.approx(1e8)  # 来自麦蕊
+    assert primary.fund_flow_calls == ["600561"]
+
+
+def test_fallback_akshare_fail_then_mairui(monkeypatch):
+    """主源 akshare 抛异常 → 麦蕊备源补齐，不中断主链路"""
+    _mock_get(monkeypatch, lambda url: _FakeResp(_lscjt_rows()))
+
+    class _Boom(_FakePrimary):
+        def fetch_fund_flow(self, code):
+            raise ConnectionError("akshare 网络不可达")
+
+    wrapper = FallbackSource(_Boom(), MairuiSource())
+    df = wrapper.fetch_fund_flow("600562")
+    assert not df.empty  # 麦蕊兜底成功
+
+
+def test_fallback_both_empty_returns_empty(monkeypatch):
+    """双源均无资金流 → 返回空表（上层标注当日不可用，不携带历史/占位值）"""
+    _mock_get(monkeypatch, lambda url: _FakeResp([]))  # 麦蕊也为空
+    primary = _FakePrimary(fund_flow_ok=False)
+    wrapper = FallbackSource(primary, MairuiSource())
+    assert wrapper.fetch_fund_flow("600563").empty
 
 
 def test_fallback_basic_data_only_primary(monkeypatch):

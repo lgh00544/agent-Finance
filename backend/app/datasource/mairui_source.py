@@ -11,7 +11,7 @@
      由上层 FallbackSource 回退 akshare 现有字段，中文日志记录原因，不报错中断。
 
 已核实的官方端点（licence 拼在 URL 末尾路径段，Get 请求，标准 JSON）：
-  /hsmy/lscjt/{code}/{licence}   最近 10 天成交分布（超大单/大单/中单/小单净流入）
+  /hsmy/lscjt/{code}/{licence}   最近 10 天成交分布（超大单/大单/小单/散单净流入，拼音缩写字段）
   /hsmy/jddxt/{code}/{licence}   最近 10 天阶段主力动向（近 3/5/10 日主力净流入）
   /hscp/gdbh/{code}/{licence}    股东变化趋势（jzrq 截止日期 / gdhs 股东户数 / bh 比上期变化）
 【刚性代码逻辑】只做数据采集与文本规整，不做任何市场判断；字段缺失一律降级不阻塞。
@@ -32,25 +32,30 @@ from app.datasource.http_client import get as http_get
 logger = logging.getLogger(__name__)
 
 # 已核实的官方端点（licence 由 _get_json 统一拼接）
-_EP_LSCJT = "/hsmy/lscjt"   # 最近10天成交分布（超大单/大单/中单/小单净流入）
+_EP_LSCJT = "/hsmy/lscjt"   # 最近10天成交分布（超大单/大单/小单/散单净流入）
 _EP_GDBH = "/hscp/gdbh"     # 股东变化趋势（jzrq 截止日期 / gdhs 股东户数 / bh 比上期变化）
 _QUOTA_MARK = "101"         # 官方约定：当日请求次数超限标记
 _RETRY_DELAYS = (1.5, 3.0, 6.0)  # 指数退避（与 akshare 源一致）
 _TTL_DAY = 86400            # 当日缓存：同日同标的重复请求不二次调用
 
-# 麦蕊成交分布字段名随版本可能有微调，按「身份词 + 任选度量词」模糊匹配（防御性取数）
-_NET_WORDS = ("净流入", "净额")  # 仅匹配金额口径（元），避免误取「净占比」等百分比列
+# 麦蕊成交分布字段为拼音缩写（实测确认，与 akshare 中文列名不同）：
+#   t=日期  cddlr=超大单流入 cddjlr=超大单净流入  ddlr=大单流入 ddjlr=大单净流入
+#   xdlr=小单流入 xdjlr=小单净流入  sdlr=散单流入 sdjlr=散单净流入  qbjlr=全部净流入
+_LSCJT_FIELDS = {
+    "date": "t",
+    "super_large_net": "cddjlr",
+    "large_net": "ddjlr",
+    "small_net": "xdjlr",
+}
 
 
-def _fuzzy_key(row: dict, identity: str, *metric: str, exclude: str | None = None) -> str | None:
-    """键名需包含 identity，且命中任意 metric 关键词（metric 为空则只匹配 identity）；
-    exclude 命中时跳过（如「大单」需排除「超大单」）。找不到返回 None"""
+def _fuzzy_key(row: dict, identity: str, *metric: str) -> str | None:
+    """键名需包含 identity，且命中任意 metric 关键词（metric 为空则只匹配 identity）。
+    找不到返回 None"""
     if not identity:
         return None
     for key in row.keys():
         s = str(key)
-        if exclude is not None and exclude in s:
-            continue
         if identity in s and (not metric or any(m in s for m in metric)):
             return key
     return None
@@ -59,7 +64,7 @@ def _fuzzy_key(row: dict, identity: str, *metric: str, exclude: str | None = Non
 def _row_value(row: dict, key: str | None) -> float | None:
     """按已解析出的精确键名取值并转 float；无键/值缺失/脏数据返回 None。
     不做二次模糊匹配：「大单净流入」是「超大单净流入」的子串，
-    若再把键名交给 _fuzzy_key 会绕过 exclude 误命中超大单列。"""
+    若再把键名交给 _fuzzy_key 会绕过排除逻辑误命中超大单列。"""
     if not key:
         return None
     try:
@@ -132,9 +137,10 @@ class MairuiSource:
     # ---------------- 资金流（对齐 akshare 标准列，供 v2.0 富化与打分） ----------------
     def fetch_fund_flow(self, code: str) -> pd.DataFrame:
         """最近 10 天成交分布 → 标准列 DataFrame：
-        date/main_net_inflow/super_large_net/large_net/medium_net/small_net。
-        主力净流入 = 超大单 + 大单（纯算术）；近 3/5/10 日累计由调用方 tail 求和。
-        字段缺失时返回空表（上层回退 akshare），不抛异常。
+        date/super_large_net/large_net/medium_net(None)/small_net/main_net_inflow。
+        主力净流入 = 超大单 + 大单（纯算术，两桶均有效才计算，缺失不填 0）；
+        近 3/5/10 日累计由调用方 tail 求和（以当日为锚点）。
+        字段缺失时返回空表（上层回退 akshare / 标注当日不可用），不抛异常。
         """
         try:
             rows = self._get_json(_EP_LSCJT, code)
@@ -143,27 +149,29 @@ class MairuiSource:
             return pd.DataFrame()
         records: list[dict] = []
         for row in rows:
-            date_key = _fuzzy_key(row, "t") or _fuzzy_key(row, "time") \
-                or _fuzzy_key(row, "日期") or _fuzzy_key(row, "时间")
-            # 先取键再取值：「超大单净流入」同时命中「大单」身份词，须排除超大单列
-            super_key = _fuzzy_key(row, "超大单", *_NET_WORDS)
-            large_key = _fuzzy_key(row, "大单", *_NET_WORDS, exclude="超大")
-            medium_key = _fuzzy_key(row, "中单", *_NET_WORDS)
-            small_key = _fuzzy_key(row, "小单", *_NET_WORDS) or _fuzzy_key(row, "散单", *_NET_WORDS)
-            if not any((super_key, large_key, medium_key, small_key)):
+            if not isinstance(row, dict):
                 continue
+            super_net = _row_value(row, _LSCJT_FIELDS["super_large_net"])
+            large_net = _row_value(row, _LSCJT_FIELDS["large_net"])
+            small_net = _row_value(row, _LSCJT_FIELDS["small_net"])
+            if super_net is None and large_net is None and small_net is None:
+                continue  # 该行无任何资金桶 → 不可用（不填占位）
             records.append({
-                "date": str(row.get(date_key, ""))[:10] if date_key else "",
-                "super_large_net": _row_value(row, super_key),
-                "large_net": _row_value(row, large_key),
-                "medium_net": _row_value(row, medium_key),
-                "small_net": _row_value(row, small_key),
+                "date": str(row.get(_LSCJT_FIELDS["date"], ""))[:10],
+                "super_large_net": super_net,
+                "large_net": large_net,
+                "medium_net": None,   # 麦蕊无中单桶（四桶为超大/大/小/散），保持缺失
+                "small_net": small_net,
             })
         if not records:
             logger.warning("麦蕊成交分布 %s 无可用字段（字段名可能已变更），回退 akshare", code)
             return pd.DataFrame()
         df = pd.DataFrame(records)
-        df["main_net_inflow"] = df["super_large_net"].fillna(0) + df["large_net"].fillna(0)
+        # 主力净流入 = 超大单 + 大单；任一元桶缺失 → NaN（不伪造 0，防历史/缺失冒充当日）
+        df["main_net_inflow"] = df.apply(
+            lambda r: r["super_large_net"] + r["large_net"]
+            if pd.notna(r["super_large_net"]) and pd.notna(r["large_net"])
+            else float("nan"), axis=1)
         df = df.dropna(subset=["date"]).reset_index(drop=True)
         return df
 
