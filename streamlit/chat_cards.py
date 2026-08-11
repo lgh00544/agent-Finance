@@ -21,7 +21,7 @@ import streamlit as st
 _TYPE_LABEL = {"qa": ("提问", "info"), "rule": ("调教", "warn"), "learn": ("学习", "ok"),
                "batch": ("批量验证", "info")}
 _VERDICT_LABEL = {"adopted": "采纳", "partial": "部分采纳", "maintained": "维持原规则"}
-_VERDICT_TONE = {"adopted": "ok", "partial": "warn", "maintained": "info"}
+_VERDICT_TONE = {"adopted": "ok", "partial": "warn", "maintained": "mute"}
 
 
 def pair_messages(messages: list[dict]) -> list[dict]:

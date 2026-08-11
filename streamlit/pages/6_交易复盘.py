@@ -952,7 +952,7 @@ with render.fold_module("strategy_loop", "策略闭环 · Agent 优化建议",
                 clicked = render.list_item(
                     key, f"[{html.escape(s['target_agent'])}] {html.escape(s['rule_name'])}",
                     subtitle=subtitle, dot=_SUG_TONE.get(status, "mute"), meta=meta,
-                    actions=("展开详情", "采纳", "驳回"))
+                    actions=("收起详情" if opened else "展开详情", "采纳", "驳回"))
                 if clicked == 0:  # 展开/收起详情
                     opened = not opened
                     st.session_state[f"open_{key}"] = opened
@@ -1148,10 +1148,11 @@ with render.fold_module("detail_hist", "详情与历史记录",
                                     except (json.JSONDecodeError, TypeError):
                                         concl = {}
                                     tp1, tp2 = concl.get("tp1"), concl.get("tp2")
-                                    st.markdown(f"- 预判第一止盈位：**{tp1 or '—'} 元**；"
-                                                f"第二止盈位：**{tp2 or '—'} 元**"
+                                    st.markdown(f"- 预判第一止盈位：**{render.num(tp1 or '—')} 元**；"
+                                                f"第二止盈位：**{render.num(tp2 or '—')} 元**"
                                                 f"（留痕 {str(tp_trace.get('create_time') or '')[:16]}，"
-                                                "source_module=position_monitor）")
+                                                "source_module=position_monitor）",
+                                                unsafe_allow_html=True)
                                     exit_prices = []
                                     try:
                                         for tr in api.holding_trades(r.get("holding_id") or 0) or []:
@@ -1162,17 +1163,21 @@ with render.fold_module("detail_hist", "详情与历史记录",
                                     if exit_prices:
                                         avg = sum(exit_prices) / len(exit_prices)
                                         if tp1 and tp2 and avg >= tp2:
-                                            verdict = f"实际卖出均价 {avg:,.2f} ≥ 第二止盈位 {tp2}：" \
-                                                      "到达波段目标，超预期兑现"
+                                            verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} ≥ "
+                                                       f"第二止盈位 {render.num(tp2)}："
+                                                       "到达波段目标，超预期兑现")
                                         elif tp1 and avg >= tp1:
-                                            verdict = f"实际卖出均价 {avg:,.2f} ≥ 第一止盈位 {tp1}：" \
-                                                      "分档锁利生效"
+                                            verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} ≥ "
+                                                       f"第一止盈位 {render.num(tp1)}："
+                                                       "分档锁利生效")
                                         else:
-                                            verdict = (f"实际卖出均价 {avg:,.2f} 低于第一止盈位 "
-                                                       f"{tp1 or '—'}：未触发止盈分档")
-                                        st.markdown(f"- 实际卖出：{len(exit_prices)} 笔，"
-                                                    f"均价 {avg:,.2f} 元")
-                                        st.markdown(f"- **比对结论**：{verdict}")
+                                            verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} "
+                                                       f"低于第一止盈位 {render.num(tp1 or '—')}："
+                                                       "未触发止盈分档")
+                                        st.markdown(f"- 实际卖出：{render.num(len(exit_prices))} 笔，"
+                                                    f"均价 {render.num(f'{avg:,.2f}')} 元",
+                                                    unsafe_allow_html=True)
+                                        st.markdown(f"- **比对结论**：{verdict}", unsafe_allow_html=True)
                                     else:
                                         st.caption("无卖出流水记录，无法比对实际卖出价。")
                                 else:
@@ -1293,6 +1298,8 @@ with render.fold_module("detail_hist", "详情与历史记录",
                 if not losers:
                     render.empty_state("暂无亏损/失效标的。失效标的明细将随亏损复盘积累自动呈现。")
                 else:
+                    render.batch_fold_bar("rev", [f"review_{r['id']}" for r in losers],
+                                          label="点击「查看详情」展开该失效标的完整复盘。")
                     render.record_list(losers, _review_detail, batch=20, key="_rev_losers_vis",
                                        empty_text="无匹配的失效标的。")
             with t3:

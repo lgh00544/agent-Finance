@@ -729,7 +729,7 @@ def _ocr_row_to_dict(r: dict) -> dict:
 def _mark_missing(row: pd.Series) -> list:
     """字段缺失行红色标注（配合「需补全」状态列，引导人工完善）"""
     if row["状态"]:
-        return ["background-color: #ffe0e0"] * len(row)
+        return ["background-color: rgba(239, 68, 68, 0.12)"] * len(row)
     return [""] * len(row)
 
 

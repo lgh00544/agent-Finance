@@ -7,6 +7,7 @@
 错误处理：接口失败按类型分类提示（后端服务/超时/数据库/解析），重试按钮在卡片右侧；
 有离线缓存时降级展示最近一次成功数据（标注缓存时间，灰色弱化），避免完全不可用。
 """
+import html
 import streamlit as st
 
 import api_client as api
@@ -191,7 +192,8 @@ with rows_area:
                     render.section_title("候选理由")
                     if reasons:
                         for i, reason in enumerate(reasons, 1):
-                            st.markdown(f"{i}. {reason}")
+                            st.markdown(f"{render.num(i)}. {html.escape(str(reason))}",
+                                        unsafe_allow_html=True)
                     else:
                         st.markdown("（该轮未输出）")
                 with st.container(border=True):
@@ -209,7 +211,8 @@ with rows_area:
                     risks = detail.get("risks") or []
                     if risks:
                         for i, risk in enumerate(risks, 1):
-                            st.markdown(f"{i}. {risk}")
+                            st.markdown(f"{render.num(i)}. {html.escape(str(risk))}",
+                                        unsafe_allow_html=True)
                     else:
                         st.markdown("（无）")
                 with st.container(border=True):
@@ -242,11 +245,16 @@ with rows_area:
                     st.session_state["_batch_scope"] = "manual"
                     st.session_state["_batch_codes"] = [code]
                     st.rerun()
-                # ===== AI 研判留痕（推理链路可溯源）：按钮触发真懒加载，未点击零接口调用 =====
+                # ===== AI 研判留痕（推理链路可溯源）：按钮触发真懒加载，未点击零接口调用；
+                # 已展开时按钮切换为「收起」支持再次收起 =====
                 tk = f"traces_{code}_{r['trade_date']}"
-                if st.button("AI 研判留痕（推理链路可溯源）", key=f"trbtn_{key}",
-                             use_container_width=True):
-                    st.session_state[tk] = "open"
+                _trace_open = st.session_state.get(tk) == "open"
+                if st.button("收起 AI 研判留痕…" if _trace_open else "AI 研判留痕（推理链路可溯源）",
+                             key=f"trbtn_{key}", use_container_width=True):
+                    if _trace_open:
+                        st.session_state.pop(tk, None)
+                    else:
+                        st.session_state[tk] = "open"
                     st.rerun()
                 if st.session_state.get(tk) == "open":
                     if f"{tk}_rows" not in st.session_state:
@@ -447,7 +455,9 @@ def _batch_panel(trade_date: str, day_rows: list[dict], trade_map: dict) -> None
             _msgs = []
         if _msgs:
             st.markdown("**批量对话历史（可追溯）**")
-            for _u in cc.pair_messages(_msgs)[:8]:
+            _units = cc.pair_messages(_msgs)[:8]
+            cc.render_batch_bar("discover", _units)
+            for _u in _units:
                 cc.render_conversation_unit("discover", _u)
 
 

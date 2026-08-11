@@ -125,6 +125,12 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
 .badge-err   { color: var(--err);   background: rgba(239, 68, 68, 0.15);  border: 1px solid rgba(239, 68, 68, 0.45); }
 .badge-info  { color: var(--info);  background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.45); }
 .badge-mute  { color: var(--text-dim); background: rgba(156, 163, 175, 0.12); border: 1px solid var(--border); }
+/* 徽章别名（游资追踪等页面直接发 badge-a/badge-up 等）：评级 a/b/c 对齐 tier 刻度，方向 up/down 对齐涨跌 */
+.badge-a   { color: var(--tier-a); background: rgba(239, 68, 68, 0.15);  border: 1px solid rgba(239, 68, 68, 0.45); }
+.badge-b   { color: var(--tier-b); background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.45); }
+.badge-c   { color: var(--tier-c); background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.45); }
+.badge-up   { color: var(--up);   background: rgba(239, 68, 68, 0.15);    border: 1px solid rgba(239, 68, 68, 0.45); }
+.badge-down { color: var(--down); background: rgba(16, 185, 129, 0.15);  border: 1px solid rgba(16, 185, 129, 0.45); }
 /* 溯源行：时间/数据源/置信度统一浅色小字，紧急信号琥珀高亮 */
 .trace-line { color: var(--text-dim); font-size: 12px; margin: 0.25rem 0; }
 .trace-line .hl { color: var(--warn); }
@@ -189,14 +195,26 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
 .dot-tier-c, .dot-info { background: #3b82f6; box-shadow: 0 0 6px rgba(59, 130, 246, 0.5); }
 .dot-ok { background: #10b981; box-shadow: 0 0 6px rgba(16, 185, 129, 0.5); }
 .dot-mute { background: #6b7280; }
+/* 状态点别名（游资追踪等页面直接发 dot-a/dot-up 等）：评级 a/b/c 对齐 tier 刻度，方向 up/down 对齐涨跌 */
+.dot-a { background: #ef4444; box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
+.dot-b { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, 0.5); }
+.dot-c { background: #3b82f6; box-shadow: 0 0 6px rgba(59, 130, 246, 0.5); }
+.dot-up { background: #ef4444; box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
+.dot-down { background: #10b981; box-shadow: 0 0 6px rgba(16, 185, 129, 0.5); }
 .item-title { font-size: 14px; font-weight: 600; color: var(--text); }
 .item-sub { font-size: 12px; color: var(--text-dim); margin-top: 3px; line-height: 1.6; }
 .item-meta { font-size: 12px; color: var(--text-dim); text-align: right; margin-bottom: 6px; }
 .item-meta .up { color: var(--up); } .item-meta .down { color: var(--down); }
-/* 详情分区小标题（左侧主色竖条） */
+/* 详情分区小标题（左侧主色竖条 + 浅弱底色 + 统一字号，L2 子分区弱底色规范） */
 .section-title { font-size: 13px; font-weight: 600; color: var(--text);
                  border-left: 3px solid var(--primary); padding-left: 8px;
-                 margin: 6px 0 8px; }
+                 background: rgba(59, 130, 246, 0.06);
+                 padding-top: 3px; padding-bottom: 3px;
+                 margin: 10px 0 8px; }
+/* 详情内关键词高亮 / 数字强调（L4 详情栏目可复用，重点栏目按需包裹） */
+.kw { color: var(--primary); font-weight: 600;
+      background: rgba(59, 130, 246, 0.12); padding: 0 2px; border-radius: 2px; }
+.num { font-variant-numeric: tabular-nums; color: var(--primary); font-weight: 600; }
 /* 嵌套卡片（详情内分区）：更紧凑的次级卡片 */
 [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlockBorderWrapper"] {
   padding: 12px 16px; margin-top: 10px; background: rgba(255, 255, 255, 0.02);
@@ -331,8 +349,9 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
 .advice-card .advice-title { font-size: 12px; color: var(--info); font-weight: 600; }
 .advice-card .advice-body { font-size: 14px; color: var(--text); line-height: 1.7; margin-top: 4px; }
 /* ===== 通用折叠规范：一级模块卡片（对齐对话历史页卡片标准） ===== */
-/* 模块标题：加粗主色高亮居左（与模块内容左边界对齐，禁止居中） */
-.fold-title { font-size: 15px; font-weight: 700; color: var(--primary); }
+/* 模块标题：加粗主色高亮居左 + 左侧主色竖条（与 h2 子标题视觉签名统一，L1 大模块） */
+.fold-title { font-size: 15px; font-weight: 700; color: var(--primary);
+              border-left: 3px solid var(--primary); padding-left: 8px; }
 /* 卡片紧凑内边距：减少标题栏无效空白，纵向更紧凑 */
 [class*="st-key-foldcard_"] { padding-top: 12px; padding-bottom: 14px; }
 </style>
@@ -353,6 +372,16 @@ def badge(text: str, tone: str = "info") -> None:
     """徽章：评级 a/b/c、状态 ok/warn/err/info/mute（纯展示样式，无任何研判语义）"""
     st.markdown(f'<span class="badge {_BADGE_TONES.get(tone, "badge-info")}">{text}</span>',
                 unsafe_allow_html=True)
+
+
+def kw(text: str) -> str:
+    """关键词高亮 HTML 片段（L4 详情栏目）：主色加粗浅底，拼入 unsafe_allow_html 的 markdown 字符串"""
+    return f'<span class="kw">{text}</span>'
+
+
+def num(text) -> str:
+    """数字强调 HTML 片段（L4 详情栏目）：等宽主色加粗，拼入 unsafe_allow_html 的 markdown 字符串"""
+    return f'<span class="num">{text}</span>'
 
 
 def trace_line(label: str, time_str: str | None = None, source: str | None = None,
@@ -574,6 +603,9 @@ def list_item_toggle_actions(key: str, title: str, subtitle: str = "", dot: str 
         default = default_open
     opened = st.session_state.get(f"open_{key}", default)
     op_state = st.session_state.get(f"op_{key}", False)
+    # 末位动作按钮双向标签：展开态切换为「收起详情」，收起态保持「查看详情」
+    actions = (tuple(actions[:-1]) + (("收起详情" if opened else "查看详情"),)
+               if actions else actions)
     clicked = list_item(key, title, subtitle, dot, meta, actions)
     if clicked == len(actions) - 1:  # 末位 = 查看详情
         opened = not opened
@@ -687,7 +719,7 @@ def section_title(text: str) -> None:
 
 
 # ================= 持仓止盈/仓位计划卡片（与系统概览/持仓监控页共用，同源展示） =================
-_TP_STATUS_TONE = {"持有观察": "info", "接近止盈": "warn", "接近止损": "err", "减仓预警": "err"}
+_TP_STATUS_TONE = {"持有观察": "mute", "接近止盈": "warn", "接近止损": "err", "减仓预警": "err"}
 _TP_GREEN = "#10B981"   # 止盈位（绿，与全站 ok/down 色一致）
 _TP_RED = "#EF4444"     # 止损位（红，与全站 up/err 色一致）
 _TP_ACTION_DEFAULT = {"接近止损": "减仓/清仓", "减仓预警": "减仓", "接近止盈": "准备减仓",
@@ -1272,7 +1304,7 @@ def rule_change_card(rc: dict, key: str) -> None:
     status=active 时附带「一键回滚」表单（原因必填留痕）。纯展示 + 人工回滚，无任何自动判断。"""
     active = rc.get("status") == "active"
     with st.container(border=True):
-        render_meta = f'<span class="badge badge-{"info" if active else "warn"}">' \
+        render_meta = f'<span class="badge badge-{"ok" if active else "err"}">' \
                       f'{_esc("生效中" if active else "已回滚")}</span>' \
                       f'<span class="badge badge-info">{_esc(rule_type_label(rc.get("rule_type", "")))}</span>' \
                       f'<span class="item-title">{_esc(rc.get("rule_name", ""))}</span>' \

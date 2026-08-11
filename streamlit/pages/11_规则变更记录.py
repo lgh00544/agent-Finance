@@ -59,6 +59,8 @@ else:
             render.empty_state("当前筛选条件下暂无记录。")
         else:
             st.caption(f"共 {len(rows)} 条记录（时间倒序）· 点击行内「查看详情」展开变更对比与回滚入口")
+            render.batch_fold_bar("rc", [f"rc_{r['id']}" for r in rows],
+                                  label="点击「查看详情」展开变更对比与回滚；新加载项自动跟随批量状态。")
 
             def _row(rc: dict, index: int) -> None:
                 rid = rc.get("id")
@@ -67,7 +69,7 @@ else:
                 summary = (rc.get("after_text") or "").strip()
                 if len(summary) > 60:
                     summary = summary[:60] + "…"
-                meta = (f'<span class="badge badge-{"info" if status == "active" else "warn"}">'
+                meta = (f'<span class="badge badge-{"ok" if status == "active" else "err"}">'
                         f'{html.escape(_STATUS_LABEL.get(status, status))}</span>'
                         f'<span class="badge badge-info">{html.escape(render.rule_type_label(rc.get("rule_type") or "soft"))}</span>'
                         f' {str(rc.get("created_at") or "")[:16]}')

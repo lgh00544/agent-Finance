@@ -349,7 +349,7 @@ with tab_overview:
                 if pct is None:
                     st.markdown("—")
                 else:
-                    color = "#F87171" if pct > 0 else "#4ADE80" if pct < 0 else "#9CA3AF"
+                    color = "var(--up)" if pct > 0 else "var(--down)" if pct < 0 else "var(--text-mute)"
                     st.markdown(f"<span style='color:{color};font-weight:600'>{pct:+.2f}%</span>",
                                 unsafe_allow_html=True)
             with c3:
@@ -528,7 +528,7 @@ except Exception:  # noqa: BLE001 后端不可达不阻塞页面
 if not tasks:
     render.empty_state("暂无任务执行记录。提交任意后台任务后在此展示执行状态。")
 else:
-    TASK_DOT = {"done": "ok", "running": "warn", "pending": "mute", "failed": "err"}
+    TASK_DOT = {"done": "ok", "running": "warn", "pending": "warn", "failed": "err"}
     TASK_META = {"done": "完成", "running": "执行中", "pending": "排队中", "failed": "失败"}
     for t in tasks:
         status = t.get("status") or ""

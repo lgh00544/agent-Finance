@@ -105,21 +105,22 @@ with render.fold_module("hm_iter", "游资胜率迭代（自进化 · 人工审�
         render.section_title("游资梯队/权重建议（全部待人工审核，绝不自动生效）")
         _SUG_STATUS = {"pending": "待审核", "approved": "已采纳", "rejected": "已驳回"}
         _SUG_TONE = {"pending": "warn", "approved": "ok", "rejected": "err"}
+        render.batch_fold_bar("hmsug", [f"hmsug_{s['id']}" for s in hm_sugs],
+                              label="点击「展开详情」查看建议全文；采纳/驳回仅对待审核生效，应用仅对已采纳生效。")
         for s in hm_sugs:
             key = f"hmsug_{s['id']}"
             status = s.get("status") or "pending"
+            opened = st.session_state.get(f"open_{key}", st.session_state.get("grpdef_hmsug", False))
             clicked = render.list_item(
                 key, f"[{s.get('target_agent')}] {s.get('rule_name')}",
                 subtitle=f"当前 {s.get('current_value')} → 建议 {s.get('suggested_value')}",
                 dot=_SUG_TONE.get(status, "mute"),
                 meta=f'{_SUG_STATUS.get(status, status)} · {str(s.get("created_at") or "")[:16]}',
-                actions=("展开详情", "采纳", "驳回", "应用生效"))
+                actions=("收起详情" if opened else "展开详情", "采纳", "驳回", "应用生效"))
             if clicked == 0:
-                with st.container(border=True):
-                    render.trace_line("建议时间", s.get("created_at"))
-                    st.markdown(f"- 建议值：**{s.get('suggested_value')}**（档位）")
-                    st.markdown(f"- 建议理由：{s.get('reason')}")
-                    st.markdown(f"- 事实依据：{s.get('evidence')}")
+                opened = not opened
+                st.session_state[f"open_{key}"] = opened
+                st.rerun()
             elif clicked == 1 and status == "pending":
                 api.approve_suggestion(s["id"])
                 st.success("已采纳（状态 approved）。点击「应用生效」后档位才会实际变更。")
@@ -137,6 +138,12 @@ with render.fold_module("hm_iter", "游资胜率迭代（自进化 · 人工审�
                 except Exception as exc:
                     render.dismissible_error("应用失败", "建议未通过人工审核，无法生效。",
                                              detail=exc, retry_key="retry_hm_apply")
+            if opened:
+                with st.container(border=True):
+                    render.trace_line("建议时间", s.get("created_at"))
+                    st.markdown(f"- 建议值：**{s.get('suggested_value')}**（档位）")
+                    st.markdown(f"- 建议理由：{s.get('reason')}")
+                    st.markdown(f"- 事实依据：{s.get('evidence')}")
 
 
 # ================= 1. 游资档案视图 =================
