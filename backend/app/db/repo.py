@@ -537,6 +537,28 @@ def add_news(stock_code: str, stock_name: str, title: str, content: str,
         return True
 
 
+def get_recent_news(stock_code: str, days: int = 7) -> list[dict]:
+    """查询某股近 N 日新闻/公告（只读，按发布时间倒序；无数据返回空列表）。
+    published_at 为空的历史行按入库时间 created_at 兜底参与过滤与排序。"""
+    from datetime import datetime, timedelta
+
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(NewsArticle).where(NewsArticle.stock_code == stock_code)
+        ).scalars().all()
+    out = []
+    for r in rows:
+        day = str(r.published_at or "")[:10] or str(r.created_at)[:10]
+        if day < cutoff:
+            continue
+        out.append({"title": r.title, "content": r.content, "source": r.source,
+                    "url": r.url, "published_at": r.published_at or str(r.created_at)[:19],
+                    "created_at": str(r.created_at)[:19]})
+    out.sort(key=lambda x: (x["published_at"], x["created_at"]), reverse=True)
+    return out
+
+
 def get_trade_profile() -> TradeProfile | None:
     """读取交易偏好档案（全局单行，id=1）"""
     with SessionLocal() as db:

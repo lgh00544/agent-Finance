@@ -56,6 +56,44 @@ except Exception:  # noqa: BLE001 后端未起时降级为静态元信息
     }
 AGENTS = list(AGENT_META.keys())
 
+# ================= 公告查询结果结构化卡片 =================
+_ANN_SENTIMENT_RENDER = {"利好": "success", "利空": "error", "中性": "info"}
+
+
+def _render_announcement(r: dict) -> None:
+    """公告查询结果卡片：利好/利空/中性标签 + 交叉验证/风险提示 + 公告清单（官方链接可跳转）；
+    无公告/抓取失败时明确提示，不输出空泛内容。"""
+    ann = r.get("announcement") or {}
+    verdict = r.get("announcement_verdict") or {}
+    sentiment = str(verdict.get("sentiment") or "")
+    with st.container(border=True):
+        st.markdown(f"**最新公告查询** · {ann.get('stock_code', '')}"
+                    f"（近 {ann.get('query_days', 7)} 日）")
+        if verdict:
+            kind = _ANN_SENTIMENT_RENDER.get(sentiment, "info")
+            icon = {"利好": "📈", "利空": "📉", "中性": "➖"}.get(sentiment, "📋")
+            st.markdown(f"{icon} **{sentiment or '待定'}**：{verdict.get('reason', '')}")
+            if verdict.get("cross_check"):
+                st.markdown(f"**交叉验证**：{verdict['cross_check']}")
+            if verdict.get("risk_note"):
+                st.markdown(f"**风险提示**：{verdict['risk_note']}")
+        items = ann.get("items") or []
+        if not items:
+            st.warning(ann.get("message", "未查询到该标的近期公开公告"))
+        else:
+            st.caption(ann.get("message", ""))
+            for it in items[:8]:
+                url = it.get("url") or ""
+                title = str(it["title"])
+                if url and url != "链接未提供":
+                    title = f"[{title}]({url})"
+                st.markdown(f"- {str(it.get('published_at', ''))[:16]} **{title}**"
+                            f"（{it.get('source', '') or '东财'} · {it.get('ann_type', '其他')}）")
+                if it.get("summary"):
+                    st.caption(str(it["summary"])[:120])
+            if len(items) > 8:
+                st.caption(f"… 共 {len(items)} 条，其余见对话历史 meta")
+
 # ================= 左右布局：左=Agent 列表（选中高亮）+ 职责卡片；右=对话主区域 =================
 left, right = st.columns([1, 2.8], gap="medium")
 with left:
@@ -107,6 +145,8 @@ with right:
                         render.trace_line("依据来源", source=str(r["sources"]))
                     if r.get("scope_note"):
                         st.info(f"职责边界：{r['scope_note']}")
+                    if r.get("announcement"):
+                        _render_announcement(r)
                     if st.button("清空本次回答"):
                         st.session_state.pop("_chat_ask_tid", None)
                         st.rerun(scope="app")

@@ -68,13 +68,15 @@ def _run(tid: str) -> None:
 
 
 def _safe_result(result: Any) -> Any:
-    """结果只保留 JSON 安全的摘要（失败/异常时为空），不放大内存占用"""
+    """结果只保留 JSON 安全的摘要（失败/异常时为空），不放大内存占用。
+    dict/list 递归保留嵌套结构（如对话回答中的 announcement 结构化数据）；
+    非 JSON 类型收窄为字符串摘要。"""
     if isinstance(result, dict):
-        return {k: v for k, v in result.items() if isinstance(v, (str, int, float, bool)) or v is None}
+        return {k: _safe_result(v) for k, v in result.items()}
+    if isinstance(result, list):
+        return [_safe_result(v) for v in result[:100]]
     if isinstance(result, (str, int, float, bool)) or result is None:
         return result
-    if isinstance(result, (list, tuple)):
-        return str(result)[:200]
     return str(result)[:200]
 
 

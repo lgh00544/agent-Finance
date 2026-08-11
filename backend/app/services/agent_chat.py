@@ -88,6 +88,12 @@ class ChatAnswer(BaseModel):
                                            "私有知识库《标题》/分职能战法知识库/公开行情数据）")
     scope_note: str = Field(default="",
                             description="职责边界说明：问题超出本 Agent 领域时明确说明不属于本领域，不越界作答")
+    announcement_verdict: dict | None = Field(
+        default=None,
+        description="个股公告研判（仅公告查询场景，非公告问题留空）："
+                    "{sentiment: 利好/利空/中性, reason: 一句话理由, "
+                    "cross_check: 与股价/量价/资金的交叉验证说明, risk_note: 风险提示}；"
+                    "未查询到公告时为 null")
 
 
 class RuleFeedback(BaseModel):
@@ -248,9 +254,54 @@ def _holding_context() -> str:
     return "\n".join(lines)
 
 
+# ==================== 个股最新公告查询触发（对话链路增量能力） ====================
+
+_ANNOUNCEMENT_KEYWORDS = ("公告", "利好", "利空", "最新消息", "消息面", "新发布")
+
+_ANNOUNCEMENT_SYSTEM_PROMPT = """
+【个股公告研判标准（本次对话已注入该标的近期公告数据，仅当存在公告数据时适用）】
+1. 公告类型定性：按注入数据中的 ann_type 分类说明（定增/回购/业绩预告/重大合同/高管增减持/
+   监管函/股权质押/立案调查/重组并购等）；
+2. 基本面影响定性：利好 / 利空 / 中性 三态，给出一句话理由（reason）；
+3. 交叉验证（cross_check）：结合当前股价位置、量价、资金（对话上下文中可获得的行情数据）交叉验证。
+   公告单一维度不得直接给出买卖建议，须与其他维度交叉验证；尤其警惕「利好消息 + 股价不涨 =
+   主力借利好出货」（项目 K189/派发期最高风险原则）；
+4. 输出：announcement_verdict 字段（sentiment/reason/cross_check/risk_note），answer 文本给出
+   可读的完整研判总结；信心度 confidence 按公告信息完整度与验证充分度取值；
+5. 无公告 / 抓取失败时：announcement_verdict 置 null，answer 明确说明「未查询到该标的近期公开公告」
+   或抓取失败原因，不得编造公告内容。"""
+
+
+def _announcement_context(question: str) -> tuple[str, dict | None]:
+    """公告查询触发：命中公告关键词且解析出 6 位代码时，注入该股近 7 日公告。
+
+    返回 (注入文本, 公告结构化数据 dict)；未触发 / 抓取失败均优雅降级，绝不阻塞对话主流程。"""
+    if not any(kw in question for kw in _ANNOUNCEMENT_KEYWORDS):
+        return "", None
+    from app.services.announcement_service import fetch_latest_announcement, parse_stock_code
+    code = parse_stock_code(question)
+    if not code:
+        return ("提示：用户问题疑似在询问个股最新公告/利好利空，但未解析到 6 位股票代码，"
+                "请在回答中请用户补充具体股票代码。", None)
+    try:
+        data = fetch_latest_announcement(code)
+    except Exception as exc:  # noqa: BLE001 公告查询失败不阻塞对话
+        logger.warning("公告查询失败 %s: %s", code, exc)
+        return ("（该标的公告查询失败，以下回答基于其他可用信息）", None)
+    lines = [f"【{code} 近{data['query_days']}日最新公告/新闻（真源：news_article 库 + 东财接口）】"]
+    for it in data["items"]:
+        lines.append(f"- {it['published_at']} [{it['ann_type']}] {it['title']}"
+                     f"（来源：{it['source'] or '东财'}）正文摘要：{it['summary'][:200] or '（无）'}"
+                     f"官方链接：{it['url']}")
+    if not data["items"]:
+        lines.append(f"（{data['message']}）")
+    return "\n".join(lines), data
+
+
 def ask_agent(agent: str, question: str) -> dict:
     """文字提问答疑：agent_call 固定段序注入知识，ttl=0 不命中缓存（交互即时性）；
-    问题涉及持仓操作时自动注入分档止盈/止损/仓位建议（与页面格式一致，零改动 Agent 调度）"""
+    问题涉及持仓操作时自动注入分档止盈/止损/仓位建议（与页面格式一致，零改动 Agent 调度）；
+    问题涉及个股最新公告/利好利空时自动抓取并注入该股近 7 日公告做交叉研判。"""
     meta = _require_agent(agent)
     if not question or not question.strip():
         raise ValueError("问题不能为空")
@@ -259,19 +310,31 @@ def ask_agent(agent: str, question: str) -> dict:
         ctx = _holding_context()
         if ctx:
             user_prompt = f"{user_prompt}\n\n{ctx}"
+    system_prompt = _CHAT_SYSTEM_PROMPT
+    announcement_data: dict | None = None
+    ann_ctx, announcement_data = _announcement_context(question)
+    if ann_ctx:
+        user_prompt = f"{user_prompt}\n\n{ann_ctx}"
+        system_prompt = f"{system_prompt}\n{_ANNOUNCEMENT_SYSTEM_PROMPT}"
     key = f"chat:{agent}:{hashlib.md5(question.strip().encode('utf-8')).hexdigest()[:10]}"
     answer = common.agent_call(
-        agent=agent, cache_key=key, system_prompt=_CHAT_SYSTEM_PROMPT,
+        agent=agent, cache_key=key, system_prompt=system_prompt,
         user_prompt=user_prompt,
         schema=ChatAnswer, ttl_seconds=0, model_level=ModelLevel.DEEP)
     sources_text = "；".join(s for s in answer.sources if s) or "未标注具体来源"
     payload = {"answer": answer.answer, "confidence": answer.confidence,
                "sources": sources_text, "scope_note": answer.scope_note}
+    if announcement_data is not None:
+        payload["announcement"] = announcement_data
+        if answer.announcement_verdict:
+            payload["announcement_verdict"] = answer.announcement_verdict
     user_mid = _record(agent, "user", question.strip(), "qa")
     _record(agent, "assistant", answer.answer, "qa", meta={"confidence": answer.confidence,
                                                            "sources": answer.sources,
                                                            "scope_note": answer.scope_note,
-                                                           "user_msg_id": user_mid})
+                                                           "user_msg_id": user_mid,
+                                                           **({"announcement": announcement_data}
+                                                              if announcement_data else {})})
     return payload
 
 
