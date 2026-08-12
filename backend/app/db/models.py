@@ -98,6 +98,25 @@ class MarketCondition(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class MarketIntel(Base):
+    """市场研判底座（每日收盘后 1 次 + 手动入口）：阶段定性/核心矛盾/风险偏好/量能信号/
+    操作含义/次日盯盘点，作为全部 agent 的参考维度注入（只新增表，不迁移不改旧表）"""
+    __tablename__ = "market_intel"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_market_intel_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD 唯一
+    phase: Mapped[str] = mapped_column(String(32), default="")       # 阶段定性（启动/主升/分化/存量博弈…）
+    core_conflict: Mapped[str] = mapped_column(Text, default="")     # 核心矛盾
+    risk_appetite: Mapped[str] = mapped_column(String(16), default="")  # 风险偏好（进取/中性/避险）
+    volume_signal: Mapped[dict] = mapped_column(SafeJSON, default=dict)  # 板块量比明细+放量/缩量分布
+    operative_meaning: Mapped[dict] = mapped_column(SafeJSON, default=dict)  # 操作含义（精选/回避/买点标准）
+    next_day_watch: Mapped[dict] = mapped_column(SafeJSON, default=dict)  # 次日盯盘点
+    summary: Mapped[str] = mapped_column(Text, default="")           # 一句话总结（供注入参考）
+    raw: Mapped[dict] = mapped_column(SafeJSON, default=dict)        # 全部输入原始数据（可追溯）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class StockScore(Base):
     """评分结果（ScoreAgent 输出）"""
     __tablename__ = "stock_score"

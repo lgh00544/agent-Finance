@@ -1,7 +1,9 @@
 """候选池可建仓判定（纯事实计算 + 每日落库）
 
 硬性三条件（口径经用户确认）：
-  c1 综合评级 ≥ B：候选 detail.confidence_tier 映射（强烈推荐→A、建议关注→B、谨慎观察→C）；
+  c1 综合评级 ≥ B：唯一读取 stock_score.grade（ScoreAgent 五维权威评分，与建仓 gate run_position
+     同源）；无评分返回 None（= 未评级/不可建仓），绝不拿 Discover confidence_tier 冒充评级；
+     人工覆盖（candidate_adjust.tier_override）优先于评分，仍只在 A/B/C 内有效。
   c2 当前股价处于建仓计划首仓买入区间：仅已有 position_plan 的标的判定（现价 ∈ batches[0].price_zone
      解析区间）；无方案 → 判不满足并标注「暂无建仓方案，买点未验证」；
   c3 无重大利空/未触发风控红线：候选入库已过 HARD_RULES 一票否决（默认满足），叠加 detail.risks/
@@ -89,7 +91,8 @@ def judge_tradeable(cand: dict, tier_effective: str, plan: dict | None,
     else:
         reasons.append("暂无建仓方案，买点未验证")
     if not cond_grade:
-        reasons.append("评级未达 B（C 级仅观察）")
+        reasons.append("未评级/无权威评分（仅观察，不可建仓）" if tier_effective is None
+                       else "评级未达 B（C 级仅观察）")
     if not cond_risk:
         reasons.append("候选风险含重大利空类表述")
 
@@ -106,12 +109,14 @@ def judge_tradeable(cand: dict, tier_effective: str, plan: dict | None,
             "plan_exists": plan_exists, "price_zone": price_zone, "current_price": current_price}
 
 
-def _effective_tier(cand: dict, adjusts: dict) -> str:
-    """人工覆盖优先，否则置信档位映射"""
+def _effective_tier(cand: dict, adjusts: dict, trade_date: str) -> str | None:
+    """唯一评级来源（与建仓 gate 同源）：人工覆盖优先 → 否则读该股当日/最近
+    stock_score.grade（ScoreAgent 权威评分）；无评分返回 None（= 未评级/不可建仓），
+    绝不拿 Discover confidence_tier 冒充评级。"""
     adj = adjusts.get(cand.get("stock_code"))
     if adj and adj.get("tier_override") in ("A", "B", "C"):
         return adj["tier_override"]
-    return tier_of(((cand.get("detail") or {}).get("confidence_tier") or ""))
+    return repo.get_closest_score_grade(cand.get("stock_code") or "", trade_date)
 
 
 def _latest_plan_for(code: str) -> dict | None:
@@ -142,7 +147,7 @@ def ensure_tradeable(trade_date: str) -> int:
         try:
             snapshot = repo.get_candidate_snapshot(code, trade_date)
             plan = _latest_plan_for(code)
-            tier = _effective_tier(cand, adjusts)
+            tier = _effective_tier(cand, adjusts, trade_date)
             res = judge_tradeable(cand, tier, plan, snapshot)
         except Exception as exc:  # noqa: BLE001 单标的异常不阻塞整体
             logger.warning("可建仓判定 %s@%s 失败: %s", code, trade_date, exc)

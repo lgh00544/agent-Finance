@@ -282,11 +282,15 @@ def _wyckoff_columns(source: DataSource, code: str) -> dict:
     return out
 
 
+_WYCKOFF_BUDGET = 600  # 威科夫整体超时预算（秒）：东财降级时宁可跳过也不无限等（防卡死 2 小时复现）
+
+
 def _fill_wyckoff_columns(source: DataSource, universe: list[dict]) -> None:
     """初筛表威科夫列前置：对全部候选补算相对结构列（只喂数据，不做阈值过滤）。
     并发拉日K（限流器按 kind 全局锁控制发起频率，网络往返并行；日K 3600s 缓存
-    后续 enrich_data 直接复用，不重复请求）；单股失败留空不阻塞。"""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    后续 enrich_data 直接复用，不重复请求）；单股失败留空不阻塞；
+    整体超时预算 _WYCKOFF_BUDGET 秒，超时未算完的股打 WARNING 跳过（空结构列继续）。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
     def _work(u: dict) -> tuple[str, dict]:
         code = str(u.get("code") or "")
@@ -296,15 +300,23 @@ def _fill_wyckoff_columns(source: DataSource, universe: list[dict]) -> None:
         for u in universe:
             u.update(_work(u)[1])
         return
+    done = 0
     with ThreadPoolExecutor(max_workers=min(_PARALLEL_MAX, len(universe))) as pool:
         futures = [pool.submit(_work, u) for u in universe]
-        for fut in as_completed(futures):
-            code, cols = fut.result()
-            for u in universe:
-                if str(u.get("code")) == code:
-                    u.update(cols)
-                    break
-    logger.info("威科夫相对结构列计算完成: %s 只", len(universe))
+        try:
+            for fut in as_completed(futures, timeout=_WYCKOFF_BUDGET):
+                code, cols = fut.result()
+                done += 1
+                for u in universe:
+                    if str(u.get("code")) == code:
+                        u.update(cols)
+                        break
+        except TimeoutError:
+            skipped = len(futures) - done
+            logger.warning("威科夫列计算整体超时 %ds，已算 %d 只，跳过 %d 只（空结构列继续）",
+                           _WYCKOFF_BUDGET, done, skipped)
+            pool.shutdown(wait=False, cancel_futures=True)  # 先丢未开始任务，尽快释放线程
+    logger.info("威科夫相对结构列计算完成: %s 只", done)
 
 
 def _merge_universe_fields(shortlist: list[dict], universe: list[dict]) -> None:

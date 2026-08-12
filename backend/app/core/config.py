@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     log_backup_count: int = 5    # 轮转保留份数（单文件×份数≈日志总占用上限）
 
     # ---------- 数据源 ----------
-    datasource_timeout: int = 15  # akshare 请求超时秒数
+    datasource_timeout: int = 5  # akshare 请求超时秒数（15→5：降级时快速失败，防 300 股串行拖死）
 
     # ---------- 数据源稳定性（请求加固/断路器/限流） ----------
     # 东财/新浪实时接口易被反爬限流：浏览器请求头 + 超时拆分 + 失败后间隔重试 1 次 +

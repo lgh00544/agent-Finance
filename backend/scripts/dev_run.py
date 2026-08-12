@@ -66,7 +66,22 @@ def _sync_on_start() -> None:
         log.warning("启动同步失败（%s），降级使用本地数据启动", exc)
 
 
+def _port_busy(host: str, port: int) -> bool:
+    """探测端口是否已被监听（多实例防护：已有后端在跑时拒绝重复启动，
+    防止两个 APScheduler 抢同一把 daily_discover 任务锁）"""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex((host, port)) == 0
+
+
 if __name__ == "__main__":
+    if _port_busy("127.0.0.1", 8000):
+        log.warning("127.0.0.1:8000 已被占用：已有后端实例在跑，拒绝重复启动"
+                    "（防双实例双 APScheduler 抢任务锁）")
+        sys.exit(1)
+
     _sync_on_start()
 
     import uvicorn

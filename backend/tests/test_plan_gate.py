@@ -152,3 +152,42 @@ def test_daily_pipeline_auto_plans_for_b_plus(monkeypatch):
     assert result["scored"] == 2
     assert result["plans"] == 1, "仅 B+ 候选应生成计划（C 级被拒）"
     assert planned == [("600001", "candidate")], "联动生成应标记来源为每日候选池"
+
+
+def test_daily_pipeline_links_tradeable_labels(monkeypatch):
+    """每日流水线收尾：细筛（run_score）后联动 ensure_tradeable 落库当日「可建仓」标签
+    （评分同源终态口径；幂等覆盖；页面请求不再懒算差异）"""
+    monkeypatch.setattr(router, "run_discover", lambda date: {
+        "candidates": [{"stock_code": "600001", "stock_name": "测试A"}]})
+    monkeypatch.setattr(router, "run_score",
+                        lambda code, name="", date=None:
+                        {"score_result": {"score": 80, "grade": "A"}})
+    monkeypatch.setattr(router, "run_position",
+                        lambda code, name="", date=None, source="manual":
+                        {"position_plan": {"plan_id": 1}})
+    dates_called = []
+    monkeypatch.setattr("app.services.candidate_tradeable.ensure_tradeable",
+                        lambda date: dates_called.append(date) or 5)
+    result = router.run_daily_pipeline("2026-08-09")
+    assert dates_called == ["2026-08-09"], "收尾应以当日 date_key 触发标签联动"
+    assert result["tradeable"] == 5, "返回 dict 应带判定条数"
+
+
+def test_daily_pipeline_tradeable_failure_degrades(monkeypatch):
+    """标签联动失败仅降级（warning），不阻塞主链路返回"""
+    monkeypatch.setattr(router, "run_discover", lambda date: {
+        "candidates": [{"stock_code": "600001", "stock_name": "测试A"}]})
+    monkeypatch.setattr(router, "run_score",
+                        lambda code, name="", date=None:
+                        {"score_result": {"score": 80, "grade": "A"}})
+    monkeypatch.setattr(router, "run_position",
+                        lambda code, name="", date=None, source="manual":
+                        {"position_plan": {"plan_id": 1}})
+
+    def _boom(date):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("app.services.candidate_tradeable.ensure_tradeable", _boom)
+    result = router.run_daily_pipeline("2026-08-09")
+    assert result["candidates"] == 1 and result["scored"] == 1
+    assert result["tradeable"] == 0, "失败降级为 0，不阻塞主链路"

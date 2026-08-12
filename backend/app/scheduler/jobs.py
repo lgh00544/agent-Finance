@@ -16,6 +16,7 @@ from app.cache import cache
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.datasource.akshare_source import AkshareSource
+from app.db import repo
 from app.graph import router as graph_router
 
 logger = get_logger("scheduler")
@@ -60,6 +61,26 @@ def track_verify_job() -> None:
     safe = {k: v for k, v in result.items() if k not in ("stats",)}
     logger.info("候选T+N验证完成: %s", safe)
     cache.set("job:last_track_verify", today, 86400)
+
+
+def market_intel_job() -> None:
+    """每日收盘后市场研判（16:20，独立于每日挖掘；当天已生成则跳过，幂等）"""
+    from app.graph.router import run_market_intel
+
+    today = time.strftime("%Y-%m-%d")
+    if repo.get_market_intel(today):
+        logger.info("今日市场研判已生成，跳过定时触发")
+        return
+    try:
+        result = run_market_intel(today)
+        mi = result.get("market_intel")
+        if mi:
+            logger.info("市场研判完成: %s（%s，风险偏好 %s）", today, mi.get("phase"),
+                        mi.get("risk_appetite"))
+        elif result.get("error"):
+            logger.error("市场研判失败: %s", result["error"])
+    except Exception as exc:  # noqa: BLE001 定时任务整体容错
+        logger.error("市场研判定时任务失败: %s", exc)
 
 
 def daily_discover_job() -> None:
@@ -193,6 +214,11 @@ def start_scheduler() -> None:
     scheduler.add_job(daily_discover_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=10,
                       id="daily_discover", name="每日潜力股挖掘",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 工作日 16:20 市场研判（独立于每日挖掘；当天已生成跳过，幂等）
+    scheduler.add_job(market_intel_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=20,
+                      id="market_intel", name="市场研判",
                       replace_existing=True, misfire_grace_time=3600)
     # 交易日 9:00-16:00 每 N 分钟触发（函数内过滤：盘中高频 + 15:00-15:30 收盘校验低频）
     monitor_minutes = max(1, int(settings.monitor_interval_minutes))

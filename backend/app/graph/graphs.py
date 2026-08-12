@@ -6,7 +6,7 @@ import logging
 
 from langgraph.graph import END, START, StateGraph
 
-from app.agents import discover, monitor, position, review, score, sell
+from app.agents import discover, market_intel, monitor, position, review, score, sell
 from app.graph.state import StockAgentState
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,15 @@ def _build_review() -> StateGraph:
     return g
 
 
+def _build_market_intel() -> StateGraph:
+    """市场研判底座：单节点（聚合客观数据 → LLM 深度研判 → 落库）"""
+    g = StateGraph(StockAgentState)
+    g.add_node("market_intel", market_intel.market_intel_node)
+    g.add_edge(START, "market_intel")
+    g.add_edge("market_intel", END)
+    return g
+
+
 _BUILDERS = {
     "discover": _build_discover,
     "score": _build_score,
@@ -91,6 +100,7 @@ _BUILDERS = {
     "monitor": _build_monitor,
     "sell": _build_sell,
     "review": _build_review,
+    "market_intel": _build_market_intel,
 }
 
 

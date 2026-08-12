@@ -146,6 +146,14 @@ def run_review(holding_id: int, trade_date: str | None = None) -> StockAgentStat
     return graph.invoke(state)
 
 
+def run_market_intel(trade_date: str | None = None) -> StockAgentState:
+    """市场研判底座（独立触发：每日收盘后 1 次 + 手动入口）。
+    产出 market_intel 落库，作为全部 agent 的参考维度注入，不强制改变任何判级。"""
+    graph = get_graph("market_intel")
+    state = _new_state(trade_date=trade_date or time.strftime("%Y-%m-%d"))
+    return graph.invoke(state)
+
+
 def run_daily_pipeline(trade_date: str | None = None) -> dict:
     """每日主链路：discover → 对全部候选打分（供面板查看评分）
 
@@ -204,4 +212,17 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
         else:
             plans_made = sum(_plan_one(i) for i in bplus)
     logger.info("建仓计划联动完成: B+ 候选 %s 只，生成 %s 份", len(bplus), plans_made)
-    return {"candidates": len(candidates), "scored": len(scores), "plans": plans_made}
+
+    # 候选池「可建仓」标签联动：细筛（批量 run_score）落库后立即按本轮 stock_score.grade
+    # 重算当日判定为终态（与建仓 gate 同源：评分 C/无评分 → 观察/未评级，绝不假标可建仓）；
+    # 幂等覆盖（code+date 唯一），失败仅降级不阻塞主链路；页面请求不再触发口径差异的懒算。
+    tradeable_n = 0
+    try:
+        from app.services import candidate_tradeable
+
+        tradeable_n = candidate_tradeable.ensure_tradeable(date_key)
+        logger.info("候选池可建仓标签联动完成: %s 只（%s）", tradeable_n, date_key)
+    except Exception as exc:  # noqa: BLE001 标签联动失败不阻塞主链路
+        logger.warning("候选池可建仓标签联动失败 %s: %s", date_key, exc)
+    return {"candidates": len(candidates), "scored": len(scores), "plans": plans_made,
+            "tradeable": tradeable_n}

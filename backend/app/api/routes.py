@@ -55,6 +55,7 @@ def _task_daily_pipeline(params: dict) -> dict:
 
 _TASK_KINDS: dict[str, tuple[str, object]] = {
     "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
+    "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
     "score": ("单股评分",
               lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
     "position": ("分批建仓方案",
@@ -78,6 +79,17 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "track_backfill": ("候选池T+N历史回填", lambda p: _task_track_verify(True)),
     "track_suggest": ("选股验证建议生成", lambda p: _task_track_suggest()),
 }
+
+
+def _task_market_intel() -> dict:
+    """市场研判底座（手动入口）：聚合客观数据 → LLM 深度研判 → 落库 market_intel"""
+    result = graph_router.run_market_intel()
+    mi = result.get("market_intel") or {}
+    return {"trade_date": mi.get("trade_date"),
+            "phase": mi.get("phase"),
+            "risk_appetite": mi.get("risk_appetite"),
+            "summary": mi.get("summary"),
+            "error": result.get("error")}
 
 
 def _task_monitor_all() -> dict:
@@ -212,6 +224,16 @@ def retry_task(tid: str):
     return {"task_id": tid, "status": "pending"}
 
 
+@router.post("/tasks/{tid}/cancel")
+def cancel_task(tid: str):
+    """手动取消卡死任务（仅待执行/执行中可取消；取消后立即释放任务队列，
+    新任务可提交，无需重启后端）"""
+    if not task_queue.cancel(tid):
+        raise HTTPException(status_code=400,
+                            detail="任务不存在或当前状态不可取消（仅待执行/执行中可取消）")
+    return {"task_id": tid, "status": "failed", "canceled": True}
+
+
 # ================= 任务触发 =================
 class CodeBody(BaseModel):
     stock_code: str = Field(description="6 位股票代码")
@@ -222,6 +244,30 @@ class CodeBody(BaseModel):
 def run_discover_job():
     """手动触发每日挖掘（异步提交：discover → 候选打分 全流程后台执行）"""
     return _submit_task("daily_pipeline", {})
+
+
+# ================= 市场研判底座（market_intel：独立触发 + 独立查看） =================
+
+@router.post("/market_intel/run")
+def run_market_intel_job():
+    """手动触发市场研判（异步提交：聚合数据 → LLM 深度研判 → 落库 market_intel）"""
+    return _submit_task("market_intel", {})
+
+
+@router.get("/market_intel")
+def get_market_intel(date: str | None = None):
+    """当日/指定日期市场研判（无参数默认最新一日；不存在返回 404）"""
+    row = (repo.get_market_intel(date) if date
+           else repo.get_latest_market_intel())
+    if row is None:
+        raise HTTPException(status_code=404, detail="当日市场研判不存在（可手动触发生成）")
+    return row
+
+
+@router.get("/market_intel/dates")
+def market_intel_dates(limit: int = 30):
+    """已生成市场研判的日期列表（最新在前，页面选日期）"""
+    return {"dates": repo.list_market_intel_dates(limit)}
 
 
 @router.get("/jobs/status")

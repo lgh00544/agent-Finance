@@ -58,7 +58,7 @@ def _judged_rows(date: str) -> list[dict]:
         try:
             snapshot = repo.get_candidate_snapshot(code, date)
             plan = _latest_plan_for(code)
-            tier = _effective_tier(cand, adjusts)
+            tier = _effective_tier(cand, adjusts, date)
             res = judge_tradeable(cand, tier, plan, snapshot)
         except Exception as exc:  # noqa: BLE001 单标的判定异常不阻塞批量
             logger.warning("批量对话判定 %s@%s 失败: %s", code, date, exc)

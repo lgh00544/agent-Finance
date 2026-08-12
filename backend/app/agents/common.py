@@ -256,6 +256,22 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
         sections.append(system_prompt)
     sys_prompt = "\n\n".join(sections)
 
+    # 拼接位5 · 市场研判底座参考（共享注入：全部 agent 的参考维度，不强制改变任何判级；
+    # 当日已有 market_intel 时注入压缩参考文本，无则跳过；读库零额外 LLM 调用）
+    try:
+        mi = repo.get_latest_market_intel()
+    except Exception:  # noqa: BLE001 注入失败不影响主链路
+        mi = None
+    if mi:
+        op = mi.get("operative_meaning") or {}
+        op_brief = "；".join(f"{k}:{v}" for k, v in list(op.items())[:4])
+        user_prompt = (
+            f"{user_prompt}\n\n【市场研判参考（{mi.get('trade_date')}，参考维度不强制）】"
+            f"阶段定性：{mi.get('phase')}；核心矛盾：{mi.get('core_conflict')}；"
+            f"风险偏好：{mi.get('risk_appetite')}；操作含义：{op_brief or '（无）'}；"
+            f"一句话总结：{mi.get('summary')}"
+        )
+
     version = repo.get_trade_profile().version
     return call_llm_cached(agent,
                            f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}:{_agent_knowledge_version(agent)}:r{_rule_version()}",

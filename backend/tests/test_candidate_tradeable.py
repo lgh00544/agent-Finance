@@ -1,16 +1,18 @@
 """可建仓判定 service 测试：
 1. _zone_bounds 区间解析（正常/单点/失败）
-2. judge_tradeable 三条件命中/未命中矩阵（无方案/买点偏离/C 级/重大利空/现价兜底/区间无法解析）
-3. _effective_tier 人工覆盖优先 + 置信档位映射兜底
+2. judge_tradeable 三条件命中/未命中矩阵（无方案/买点偏离/C 级/无评分/重大利空/现价兜底/区间无法解析）
+3. _effective_tier 人工覆盖优先 + 唯一读 stock_score.grade（无评分返回 None，不拿 confidence_tier 兜底）
 4. ensure_tradeable 幂等落库 + ensure_if_missing 懒补算
 5. plan_candidate_count 联动指标
 6. tradeable_view 视图形状（count=0 也明确返回）
+7. repo.get_closest_score_grade 当日优先/回退过去/无评分 None
 """
 import pytest
 from sqlalchemy import delete
 
 from app.db import repo
-from app.db.models import CandidateAdjust, CandidateTradeable, PositionPlan, StockCandidate
+from app.db.models import (CandidateAdjust, CandidateTradeable, PositionPlan,
+                           StockCandidate, StockScore)
 from app.db.session import SessionLocal, init_db
 from app.services.candidate_tradeable import (_effective_tier, _zone_bounds,
                                               ensure_if_missing, ensure_tradeable,
@@ -32,6 +34,7 @@ def _clean():
         db.execute(delete(CandidateTradeable))
         db.execute(delete(PositionPlan))
         db.execute(delete(StockCandidate))
+        db.execute(delete(StockScore))
         db.commit()
     repo._invalidate("tradeable")
     repo._invalidate("candidate")
@@ -116,12 +119,67 @@ def test_tier_of_mapping():
     assert tier_of("") == ""
 
 
-# ==================== 3. _effective_tier ====================
+# ==================== 3. _effective_tier（唯一读 stock_score.grade，不兜底） ====================
+
+def _seed_scores():
+    with SessionLocal() as db:
+        db.add_all([
+            StockScore(stock_code="600000", stock_name="评分股", trade_date=DATE,
+                       score=55.0, grade="C", detail={}, risk_list=[]),
+            StockScore(stock_code="600004", stock_name="B评分股", trade_date=DATE,
+                       score=72.0, grade="B", detail={}, risk_list=[]),
+        ])
+        db.commit()
+    repo._invalidate("score")
+
 
 def test_effective_tier_override_first():
     cand = _cand(tier="谨慎观察")
-    assert _effective_tier(cand, {"600000": {"tier_override": "A"}}) == "A"
-    assert _effective_tier(cand, {}) == "C"
+    _seed_scores()  # 600000 有评分 C；人工覆盖仍最优先
+    assert _effective_tier(cand, {"600000": {"tier_override": "A"}}, DATE) == "A"
+    assert _effective_tier(cand, {}, DATE) == "C"           # 评分 C，即使 confidence_tier 非 C 也不误判
+
+
+def test_effective_tier_score_grade_is_authoritative():
+    """评分 C + Discover confidence_tier=强烈推荐 → 返回 C（权威评分同源，不被粗筛冒充）"""
+    cand = _cand(tier="强烈推荐")
+    _seed_scores()
+    assert _effective_tier(cand, {}, DATE) == "C"
+
+
+def test_effective_tier_no_score_returns_none():
+    """无任何评分 → None（= 未评级/不可建仓），绝不拿 Discover confidence_tier 兜底"""
+    cand = {"stock_code": "600999", "stock_name": "无评分股",
+            "detail": {"confidence_tier": "强烈推荐", "risks": ["无"]}}
+    assert _effective_tier(cand, {}, DATE) is None
+
+
+def test_judge_tradeable_none_tier_not_tradeable():
+    """tier=None（未评级）→ 不可建仓 + 观察 + 明确原因"""
+    res = judge_tradeable(_cand(), None, _plan(), {"price": "23.8"})
+    assert res["is_tradeable"] == 0
+    assert res["label"] == "观察"
+    assert res["cond_grade"] == 0
+    assert "无权威评分" in res["block_reason"]
+
+
+# ==================== 3.5 repo.get_closest_score_grade ====================
+
+def test_get_closest_score_grade_same_day_first():
+    _seed_scores()
+    assert repo.get_closest_score_grade("600000", DATE) == "C"
+
+
+def test_get_closest_score_grade_fallback_to_past():
+    """当日无评分 → 回退最近一条不晚于 trade_date 的过去评分"""
+    _seed_scores()
+    assert repo.get_closest_score_grade("600000", "2026-08-11") == "C"   # 当日无 → 回退 08-10
+    assert repo.get_closest_score_grade("600004", "2026-08-12") == "B"
+
+
+def test_get_closest_score_grade_none():
+    assert repo.get_closest_score_grade("999999", DATE) is None
+    assert repo.get_closest_score_grade("600000", "2026-08-01") is None  # 早于最早评分
 
 
 # ==================== 4. ensure_tradeable 幂等 ====================
@@ -138,9 +196,17 @@ def _seed_candidates():
             StockCandidate(stock_code="600003", stock_name="C级观察股", trade_date=DATE, rank=3,
                            reasons=["谨慎"], risk_notice=[], snapshot={"price": "5.5"},
                            detail={"confidence_tier": "谨慎观察", "risks": ["无"]}),
+            # 权威评分（ScoreAgent）：与候选同日，c1 评级唯一来源（与建仓 gate 同源）
+            StockScore(stock_code="600001", stock_name="可建仓股", trade_date=DATE,
+                       score=85.0, grade="A", detail={}, risk_list=[]),
+            StockScore(stock_code="600002", stock_name="无方案股", trade_date=DATE,
+                       score=72.0, grade="B", detail={}, risk_list=[]),
+            StockScore(stock_code="600003", stock_name="C级观察股", trade_date=DATE,
+                       score=55.0, grade="C", detail={}, risk_list=[]),
         ])
         db.commit()
     repo._invalidate("candidate")
+    repo._invalidate("score")
 
 
 def _seed_plan():

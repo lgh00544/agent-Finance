@@ -10,7 +10,8 @@ import pytest
 from sqlalchemy import delete
 
 from app.db import repo
-from app.db.models import AgentChatMessage, BatchAdjust, CandidateAdjust, StockCandidate
+from app.db.models import (AgentChatMessage, BatchAdjust, CandidateAdjust,
+                           StockCandidate, StockScore)
 from app.db.session import SessionLocal, init_db
 from app.services.batch_chat import (apply_batch_adjust, ask_batch,
                                      resolve_scope, rollback_batch_adjust)
@@ -30,6 +31,7 @@ def _clean():
         db.execute(delete(BatchAdjust))
         db.execute(delete(CandidateAdjust))
         db.execute(delete(StockCandidate))
+        db.execute(delete(StockScore))
         db.commit()
     repo._invalidate("candidate")
     repo._invalidate("plan")
@@ -38,7 +40,7 @@ def _clean():
 
 
 def _seed():
-    """3 只候选：600001=可建仓(A)、600002=无方案(B)、600003=C 级"""
+    """3 只候选 + 权威评分（细筛同源）：600001=可建仓(A)、600002=无方案(B)、600003=C 级"""
     with SessionLocal() as db:
         db.add_all([
             StockCandidate(stock_code="600001", stock_name="可建仓股", trade_date=DATE, rank=1,
@@ -50,9 +52,17 @@ def _seed():
             StockCandidate(stock_code="600003", stock_name="C级观察股", trade_date=DATE, rank=3,
                            reasons=["谨慎"], risk_notice=[], snapshot={"price": "5.5"},
                            detail={"confidence_tier": "谨慎观察", "risks": ["无"]}),
+            # 权威评分（ScoreAgent）：c1 评级唯一来源（与建仓 gate 同源）
+            StockScore(stock_code="600001", stock_name="可建仓股", trade_date=DATE,
+                       score=85.0, grade="A", detail={}, risk_list=[]),
+            StockScore(stock_code="600002", stock_name="无方案股", trade_date=DATE,
+                       score=72.0, grade="B", detail={}, risk_list=[]),
+            StockScore(stock_code="600003", stock_name="C级观察股", trade_date=DATE,
+                       score=55.0, grade="C", detail={}, risk_list=[]),
         ])
         db.commit()
     repo._invalidate("candidate")
+    repo._invalidate("score")
 
 
 def _make_answer(plan=None):

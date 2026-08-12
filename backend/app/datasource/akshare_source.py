@@ -87,12 +87,67 @@ _INDEX_COLS = {"日期": "date", "开盘": "open", "收盘": "close", "最高": 
                "最低": "low", "成交量": "volume", "成交额": "amount"}
 _BOARD_COLS = {"板块名称": "board_name", "板块": "board_name",  # 东财/新浪列名变体
                "最新价": "price", "涨跌幅": "change_pct", "总市值": "total_mv",
-               "换手率": "turnover_rate", "上涨家数": "up_count", "下跌家数": "down_count",
+               "换手率": "turnover_rate", "量比": "volume_ratio",  # 东财板块行情量比（缺失时不编造）
+               "上涨家数": "up_count", "下跌家数": "down_count",
                "领涨股票": "leading_stock", "领涨股": "leading_stock", "股票名称": "leading_stock"}
 _SUSPEND_COLS = {"代码": "code", "名称": "name", "停牌时间": "suspend_time",
                  "停牌原因": "reason", "预计复牌时间": "resume_time"}
 _CONS_COLS = {"代码": "code", "名称": "name", "最新价": "price", "涨跌幅": "change_pct",
               "成交额": "amount", "换手率": "turnover_rate"}
+
+# ---------------- 避险/进取板块归类（市场研判底座输入；纯关键词归类，客观不编造） ----------------
+# 按板块名称关键词归属资金属性：防御/消费类 → 避险池；科技/进攻类 → 进取池
+_DEFENSIVE_KW = ("地产", "房地产", "白酒", "消费", "农林牧渔", "农业", "食品", "医药", "银行",
+                 "公用事业", "电力", "港口", "机场", "公路", "煤炭", "石油")
+_AGGRESSIVE_KW = ("通信", "芯片", "半导体", "算力", "计算机", "电子", "软件", "人工智能", "AI",
+                  "数字经济", "互联网", "新能源", "军工", "证券", "传媒", "游戏", "机器人")
+
+
+def classify_board_groups(board: pd.DataFrame) -> dict:
+    """板块 → 避险池 / 进取池 资金归类（市场研判「风险偏好切换」维度输入）。
+
+    【刚性代码逻辑】仅按板块名关键词归类 + 客观聚合（涨跌幅/量比/成交额均值），不做任何判断；
+    板块表缺失量比/成交额列时该组指标标注 None（数据缺失如实标注，不编造）。
+    返回: {"defensive": [板块名...], "aggressive": [...], "unclassified": [...],
+           "stats": {"defensive": {...}, "aggressive": {...}}}"""
+    if board is None or board.empty or "board_name" not in board.columns:
+        return {"defensive": [], "aggressive": [], "unclassified": [],
+                "stats": {"defensive": None, "aggressive": None, "note": "板块数据缺失"}}
+
+    def _match(name: str, kws: tuple) -> bool:
+        return any(k in str(name) for k in kws)
+
+    groups = {"defensive": [], "aggressive": [], "unclassified": []}
+    for _, row in board.iterrows():
+        name = str(row.get("board_name") or "")
+        if _match(name, _DEFENSIVE_KW):
+            groups["defensive"].append(name)
+        elif _match(name, _AGGRESSIVE_KW):
+            groups["aggressive"].append(name)
+        else:
+            groups["unclassified"].append(name)
+
+    def _stats(names: list[str]) -> dict | None:
+        if not names:
+            return None
+        sub = board[board["board_name"].astype(str).isin(names)]
+        st = {"count": int(len(sub))}
+        for col, key in (("change_pct", "avg_change_pct"),
+                         ("volume_ratio", "avg_volume_ratio")):
+            if col in sub.columns:
+                vals = pd.to_numeric(sub[col], errors="coerce").dropna()
+                st[key] = round(float(vals.mean()), 3) if not vals.empty else None
+            else:
+                st[key] = None  # 源无该字段：如实标注缺失
+        if "amount" in sub.columns:
+            vals = pd.to_numeric(sub["amount"], errors="coerce").dropna()
+            st["sum_amount"] = int(vals.sum()) if not vals.empty else None
+        return st
+
+    return {"defensive": groups["defensive"], "aggressive": groups["aggressive"],
+            "unclassified": groups["unclassified"],
+            "stats": {"defensive": _stats(groups["defensive"]),
+                      "aggressive": _stats(groups["aggressive"])}}
 
 
 def _normalize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
@@ -568,6 +623,31 @@ class AkshareSource(DataSource):
                          ttl_seconds=3600, fallback=fallback,
                          normalize=lambda d: _normalize(d, _INDEX_COLS))
         return _to_json_safe(df)
+
+    def fetch_index_volume_ratios(self, days: int = 6) -> pd.DataFrame:
+        """上证指数近 N 日「量比」序列（市场研判底座·大盘连续量比维度输入）。
+
+        东财指数日线接口无直接量比字段，按成交量比近似：量比 = 当日成交量 ÷ 前 5 日均量
+        （口径在输出标注）；前 5 日不足 3 日的交易日标注 None（数据不足如实标注，不编造）。
+        返回列: date / volume_ratio / close，最多最近 days 行。"""
+        from datetime import datetime, timedelta
+
+        today = time.strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")  # 前置窗口取 5 日均量
+        df = self.fetch_index_daily("sh000001", start, today)
+        if df is None or df.empty or "volume" not in df.columns:
+            return pd.DataFrame(columns=["date", "volume_ratio", "close"])
+        df = df.dropna(subset=["volume"]).reset_index(drop=True)
+        vol = pd.to_numeric(df["volume"], errors="coerce")
+        ratios: list = []
+        for i in range(len(df)):
+            base = vol[max(0, i - 5):i].dropna()
+            if len(base) >= 3 and float(base.mean()) > 0:
+                ratios.append(round(float(vol.iloc[i]) / float(base.mean()), 3))
+            else:
+                ratios.append(None)
+        df["volume_ratio"] = ratios
+        return _to_json_safe(df[["date", "volume_ratio", "close"]].tail(days))
 
     def fetch_index_spot(self) -> pd.DataFrame:
         """三大指数实时行情（东财指数快照：上证系列 + 深证系列，60s 缓存防限流）；

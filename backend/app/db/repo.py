@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable, Holding,
-    HotMoneyProfile, LhbOriginalFlow, MarketCondition,
+    HotMoneyProfile, LhbOriginalFlow, MarketCondition, MarketIntel,
     NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult, RuleChange, SellDecision,
     StockCandidate, StockScore, TradeProfile, TradeRecord, _now,
 )
@@ -140,6 +140,68 @@ def get_latest_market_condition() -> dict | None:
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
+
+
+# ==================== 市场研判底座（market_intel，每日收盘后 1 次 + 手动入口） ====================
+
+def upsert_market_intel(trade_date: str, phase: str, core_conflict: str, risk_appetite: str,
+                        volume_signal: dict, operative_meaning: dict, next_day_watch: dict,
+                        summary: str, raw: dict) -> None:
+    """当日市场研判落库（code 唯一幂等覆盖；只新增，不迁移不改旧表）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(MarketIntel).where(MarketIntel.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = MarketIntel(trade_date=trade_date)
+            db.add(row)
+        row.phase, row.core_conflict, row.risk_appetite = phase, core_conflict, risk_appetite
+        row.volume_signal, row.operative_meaning, row.next_day_watch = (
+            volume_signal, operative_meaning, next_day_watch)
+        row.summary, row.raw = summary, raw
+        db.commit()
+
+
+def get_market_intel(trade_date: str) -> dict | None:
+    """当日市场研判（含全部字段，供页面/共享注入）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(MarketIntel).where(MarketIntel.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {"trade_date": row.trade_date, "phase": row.phase,
+                "core_conflict": row.core_conflict, "risk_appetite": row.risk_appetite,
+                "volume_signal": row.volume_signal or {},
+                "operative_meaning": row.operative_meaning or {},
+                "next_day_watch": row.next_day_watch or {},
+                "summary": row.summary, "raw": row.raw or {},
+                "created_at": str(row.created_at)}
+
+
+def get_latest_market_intel() -> dict | None:
+    """最新一日市场研判（供 agent 共享注入：当日不存在时回退最近一日）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(MarketIntel).order_by(MarketIntel.trade_date.desc()).limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {"trade_date": row.trade_date, "phase": row.phase,
+                "core_conflict": row.core_conflict, "risk_appetite": row.risk_appetite,
+                "volume_signal": row.volume_signal or {},
+                "operative_meaning": row.operative_meaning or {},
+                "next_day_watch": row.next_day_watch or {},
+                "summary": row.summary, "raw": row.raw or {},
+                "created_at": str(row.created_at)}
+
+
+def list_market_intel_dates(limit: int = 30) -> list[str]:
+    """已生成研判的日期列表（页面选日期用，最新在前）"""
+    with SessionLocal() as db:
+        return list(db.execute(
+            select(MarketIntel.trade_date).distinct()
+            .order_by(MarketIntel.trade_date.desc()).limit(limit)).scalars().all())
 
 
 # ==================== 候选池可建仓标记（每日落库·历史可追溯） ====================
@@ -717,6 +779,26 @@ def get_latest_score(code: str) -> StockScore | None:
         return db.execute(
             select(StockScore).where(StockScore.stock_code == code)
             .order_by(StockScore.trade_date.desc()).limit(1)).scalar_one_or_none()
+
+
+def get_closest_score_grade(stock_code: str, trade_date: str) -> str | None:
+    """该股最接近 trade_date 且不晚于 trade_date 的权威评分 grade（ScoreAgent，只读幂等）：
+    当日评分优先，回退到最近一条过去评分；无任何评分返回 None。
+    供候选池「可建仓」c1 评级判定唯一读取（与建仓 gate run_position 同源），
+    不做 Discover confidence_tier 兜底——无评分即「未评级/不可建仓」。"""
+    with SessionLocal() as db:
+        score = db.execute(
+            select(StockScore).where(StockScore.stock_code == stock_code,
+                                     StockScore.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if score is None:
+            score = db.execute(
+                select(StockScore).where(StockScore.stock_code == stock_code,
+                                         StockScore.trade_date <= trade_date)
+                .order_by(StockScore.trade_date.desc()).limit(1)).scalar_one_or_none()
+        if score is not None and score.grade:
+            return score.grade.strip()
+        return None
 
 
 def get_latest_plan(code: str) -> PositionPlan | None:

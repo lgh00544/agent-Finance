@@ -66,6 +66,19 @@ class MarketConditionOutput(BaseModel):
     summary: str = Field(description="当日市况一句话综述（含操作节奏建议）")
 
 
+class MarketIntelOutput(BaseModel):
+    """市场研判底座输出（5 大思考维度引导的深度理解，非打分；数据缺失须明确标注不编造）"""
+    phase: str = Field(description="行情阶段定性（启动/主升/分化/存量博弈/弱势…，给一句依据）")
+    core_conflict: str = Field(description="核心矛盾（增量 vs 存量资金，一段话）")
+    risk_appetite: str = Field(pattern="^(进取|中性|避险)$", description="风险偏好三态")
+    volume_signal: dict = Field(
+        description="量能信号：放量/缩量板块分布、极端天量标注（脉冲或趋势）；数据缺失明确标注")
+    operative_meaning: dict = Field(
+        description="操作含义：精选方向/回避方向/买点标准（参考维度，不强制）")
+    next_day_watch: dict = Field(description="次日盯盘点（前向可验证的观察点）")
+    summary: str = Field(description="一句话总结（供全部 agent 注入参考）")
+
+
 # ================= ScoreAgent 多维打分 =================
 class ScoreDimension(BaseModel):
     """v3.0 白盒维度归因：单维度结论（资金流向维度内部体现游资信号）"""
