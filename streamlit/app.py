@@ -10,6 +10,7 @@ st.set_page_config(page_title="A股决策 Agent 系统", page_icon="📊", layou
 pages = st.navigation({
     "系统概览": [
         st.Page("pages/0_系统概览.py", title="系统概览", icon="🏠", default=True),
+        st.Page("pages/12_市场研判.py", title="市场研判", icon="🧠"),
     ],
     "选股决策": [
         st.Page("pages/1_每日候选池.py", title="每日候选池", icon="📈"),

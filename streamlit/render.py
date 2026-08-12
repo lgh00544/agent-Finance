@@ -323,6 +323,14 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
   padding: 6px 10px; margin: 4px 0;
   border: 1px dashed var(--border); border-radius: 6px; background: var(--bg-input); }
 .learn-desc b { color: var(--text); }
+/* ===== Agent 对话看板化：摘要卡三行缩写 + 看板列头 ===== */
+.board-col-head { display: flex; align-items: center; gap: 6px; margin: 4px 0 10px; }
+.board-col-head .t { color: var(--text-mute); font-size: 12px; }
+.board-sum { margin: 6px 0 4px; font-size: 12px; color: var(--text-dim); line-height: 1.7; }
+.board-line { margin: 2px 0; }
+.board-line .sum-k { color: var(--info); font-weight: 600; }
+.board-risk .sum-k { color: var(--warn); }
+.board-act .sum-k { color: var(--ok); }
 /* ===== 维度归因条（v3.0 白盒框架）：维度名 + 评分条 + 结论色点 + 建议文本 ===== */
 .dim-summary { margin: 0.3rem 0 0.6rem; }
 .dim-block { margin: 0.45rem 0; }
@@ -958,14 +966,25 @@ def task_status_area() -> None:
     - failed：红色提示 + 一键重试（复用原任务ID重新入队）；
     - 任务完成/失败瞬间弹一次性 toast（session_state 标记，不重复弹）；
       任务完成时自动刷新整页（候选池等模块立即展示最新结果，无需手动刷新）；
-    - 无未完成任务时本区域不渲染任何内容。
+    - 无未完成任务时本区域不渲染任何内容；
+    - 节流：距上次请求 <5s 的 rerun（含用户交互触发的整页 rerun）直接复用
+      会话内结果，不重复向后端打请求（fragment 定时刷新独立按 5s 调度）。
     """
+    import time as _t
+
     from api_client import recent_tasks, retry_task
 
-    try:
-        tasks = recent_tasks(limit=8) or []
-    except Exception:  # noqa: BLE001 后端暂不可达时静默跳过，页面主体照常
-        return
+    now = _t.time()
+    last = st.session_state.get("_task_fetch_ts", 0.0)
+    if now - last >= 5:
+        try:
+            tasks = recent_tasks(limit=8) or []
+            st.session_state["_task_fetch_ts"] = now
+            st.session_state["_task_cache"] = tasks
+        except Exception:  # noqa: BLE001 后端暂不可达时静默跳过，页面主体照常
+            return
+    else:
+        tasks = st.session_state.get("_task_cache") or []
     active = [t for t in tasks if t["status"] in ("pending", "running")]
     failed = [t for t in tasks if t["status"] == "failed"]
 
@@ -1082,6 +1101,13 @@ def _bar_sign(value) -> str:
     return _COLOR_UP if v > 0 else (_COLOR_DOWN if v < 0 else _COLOR_FLAT)
 
 
+def _t_now() -> float:
+    """当前时间戳（节流判定基准）"""
+    import time
+
+    return time.time()
+
+
 def _bar_stale_fetch(state_key: str, fn):
     """接口失败时返回上次成功缓存值（标注「上次数据」）；无缓存返回 (None, 错误标记) 显示「数据加载中」"""
     try:
@@ -1109,8 +1135,16 @@ def top_status_bar() -> None:
     st.markdown(_TOP_BAR_CSS, unsafe_allow_html=True)
 
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    acc, acc_err = _bar_stale_fetch("_bar_account", api.account_summary)
-    idx, idx_err = _bar_stale_fetch("_bar_indices", api.market_indices)
+    # 节流：距上次拉取 <60s 的 rerun 复用会话内结果（交互 rerun 不重复打后端；
+    # 失败降级逻辑仍由 _bar_stale_fetch 的 session 缓存兜底）
+    if _t_now() - st.session_state.get("_bar_fetch_ts", 0.0) >= 60:
+        acc, acc_err = _bar_stale_fetch("_bar_account", api.account_summary)
+        idx, idx_err = _bar_stale_fetch("_bar_indices", api.market_indices)
+        st.session_state["_bar_fetch_ts"] = _t_now()
+    else:
+        acc = st.session_state.get("_bar_account")
+        idx = st.session_state.get("_bar_indices")
+        acc_err = idx_err = ""
 
     parts = [f'<span class="bar-label">北京时间</span><b>{now}</b>']
 

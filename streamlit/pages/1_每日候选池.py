@@ -448,11 +448,17 @@ def _batch_panel(trade_date: str, day_rows: list[dict], trade_map: dict) -> None
                 st.session_state.pop("_batch_tid", None)
             elif task and task.get("status") in ("pending", "running"):
                 st.info(f"批量验证处理中（任务 {tid}），完成后自动展示……")
-        # ---- 批量对话历史（回溯留痕） ----
-        try:
-            _msgs = api.chat_history("discover", limit=30, message_type="batch")
-        except Exception:  # noqa: BLE001 历史失败只降级，不阻塞面板
-            _msgs = []
+        # ---- 批量对话历史（回溯留痕；30s 会话缓存：每次 rerun 不重复拉取） ----
+        import time as _t
+        if _t.time() - st.session_state.get("_batch_hist_ts", 0.0) >= 30:
+            try:
+                _msgs = api.chat_history("discover", limit=30, message_type="batch")
+                st.session_state["_batch_hist"] = _msgs
+                st.session_state["_batch_hist_ts"] = _t.time()
+            except Exception:  # noqa: BLE001 历史失败只降级，不阻塞面板
+                _msgs = st.session_state.get("_batch_hist") or []
+        else:
+            _msgs = st.session_state.get("_batch_hist") or []
         if _msgs:
             st.markdown("**批量对话历史（可追溯）**")
             _units = cc.pair_messages(_msgs)[:8]

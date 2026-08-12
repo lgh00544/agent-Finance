@@ -37,8 +37,13 @@ st.caption("与各核心 Agent 直接对话：规则调教（经校验后生效�
 render.task_status_area()
 
 # ================= 六 Agent 元信息 =================
+@st.cache_data(ttl=600)  # Agent 元信息几乎不变（名称/职责/知识库来源），10 分钟缓存减少重复请求
+def _chat_agents_cached() -> list[dict]:
+    return api.chat_agents()
+
+
 try:
-    AGENT_META = {m["agent"]: m for m in api.chat_agents()}
+    AGENT_META = {m["agent"]: m for m in _chat_agents_cached()}
 except Exception:  # noqa: BLE001 后端未起时降级为静态元信息
     AGENT_META = {
         "discover": {"agent": "discover", "name": "选股发现 Agent", "scope": "全市场候选挖掘",
@@ -307,12 +312,8 @@ with right:
             elif task and task.get("status") in ("pending", "running"):
                 st.info(f"识别处理中（任务 {ltid}，大图可能需要 1-2 分钟）……")
 
-    # ================= 对话历史（单轮对话单元：问答绑定 + 展开/收起） =================
+    # ================= 对话历史（看板化：摘要卡片 + 状态流转 + 看板/线性双视图） =================
     with tab_history:
-        st.markdown(f"**{meta['name']} 对话历史**（最新在前，每条「提问+回答」绑定为一轮，"
-                    "默认完整展示，可单条/批量收起展开）")
-        try:
-            history = api.chat_history(sel, limit=50)
-        except Exception:  # noqa: BLE001
-            history = []
-        chat_cards.render_history(sel, history)
+        st.markdown(f"**{meta['name']} 对话历史**（最新在前；未展开卡片展示"
+                    "结论/风险/待办摘要，可标记跟进状态，看板/线性双视图）")
+        chat_cards.render_dashboard(sel, meta["name"])

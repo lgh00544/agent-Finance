@@ -90,6 +90,17 @@ def market_condition() -> dict | None:
     return _get("/api/market-condition")
 
 
+def market_intel(date: str | None = None) -> dict:
+    """市场研判底座（指定日期或最新一日；不存在时后端返回 404 → HTTPError）"""
+    params = {"date": date} if date else {}
+    return _get("/api/market_intel", params)
+
+
+def market_intel_dates(limit: int = 30) -> list[str]:
+    """已生成市场研判的日期列表（最新在前）"""
+    return _get("/api/market_intel/dates", {"limit": limit}).get("dates") or []
+
+
 def market_indices() -> dict:
     """三大指数实时行情（上证指数/深证成指/创业板指 + 更新时间；失败含 error 标注）"""
     return _get("/api/market/indices")

@@ -52,6 +52,23 @@ def _now_min() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
 
 
+def _throttle_load(key: str, fn, ttl: float = 30.0):
+    """非红线数据会话内 TTL 缓存（按需加载：未加载返回 None 由调用方渲染加载按钮；
+    ttl=0 强制立即拉取）。红线数据（持仓行情/评分等）禁止使用本 helper。"""
+    import time as _t
+
+    if st.session_state.get(f"{key}_ts", 0.0) + ttl > _t.time():
+        return st.session_state.get(key)
+    try:
+        data = fn()
+        st.session_state[key] = data
+        st.session_state[f"{key}_ts"] = _t.time()
+        return data
+    except Exception:  # noqa: BLE001 拉取失败返回旧缓存或 None；不记时间戳（下次 rerun 自动重试）
+        st.session_state.pop(f"{key}_ts", None)
+        return st.session_state.get(key)
+
+
 def _signal_time(label: str, time_str: str | None, signal: dict) -> None:
     """信号生成时间标注：紧急信号（减仓/清仓建议或高严重度）时间琥珀色高亮"""
     urgent = bool(signal) and (signal.get("action") != "hold"
@@ -644,8 +661,18 @@ try:
                                empty_text="无当前持仓。")
 
     with tab_alert:
-        try:
-            alert_rows = api.alerts()
+        # 按需加载：首次点击才拉取告警（进页面零请求）；加载后 30s 会话缓存 + 手动刷新
+        alert_rows = _throttle_load("_hold_alerts", api.alerts)
+        if alert_rows is None and "_hold_alerts_ts" not in st.session_state:
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                st.caption("告警记录为按需加载（页面提速）：点击右侧按钮拉取最近告警。")
+            with c2:
+                if st.button("加载告警记录", key="load_hold_alerts", use_container_width=True):
+                    _throttle_load("_hold_alerts", api.alerts, ttl=0)
+                    st.rerun()
+        else:
+            alert_rows = alert_rows or []
             if alert_rows:
                 alert_keys = [f"hold_alert_list_{r['id']}" for r in alert_rows]
                 render.batch_fold_bar("hold_alert", alert_keys,
@@ -653,19 +680,23 @@ try:
             render.alert_list(alert_rows, key="hold_alert_list",
                               empty_text="暂无告警记录。持仓监控在交易时段每 3 分钟自动运行。",
                               scope="hold_alert")
-        except Exception as exc:
-            render.dismissible_error("告警记录加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
-                                     detail=exc, retry_key="retry_hold_alerts",
-                                     dismiss_key="hold_alert")
+            if st.button("刷新告警", key="refresh_hold_alerts"):
+                st.session_state.pop("_hold_alerts_ts", None)
+                st.rerun()
 
     with tab_hist:
-        try:
-            exited = api.holdings(status="exited")
-        except Exception as exc:
-            render.dismissible_error("历史持仓加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
-                                     detail=exc, retry_key="retry_exited",
-                                     dismiss_key="exit_list")
-            exited = []
+        # 按需加载：首次点击才拉取历史持仓（进页面零请求）；加载后 30s 会话缓存 + 手动刷新
+        exited = _throttle_load("_hold_exited", lambda: api.holdings(status="exited"))
+        if exited is None and "_hold_exited_ts" not in st.session_state:
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                st.caption("历史持仓为按需加载（页面提速）：点击右侧按钮拉取已离场记录。")
+            with c2:
+                if st.button("加载历史持仓", key="load_hold_exited", use_container_width=True):
+                    _throttle_load("_hold_exited", lambda: api.holdings(status="exited"), ttl=0)
+                    st.rerun()
+        else:
+            exited = exited or []
         if not exited:
             render.empty_state("暂无已离场持仓。在「当前持仓」详情中录入人工卖出后自动归档到此。",
                                icon="📭")
