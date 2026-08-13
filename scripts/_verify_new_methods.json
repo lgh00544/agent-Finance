@@ -1,0 +1,78 @@
+{
+ "us_market": {
+  "date": "2026-08-12",
+  "indices": [
+   {
+    "name": "标普500",
+    "change_pct": 0.26
+   },
+   {
+    "name": "纳斯达克",
+    "change_pct": 0.54
+   },
+   {
+    "name": "道琼斯",
+    "change_pct": -0.04
+   }
+  ],
+  "stocks": [
+   {
+    "name": "英伟达",
+    "code": "NVDA",
+    "change_pct": 3.03
+   },
+   {
+    "name": "美光",
+    "code": "MU",
+    "change_pct": 4.92
+   },
+   {
+    "name": "博通",
+    "code": "AVGO",
+    "change_pct": -0.01
+   },
+   {
+    "name": "AMD",
+    "code": "AMD",
+    "change_pct": 1.82
+   },
+   {
+    "name": "台积电(ADR)",
+    "code": "TSM",
+    "change_pct": 1.68
+   }
+  ]
+ },
+ "total_ratio": {
+  "amount": 25509.0,
+  "ratio": 0.893,
+  "note": "两市总成交量量倍（新浪口径，日线缺成交额以成交量近似）"
+ },
+ "board_box": {
+  "半导体": {
+   "main_box_pct": null,
+   "box60_pct": null,
+   "note": "数据缺失"
+  },
+  "通信设备": {
+   "main_box_pct": null,
+   "box60_pct": null,
+   "note": "数据缺失"
+  },
+  "光学光电子": {
+   "main_box_pct": null,
+   "box60_pct": null,
+   "note": "数据缺失"
+  },
+  "证券": {
+   "main_box_pct": null,
+   "box60_pct": null,
+   "note": "数据缺失"
+  },
+  "电子元件": {
+   "main_box_pct": null,
+   "box60_pct": null,
+   "note": "数据缺失"
+  }
+ }
+}

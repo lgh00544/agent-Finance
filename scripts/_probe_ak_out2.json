@@ -1,0 +1,61 @@
+{
+ "index_us_sig": "(symbol: str = '.INX') -> pandas.DataFrame",
+ "us_sina_default": {
+  "ok": true,
+  "cols": [
+   "date",
+   "open",
+   "high",
+   "low",
+   "close",
+   "volume",
+   "amount"
+  ],
+  "n": 5691,
+  "tail": [
+   {
+    "date": "2026-08-10",
+    "open": 7751.7402,
+    "high": 7773.7598,
+    "low": 7743.1099,
+    "close": 7753.1099,
+    "volume": 2686909762,
+    "amount": 0
+   },
+   {
+    "date": "2026-08-11",
+    "open": 7767.5098,
+    "high": 7767.5098,
+    "low": 7717.25,
+    "close": 7728.2002,
+    "volume": 2502546862,
+    "amount": 0
+   },
+   {
+    "date": "2026-08-12",
+    "open": 7765.46,
+    "high": 7766.0098,
+    "low": 7737.9502,
+    "close": 7748.5,
+    "volume": 2674503179,
+    "amount": 0
+   }
+  ]
+ },
+ "board_hist": {
+  "ok": false,
+  "err": "ProxyError: HTTPSConnectionPool(host='17.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6"
+ },
+ "board_name_em": {
+  "ok": false,
+  "err": "ProxyError: HTTPSConnectionPool(host='17.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6"
+ },
+ "index_daily_em": {
+  "ok": false,
+  "err": "ProxyError: HTTPSConnectionPool(host='push2his.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/stock/kline/get?secid=1.000001&fields1=f1%2Cf2%2Cf3%2Cf4%2C"
+ },
+ "spot_em": {
+  "ok": false,
+  "err": "ProxyError: HTTPSConnectionPool(host='82.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6"
+ }
+}

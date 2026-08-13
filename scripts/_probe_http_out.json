@@ -1,0 +1,13 @@
+{
+ "eastmoney_kline": {
+  "err": "ProxyError: HTTPSConnectionPool(host='push2his.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/stock/kline/get?secid=1.000001&fields1="
+ },
+ "eastmoney_spot": {
+  "err": "ProxyError: HTTPSConnectionPool(host='82.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=5&po=1&np=1&ut=bd1d9d"
+ },
+ "sina_spot": {
+  "status": 200,
+  "len": 170,
+  "head": "var hq_str_sh000001=\"上证指数,3957.1612,3946.6752,3926.9648,3968.4758,3924.6418,0,0,572793677,1164203068530,0,0,0,0,0,0,0,0,"
+ }
+}

@@ -1,0 +1,89 @@
+{
+ "board_hist_sig": "(symbol: str = '小金属', start_date: str = '20211201', end_date: str = '20220401', period: str = '日k', adjust: str = '') -> pandas.DataFrame",
+ "us_index_cols": [
+  "date",
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "amount"
+ ],
+ "us_index_n": 5691,
+ "us_index_head": [
+  {
+   "date": "2004-01-02",
+   "open": 1111.92,
+   "high": 1118.85,
+   "low": 1105.08,
+   "close": 1108.48,
+   "volume": 1153200000,
+   "amount": 1281300000000
+  },
+  {
+   "date": "2004-01-05",
+   "open": 1108.48,
+   "high": 1122.22,
+   "low": 1108.48,
+   "close": 1122.22,
+   "volume": 1578200064,
+   "amount": 1760250000000
+  },
+  {
+   "date": "2004-01-06",
+   "open": 1122.22,
+   "high": 1124.46,
+   "low": 1118.4399,
+   "close": 1123.67,
+   "volume": 1494499968,
+   "amount": 1677120000000
+  },
+  {
+   "date": "2004-01-07",
+   "open": 1123.67,
+   "high": 1126.33,
+   "low": 1116.45,
+   "close": 1126.33,
+   "volume": 1704899968,
+   "amount": 1914940000000
+  },
+  {
+   "date": "2004-01-08",
+   "open": 1126.33,
+   "high": 1131.92,
+   "low": 1124.91,
+   "close": 1131.92,
+   "volume": 1868400000,
+   "amount": 2108990000000
+  },
+  {
+   "date": "2004-01-09",
+   "open": 1131.92,
+   "high": 1131.92,
+   "low": 1120.9,
+   "close": 1121.86,
+   "volume": 1720700032,
+   "amount": 1938630000000
+  },
+  {
+   "date": "2004-01-12",
+   "open": 1121.86,
+   "high": 1127.85,
+   "low": 1120.9,
+   "close": 1127.23,
+   "volume": 1510200064,
+   "amount": 1698160000000
+  },
+  {
+   "date": "2004-01-13",
+   "open": 1127.23,
+   "high": 1129.0699,
+   "low": 1115.1899,
+   "close": 1121.22,
+   "volume": 1595900032,
+   "amount": 1792480000000
+  }
+ ],
+ "us_spot": "ERR ProxyError: HTTPSConnectionPool(host='72.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f12&fs=m%3A105%2Cm%3A106%2Cm%3A107&fields=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6%2Cf7%2Cf8%2Cf9%2Cf10%2Cf12%2Cf13%2Cf14%2Cf15%2Cf16%2Cf17%2Cf18%2Cf20%2Cf21%2Cf23%2Cf24%2Cf25%2Cf26%2Cf22%2Cf33%2Cf11%2Cf62%2Cf128%2Cf136%2Cf115%2Cf152 (Caused by ProxyError('Unable to connect to proxy', RemoteDisconnected('Remote end closed connection without response')))",
+ "sh_index": "ERR ProxyError: HTTPSConnectionPool(host='48.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&wbp2u=%7C0%7C0%7C0%7Cweb&fid=f12&fs=m%3A1%2Bt%3A1&fields=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6%2Cf7%2Cf8%2Cf9%2Cf10%2Cf12%2Cf13%2Cf14%2Cf15%2Cf16%2Cf17%2Cf18%2Cf20%2Cf21%2Cf23%2Cf24%2Cf25%2Cf26%2Cf22%2Cf33%2Cf11%2Cf62%2Cf128%2Cf136%2Cf115%2Cf152 (Caused by ProxyError('Unable to connect to proxy', RemoteDisconnected('Remote end closed connection without response')))"
+}
