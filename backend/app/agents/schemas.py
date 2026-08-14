@@ -205,6 +205,55 @@ class ReviewOutput(BaseModel):
                     "basis, weight_suggestion}；无游资信号可回溯时输出 null。只留痕，不直接改任何配置")
 
 
+# ================= PortfolioSentinel 组合哨兵（组合级风控，与 MonitorAgent 零耦合） =================
+class SectorAlert(BaseModel):
+    """板块退潮预警（LLM 研判：板块是否从强势转弱势/量比显著下降）"""
+    stock_code: str = Field(description="6 位股票代码")
+    stock_name: str = Field(description="股票名称")
+    sector: str = Field(description="所属板块")
+    sector_change_pct: float | None = Field(default=None, description="板块当日涨跌幅 %（数据缺失为 null）")
+    sector_volume_ratio: float | None = Field(default=None, description="板块量比（数据缺失为 null）")
+    alert_level: str = Field(pattern="^(高|中|低)$", description="预警级别：高/中/低")
+    reason: str = Field(description="预警理由（引用具体数据；数据不足时如实标注「数据不足」不编造）")
+
+
+class TimeStopAlert(BaseModel):
+    """时间止损预警（LLM 研判：持仓天数超过偏好周期一半且浮盈亏在 ±2% 内=横盘建议退出）"""
+    stock_code: str = Field(description="6 位股票代码")
+    stock_name: str = Field(description="股票名称")
+    holding_days: int = Field(description="持仓天数")
+    pnl_pct: float | None = Field(default=None, description="当前浮盈亏 %（现价缺失为 null）")
+    verdict: str = Field(description="结论（如 建议退出/继续持有观察）")
+    reason: str = Field(description="研判理由（引用持仓天数与盈亏数据）")
+
+
+class PortfolioRisk(BaseModel):
+    """组合风险快照（代码纯数学计算，非 LLM 输出）"""
+    total_pnl_pct: float | None = Field(default=None, description="组合总盈亏 %（Σ市值-Σ成本）/Σ成本")
+    max_sector_pct: float | None = Field(default=None, description="最大板块持仓占比 %（集中度）")
+    drawdown_alert: bool = Field(description="组合回撤预警（总盈亏 < -3%）")
+    concentration_alert: bool = Field(description="集中度预警（同板块持仓合计占总市值 > 40%）")
+
+
+class ActionSuggestion(BaseModel):
+    """行动建议（仅供参考，人工执行）"""
+    stock_code: str = Field(description="6 位股票代码")
+    suggestion: str = Field(description="行动建议（如 减仓/离场/观望/继续持有）")
+    reason: str = Field(description="建议理由")
+
+
+class PortfolioSentinelOutput(BaseModel):
+    """组合哨兵输出（LIGHT 模型高频巡检）"""
+    sector_alerts: list[SectorAlert] = Field(default_factory=list,
+        description="板块退潮预警列表（无预警输出空列表，绝不为了输出而输出）")
+    time_stop_alerts: list[TimeStopAlert] = Field(default_factory=list,
+        description="时间止损预警列表（无预警输出空列表）")
+    portfolio_risk: PortfolioRisk = Field(description="组合风险快照（代码已算好，LLM 原文透传）")
+    overall_assessment: str = Field(description="一句话组合风险评估（引用组合盈亏/集中度/板块信号）")
+    action_suggestions: list[ActionSuggestion] = Field(default_factory=list,
+        description="行动建议列表（仅供参考，人工执行）")
+
+
 class TrackVerifyOutput(BaseModel):
     """选股验证统计建议输出（候选池 T+N 追踪验证 Agent 输出）
     建议仅作为提案，必须经人工审核确认后生效（走 agent_suggestions 审核闭环）"""

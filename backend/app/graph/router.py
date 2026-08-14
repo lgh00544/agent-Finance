@@ -154,6 +154,14 @@ def run_market_intel(trade_date: str | None = None) -> StockAgentState:
     return graph.invoke(state)
 
 
+def run_portfolio_sentinel(trade_date: str | None = None) -> StockAgentState:
+    """组合哨兵巡检（独立触发：交易时段每 10 分钟自动 + 手动入口）。
+    与 MonitorAgent 零耦合；无持仓时正常跳过（skipped=True），不报错。"""
+    graph = get_graph("portfolio_sentinel")
+    state = _new_state(trade_date=trade_date or time.strftime("%Y-%m-%d"))
+    return graph.invoke(state)
+
+
 def run_daily_pipeline(trade_date: str | None = None) -> dict:
     """每日主链路：discover → 对全部候选打分（供面板查看评分）
 

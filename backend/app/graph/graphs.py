@@ -6,7 +6,8 @@ import logging
 
 from langgraph.graph import END, START, StateGraph
 
-from app.agents import discover, market_intel, monitor, position, review, score, sell
+from app.agents import (discover, market_intel, monitor, portfolio_sentinel,
+                        position, review, score, sell)
 from app.graph.state import StockAgentState
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,15 @@ def _build_market_intel() -> StateGraph:
     return g
 
 
+def _build_portfolio_sentinel() -> StateGraph:
+    """组合哨兵：单节点（聚合客观数据 → LLM 组合研判 → 落库推送）；与 MonitorAgent 零耦合"""
+    g = StateGraph(StockAgentState)
+    g.add_node("portfolio_sentinel", portfolio_sentinel.portfolio_sentinel_node)
+    g.add_edge(START, "portfolio_sentinel")
+    g.add_edge("portfolio_sentinel", END)
+    return g
+
+
 _BUILDERS = {
     "discover": _build_discover,
     "score": _build_score,
@@ -101,6 +111,7 @@ _BUILDERS = {
     "sell": _build_sell,
     "review": _build_review,
     "market_intel": _build_market_intel,
+    "portfolio_sentinel": _build_portfolio_sentinel,
 }
 
 

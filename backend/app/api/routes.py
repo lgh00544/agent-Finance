@@ -65,6 +65,8 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
                       lambda p: graph_router.run_sell_decision(p.get("holding_id"))),
     "monitor_all": ("全量持仓实时监控",
                     lambda p: _task_monitor_all()),
+    "portfolio_sentinel": ("组合哨兵巡检",
+                           lambda p: _task_portfolio_sentinel()),
     "review": ("卖出复盘",
                lambda p: graph_router.run_review(p.get("holding_id"), p.get("exit_date"))),
     "review_rethink": ("复盘建议重思考",
@@ -100,6 +102,20 @@ def _task_monitor_all() -> dict:
                          "action": ((r.get("holding_signal") or {}).get("action")),
                          "severity": ((r.get("holding_signal") or {}).get("severity"))}
                         for r in results]}
+
+
+def _task_portfolio_sentinel() -> dict:
+    """组合哨兵巡检（手动入口）：聚合客观数据 → LLM 组合研判（LIGHT）→ 告警落库 + 飞书；
+    返回 JSON 安全摘要；无持仓正常跳过（skipped）"""
+    result = graph_router.run_portfolio_sentinel()
+    ps = result.get("portfolio_sentinel") or {}
+    if ps.get("skipped"):
+        return {"skipped": True, "reason": ps.get("reason")}
+    return {"trade_date": ps.get("trade_date"),
+            "sector_alerts": len(ps.get("sector_alerts") or []),
+            "time_stop_alerts": len(ps.get("time_stop_alerts") or []),
+            "overall_assessment": ps.get("overall_assessment"),
+            "error": result.get("error")}
 
 
 def _task_track_verify(backfill: bool) -> dict:
@@ -252,6 +268,14 @@ def run_discover_job():
 def run_market_intel_job():
     """手动触发市场研判（异步提交：聚合数据 → LLM 深度研判 → 落库 market_intel）"""
     return _submit_task("market_intel", {})
+
+
+# ================= 组合哨兵（portfolio_sentinel：组合级风控，与 MonitorAgent 零耦合） =================
+
+@router.post("/portfolio_sentinel/run")
+def run_portfolio_sentinel_job():
+    """手动触发组合哨兵巡检（异步提交：组合数据聚合 → LLM 组合研判 → 告警落库 + 飞书）"""
+    return _submit_task("portfolio_sentinel", {})
 
 
 @router.get("/market_intel")

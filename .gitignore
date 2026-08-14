@@ -34,6 +34,21 @@ _bak_*/
 
 # 一次性连接探测脚本（可能含数据库密码明文，严禁提交）
 _tidb_probe.py
+_probe_*.py
+
+# 改动前备份文件（*.bak / *.bak_时间戳 / .backup_日期目录）
+*.bak
+*.bak_*
+.backup_*/
+
+# 工具本地配置与临时文件
+.codex/
+.mcp.json.tmp
+
+# 个人提示词备份
+CLAUDE_CODE_PROMPT*.md
+CONFIDENCE_UPGRADE_PROMPT.md
+SYNC_ON_START_PROMPT.md
 
 # 本地个人配置
 .claude/settings.local.json

@@ -40,6 +40,8 @@ TP1_PCT = 0.10            # 第一止盈位保守参考：成本 + 8%~10%（取�
 TP1_FLOOR_PCT = 0.08      # 第一止盈位下限（成本 + 8%）
 TP2_EXT = 0.618           # 第二止盈位波段目标：黄金分割扩展位 0.618
 TP_NEAR_PCT = 0.03        # 接近止盈/止损阈值：现价距点位 ≤3%
+TRAILING_ENABLE_PNL_PCT = 5.0   # 移动止盈启用门槛：持仓浮盈超过 5% 后启用
+TRAILING_DRAWBACK_PCT = 0.92    # 移动止盈线 = 持仓期最高价 × 0.92（从最高点回撤 8% 止盈）
 _CACHE_TTL = 600          # 计算结果缓存 10 分钟（与行情缓存同量级）
 _TRACE_MODULE = "position_monitor"
 _ANOMALY_KEYS = ("异动", "涨停", "跌停", "利好", "利空", "大单", "减持", "增持",
@@ -50,6 +52,28 @@ _ANOMALY_KEYS = ("异动", "涨停", "跌停", "利好", "利空", "大单", "�
 
 def _round2(v: float | None) -> float | None:
     return round(v, 2) if v is not None else None
+
+
+def calc_trailing_stop(entry_price: float, high_price: float | None,
+                       current_price: float | None) -> float | None:
+    """移动止盈线（批次1 · 纯函数，可单测）：持仓浮盈超过 5% 后启用，
+    移动止盈线 = 持仓期最高价 × 0.92（从最高点回撤 8% 止盈），且不低于成本价（保底不亏）；
+    浮盈不足 5% 或数据缺失返回 None（沿用原固定止盈，不启用移动止盈）。
+
+    entry_price: 加权成本价；high_price: 持仓期最高价（NULL/0 时按当前价基准）；
+    current_price: 当前价。"""
+    try:
+        entry = float(entry_price)
+        high = float(high_price or 0.0)
+        price = float(current_price or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or high <= 0 or price <= 0:
+        return None
+    pnl_pct = (price - entry) / entry * 100
+    if pnl_pct < TRAILING_ENABLE_PNL_PCT:
+        return None
+    return round(max(high * TRAILING_DRAWBACK_PCT, entry), 2)
 
 
 def compute_plan(row: dict, ind: dict) -> dict:

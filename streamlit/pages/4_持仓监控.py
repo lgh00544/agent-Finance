@@ -661,6 +661,22 @@ try:
                                empty_text="无当前持仓。")
 
     with tab_alert:
+        # ===== 组合哨兵（组合级风控，与 MonitorAgent 零耦合；交易时段每 10 分钟自动巡检）=====
+        with st.container(border=True):
+            render.section_title("组合哨兵 · 组合级风控")
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.caption("板块退潮 / 时间止损 / 组合回撤 / 集中度 四项组合级信号（LIGHT 模型巡检，"
+                           "告警标记 source='portfolio_sentinel'）；手动触发一次即时巡检。")
+            with c2:
+                if st.button("运行组合哨兵", key="run_portfolio_sentinel", use_container_width=True):
+                    try:
+                        tid = api.submit_task("portfolio_sentinel", {})
+                        st.success(f"组合哨兵任务已提交：{tid.get('task_id')}，"
+                                   f"可到「Agent 对话」页或任务状态区查看结果")
+                        st.session_state.pop("_hold_alerts_ts", None)
+                    except Exception as exc:  # noqa: BLE001 提交失败提示即可
+                        render.error_card("组合哨兵任务提交失败", str(exc))
         # 按需加载：首次点击才拉取告警（进页面零请求）；加载后 30s 会话缓存 + 手动刷新
         alert_rows = _throttle_load("_hold_alerts", api.alerts)
         if alert_rows is None and "_hold_alerts_ts" not in st.session_state:
@@ -673,6 +689,13 @@ try:
                     st.rerun()
         else:
             alert_rows = alert_rows or []
+            # 组合哨兵告警（source 标记过滤展示）
+            sentinel_rows = [r for r in alert_rows if r.get("source") == "portfolio_sentinel"]
+            if sentinel_rows:
+                st.markdown("**组合哨兵告警**（组合级风控，板块/组合/时间维度）")
+                render.alert_list(sentinel_rows, key="sentinel_alert_list",
+                                  empty_text="暂无组合哨兵告警。", scope="sentinel_alert")
+                st.caption("组合哨兵在交易时段每 10 分钟自动巡检，也可点击上方「运行组合哨兵」手动触发。")
             if alert_rows:
                 alert_keys = [f"hold_alert_list_{r['id']}" for r in alert_rows]
                 render.batch_fold_bar("hold_alert", alert_keys,

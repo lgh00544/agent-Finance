@@ -163,6 +163,7 @@ class Holding(Base):
     entry_date: Mapped[str] = mapped_column(String(10))              # 建仓日期
     entry_price: Mapped[float] = mapped_column(Float)                # 平均建仓成本价
     shares: Mapped[int] = mapped_column(Integer)                     # 当前股数
+    high_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 持仓期最高价（移动止盈线基准；旧数据 NULL 降级以当前价为基准）
     cost: Mapped[float] = mapped_column(Float, default=0.0)          # 总成本（元）
     stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（Plan/人工）
     take_profit: Mapped[float] = mapped_column(Float, default=0.0)   # 止盈参考价
@@ -205,6 +206,7 @@ class AlertLog(Base):
     action: Mapped[str] = mapped_column(String(16), default="hold")  # hold/reduce/exit（LLM 输出）
     signal: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # 完整信号结构化输出
     pushed: Mapped[bool] = mapped_column(Boolean, default=False)     # 是否已推飞书
+    source: Mapped[str] = mapped_column(String(16), default="monitor")  # 告警来源标记 monitor/portfolio_sentinel
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

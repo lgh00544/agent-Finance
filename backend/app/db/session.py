@@ -64,6 +64,8 @@ def init_db() -> None:
     _ensure_position_plan_detail()
     _ensure_position_plan_source()
     _ensure_hot_money_profile_columns()
+    _ensure_holding_high_price()
+    _ensure_alert_log_source()
     _ensure_indexes()
 
 
@@ -235,6 +237,40 @@ def _ensure_position_plan_detail(eng=None) -> None:
         else:
             try:
                 conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN detail JSON")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _ensure_holding_high_price(eng=None) -> None:
+    """幂等补齐 holding.high_price 列（移动止盈线基准；仅增量加列，不重建表不丢数据；
+    旧数据为 NULL，MonitorAgent 首次取行情时降级以当前价为基准）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(holding)")}
+            if "high_price" not in existing:
+                conn.exec_driver_sql("ALTER TABLE holding ADD COLUMN high_price FLOAT")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql("ALTER TABLE holding ADD COLUMN high_price FLOAT")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _ensure_alert_log_source(eng=None) -> None:
+    """幂等补齐 alert_log.source 列（告警来源标记 monitor/portfolio_sentinel；
+    仅增量加列，不重建表不丢数据；旧数据默认 monitor）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(alert_log)")}
+            if "source" not in existing:
+                conn.exec_driver_sql("ALTER TABLE alert_log ADD COLUMN source VARCHAR(16) DEFAULT 'monitor'")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql("ALTER TABLE alert_log ADD COLUMN source VARCHAR(16) DEFAULT 'monitor'")
             except Exception:  # noqa: BLE001 列已存在
                 pass
 

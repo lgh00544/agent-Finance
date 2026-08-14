@@ -33,5 +33,6 @@ class StockAgentState(TypedDict, total=False):
     candidates: Optional[List[Dict]]      # 最终候选（Discover）
     holding_id: Optional[int]             # 持仓 ID（Monitor/Review）
     batch_quotes: Optional[Dict[str, Dict]]  # code -> 批量预取实时行情（批量监控一次获取）
+    portfolio_sentinel: Optional[Dict]   # 组合哨兵结果（sector_alerts/time_stop_alerts/portfolio_risk…）
     error: Optional[str]                  # 节点错误信息（容错流转）
     trace: List[str]                      # 执行轨迹（调试/面板展示）

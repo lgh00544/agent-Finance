@@ -42,6 +42,8 @@ def collect_quote(state: StockAgentState) -> StockAgentState:
         quote, stale = batch_quote, False
     else:
         quote, stale = _fetch_realtime_quote(source, code, indicators)
+    # 移动止盈线（批次1）：持仓期最高价跟踪 + 止盈线计算（纯数学，判断在 LLM；失败降级不阻塞）
+    _attach_trailing_stop(quote, state)
     state["real_time"] = quote
     state["quote_stale"] = stale
 
@@ -74,6 +76,27 @@ def collect_quote(state: StockAgentState) -> StockAgentState:
                       f"行情聚合: {indicators.get('latest_date')}"
                       + ("（实时价不可用，用日K收盘兜底）" if stale else "")]
     return state
+
+
+def _attach_trailing_stop(quote: dict, state: StockAgentState) -> None:
+    """移动止盈线（批次1）【刚性代码逻辑】：当前价 > 持仓期最高价时更新最高价落库；
+    浮盈 ≥5% 时在 quote 上挂 trailing_stop 字段（= 持仓期最高价×0.92，不低于成本价），
+    作为数据字段传给 LLM（判断在 LLM，此处零判断）；失败降级跳过不阻塞监控。"""
+    try:
+        holding = repo.get_holding(state["holding_id"]) if state.get("holding_id") else None
+        if holding is None:
+            return
+        price = quote.get("price")
+        high_price = to_float(getattr(holding, "high_price", None), 0.0)
+        if price is not None and price > 0:
+            if price > high_price:
+                repo.update_holding(holding.id, high_price=round(price, 2))
+                high_price = price
+            from app.services.take_profit import calc_trailing_stop
+
+            quote["trailing_stop"] = calc_trailing_stop(holding.entry_price, high_price, price)
+    except Exception as exc:  # noqa: BLE001 移动止盈失败不阻塞监控
+        logger.warning("移动止盈线计算失败（降级跳过）: %s", exc)
 
 
 def _fetch_realtime_quote(source: DataSource, code: str, indicators: dict) -> tuple[dict, bool]:

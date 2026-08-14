@@ -132,6 +132,34 @@ def monitor_job() -> None:
         cache.release_lock("monitor")
 
 
+def portfolio_sentinel_job() -> None:
+    """组合哨兵巡检：交易时段每 10 分钟；无持仓正常跳过；异常不抛断。
+    与 monitor_job 独立（各自锁/各自频率），互不影响。"""
+    now = datetime.now()
+    if not _in_trading_window(now):
+        return
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        return
+    if not cache.acquire_lock("portfolio_sentinel", ttl_seconds=600):
+        logger.info("portfolio_sentinel 锁被占用，跳过本次")
+        return
+    try:
+        result = graph_router.run_portfolio_sentinel(today)
+        ps = result.get("portfolio_sentinel") or {}
+        if ps.get("skipped"):
+            logger.info("组合哨兵跳过（无持仓）: %s", today)
+        else:
+            cache.set("job:last_portfolio_sentinel", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("组合哨兵巡检完成: %s（板块预警 %s / 时间止损 %s）", today,
+                        len(ps.get("sector_alerts") or []),
+                        len(ps.get("time_stop_alerts") or []))
+    except Exception as exc:  # noqa: BLE001 定时任务整体容错
+        logger.error("组合哨兵巡检失败: %s", exc)
+    finally:
+        cache.release_lock("portfolio_sentinel")
+
+
 def _is_previous_trading_day(yesterday: str) -> bool:
     """昨天是否最近交易日（龙虎榜 T+1：16:30 后拉的是昨日数据）。
     日历为全量静态历（1990~年末含未来日期）：取今天之前的最后一个交易日与昨天比对"""
@@ -226,6 +254,12 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-16", minute=f"*/{monitor_minutes}",
                       id="monitor", name="盘中持仓监控",
                       replace_existing=True, misfire_grace_time=300)
+    # 交易日 9:00-16:00 每 10 分钟触发（函数内过滤交易时段窗口；组合级风控巡检，
+    # 与 monitor 独立锁/独立频率，互不影响）
+    scheduler.add_job(portfolio_sentinel_job, "cron",
+                      day_of_week="mon-fri", hour="9-16", minute="*/10",
+                      id="portfolio_sentinel", name="组合哨兵巡检",
+                      replace_existing=True, misfire_grace_time=300)
     # 每周一次空间维护（默认周日 05:30，低频）
     scheduler.add_job(maintenance_job, "cron",
                       day_of_week=settings.db_maintenance_day_of_week,
@@ -260,5 +294,6 @@ def job_status() -> list[dict]:
                     "next_run": str(job.next_run_time) if job.next_run_time else None})
     out.append({"id": "last_discover", "name": "最近挖掘", "next_run": cache.get("job:last_discover")})
     out.append({"id": "last_monitor", "name": "最近监控", "next_run": cache.get("job:last_monitor")})
+    out.append({"id": "last_portfolio_sentinel", "name": "最近组合哨兵", "next_run": cache.get("job:last_portfolio_sentinel")})
     out.append({"id": "last_track_verify", "name": "最近候选验证", "next_run": cache.get("job:last_track_verify")})
     return out

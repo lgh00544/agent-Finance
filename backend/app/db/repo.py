@@ -416,10 +416,13 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
 
 
 def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: str,
-                 message: str, action: str, signal: dict, pushed: bool) -> int:
+                 message: str, action: str, signal: dict, pushed: bool,
+                 source: str = "monitor") -> int:
+    """写告警日志；source 标记来源（monitor/portfolio_sentinel），默认 monitor 保持旧链路不变"""
     with SessionLocal() as db:
         row = AlertLog(stock_code=stock_code, stock_name=stock_name, alert_type=alert_type,
-                       severity=severity, message=message, action=action, signal=signal, pushed=pushed)
+                       severity=severity, message=message, action=action, signal=signal,
+                       pushed=pushed, source=source)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -1138,6 +1141,7 @@ def list_alerts(limit: int = 100) -> list[dict]:
                                            "alert_type": r.alert_type, "severity": r.severity,
                                            "message": r.message, "action": r.action,
                                            "signal": r.signal, "pushed": r.pushed,
+                                           "source": r.source,
                                            "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("alert", {"limit": limit}, _load)
