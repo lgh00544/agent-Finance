@@ -1,0 +1,151 @@
+/* ===== 全局暗色科技感主题（对齐 Streamlit 版 render.py _GLOBAL_THEME_CSS 视觉体系） ===== */
+:root {
+  /* 背景分层：页面 < 卡片 < 悬浮层 */
+  --bg-base: #0f1115;
+  --bg-card: #171a21;
+  --bg-hover: #1e242e;
+  --bg-input: #12151b;
+  /* 边框：极细 1px 描边 */
+  --border: rgba(60, 80, 120, 0.25);
+  --border-hi: rgba(96, 130, 190, 0.35);
+  /* 主色科技蓝 */
+  --primary: #3b82f6;
+  --primary-dim: #1e3a5f;
+  /* 状态色：中国股市惯例 涨红跌绿 */
+  --up: #ef4444;   /* 涨/盈利 = 红 */
+  --down: #10b981; /* 跌/亏损 = 绿 */
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --err: #ef4444;
+  --info: #3b82f6;
+  /* 评级色：A 红 / B 橙 / C 蓝 */
+  --tier-a: #ef4444;
+  --tier-b: #f59e0b;
+  --tier-c: #3b82f6;
+  /* 文字 */
+  --text: #e5e7eb;
+  --text-dim: #9ca3af;
+  --text-mute: #6b7280;
+}
+
+html,
+body,
+#root {
+  background: var(--bg-base);
+  color: var(--text);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* 数字等宽对齐 */
+.stat-value,
+.ant-statistic-content,
+.ant-table-cell,
+td,
+th {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 暗色滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3240;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4455;
+}
+
+/* AntD 布局底座：侧边栏深于主背景 */
+.ant-layout {
+  background: var(--bg-base);
+}
+.ant-layout-sider {
+  background: #0d0f13 !important;
+  border-right: 1px solid var(--border);
+}
+.ant-menu-dark,
+.ant-menu-dark .ant-menu-sub {
+  background: transparent !important;
+}
+.ant-menu-dark .ant-menu-item-selected {
+  background: rgba(59, 130, 246, 0.18) !important;
+  border-left: 3px solid var(--primary);
+}
+.ant-menu-dark .ant-menu-item:hover {
+  background: rgba(59, 130, 246, 0.12) !important;
+}
+.ant-menu-item-group-title {
+  color: var(--text-mute) !important;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+
+/* 顶部状态栏样式 */
+.top-status-bar {
+  height: 48px;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  background: #0f1115;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.tsb-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.tsb-item b {
+  font-weight: 700;
+  color: var(--text);
+}
+.tsb-up {
+  color: var(--up) !important;
+  font-weight: 700;
+}
+.tsb-down {
+  color: var(--down) !important;
+  font-weight: 700;
+}
+.tsb-mute {
+  color: var(--text-mute);
+}
+.tsb-ok-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  background: var(--ok);
+  box-shadow: 0 0 6px rgba(16, 185, 129, 0.5);
+}
+.tsb-err-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  background: var(--err);
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.5);
+}
+
+/* 主内容区 */
+.main-content {
+  padding: 20px 24px;
+}

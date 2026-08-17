@@ -52,3 +52,8 @@ SYNC_ON_START_PROMPT.md
 
 # 本地个人配置
 .claude/settings.local.json
+
+# React web（Phase1 起）
+web/node_modules/
+web/dist/
+web/.env.local
