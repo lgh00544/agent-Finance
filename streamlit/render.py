@@ -6,6 +6,7 @@
 """
 import contextlib
 import json
+import math
 from collections.abc import Iterator
 
 import streamlit as st
@@ -13,6 +14,22 @@ import streamlit as st
 # 时效标注配色：普通浅灰 / 紧急琥珀（深色主题下均清晰可读）
 _TIME_COLOR = "#9CA3AF"
 _TIME_HIGHLIGHT = "#F59E0B"
+
+
+def reduce_share_plan(ratio: float, shares: int | None) -> tuple[int, int]:
+    """按减仓比例换算可执行股数：向下取整到 100 股整数倍（A股最小交易单位 1 手），
+    不足 100 股向上取 100（最小可卖单位）；不超持仓。
+    持仓股数缺失或为 0 时返回 (0, 0)（调用方不展示、不报错）。
+    返回 (建议减仓股数, 减仓后剩余股数)。"""
+    shares = int(shares or 0)
+    if shares <= 0:
+        return 0, 0
+    sell = math.floor(shares * float(ratio) / 100) * 100
+    if sell < 100:
+        sell = 100
+    if sell > shares:
+        sell = shares
+    return sell, shares - sell
 
 
 def stock_label(code: str, name: str) -> str:
@@ -362,6 +379,48 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
               border-left: 3px solid var(--primary); padding-left: 8px; }
 /* 卡片紧凑内边距：减少标题栏无效空白，纵向更紧凑 */
 [class*="st-key-foldcard_"] { padding-top: 12px; padding-bottom: 14px; }
+/* ===== 批次1 全局交互基础：页面头部 / 合规细条 / 快捷操作条 / 骨架屏 ===== */
+/* 页面头部单行范式：左侧标题+弱化说明，右侧操作按钮组（调用方用 columns 排布） */
+.page-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+               margin: 0 0 8px; }
+.page-header .ph-title { font-size: 24px; font-weight: 700; color: var(--text); }
+.page-header .ph-caption { font-size: 13px; color: var(--text-dim); flex: 1;
+                           min-width: 200px; }
+.page-header .ph-actions { display: flex; gap: 8px; margin-left: auto; }
+/* 合规细条：单行信息级（长文本单行省略，hover 看全文），不再占 3 行 */
+.compliance-bar { font-size: 12px; color: var(--text-mute); padding: 4px 10px;
+                  border-radius: 6px; background: rgba(59, 130, 246, 0.05);
+                  border: 1px solid var(--border); margin-bottom: 6px;
+                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                  cursor: default; }
+/* 快捷操作条：详情头部一行紧凑按钮组（primary/secondary 视觉由 stBaseButton 提供），
+   容器 key 前缀 qa_ 控制外边距 */
+[class*="st-key-qa_"] { margin: 6px 0 10px; }
+/* 骨架屏：灰色渐变动画块 + 顶部小字标签，替代空白/spinner 挂顶 */
+.skeleton-box { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.skeleton-label { font-size: 12px; color: var(--text-mute); margin-bottom: 2px; }
+.skeleton { background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%,
+            var(--bg-card) 75%); background-size: 200% 100%;
+            animation: skeleton-wave 1.2s ease infinite; border-radius: 6px; }
+@keyframes skeleton-wave { 0% { background-position: 200% 0; }
+                           100% { background-position: -200% 0; } }
+/* 置信度进度条（M2/M4 经验沉淀）：容器+填充，high/mid/low 三档色（复用 --up/--warn/--text-mute） */
+.conf-bar { width: 100%; height: 6px; border-radius: 3px;
+            background: var(--bg-hover); overflow: hidden; margin: 2px 0 4px; }
+.conf-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+.conf-bar-fill.high { background: var(--up); }
+.conf-bar-fill.mid  { background: var(--warn); }
+.conf-bar-fill.low  { background: var(--text-mute); }
+/* ===== 批次1 响应式兜底：窄窗口不换行不溢出（Streamlit columns 无法媒体查询，纯 CSS） ===== */
+@media (max-width: 1280px) {
+  .stat-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .stat-value { font-size: 18px; }
+  [data-testid="stHeading"] h1 { font-size: 20px; }
+}
+@media (max-width: 1100px) {
+  .top-status-bar { font-size: 0.8rem; padding: 6px 12px; }
+  .top-status-bar .bar-group-label { display: none; }
+}
 </style>
 """
 
@@ -827,6 +886,27 @@ def stat_cards(items: list[dict]) -> None:
     st.markdown(f'<div class="stat-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
+def selection_stat_cards(stats: dict) -> list[dict]:
+    """选股表现统计卡（候选池顶部）：把 /track/verify/stats 返回转成 stat_cards items（纯展示）。
+    胜率三档：≥50 ok（绿）/ <40 err（红）/ 其余 warn（黄）；涨幅正 up（红）负 down（绿）；
+    win_rate/avg_pct 为 None 显示「无数据」，pl_ratio 为 None（无亏损样本）显示「—」，不报错。"""
+    n = int(stats.get("n") or 0)
+    wr, avg, pl = stats.get("win_rate"), stats.get("avg_pct"), stats.get("pl_ratio")
+    return [
+        {"label": "近期选股胜率", "value": f"{wr:.1f}%" if wr is not None else "无数据",
+         "sub": f"盈利 {stats.get('wins', 0)} 笔 / 共 {n} 笔（T+5 已到期）",
+         "tone": ("ok" if wr is not None and wr >= 50
+                  else "err" if wr is not None and wr < 40
+                  else "warn" if wr is not None else "mute")},
+        {"label": "平均涨幅", "value": f"{avg:+.2f}%" if avg is not None else "无数据",
+         "sub": "T+5 周期", "tone": ("up" if avg is not None and avg > 0
+                                     else "down" if avg is not None and avg < 0 else "mute")},
+        {"label": "盈亏比", "value": f"{pl:.2f}" if pl is not None else "—",
+         "sub": "盈利合计 / 亏损合计（T+5）", "tone": "mute"},
+        {"label": "样本量", "value": f"{n} 笔", "sub": "T+5 已到期", "tone": "mute"},
+    ]
+
+
 # ================= 维度归因白盒展示（v3.0） =================
 _DIM_VERDICT_CLS = {"支持": "support", "中性": "neutral", "风险": "risk"}
 _DIM_FILL_COLOR = {"支持": "#ef4444", "中性": "#9ca3af", "风险": "#f59e0b"}
@@ -1065,6 +1145,8 @@ body:has([data-testid="stSidebar"][aria-expanded="true"]) .top-status-bar {
 .top-status-bar .down { color: #10b981; font-weight: 700; }
 .top-status-bar .flat { color: #9ca3af; }
 .top-status-bar .stale { color: #f59e0b; font-size: 0.8em; }
+.top-status-bar .bar-exp-amber { color: #f59e0b; font-weight: 700; }
+.top-status-bar .bar-exp-mute { color: #6b7280; font-weight: 700; }
 </style>
 """
 _COLOR_UP = "up"
@@ -1118,6 +1200,13 @@ def _bar_stale_fetch(state_key: str, fn):
         return st.session_state.get(state_key), f"更新失败（{type(exc).__name__}）"
 
 
+def _exp_pending_count() -> int:
+    """经验沉淀待审核数（无专用 count 端点，用 list?status=pending_review&limit=1000 长度近似；
+    并入 top_status_bar 60s 节流，避免每次 rerun 打接口）"""
+    import api_client as api
+    return len(api.get_experience_list(status="pending_review", limit=1000))
+
+
 @st.fragment(run_every="60s")
 def top_status_bar() -> None:
     """全局顶部常驻状态栏（所有页面固定显示，不随滚动消失）
@@ -1140,11 +1229,13 @@ def top_status_bar() -> None:
     if _t_now() - st.session_state.get("_bar_fetch_ts", 0.0) >= 60:
         acc, acc_err = _bar_stale_fetch("_bar_account", api.account_summary)
         idx, idx_err = _bar_stale_fetch("_bar_indices", api.market_indices)
+        exp_pending, _ = _bar_stale_fetch("_bar_exp_pending", _exp_pending_count)
         st.session_state["_bar_fetch_ts"] = _t_now()
     else:
         acc = st.session_state.get("_bar_account")
         idx = st.session_state.get("_bar_indices")
         acc_err = idx_err = ""
+        exp_pending = st.session_state.get("_bar_exp_pending")
 
     parts = [f'<span class="bar-label">北京时间</span><b>{now}</b>']
 
@@ -1195,6 +1286,12 @@ def top_status_bar() -> None:
     else:
         idx_parts.append(f'<span class="bar-label">指数</span><b>{"数据加载中" if idx_err else "—"}</b>')
     parts.append(f'<span class="bar-group">{"".join(idx_parts)}</span>')
+
+    # ---------- 经验沉淀待审核徽章（纯展示不可点，绝不打断操作；失败/无缓存时隐藏） ----------
+    if exp_pending is not None:
+        exp_cls = "bar-exp-amber" if exp_pending > 0 else "bar-exp-mute"
+        parts.append(f'<span class="bar-group"><span class="bar-group-label">经验待审核</span>'
+                     f'<b class="{exp_cls}">{exp_pending}</b></span>')
 
     st.markdown(f'<div class="top-status-bar">{"".join(parts)}</div>', unsafe_allow_html=True)
 
@@ -1417,3 +1514,130 @@ def api_rollback_rule_change(rid: int, reason: str) -> dict:
     from api_client import rollback_rule_change as _fn
 
     return _fn(rid, reason)
+
+
+# ================= 批次1 全局交互基础组件（2026-08-17 新增，纯新增不改存量） =================
+# 用途：页面头部单行范式 / 详情分区 Tab 化 / 详情顶部快捷操作条 / 骨架屏加载占位。
+# 本批次仅提供组件，未被任何页面调用（零影响）；页面接入在批次 2-5。
+# 全站规范（本批次写进 docstring，页面改造在后续批次执行）：
+# - 空态一律 empty_state()，错误一律 error_card()/dismissible_error()，禁止裸 st.caption/st.error；
+# - 页面顶部 5 件套（title/caption/合规/任务状态/操作行）统一收敛到 page_header()。
+
+_PH_ATTR_ESC = lambda t: str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def page_header(title: str, caption: str = "", primary_actions: list[dict] | None = None,
+                secondary_actions: list[dict] | None = None,
+                compliance: str = "", key: str = "page_header") -> dict | None:
+    """统一页面头部（替代各页面手写 title+caption+合规+操作行堆叠）：
+    - 标题行：左侧 H1 标题 + 弱化说明小字（.page-header 单行 flex），右侧操作按钮组
+      （primary_actions 实心主操作在前、secondary_actions 描边次操作在后，各一列等宽）；
+    - 合规提示：收敛为单行细条（.compliance-bar，长文本单行省略，hover 看全文），
+      不再占用 3 行 warn 大卡；
+    - 返回值：{"primary": 被点击主按钮在 primary_actions 的下标或 None,
+               "secondary": 被点击次按钮在 secondary_actions 的下标或 None}，
+      供调用方作页面分发；无点击返回两个 None。
+    primary_actions/secondary_actions 元素：{"label": str, "key": str(按钮唯一 key，可省略自动生成)}
+    """
+    if compliance:
+        esc_attr = _PH_ATTR_ESC(compliance)
+        st.markdown(f'<div class="compliance-bar" title="{esc_attr}">{esc_attr}</div>',
+                    unsafe_allow_html=True)
+    cap_html = f'<span class="ph-caption">{_esc(caption)}</span>' if caption else ""
+    p_acts = primary_actions or []
+    s_acts = secondary_actions or []
+    if not p_acts and not s_acts:
+        st.markdown(f'<div class="page-header"><h1 class="ph-title">{_esc(title)}</h1>{cap_html}</div>',
+                    unsafe_allow_html=True)
+        return {"primary": None, "secondary": None}
+    with st.container(key=f"ph_{key}", border=False):
+        c1, c2 = st.columns([2.4, 1.4], vertical_alignment="center", gap="medium")
+        with c1:
+            st.markdown(f'<div class="page-header"><h1 class="ph-title">{_esc(title)}</h1>{cap_html}</div>',
+                        unsafe_allow_html=True)
+        with c2:
+            clicked_p = clicked_s = None
+            cols = st.columns(len(p_acts) + len(s_acts))
+            for i, a in enumerate(p_acts):
+                with cols[i]:
+                    if st.button(a.get("label", "操作"), key=a.get("key") or f"{key}_p_{i}",
+                                 type="primary", use_container_width=True):
+                        clicked_p = i
+            for j, a in enumerate(s_acts):
+                with cols[len(p_acts) + j]:
+                    if st.button(a.get("label", "操作"), key=a.get("key") or f"{key}_s_{j}",
+                                 type="secondary", use_container_width=True):
+                        clicked_s = j
+            return {"primary": clicked_p, "secondary": clicked_s}
+    return {"primary": None, "secondary": None}
+
+
+def detail_tabs(sections: list[tuple[str, callable]], key: str,
+                default_index: int = 0) -> None:
+    """详情分区 Tab 化（解决详情垂直堆叠过长，先看任一分区不再滚过全部前置分区）：
+    - sections: [(分区标题, 渲染函数), ...]，渲染函数无参、内容自包含（数据在闭包/参数里），
+      因此 Tab 切换是纯前端交互，零网络请求；
+    - 分区数 ≤6：st.tabs 同一行标签切换（Streamlit 原生默认停在第一个 Tab）；
+    - 分区数 >6：自动降级为 selectbox + 单区渲染，防标签溢出换行（default_index 作用于该下拉初值）；
+    - 空 sections 直接返回不渲染；key 保证同页多处调用的控件 key 唯一。
+    """
+    if not sections:
+        return
+    if len(sections) > 6:
+        labels = [t for t, _ in sections]
+        idx = st.selectbox("查看分区", labels, index=min(default_index, len(labels) - 1),
+                           key=f"dtab_sel_{key}")
+        for title, fn in sections:
+            if title == idx:
+                fn()
+                return
+        return
+    tabs = st.tabs([t for t, _ in sections])
+    for tab, (_, fn) in zip(tabs, sections):
+        with tab:
+            fn()
+
+
+def quick_actions(key: str, actions: list[dict]) -> int:
+    """详情卡片头部快捷操作条（把原埋在详情底部的操作按钮提到顶部）：
+    - actions: [{"label": str, "type": "primary"|"secondary", "icon": str(可选前置图标)}]；
+    - 渲染为一行紧凑按钮组（primary 实心蓝底、secondary 透明描边，视觉两级），
+      返回被点击按钮下标（-1 表示无点击）；
+    - 与 detail_tabs 配合：Tab 行下方紧跟操作条，先看到操作再看内容。
+    """
+    if not actions:
+        return -1
+    norm = []
+    for a in actions:
+        icon = a.get("icon", "")
+        label = a.get("label", "操作")
+        norm.append((f"{icon} {label}" if icon else label,
+                     "primary" if a.get("type") == "primary" else "secondary"))
+    with st.container(key=f"qa_{key}", border=False):
+        cols = st.columns(len(norm))
+        for i, (col, (full, typ)) in enumerate(zip(cols, norm)):
+            with col:
+                if st.button(full, key=f"{key}_qa_{i}",
+                             type="primary" if typ == "primary" else "secondary",
+                             use_container_width=True):
+                    return i
+    return -1
+
+
+_SKEL_WIDTHS = (72, 100, 88, 60, 95, 80, 66, 90)
+
+
+def loading_skeleton(key: str, lines: int = 3, label: str = "加载中…") -> None:
+    """骨架屏占位（数据未到时渲染，替代空白/挂顶 spinner；数据到达后调用方直接不渲染本组件）：
+    顶部小字标签 + lines 行灰色渐变动画块（宽度伪随机排布，视觉接近真实内容）；key 保证唯一。
+    无副作用、零网络请求，加载完成后由调用方替换为真实内容。
+    """
+    n = max(1, int(lines))
+    blocks = "".join(
+        f'<div class="skeleton" style="height:{20 if i % 4 == 0 else 15}px;'
+        f'width:{_SKEL_WIDTHS[i % len(_SKEL_WIDTHS)]}%"></div>'
+        for i in range(n))
+    st.markdown(f'<div class="skeleton-box" data-skeleton-key="{_esc(key)}">'
+                f'<div class="skeleton-label">{_esc(label)}</div>{blocks}</div>',
+                unsafe_allow_html=True)
+

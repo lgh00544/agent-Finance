@@ -57,6 +57,7 @@ def init_db() -> None:
     from app.db import models  # noqa: F401  确保模型注册
 
     Base.metadata.create_all(bind=engine)
+    _ensure_experience_fts()
     _ensure_review_result_columns()
     _ensure_stock_candidate_detail()
     _ensure_trade_record_columns()
@@ -67,6 +68,32 @@ def init_db() -> None:
     _ensure_holding_high_price()
     _ensure_alert_log_source()
     _ensure_indexes()
+
+
+def _ensure_experience_fts() -> None:
+    """经验全文检索 FTS5 虚拟表 + 触发器（幂等）。SQLAlchemy 不直接支持虚拟表，
+    用原生 SQL；仅 SQLite 模式启用（MySQL 无 FTS5，检索走 LIKE 降级，见 repo.search_experience）。
+    必须与 create_all 后同一会话执行：FTS 内容表触发器引用 experience 表须已存在。"""
+    if settings.db_backend == "mysql":
+        return
+    statements = [
+        "CREATE VIRTUAL TABLE IF NOT EXISTS experience_fts USING fts5("
+        "title, body, tags, content='experience', content_rowid='id')",
+        "CREATE TRIGGER IF NOT EXISTS experience_ai AFTER INSERT ON experience BEGIN "
+        "INSERT INTO experience_fts(rowid, title, body, tags) "
+        "VALUES (new.id, new.title, new.body, new.tags); END",
+        "CREATE TRIGGER IF NOT EXISTS experience_ad AFTER DELETE ON experience BEGIN "
+        "INSERT INTO experience_fts(experience_fts, rowid, title, body, tags) "
+        "VALUES('delete', old.id, old.title, old.body, old.tags); END",
+        "CREATE TRIGGER IF NOT EXISTS experience_au AFTER UPDATE ON experience BEGIN "
+        "INSERT INTO experience_fts(experience_fts, rowid, title, body, tags) "
+        "VALUES('delete', old.id, old.title, old.body, old.tags); "
+        "INSERT INTO experience_fts(rowid, title, body, tags) "
+        "VALUES (new.id, new.title, new.body, new.tags); END",
+    ]
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.exec_driver_sql(stmt)
 
 
 def _ensure_indexes() -> None:

@@ -27,6 +27,7 @@ pages = st.navigation({
         st.Page("pages/9_交易知识库.py", title="交易知识库", icon="📚"),
         st.Page("pages/10_Agent对话.py", title="Agent 对话", icon="💬"),
         st.Page("pages/11_规则变更记录.py", title="规则变更记录", icon="📜"),
+        st.Page("pages/13_经验沉淀.py", title="经验沉淀", icon="🧠"),
     ],
 })
 pages.run()

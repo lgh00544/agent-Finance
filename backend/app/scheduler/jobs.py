@@ -77,10 +77,43 @@ def market_intel_job() -> None:
         if mi:
             logger.info("市场研判完成: %s（%s，风险偏好 %s）", today, mi.get("phase"),
                         mi.get("risk_appetite"))
+            try:
+                from app.services import pre_market_screen
+                changes = pre_market_screen.market_shift_detect()
+                if changes:
+                    logger.info("市况切换检测: %s 项变化（%s）", len(changes),
+                                "、".join(c["dim"] for c in changes))
+            except Exception as exc:  # noqa: BLE001 市况切换检测失败不阻塞 market_intel 主流程
+                logger.error("市况切换检测失败: %s", exc)
         elif result.get("error"):
             logger.error("市场研判失败: %s", result["error"])
     except Exception as exc:  # noqa: BLE001 定时任务整体容错
         logger.error("市场研判定时任务失败: %s", exc)
+
+
+def pre_market_screen_job() -> None:
+    """盘前快筛（工作日 9:25 集合竞价撮合完成后）：交易日校验 + 防重锁 300s。
+    检测最近一批候选的竞价异常（大幅低开/高开/可能停牌），异常逐条落库 + 合并一条飞书；
+    纯代码检测，无 LLM 调用；无异常不推送不落库。"""
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        logger.info("今天 %s 非交易日，跳过盘前快筛", today)
+        return
+    if not cache.acquire_lock("pre_market_screen", ttl_seconds=300):
+        logger.info("pre_market_screen 锁被占用，跳过本次")
+        return
+    try:
+        from app.services import pre_market_screen
+
+        result = pre_market_screen.pre_market_screen()
+        logger.info("盘前快筛完成: 检查 %s 只候选，异常 %s 只（%s）",
+                    result.get("checked", 0), len(result.get("anomalies") or []),
+                    result.get("skipped", "正常"))
+        cache.set("job:last_pre_market", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+    except Exception as exc:  # noqa: BLE001 盘前快筛失败不阻塞其他任务
+        logger.error("盘前快筛失败: %s", exc)
+    finally:
+        cache.release_lock("pre_market_screen")
 
 
 def daily_discover_job() -> None:
@@ -228,6 +261,18 @@ def maintenance_job() -> None:
         cache.release_lock("db_maintenance")
 
 
+def experience_worker_job(force: bool = False) -> None:
+    """经验沉淀 Worker 调度入口：
+    force=True（每日 02:00 主跑）直接执行；force=False（30min 探针）由 Worker 内部积压门判断，
+    积压 < 阈值或 task_queue 活跃时轻量跳过。异常不外抛（调度线程吞掉告警日志）。"""
+    try:
+        from app.services.experience_worker import worker_run
+        result = worker_run(force=force)
+        logger.info("经验沉淀 Worker: %s", result)
+    except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
+        logger.error("经验沉淀 Worker 异常: %s", exc)
+
+
 def start_scheduler() -> None:
     global scheduler
     if scheduler is not None:
@@ -260,6 +305,18 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-16", minute="*/10",
                       id="portfolio_sentinel", name="组合哨兵巡检",
                       replace_existing=True, misfire_grace_time=300)
+    # 工作日 9:25 盘前快筛（集合竞价撮合完成后；候选为上一交易日 16:10 生成）
+    scheduler.add_job(pre_market_screen_job, "cron",
+                      day_of_week="mon-fri", hour=9, minute=25,
+                      id="pre_market_screen", name="盘前快筛",
+                      replace_existing=True, misfire_grace_time=300)
+    # 经验沉淀：每日 02:00 主跑（与现有任务零冲突）+ 每 30 分钟积压探针（内部积压门判断，轻量）
+    scheduler.add_job(experience_worker_job, "cron", hour=2, minute=0,
+                      args=[True], id="experience_worker", name="经验沉淀识别",
+                      replace_existing=True, misfire_grace_time=3600)
+    scheduler.add_job(experience_worker_job, "cron", minute="*/30",
+                      args=[False], id="experience_worker_probe", name="经验沉淀积压探针",
+                      replace_existing=True, misfire_grace_time=1800)
     # 每周一次空间维护（默认周日 05:30，低频）
     scheduler.add_job(maintenance_job, "cron",
                       day_of_week=settings.db_maintenance_day_of_week,
@@ -296,4 +353,5 @@ def job_status() -> list[dict]:
     out.append({"id": "last_monitor", "name": "最近监控", "next_run": cache.get("job:last_monitor")})
     out.append({"id": "last_portfolio_sentinel", "name": "最近组合哨兵", "next_run": cache.get("job:last_portfolio_sentinel")})
     out.append({"id": "last_track_verify", "name": "最近候选验证", "next_run": cache.get("job:last_track_verify")})
+    out.append({"id": "last_pre_market", "name": "最近盘前快筛", "next_run": cache.get("job:last_pre_market")})
     return out

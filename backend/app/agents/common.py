@@ -20,6 +20,7 @@ from typing import Type, TypeVar
 
 from app.db import repo
 from app.llm.structured import ModelLevel, call_llm_cached
+from app.services import track_verify
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -156,12 +157,33 @@ def knowledge_section(agent: str) -> str:
 
 
 def _knowledge_version() -> str:
-    """知识库变更感知（数量+最大ID），入缓存键使知识更新后 LLM 缓存自动失效"""
+    """知识库+经验变更感知（k{count}:{max_id}:e{ecount}:{emax_id}），入缓存键
+    使知识/经验更新后 LLM 缓存自动失效；经验表新增/修改由 max_id 递增感知"""
     try:
         count, max_id = repo.knowledge_version()
-        return f"k{count}:{max_id}"
+        return f"k{count}:{max_id}:{repo.experience_version()}"
     except Exception:  # noqa: BLE001
-        return "k0:0"
+        return "k0:0:e0:0"
+
+
+def experience_section(agent: str) -> str:
+    """自动沉淀经验参考注入（仅 active；auto_merged 项带「·自动」标记；限量 ≤5 条每条 ≤200 字）。
+    与私有知识库（人工）共存不冲突：experience 是自动沉淀经验库，注入段独立标注，避免混同。"""
+    stage_map = {"discover": "选股", "score": "选股", "position": "建仓",
+                 "monitor": "持仓", "sell": "持仓", "review": "持仓"}
+    try:
+        items = repo.search_experience(stage=stage_map.get(agent, "选股"), k=5)
+    except Exception as exc:  # noqa: BLE001 经验检索失败不阻塞主链路
+        logger.warning("经验检索注入失败: %s", exc)
+        return ""
+    if not items:
+        return ""
+    lines = []
+    for it in items:
+        tag = "·自动" if it.get("auto_merged") else ""
+        body = str(it.get("body") or "")[:200]
+        lines.append(f"- {it['title']}（置信 {it['confidence']:.2f}{tag}）\n  {body}")
+    return "\n\n【历史经验参考（自动沉淀，仅供参考）】\n" + "\n".join(lines)
 
 
 # ==================== 分职能战法知识库（方法论文本沉淀，插槽1实现） ====================
@@ -243,6 +265,10 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
         section = knowledge_section(agent)
         if section:
             sections.append(section)
+    # 拼接位3.1 · 自动沉淀经验参考（仅 active 限量注入；与私有知识库共存不冲突）
+    exp_section = experience_section(agent)
+    if exp_section:
+        sections.append(exp_section)
     # 拼接位3.5 · 分职能战法知识库（方法论文本沉淀，参考权重非死条件）
     kb_text = _agent_knowledge_text(agent)
     if kb_text:
@@ -264,13 +290,41 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
         mi = None
     if mi:
         op = mi.get("operative_meaning") or {}
-        op_brief = "；".join(f"{k}:{v}" for k, v in list(op.items())[:4])
+        # 摘要版：dict/list 值（箱位理解/个股验证）不拼 Python repr 到 prompt
+        op_brief = "；".join(
+            f"{k}:{v if isinstance(v, str) else ('...' if v else '（空）')}"
+            for k, v in list(op.items())[:6])
+        vs = mi.get("volume_signal") or {}
+        ms = vs.get("主线结构") or {}
+        # 主线结构可能是 dict 也可能是字符串，做类型防御
+        if isinstance(ms, dict):
+            main_brief = "；".join(f"{k}:{v}" for k, v in list(ms.items())[:3])
+        elif isinstance(ms, str):
+            main_brief = ms
+        else:
+            main_brief = ""
+        vc = vs.get("量能成色") or "（无）"
         user_prompt = (
             f"{user_prompt}\n\n【市场研判参考（{mi.get('trade_date')}，参考维度不强制）】"
             f"阶段定性：{mi.get('phase')}；核心矛盾：{mi.get('core_conflict')}；"
-            f"风险偏好：{mi.get('risk_appetite')}；操作含义：{op_brief or '（无）'}；"
-            f"一句话总结：{mi.get('summary')}"
+            f"风险偏好：{mi.get('risk_appetite')}；"
+            f"主线结构：{main_brief or '（无）'}；量能成色：{vc}；"
+            f"操作含义：{op_brief or '（无）'}；一句话总结：{mi.get('summary')}"
         )
+
+    # 拼接位5.5 · 选股表现回顾（仅 discover/discover_final；客观统计，参考不强制，不改变规则）
+    if agent in ("discover", "discover_final"):
+        try:
+            perf_summary = track_verify.get_selection_performance_summary("t5")
+        except Exception as exc:  # noqa: BLE001 注入失败不阻塞主链路
+            logger.warning("选股表现回顾注入失败（跳过）: %s", exc)
+            perf_summary = ""
+        if perf_summary:
+            user_prompt = (
+                f"{user_prompt}\n\n"
+                f"【选股表现回顾】（近 20 只有到期数据的候选，客观统计，参考信息不改变已有规则）\n"
+                f"{perf_summary}"
+            )
 
     version = repo.get_trade_profile().version
     return call_llm_cached(agent,

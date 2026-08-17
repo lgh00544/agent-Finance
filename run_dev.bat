@@ -10,8 +10,8 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set PY=D:\space\self\self\.venv\Scripts\python.exe
-set ST=D:\space\self\self\.venv\Scripts\streamlit.exe
+set PY=D:\self\.venv\Scripts\python.exe
+set ST=D:\self\.venv\Scripts\streamlit.exe
 
 if not exist "%PY%" (
     echo [ERROR] venv python not found: %PY%

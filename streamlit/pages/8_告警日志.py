@@ -14,7 +14,11 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("告警日志（MonitorAgent）")
+# ===== 批次3：页面头部收敛为 page_header 单行范式 =====
+render.page_header(
+    "告警日志（MonitorAgent）",
+    caption="MonitorAgent 全部信号记录：含飞书推送状态，按级别/类型筛选。",
+)
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
@@ -35,7 +39,7 @@ try:
         render.time_text("告警统计时间范围",
                          f"{rows[0]['created_at'][:16]} ~ {rows[-1]['created_at'][:16]}")
         if not filtered:
-            st.caption("当前筛选条件下无匹配告警。")
+            render.empty_state("当前筛选条件下无匹配告警。", icon="🔍")
         else:
             alert_keys = [f"alert_page_{r['id']}" for r in filtered]
             render.batch_fold_bar("alert", alert_keys,

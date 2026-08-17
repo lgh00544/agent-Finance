@@ -19,8 +19,18 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("每日候选池（DiscoverAgent）")
-st.caption("筛选标准由 LLM 综合量能/趋势/行业热度/基本面研判，每日 16:10 自动生成，也可手动触发。")
+# ===== 批次2：页面头部收敛为 page_header 单行范式（标题+说明+合规+操作按钮组）=====
+_hdr = render.page_header(
+    "每日候选池（DiscoverAgent）",
+    caption="筛选标准由 LLM 综合量能/趋势/行业热度/基本面研判，每日 16:10 自动生成，也可手动触发。",
+    primary_actions=[{"label": "⛏ 手动触发每日挖掘", "key": "hdr_trigger"},
+                     {"label": "💬 批量验证对话", "key": "hdr_batch"}],
+)
+if _hdr["primary"] == 0:
+    render.submit_task("daily_pipeline", label="每日挖掘")
+if _hdr["primary"] == 1:
+    st.session_state["_batch_open"] = True
+    st.rerun()
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
@@ -57,20 +67,46 @@ if not dates:
         st.session_state["empty_trigger_discover"] = False
     st.stop()
 
-# 顶部操作行：左=日期选择 + 评级筛选（Tab 样式），右=高频主按钮
-f1, f2, f3 = st.columns([1.2, 2.6, 1.2])
+# 顶部筛选行：左=日期选择 + 评级筛选（Tab 样式），操作按钮已上移 page_header
+f1, f2 = st.columns([1, 3])
 with f1:
     date = st.selectbox("选择日期", dates, index=0)
 with f2:
     filter_opt = st.segmented_control("评级筛选", ["全部候选", "可建仓 A+B", "观察 C"],
                                       default="全部候选")
-with f3:
-    if st.button("手动触发每日挖掘", type="primary", use_container_width=True):
-        render.submit_task("daily_pipeline", label="每日挖掘")
-    if st.button("批量验证对话", use_container_width=True):
-        st.session_state["_batch_open"] = True
-        st.rerun()
 st.caption("评级：A 强烈推荐 / B 建议关注 / C 谨慎观察（LLM 信心度档位映射，纯展示）")
+
+# ===== 选股表现统计卡（顶部增强信息：T+5 全量口径，无数据不展示，API 失败静默跳过） =====
+try:
+    _tv_stats = api.track_verify_stats(period="t5")
+    _tv_n = int((_tv_stats or {}).get("n") or 0)
+except Exception:  # noqa: BLE001 选股表现统计卡失败静默降级（增强信息，不加提示文案）
+    _tv_stats, _tv_n = None, 0
+if _tv_stats and _tv_n > 0:
+    render.stat_cards(render.selection_stat_cards(_tv_stats))
+    for _a in (_tv_stats.get("anomalies") or []):
+        _facts = "；".join(f"{k} {v}" for k, v in (_a.get("data") or {}).items())
+        render.msg_card("warn", _a.get("desc", "选股表现异常"), _facts)
+
+# ===== 候选行业集中度（顶部增强信息：只读 detail.enriched.industry；覆盖不足/无数据/API 失败静默） =====
+try:
+    _conc = api.candidate_concentration(date=date)
+except Exception:  # noqa: BLE001 行业集中度失败静默跳过（增强信息，不打扰）
+    _conc = None
+if _conc:
+    _c_total = int(_conc.get("total") or 0)
+    _c_cov = float(_conc.get("coverage") or 0)
+    if _c_total >= 3:  # 候选 <3 只不展示
+        if _c_cov < 50:
+            st.caption(f"行业数据覆盖不足（{_c_cov}%），集中度统计暂不展示。")
+        elif _conc.get("groups"):
+            _c_parts = "｜".join(f"{g['industry']} {g['count']}只({g['pct']}%)"
+                                 for g in _conc["groups"])
+            st.markdown(f"**候选行业分布**：{_c_parts}")
+            if float(_conc.get("max_concentration") or 0) >= 50:
+                render.msg_card("warn",
+                                f"行业集中度 {_conc['max_concentration']}%（{_conc['max_industry']}）",
+                                "建议分散，避免单一行业过度暴露。")
 
 # ===== 可建仓统计卡（顶部；0 只也明确显示，接口失败降级 caption 不阻塞页面） =====
 tradeable_view = None
@@ -181,14 +217,41 @@ with rows_area:
         if render.list_item_toggle(key, f"#{r.get('rank', '-')} {label}　{tier_label}　{_badge_html}",
                                    subtitle=subtitle, dot=dot, meta=meta, scope="cand"):
             with st.container(border=True):
+                code, name = r["stock_code"], r["stock_name"]
+                tk = f"traces_{code}_{r['trade_date']}"
+                _trace_open = st.session_state.get(tk) == "open"
+                # 批次2：操作前置——原埋在底部的 3 个操作按钮提到详情首行
+                _act = render.quick_actions(f"cand_act_{key}", [
+                    {"label": "🧭 生成建仓方案", "type": "primary"},
+                    {"label": "💬 单标的追问", "type": "secondary"},
+                    {"label": "🔍 收起 AI 研判留痕" if _trace_open else "🔍 AI 研判留痕",
+                     "type": "secondary"},
+                ])
+                if _act == 0:
+                    render.submit_task("position", {"stock_code": code, "stock_name": name},
+                                       label="建仓方案生成")
+                if _act == 1:
+                    st.session_state["_batch_open"] = True
+                    st.session_state["_batch_scope"] = "manual"
+                    st.session_state["_batch_codes"] = [code]
+                    st.rerun()
+                if _act == 2:
+                    if _trace_open:
+                        st.session_state.pop(tk, None)
+                    else:
+                        st.session_state[tk] = "open"
+                    st.rerun()
+                # 溯源行保留在 Tab 上方
                 render.trace_line("本轮挖掘执行时间", r.get("created_at"),
                                   source="行情快照 + LLM 研判", confidence=detail.get("confidence"))
-                # v3.0 白盒维度归因：维度数组 + 综合评估（主结论，置顶展示）
-                with st.container(border=True):
+                # 批次2：8 个垂直堆叠分区 → detail_tabs（>6 自动降级 selectbox，默认停在结论性分区）；
+                # 字段与文案零删减，仅换容器（风险点合并「核心风险点 + 风险初判」两类字段）
+                def _tab_dims():
                     render.section_title("维度归因（五维白盒，主结论）")
                     render.dimension_bars(detail.get("dimensions"),
                                           final_advice=detail.get("final_advice"))
-                with st.container(border=True):
+
+                def _tab_reasons():
                     render.section_title("候选理由")
                     if reasons:
                         for i, reason in enumerate(reasons, 1):
@@ -196,17 +259,21 @@ with rows_area:
                                         unsafe_allow_html=True)
                     else:
                         st.markdown("（该轮未输出）")
-                with st.container(border=True):
+
+                def _tab_tech():
                     render.section_title("技术面研判（威科夫/量价/K线形态/谐波交叉验证）")
                     st.markdown(detail.get("tech_view") or detail.get("meso_view")
                                 or "（该轮未输出，可重新触发挖掘生成）")
-                with st.container(border=True):
+
+                def _tab_volume():
                     render.section_title("量价与资金结论（主力动向/量能结构）")
                     st.markdown(detail.get("volume_analysis") or "（无）")
-                with st.container(border=True):
+
+                def _tab_levels():
                     render.section_title("关键价位（支撑位/压力位/建议关注区间）")
                     st.markdown(detail.get("price_levels") or "（未输出）")
-                with st.container(border=True):
+
+                def _tab_risks():
                     render.section_title("核心风险点（≥2 项）")
                     risks = detail.get("risks") or []
                     if risks:
@@ -215,19 +282,6 @@ with rows_area:
                                         unsafe_allow_html=True)
                     else:
                         st.markdown("（无）")
-                with st.container(border=True):
-                    render.section_title("操作建议（标的类型 + 关注类型 + 参考仓位）")
-                    focus = detail.get("focus_type", "")
-                    st.markdown(f"- 标的类型：{stock_type or '（未输出）'}（威科夫阶段定位，参考权重）")
-                    st.markdown(f"- 关注类型：{focus or '观察'}")
-                    hint = detail.get("position_hint") or ""
-                    st.markdown(f"- 参考建议：{hint}" if hint else "- 参考建议：（该轮未输出）")
-                with st.container(border=True):
-                    render.section_title("三维验证（宏观 / 中观 / 微观）")
-                    st.markdown(f"- 宏观：{detail.get('macro_view', '（无）')}")
-                    st.markdown(f"- 中观：{detail.get('meso_view', '（无）')}")
-                    st.markdown(f"- 微观：{detail.get('micro_view', '（无）')}")
-                with st.container(border=True):
                     render.section_title("风险初判")
                     risk_notice = r.get("risk_notice") or []
                     if risk_notice:
@@ -235,27 +289,33 @@ with rows_area:
                             st.markdown(f"- {risk}")
                     else:
                         st.markdown("（无）")
-                code, name = r["stock_code"], r["stock_name"]
-                if st.button("生成建仓方案", key=f"plan_{code}_{r['trade_date']}"):
-                    render.submit_task("position", {"stock_code": code, "stock_name": name},
-                                       label="建仓方案生成")
-                if st.button("单标的追问", key=f"ask_{code}_{r['trade_date']}",
-                             use_container_width=True):
-                    st.session_state["_batch_open"] = True
-                    st.session_state["_batch_scope"] = "manual"
-                    st.session_state["_batch_codes"] = [code]
-                    st.rerun()
+
+                def _tab_advice():
+                    render.section_title("操作建议（标的类型 + 关注类型 + 参考仓位）")
+                    focus = detail.get("focus_type", "")
+                    st.markdown(f"- 标的类型：{stock_type or '（未输出）'}（威科夫阶段定位，参考权重）")
+                    st.markdown(f"- 关注类型：{focus or '观察'}")
+                    hint = detail.get("position_hint") or ""
+                    st.markdown(f"- 参考建议：{hint}" if hint else "- 参考建议：（该轮未输出）")
+
+                def _tab_macro():
+                    render.section_title("三维验证（宏观 / 中观 / 微观）")
+                    st.markdown(f"- 宏观：{detail.get('macro_view', '（无）')}")
+                    st.markdown(f"- 中观：{detail.get('meso_view', '（无）')}")
+                    st.markdown(f"- 微观：{detail.get('micro_view', '（无）')}")
+
+                render.detail_tabs([
+                    ("维度归因", _tab_dims),
+                    ("候选理由", _tab_reasons),
+                    ("技术面", _tab_tech),
+                    ("量价资金", _tab_volume),
+                    ("关键价位", _tab_levels),
+                    ("风险点", _tab_risks),
+                    ("操作建议", _tab_advice),
+                    ("三维验证", _tab_macro),
+                ], key=f"cand_tabs_{key}", default_index=0)
                 # ===== AI 研判留痕（推理链路可溯源）：按钮触发真懒加载，未点击零接口调用；
-                # 已展开时按钮切换为「收起」支持再次收起 =====
-                tk = f"traces_{code}_{r['trade_date']}"
-                _trace_open = st.session_state.get(tk) == "open"
-                if st.button("收起 AI 研判留痕…" if _trace_open else "AI 研判留痕（推理链路可溯源）",
-                             key=f"trbtn_{key}", use_container_width=True):
-                    if _trace_open:
-                        st.session_state.pop(tk, None)
-                    else:
-                        st.session_state[tk] = "open"
-                    st.rerun()
+                # 已展开时 quick_actions 按钮切换为「收起」支持再次收起 =====
                 if st.session_state.get(tk) == "open":
                     if f"{tk}_rows" not in st.session_state:
                         try:
@@ -270,6 +330,7 @@ with rows_area:
                             st.session_state.pop(f"{tk}_rows", None)
                             st.rerun()
                     elif not trace_rows:
+                        # 保留 caption：留痕子区内单标的说明（非整区空态），empty_state 虚线框过重
                         st.caption("该标的本交易日暂无留痕记录（历史快照或留痕启用前数据）。")
                     else:
                         for t in trace_rows:

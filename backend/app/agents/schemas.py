@@ -78,6 +78,35 @@ class MarketIntelOutput(BaseModel):
     next_day_watch: dict = Field(description="次日盯盘点（前向可验证的观察点）")
     summary: str = Field(description="一句话总结（供全部 agent 注入参考）")
 
+    # v3 调整：以下 4 个新字段全部带默认值（default_factory）。
+    # 原因：Prompt 方法论由 sir 另行提供，本次不注入；默认值保证 LLM 未输出时研判正常。
+    # 待 sir 的 prompt 到位后，移除 default_factory 即可激活强制结构化输出。
+    main_structure: dict = Field(
+        default_factory=dict,
+        description="主线结构三分类。包含三个 key："
+                    "'进攻主线'（连续多日走强+隔夜催化源，含方向名+连续天数+催化源+一句依据）、"
+                    "'接力方向'（低位放量启动+直系催化，含方向名+量倍+60日箱位+催化源+一句依据）、"
+                    "'退潮方向'（资金流出+箱位验证，含方向名+箱位特征+一句依据）。"
+                    "某分类无数据时填 '（今日无明确该类方向）'，不编造")
+    box_view: dict = Field(
+        default_factory=dict,
+        description="箱位理解：重点板块的主箱位/60日箱位组合解读。"
+                    "每个板块一个 key，value 含 'main_box'(主箱位%)、'box60'(60日箱位%)、"
+                    "'interpretation'(解读：主升初期/出货风险/高位震荡等)。"
+                    "核心认知——短箱贴顶+60日箱位低(<40%)=主升初期波段空间仍在；"
+                    "长短双高(≈100%/100%)=真出货风险。只解读数据实际提供的板块，缺失标注")
+    volume_character: str = Field(
+        default="",
+        description="量能成色定性一句话。必须引用量倍数值与口径，如"
+                    "'量倍1.15温和放大，结构性行情而非全面牛市'。"
+                    "禁止只写'放量/缩量'不给量级。数据缺失时写'量倍数据缺失，基于板块量比推断：...'")
+    stock_verification: list = Field(
+        default_factory=list,
+        description="个股强度三维验证（仅主线板块内抽样≤5只）。每只含"
+                    "'name'(名称)、'change_pct'(涨幅%)、'volume_ratio'(量倍)、"
+                    "'box60'(60日箱位%，缺失写None)、'verdict'(真强/加速后段/放量滞涨/弱势)、"
+                    "'basis'(一句依据)。数据缺失的个股也要列出，verdict标注'数据不足'")
+
 
 # ================= ScoreAgent 多维打分 =================
 class ScoreDimension(BaseModel):
@@ -137,6 +166,9 @@ class SellOutput(BaseModel):
     stock_code: str
     action: str = Field(pattern="^(hold|partial|sell)$",
                         description="建议：hold=继续持有 / partial=部分减仓 / sell=卖出清仓")
+    reduce_ratio: float | None = Field(default=None, ge=0.0, le=1.0,
+        description="建议减仓比例 0.0-1.0（如 0.33=减1/3，0.5=减1/2）；仅 action=partial 时有值，"
+                    "hold/sell 为 None；超出值域由 pydantic 校验拦截")
     confidence: str = Field(pattern="^(high|medium|low)$", description="决策置信度")
     reasons: list[str] = Field(description="决策依据（引用具体数据与近期监控信号）")
     exit_price_zone: str = Field(description="建议卖出价格区间或触发条件（如 '反弹至 26.5 附近' / '跌破 24.8 离场'）")
@@ -260,3 +292,25 @@ class TrackVerifyOutput(BaseModel):
     summary_note: str = Field(default="", description="本轮统计要点自评（一句话）")
     agent_suggestions: list[AgentSuggestionItem] = Field(default_factory=list,
         description="选股规则优化建议（基于统计事实；无显著异常时输出空列表，绝不为了输出而输出）")
+
+
+# ==================== 经验沉淀闭环：LLM 抽取草稿 / 冲突判定 ====================
+
+class ExperienceDraft(BaseModel):
+    """经验抽取草稿（Worker 离线识别输出；pydantic 严格校验，强制 JSON）
+    仅约束结构，不含任何业务阈值；impact/confidence 的裁定见 route_draft。"""
+    worth: bool = Field(description="是否含可沉淀经验")
+    title: str = Field(default="", description="经验标题")
+    body: str = Field(default="", description="经验正文（具体、可复用、严禁编造）")
+    stage: str = Field(default="选股", description="选股|建仓|持仓")
+    tags: list[str] = Field(default_factory=list, description="标签（板块/形态/指标）")
+    impact: str = Field(default="low", description="high|low（涉及规则/标准修改→high；纯观测→low）")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="抽取置信度 0-1")
+    reason: str = Field(default="", description="为何值得沉淀")
+
+
+class RouteConflict(BaseModel):
+    """冲突判定结果（自动合并前 LLM 两段式判定第二段）"""
+    conflict: bool = Field(default=False, description="是否存在结论相反的经验")
+    conflicting_ids: list[int] = Field(default_factory=list, description="冲突候选经验 id")
+    reason: str = Field(default="", description="冲突判断依据（一句话）")

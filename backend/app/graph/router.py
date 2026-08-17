@@ -25,6 +25,65 @@ def _new_state(**kwargs) -> StockAgentState:
     return base
 
 
+def _exp_summary(kind: str, state: dict) -> tuple[str, str]:
+    """从 run_* 结果 state 提取经验摘要与产物引用（缺失字段安全兜底，返回 ("", "") 表示无有效产出）"""
+    code = state.get("stock_code") or ""
+    if kind == "discover":
+        cands = state.get("candidates") or []
+        if not cands:
+            return "", ""
+        codes = ",".join(str(c.get("stock_code") or "") for c in cands[:20])
+        return f"候选 {len(cands)} 只", codes
+    if kind == "score":
+        sr = state.get("score_result") or {}
+        if not code or not sr:
+            return "", ""
+        return f"{code} 评分 {sr.get('score', '—')} 分 {sr.get('grade', '—')} 级", code
+    if kind == "position":
+        pp = state.get("position_plan") or {}
+        if not code or not pp:
+            return "", ""
+        nb = len(pp.get("batches") or [])
+        return f"{code} 建仓方案 {nb} 批", str(pp.get("plan_id") or code)
+    if kind == "monitor":
+        sig = state.get("holding_signal") or {}
+        if not code or not sig:
+            return "", ""
+        return f"{code} 监控信号 {sig.get('action', '—')}", str(state.get("holding_id") or code)
+    if kind == "sell":
+        sd = state.get("sell_decision") or {}
+        if not code or not sd:
+            return "", ""
+        return f"{code} 卖出决策 {sd.get('action', '—')}", str(state.get("holding_id") or code)
+    if kind == "review":
+        es = state.get("exit_suggest") or {}
+        if not code or not es:
+            return "", ""
+        pnl = es.get("pnl_pct")
+        pnl_txt = f"{pnl:+.2f}%" if isinstance(pnl, (int, float)) else "—"
+        return f"{code} 复盘 持有 {es.get('hold_days', '—')} 天 盈亏 {pnl_txt}", \
+            str(state.get("holding_id") or code)
+    return "", ""
+
+
+def _record_pending_experience(kind: str, state: dict) -> None:
+    """热路径经验沉淀钩子：单行 INSERT，零分析，失败静默降级（不阻塞主任务）。
+    复盘经验最有价值（run_review 重点）；market_intel/portfolio_sentinel 不沉淀（宁缺毋滥）。"""
+    try:
+        stage_map = {"discover": "选股", "score": "选股", "position": "建仓",
+                     "monitor": "持仓", "sell": "持仓", "review": "持仓"}
+        if kind not in stage_map:
+            return
+        summary, artifacts = _exp_summary(kind, state)
+        if not summary:
+            return
+        trade_date = state.get("trade_date") or time.strftime("%Y-%m-%d")
+        from app.db import repo
+        repo.add_pending_experience(f"{kind}:{trade_date}", stage_map[kind], summary, artifacts)
+    except Exception:  # noqa: BLE001 热路径钩子绝不抛异常影响主任务
+        logger.warning("record_pending_experience 失败（降级不影响主任务）", exc_info=True)
+
+
 def run_discover(trade_date: str | None = None) -> StockAgentState:
     """每日潜力股挖掘：硬过滤 → LLM 初选 → 新闻核实 → 最终候选落库"""
     date_key = trade_date or time.strftime("%Y-%m-%d")
@@ -32,6 +91,7 @@ def run_discover(trade_date: str | None = None) -> StockAgentState:
     state = _new_state(trade_date=date_key)
     result = graph.invoke(state)
     logger.info("discover 完成: candidates=%s", len(result.get("candidates") or []))
+    _record_pending_experience("discover", result)
     return result
 
 
@@ -40,7 +100,9 @@ def run_score(code: str, stock_name: str = "", trade_date: str | None = None) ->
     graph = get_graph("score")
     state = _new_state(stock_code=code, stock_name=stock_name or code,
                        trade_date=trade_date or time.strftime("%Y-%m-%d"))
-    return graph.invoke(state)
+    result = graph.invoke(state)
+    _record_pending_experience("score", result)
+    return result
 
 
 # B 级建仓计划缓存时长（分级缓存：B 级 30 分钟，A 级实时计算）
@@ -82,7 +144,9 @@ def run_position(code: str, stock_name: str = "", trade_date: str | None = None,
     graph = get_graph("position")
     state = _new_state(stock_code=code, stock_name=stock_name or code, trade_date=today,
                        plan_source=source)
-    return graph.invoke(state)
+    result = graph.invoke(state)
+    _record_pending_experience("position", result)
+    return result
 
 
 def run_monitor(holding_id: int, trade_date: str | None = None,
@@ -98,7 +162,9 @@ def run_monitor(holding_id: int, trade_date: str | None = None,
                        stock_name=holding.stock_name,
                        trade_date=trade_date or time.strftime("%Y-%m-%d"),
                        batch_quotes=batch_quotes)
-    return graph.invoke(state)
+    result = graph.invoke(state)
+    _record_pending_experience("monitor", result)
+    return result
 
 
 def run_monitor_all(trade_date: str | None = None) -> list[StockAgentState]:
@@ -136,14 +202,18 @@ def run_sell_decision(holding_id: int, trade_date: str | None = None) -> StockAg
     state = _new_state(holding_id=holding_id, stock_code=holding.stock_code,
                        stock_name=holding.stock_name,
                        trade_date=trade_date or time.strftime("%Y-%m-%d"))
-    return graph.invoke(state)
+    result = graph.invoke(state)
+    _record_pending_experience("sell", result)
+    return result
 
 
 def run_review(holding_id: int, trade_date: str | None = None) -> StockAgentState:
     """卖出复盘"""
     graph = get_graph("review")
     state = _new_state(holding_id=holding_id, trade_date=trade_date or time.strftime("%Y-%m-%d"))
-    return graph.invoke(state)
+    result = graph.invoke(state)
+    _record_pending_experience("review", result)
+    return result
 
 
 def run_market_intel(trade_date: str | None = None) -> StockAgentState:

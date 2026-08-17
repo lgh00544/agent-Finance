@@ -8,6 +8,7 @@ PortfolioSentinel 组合哨兵 - LangGraph 单节点（交易时段每 10 分钟
 流转：portfolio_sentinel_node（collect → agent_call(LIGHT) → 落库推送）
 数据纪律：各数据段独立 try/except，缺失字段标注「数据不足」绝不编造；无持仓正常跳过不报错。
 """
+import json
 import logging
 import re
 import time
@@ -232,6 +233,9 @@ def portfolio_sentinel_node(state: StockAgentState) -> StockAgentState:
         )
         result = output.model_dump()
         state["portfolio_sentinel"] = {"trade_date": today, **result}
+        # 暴露组合风险快照供 SellAgent 只读消费（30 分钟 TTL，与巡检节奏一致；仅暴露已算好的结果，不改判断逻辑）
+        cache.set("portfolio_sentinel:last_risk",
+                  json.dumps(result.get("portfolio_risk") or {}, ensure_ascii=False, default=str), 1800)
         _persist_alerts(raw, result, today)
         logger.info("组合哨兵完成: %s 板块预警 %s 条 / 时间止损 %s 条 / 组合回撤 %s / 集中度 %s",
                     today, len(result["sector_alerts"]), len(result["time_stop_alerts"]),

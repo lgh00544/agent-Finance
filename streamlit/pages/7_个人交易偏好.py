@@ -17,10 +17,12 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("个人交易偏好档案（sys_trade_profile）")
-
-st.caption("偏好会在所有 Agent 调用 LLM 时自动注入研判上下文。保存立即生效，无需重启。"
-           "字段可自由增删，支持导出/导入 JSON 备份迁移。")
+# ===== 批次3：页面头部收敛为 page_header 单行范式 =====
+render.page_header(
+    "个人交易偏好档案（sys_trade_profile）",
+    caption="偏好会在所有 Agent 调用 LLM 时自动注入研判上下文。保存立即生效，无需重启。"
+            "字段可自由增删，支持导出/导入 JSON 备份迁移。",
+)
 
 try:
     profile = api.get_profile()

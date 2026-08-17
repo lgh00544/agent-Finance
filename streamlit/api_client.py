@@ -147,6 +147,15 @@ def candidate_tradeable(date: str | None = None, limit: int = 200) -> dict:
     return _get("/api/candidates/tradeable", params)
 
 
+def candidate_concentration(date: str | None = None) -> dict:
+    """候选行业集中度（只读 detail.enriched.industry）：
+    {total, groups, max_concentration, max_industry, coverage}；coverage<50% 前端不展示集中度"""
+    params = {}
+    if date:
+        params["date"] = date
+    return _get("/api/candidate/concentration", params or None)
+
+
 def traces(code: str | None = None, date: str | None = None,
            module: str | None = None, limit: int = 50) -> list:
     """推理留痕轻量列表（不含长文本，毫秒级；详情按需单查）"""
@@ -484,3 +493,98 @@ def chat_learn(agent: str, image_bytes: bytes, filename: str, description: str =
 def chat_learn_confirm(agent: str, entries: list[dict]) -> dict:
     """确认多模态学习结果：知识点（可含修正后的标签）写入对应 Agent 知识库"""
     return _post("/api/agent-chat/learn/confirm", {"agent": agent, "entries": entries})
+
+
+# ================= 经验沉淀闭环（自动识别 → 分层审核 → 检索注入） =================
+class ConflictError(Exception):
+    """后端 409 冲突（已有同类任务 / 状态不允许操作）；页面捕获后提示而非报错"""
+
+
+def get_experience_pending(status: str | None = None, stage: str | None = None,
+                           limit: int = 50) -> list:
+    """M1 沉淀队列（只读看板；pending/processing/done 分类计数）"""
+    params = {"limit": limit}
+    if status:
+        params["status"] = status
+    if stage:
+        params["stage"] = stage
+    return _get("/api/experience/pending", params)
+
+
+def run_experience_worker() -> dict:
+    """M1 立即触发识别（异步后台任务）；同类型活跃时后端 409 → 抛 ConflictError"""
+    try:
+        return _post("/api/experience/worker/run")
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 409:
+            raise ConflictError("已有识别任务执行中，请等待其完成后重试") from exc
+        raise
+
+
+def get_experience_list(status: str | None = None, stage: str | None = None,
+                        auto_merged: int | None = None, limit: int = 100) -> list:
+    """经验库列表（按状态/阶段/自动合并筛选；M2 Digest 取 status=pending_review）"""
+    params = {"limit": limit}
+    if status:
+        params["status"] = status
+    if stage:
+        params["stage"] = stage
+    if auto_merged is not None:
+        params["auto_merged"] = auto_merged
+    return _get("/api/experience/list", params)
+
+
+def search_experience(stage: str | None = None, query: str | None = None, k: int = 50) -> list:
+    """经验检索（参数名是 query 不是 q；仅返回 active；k=50 保证够用）"""
+    params = {"k": k}
+    if stage:
+        params["stage"] = stage
+    if query:
+        params["query"] = query
+    return _get("/api/experience/search", params)
+
+
+def get_experience_config() -> dict:
+    """M5 设置读取（返回值全为字符串，页面侧需 float()/int()/bool 转换）"""
+    return _get("/api/experience/config")
+
+
+def set_experience_config(config: dict) -> dict:
+    """M5 设置写入（key-value 热加载，无需重启；key 须为已知配置项）"""
+    return _post("/api/experience/config", {"config": config})
+
+
+def get_experience_detail(eid: int) -> dict:
+    """单条经验（含 source_summary / source_task_id）"""
+    return _get(f"/api/experience/{eid}")
+
+
+def review_experience(eid: int, action: str, note: str = "") -> dict:
+    """M2/M3 审核：approve→active / reject→rejected（驳回必填理由）。
+    非 pending_review→409、驳回无理由→400，均抛 ConflictError"""
+    try:
+        return _post(f"/api/experience/{eid}/review", {"action": action, "note": note})
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in (400, 409):
+            detail = ""
+            try:
+                detail = exc.response.json().get("detail", "")
+            except Exception:  # noqa: BLE001
+                pass
+            raise ConflictError(detail or "操作不允许（状态或参数不符）") from exc
+        raise
+
+
+def rollback_experience(eid: int) -> dict:
+    """M4 回滚（仅 active 且 auto_merged=1 可回滚；否则 409 → ConflictError）"""
+    try:
+        return _post(f"/api/experience/{eid}/rollback")
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 409:
+            detail = ""
+            try:
+                detail = exc.response.json().get("detail", "")
+            except Exception:  # noqa: BLE001
+                pass
+            raise ConflictError(detail or "仅已生效且自动合并的经验可回滚") from exc
+        raise

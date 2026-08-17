@@ -23,7 +23,11 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("建仓计划（PositionAgent）")
+# ===== 批次2：页面头部收敛为 page_header 单行范式 =====
+render.page_header(
+    "建仓计划（PositionAgent）",
+    caption="PositionAgent 分批建仓方案：A 级实时数据 / B 级 30 分钟缓存；仅综合评级 ≥B 级可生成。",
+)
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
@@ -56,43 +60,44 @@ try:
 except Exception:  # noqa: BLE001 候选池失败降级：下拉为空，手动输入仍可用
     pool_options = []
 
-st.markdown("**生成建仓计划**（仅综合评级 ≥B 级标的可生成；C 级及以下会提示「评级不足」）")
-sel_col, man_col, btn_col = st.columns([2.2, 1.6, 1.2], vertical_alignment="center")
-with sel_col:
-    _pool_labels = ["（从候选池选择）"] + [
-        f"{r['stock_code']} {r['stock_name']}（{score_map.get(r['stock_code'], {}).get('grade', '—')} 级）"
-        for r in pool_options]
-    sel = st.selectbox("候选池标的（最新一轮）", _pool_labels, key="_plan_pool_sel",
-                       label_visibility="collapsed")
-with man_col:
-    manual = st.text_input("或手动输入代码（6 位数字）", key="_plan_manual_input",
-                           label_visibility="collapsed",
-                           placeholder="或手动输入 6 位股票代码")
-with btn_col:
-    # C 级选中 → 生成按钮置灰 + 提示（手动输入不受下拉限制，后端仍强校验）
-    _sel_grade = None
-    if not sel.startswith("（"):
-        _sel_grade = score_map.get(sel.split(" ")[0], {}).get("grade")
-    _disabled = not (manual.strip() or (not sel.startswith("（") and _sel_grade in ("A", "B")))
-    if st.button("生成建仓计划", type="primary", use_container_width=True,
-                 disabled=_disabled):
-        target = None
-        if manual.strip().isdigit() and len(manual.strip()) == 6:
-            target = {"stock_code": manual.strip(), "source": "manual"}
-        elif not sel.startswith("（"):
-            code = sel.split(" ")[0]
-            name = next((r["stock_name"] for r in pool_options
-                         if r["stock_code"] == code), "")
-            target = {"stock_code": code, "stock_name": name, "source": "manual"}
-        if target is None:
-            render.msg_card("warn", "请选择候选池标的或输入 6 位数字股票代码")
-        else:
-            render.submit_task("position", target, label="建仓方案生成")
-            st.toast(f"建仓方案生成任务已提交后台（{target['stock_code']}），"
-                     "评级校验与生成完成后顶部任务状态区会提示；B 级标的 30 分钟内复用缓存")
-    if not manual.strip() and not sel.startswith("（") and _sel_grade not in ("A", "B"):
-        render.msg_card("warn", "评级不足 B 级（建议谨慎建仓）：生成按钮已置灰；"
-                        "如需强制生成可手动输入代码提交（后端仍会按评级强校验）")
+with st.expander("➕ 新建建仓计划", expanded=False):
+    st.markdown("**生成建仓计划**（仅综合评级 ≥B 级标的可生成；C 级及以下会提示「评级不足」）")
+    sel_col, man_col, btn_col = st.columns([2.2, 1.6, 1.2], vertical_alignment="center")
+    with sel_col:
+        _pool_labels = ["（从候选池选择）"] + [
+            f"{r['stock_code']} {r['stock_name']}（{score_map.get(r['stock_code'], {}).get('grade', '—')} 级）"
+            for r in pool_options]
+        sel = st.selectbox("候选池标的（最新一轮）", _pool_labels, key="_plan_pool_sel",
+                           label_visibility="collapsed")
+    with man_col:
+        manual = st.text_input("或手动输入代码（6 位数字）", key="_plan_manual_input",
+                               label_visibility="collapsed",
+                               placeholder="或手动输入 6 位股票代码")
+    with btn_col:
+        # C 级选中 → 生成按钮置灰 + 提示（手动输入不受下拉限制，后端仍强校验）
+        _sel_grade = None
+        if not sel.startswith("（"):
+            _sel_grade = score_map.get(sel.split(" ")[0], {}).get("grade")
+        _disabled = not (manual.strip() or (not sel.startswith("（") and _sel_grade in ("A", "B")))
+        if st.button("生成建仓计划", type="primary", use_container_width=True,
+                     disabled=_disabled):
+            target = None
+            if manual.strip().isdigit() and len(manual.strip()) == 6:
+                target = {"stock_code": manual.strip(), "source": "manual"}
+            elif not sel.startswith("（"):
+                code = sel.split(" ")[0]
+                name = next((r["stock_name"] for r in pool_options
+                             if r["stock_code"] == code), "")
+                target = {"stock_code": code, "stock_name": name, "source": "manual"}
+            if target is None:
+                render.msg_card("warn", "请选择候选池标的或输入 6 位数字股票代码")
+            else:
+                render.submit_task("position", target, label="建仓方案生成")
+                st.toast(f"建仓方案生成任务已提交后台（{target['stock_code']}），"
+                         "评级校验与生成完成后顶部任务状态区会提示；B 级标的 30 分钟内复用缓存")
+        if not manual.strip() and not sel.startswith("（") and _sel_grade not in ("A", "B"):
+            render.msg_card("warn", "评级不足 B 级（建议谨慎建仓）：生成按钮已置灰；"
+                            "如需强制生成可手动输入代码提交（后端仍会按评级强校验）")
 
 # ================= 日期 / 评级筛选（前端过滤，零额外接口） =================
 try:
@@ -171,8 +176,44 @@ else:
                                    dot=dot, meta=meta, scope="plan"):
             with st.container(border=True):
                 render.trace_line("方案生成时间", r.get("created_at"), source="LLM 生成")
-                # ===== 核心信息总览（6 项量化数值，一眼看懂） =====
-                with st.container(border=True):
+                # 批次2：操作前置——手动刷新（击穿缓存重算）提到详情首行
+                _act = render.quick_actions(f"plan_act_{key}", [
+                    {"label": "🔄 手动刷新本计划（击穿缓存重算）", "type": "primary"},
+                ])
+                if _act == 0:
+                    render.submit_task("position", {"stock_code": r["stock_code"],
+                                                    "stock_name": r["stock_name"]},
+                                       label="建仓方案重算")
+                    st.toast("已提交建仓方案重算任务，完成后顶部任务状态区会提示")
+                # 批次2：5 分区垂直堆叠 → detail_tabs（默认停「分档买入」；字段与文案零删减仅换容器）
+                def _tab_batches():
+                    # 分档买入明细（表格化：价格/金额/股数/累计占比）
+                    render.section_title("分档买入明细")
+                    qb = quant.get("batches") if quant else None
+                    if qb:
+                        batch_df = pd.DataFrame([
+                            {"批次": b.get("tranche"), "价格区间": b.get("price_zone"),
+                             "触发条件": b.get("trigger_note"), "投入金额": b.get("amount"),
+                             "买入股数": b.get("shares"), "累计仓位占比%": b.get("cum_pct")}
+                            for b in qb
+                        ])
+                        st.dataframe(batch_df, width="stretch", hide_index=True)
+                        st.markdown(f"**合计**：总投入 **{quant.get('total_amount') or '—'} 元**，"
+                                    f"总持股 **{quant.get('total_shares') or '—'} 股**，"
+                                    f"不突破 C1 单票上限 {quant.get('position_cap_pct', '—')}%")
+                    elif r["batches"]:
+                        # 旧数据降级：LLM 比例明细
+                        batch_df = pd.DataFrame([
+                            {"批次": b.get("tranche"), "价格区间": b.get("price_zone"),
+                             "资金占比%": b.get("ratio_pct"), "触发条件": b.get("trigger_note")}
+                            for b in r["batches"]
+                        ])
+                        st.dataframe(batch_df, width="stretch", hide_index=True)
+                    else:
+                        st.markdown("（该轮未输出分批明细）")
+
+                def _tab_allocation():
+                    # 核心信息总览（仓位分配量化数值，6 项一眼看懂）
                     render.section_title("核心信息总览（量化数值，可直接对照执行）")
                     q = quant
                     if q:
@@ -202,33 +243,9 @@ else:
                     else:
                         st.caption("该计划为旧数据（量化功能上线前生成），仅展示 LLM 原始数值："
                                    f"当前价与金额量化不可用；止损 {sl} / 止盈 {tp} 为参考值。")
-                # ===== 分档买入明细（表格化：价格/金额/股数/累计占比） =====
-                with st.container(border=True):
-                    render.section_title("分档买入明细")
-                    qb = quant.get("batches") if quant else None
-                    if qb:
-                        batch_df = pd.DataFrame([
-                            {"批次": b.get("tranche"), "价格区间": b.get("price_zone"),
-                             "触发条件": b.get("trigger_note"), "投入金额": b.get("amount"),
-                             "买入股数": b.get("shares"), "累计仓位占比%": b.get("cum_pct")}
-                            for b in qb
-                        ])
-                        st.dataframe(batch_df, width="stretch", hide_index=True)
-                        st.markdown(f"**合计**：总投入 **{quant.get('total_amount') or '—'} 元**，"
-                                    f"总持股 **{quant.get('total_shares') or '—'} 股**，"
-                                    f"不突破 C1 单票上限 {quant.get('position_cap_pct', '—')}%")
-                    elif r["batches"]:
-                        # 旧数据降级：LLM 比例明细
-                        batch_df = pd.DataFrame([
-                            {"批次": b.get("tranche"), "价格区间": b.get("price_zone"),
-                             "资金占比%": b.get("ratio_pct"), "触发条件": b.get("trigger_note")}
-                            for b in r["batches"]
-                        ])
-                        st.dataframe(batch_df, width="stretch", hide_index=True)
-                    else:
-                        st.markdown("（该轮未输出分批明细）")
-                # ===== 止盈止损与风控规则 =====
-                with st.container(border=True):
+
+                def _tab_rules():
+                    # 止盈止损与风控规则
                     render.section_title("止盈止损与风控规则")
                     init_stop = (quant.get("initial_stop") if quant else None) or r["stop_loss"]
                     st.markdown(f"- **止损规则**：初始止损位 **{init_stop}**（C3 硬止损，跌破无条件离场）；"
@@ -241,15 +258,17 @@ else:
                                 f"{quant.get('expected_total_pct') if quant else '—'}%")
                     st.markdown("⚠️ 标的自身风险与大盘系统性风险请结合评分风险清单综合判断；"
                                 "**所有建议仅作参考，最终交易由人工判断**。")
-                # 市场强弱判断与建仓逻辑（分档买入依据）
-                with st.container(border=True):
+
+                def _tab_logic():
+                    # 市场强弱判断与建仓逻辑（分档买入依据）
                     render.section_title("市场强弱判断与建仓逻辑")
                     st.markdown(detail.get("market_regime") or "（无）")
                     st.markdown(r["rationale"] or "（无）")
-                # 生成依据（评级依据：评分 + 风险清单，与评分报告同源）
-                sc = score_map.get(r["stock_code"], {})
-                if sc:
-                    with st.container(border=True):
+
+                def _tab_evidence():
+                    # 生成依据（评级依据：评分 + 风险清单，与评分报告同源）
+                    sc = score_map.get(r["stock_code"], {})
+                    if sc:
                         render.section_title("生成依据（评级依据）")
                         st.markdown(f"- 综合评级：**{sc.get('grade', '—')} 级**"
                                     f"（{sc.get('score', '—')} 分，评分报告同源数据）")
@@ -260,18 +279,18 @@ else:
                                 st.markdown(f"  - {risk}")
                         else:
                             st.markdown("- 风险提示：（该轮未输出）")
-                # v3.0 白盒维度归因：维度数组 + 综合评估（主结论，置顶展示；旧数据缺省自动跳过）
-                with st.container(border=True):
+                    # v3.0 白盒维度归因：维度数组 + 综合评估（主结论；旧数据缺省自动跳过）
                     render.section_title("维度归因（五维白盒，主结论）")
                     render.dimension_bars(detail.get("dimensions"),
                                           final_advice=detail.get("final_advice"))
-                # 单条手动刷新（强制击穿缓存重新计算，A/B 级均生效）
-                if st.button("手动刷新本计划（击穿缓存重算）", key=f"ref_plan_{r['id']}",
-                             use_container_width=False):
-                    render.submit_task("position", {"stock_code": r["stock_code"],
-                                                    "stock_name": r["stock_name"]},
-                                       label="建仓方案重算")
-                    st.toast("已提交建仓方案重算任务，完成后顶部任务状态区会提示")
+
+                render.detail_tabs([
+                    ("分档买入", _tab_batches),
+                    ("仓位分配", _tab_allocation),
+                    ("止盈止损", _tab_rules),
+                    ("建仓逻辑", _tab_logic),
+                    ("生成依据", _tab_evidence),
+                ], key=f"plan_tabs_{key}", default_index=0)
                 render.raw_json_expander(
                     {"status": r["status"], "batches": r["batches"]},
                     key=f"raw_plan_{r['id']}")

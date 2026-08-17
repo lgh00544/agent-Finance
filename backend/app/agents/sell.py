@@ -11,6 +11,7 @@ import time
 from app.agents.common import ModelLevel, agent_call
 from agent_prompts import sell_prompt
 from app.agents.schemas import SellOutput
+from app.cache import cache
 from app.datasource.base import DataSource
 from app.datasource.fallback import get_datasource
 from app.db import repo
@@ -67,6 +68,21 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 游资聚合失败不阻塞卖出决策
         logger.warning("卖出游资聚合失败（降级跳过）: %s", exc)
 
+    # 组合风险上下文（单向只读 PortfolioSentinel 最近快照；未运行过如实标注不可用，不影响个股独立研判）
+    portfolio_risk_context: dict = {"available": False,
+                                    "note": "组合数据不可用（PortfolioSentinel 未运行或快照过期）"}
+    try:
+        _raw = cache.get("portfolio_sentinel:last_risk")
+        if _raw:
+            _risk = json.loads(_raw) if isinstance(_raw, str) else _raw
+            portfolio_risk_context = {"available": True,
+                                      "total_pnl_pct": _risk.get("total_pnl_pct"),
+                                      "max_sector_pct": _risk.get("max_sector_pct"),
+                                      "drawdown_alert": _risk.get("drawdown_alert"),
+                                      "concentration_alert": _risk.get("concentration_alert")}
+    except Exception as exc:  # noqa: BLE001 组合快照读取失败降级标注不可用，不阻塞卖出决策
+        logger.warning("组合风险上下文读取失败（降级标注不可用）: %s", exc)
+
     state["sell_input"] = {
         "holding": {"entry_date": holding.entry_date, "entry_price": holding.entry_price,
                     "shares": holding.shares, "stop_loss": holding.stop_loss,
@@ -79,6 +95,7 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
         "monitor_signals": signal_rows,
         "news_titles": news_titles,
         "hot_money": hm_agg,
+        "portfolio_risk_context": portfolio_risk_context,
     }
     state["tech_index"] = indicators
     state["trace"] = [*state.get("trace", []),
@@ -118,12 +135,27 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
         "游资聚合": data.get("hot_money"),
     }
 
+    # 组合风险上下文 → 文本（只读参考；缺失标注不可用，不影响个股独立研判）
+    risk_ctx = data.get("portfolio_risk_context") or {}
+    if risk_ctx.get("available"):
+        portfolio_risk_text = (
+            f"组合总盈亏: {risk_ctx.get('total_pnl_pct') or '数据不足'}% | "
+            f"最大板块占比: {risk_ctx.get('max_sector_pct') or '数据不足'}% | "
+            f"组合回撤预警: {'触发' if risk_ctx.get('drawdown_alert') else '未触发'} | "
+            f"集中度预警: {'触发' if risk_ctx.get('concentration_alert') else '未触发'}"
+        )
+    else:
+        portfolio_risk_text = (risk_ctx.get("note")
+                               or "组合数据不可用（PortfolioSentinel 未运行或快照过期）")
+
     output = agent_call(
         agent="sell",
         cache_key=f"selldec:{code}:{today}",
         system_prompt=sell_prompt.SYSTEM_PROMPT,
         user_prompt=sell_prompt.build_user_prompt(
-            holding_info, signals_text, plan_info, json.dumps(quote_pack, ensure_ascii=False, default=str)),
+            holding_info, signals_text, plan_info,
+            json.dumps(quote_pack, ensure_ascii=False, default=str),
+            portfolio_risk_context=portfolio_risk_text),
         schema=SellOutput,
         ttl_seconds=86400,
         model_level=ModelLevel.DEEP,

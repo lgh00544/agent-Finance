@@ -5,6 +5,7 @@
 4. 各列表接口（评分/告警/复盘/建仓/持仓）返回的名称均经补全。"""
 import pytest
 
+from app.cache import cache
 from app.db import repo
 from app.db.models import Holding, NewsArticle, StockCandidate, StockScore
 from app.db.session import SessionLocal
@@ -18,12 +19,15 @@ def _db_ready():
 
 @pytest.fixture()
 def _clean(monkeypatch):
-    """隔离测试数据：清空相关表，测试后恢复"""
+    """隔离测试数据：清空相关表 + 失效查询缓存（原生 SQLAlchemy 直写绕过 repo._invalidate，
+    不清缓存会让后续同参数 list_* 读到 prior test 的脏缓存，产生顺序依赖 flake），测试后恢复"""
+    cache.delete_prefix("dbq:")
     with SessionLocal() as db:
         for m in (StockCandidate, StockScore, Holding, NewsArticle):
             db.query(m).delete()
         db.commit()
     yield
+    cache.delete_prefix("dbq:")
     with SessionLocal() as db:
         for m in (StockCandidate, StockScore, Holding, NewsArticle):
             db.query(m).delete()

@@ -495,12 +495,15 @@ class AkshareSource(DataSource):
     # ---------------- 批量实时行情（监控全持仓一次获取） ----------------
     _BATCH_QUOTE_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 
-    def fetch_spot_quotes_batch(self, codes: list[str]) -> dict[str, dict]:
+    def fetch_spot_quotes_batch(self, codes: list[str],
+                                force_realtime: bool = False) -> dict[str, dict]:
         """批量实时行情【刚性代码逻辑】：全持仓统一获取后再过滤，禁止循环内逐只请求。
 
         链路：东财 push2 ulist 批量（一次请求全部代码）→ 全市场快照过滤（收盘数据）
         → 仍缺的逐只 fetch_spot_quote 兜底（极少）；TTL 30s，key 按排序代码哈希。
         非交易时段不请求实时接口，直接走快照（收盘数据）。
+        force_realtime=True：跳过 realtime_open 闸门直接走 ulist 实时接口
+        （盘前集合竞价等场景，ulist 返回竞价撮合价；失败仍走快照兜底）。
         返回 {code: {"code","name","price","change_pct","time"}}，price 缺失置 None。
         """
         codes = sorted({str(c) for c in codes if c})
@@ -514,7 +517,7 @@ class AkshareSource(DataSource):
             except (ValueError, TypeError):
                 pass
         out: dict[str, dict] = {}
-        if market_hours.realtime_open():
+        if force_realtime or market_hours.realtime_open():
             try:
                 out = self._batch_from_ulist(codes)
             except Exception as exc:  # noqa: BLE001 批量主源失败不阻塞，走快照降级

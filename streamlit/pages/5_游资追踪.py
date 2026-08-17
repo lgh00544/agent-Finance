@@ -17,7 +17,20 @@ import render
 render.apply_global_theme()
 render.top_status_bar()
 
-st.title("游资追踪（Hot Money）")
+# ===== 批次3：页面头部收敛为 page_header（胜率迭代为 primary action）=====
+_hdr = render.page_header(
+    "游资追踪（Hot Money）",
+    caption="游资档案 / 今日龙虎榜 / 席位监控 / 研判留痕 · 权重迭代需人工审核后生效",
+    primary_actions=[{"label": "⚙️ 运行胜率迭代", "key": "hdr_hm_iter"}],
+)
+if _hdr["primary"] == 0:
+    with st.spinner("正在统计各游资信号胜率并生成建议…"):
+        try:
+            st.session_state["_hm_iter_result"] = api.hot_money_winrate_iterate()
+            st.session_state["_hm_iter_err"] = None
+        except Exception as exc:  # noqa: BLE001 迭代失败降级为可重试错误卡
+            st.session_state["_hm_iter_result"] = None
+            st.session_state["_hm_iter_err"] = exc
 render.task_status_area()
 
 _TIER_TONE = {"一线": "a", "二线": "b", "观察": "c"}
@@ -70,31 +83,33 @@ with render.fold_module("hm_iter", "游资胜率迭代（自进化 · 人工审�
     st.caption("触发后：代码侧统计各游资历史「信号后5日上涨胜率」并落库（win_rate_5d/last_review_at），"
                "按胜率生成降/升档建议（agent_suggestion 落 pending 待你审核）。"
                "⚠️ 系统绝不自动修改任何游资档位/权重——所有建议必须经你人工审核确认后才生效。")
-    if st.button("运行胜率迭代（需真实行情回溯，耗时较长）", key="hm_iter_run",
-                 use_container_width=True):
-        with st.spinner("正在统计各游资信号胜率并生成建议…"):
-            try:
-                result = api.hot_money_winrate_iterate()
-                updated = result.get("updated") or []
-                suggestions = result.get("suggestions") or []
-                errors = result.get("errors") or []
-                if updated:
-                    render.stat_cards([
-                        {"label": "已统计游资", "value": len(updated), "tone": "info"},
-                        {"label": "生成建议", "value": len(suggestions),
-                         "tone": "warn" if suggestions else "mute",
-                         "sub": "均待人工审核"},
-                        {"label": "统计失败", "value": len(errors),
-                         "tone": "err" if errors else "mute"},
-                    ])
-                if errors:
-                    for e in errors:
-                        st.warning(f"{e.get('actor_name')} 统计失败：{e.get('error')}")
-                st.success(f"迭代完成：统计 {len(updated)} 位游资，生成 {len(suggestions)} 条建议"
-                           "（pending 待审核，审核通过后在下方「游资梯队建议」采纳应用）。")
-            except Exception as exc:
-                render.dismissible_error("胜率迭代失败", "后端未启动或行情回溯超时，可稍后重试。",
-                                         detail=exc, retry_key="retry_hm_iter")
+    # 批次3：胜率迭代按钮已上移 page_header primary action，此处仅渲染结果
+    _iter_res = st.session_state.get("_hm_iter_result")
+    _iter_err = st.session_state.get("_hm_iter_err")
+    if _iter_err is not None:
+        render.dismissible_error("胜率迭代失败", "后端未启动或行情回溯超时，可稍后重试。",
+                                 detail=_iter_err, retry_key="retry_hm_iter")
+    elif _iter_res:
+        updated = _iter_res.get("updated") or []
+        suggestions = _iter_res.get("suggestions") or []
+        errors = _iter_res.get("errors") or []
+        if updated:
+            render.stat_cards([
+                {"label": "已统计游资", "value": len(updated), "tone": "info"},
+                {"label": "生成建议", "value": len(suggestions),
+                 "tone": "warn" if suggestions else "mute",
+                 "sub": "均待人工审核"},
+                {"label": "统计失败", "value": len(errors),
+                 "tone": "err" if errors else "mute"},
+            ])
+        if errors:
+            for e in errors:
+                st.warning(f"{e.get('actor_name')} 统计失败：{e.get('error')}")
+        st.success(f"迭代完成：统计 {len(updated)} 位游资，生成 {len(suggestions)} 条建议"
+                   "（pending 待审核，审核通过后在下方「游资梯队建议」采纳应用）。")
+    else:
+        st.caption("点击页面顶部「运行胜率迭代」触发（需真实行情回溯，耗时较长）；"
+                   "结果在此展示，建议落待审核队列。")
     # 游资梯队建议（复用策略闭环建议流：仅审核通过后可应用）
     try:
         hm_sugs = [s for s in (api.agent_suggestions() or [])

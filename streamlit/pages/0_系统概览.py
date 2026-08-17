@@ -22,28 +22,26 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("单人 A 股全生命周期决策 Agent 系统")
-
-# 合规风险提示条（业务规则级警示，顶部显著标注；不阻断任何操作）
-render.msg_card("warn", "本系统为个人研究辅助工具：只输出分析报告、打分、仓位建议与预警信号，"
-                "不包含任何自动下单/实盘交易功能，所有交易必须由你人工执行。")
+# ===== 批次2：页面头部收敛为 page_header 单行范式（合规降级为单行细条）=====
+_hdr = render.page_header(
+    "单人 A 股全生命周期决策 Agent 系统",
+    caption="系统服务 / 今日概览 / 性能统计 · 数据聚合看板",
+    primary_actions=[{"label": "⛏ 手动触发每日挖掘", "key": "hdr_dig"}],
+    secondary_actions=[{"label": "🔄 手动刷新全部数据", "key": "hdr_refresh"}],
+    compliance="本系统为个人研究辅助工具：只输出分析报告、打分、仓位建议与预警信号，"
+               "不包含任何自动下单/实盘交易功能，所有交易必须由你人工执行。",
+)
+if _hdr["primary"] == 0:
+    render.submit_task("daily_pipeline", label="每日挖掘")
+if _hdr["secondary"] == 0:
+    # 击穿前端 60s 短缓存（后端另有 60s dbq / 10min 止盈计划缓存）
+    st.session_state.pop("_dash_cache", None)
+    st.session_state.pop("_tp_cache", None)
+    st.rerun()
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
-
-# ============ 顶部操作行：左=数据更新时间，右=高频操作按钮 ============
-top1, top2, top3 = st.columns([3, 1, 1])
-with top1:
-    render.time_text("当前数据更新于", datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M"))
-with top2:
-    if st.button("手动刷新全部数据", use_container_width=True):
-        # 击穿前端 60s 短缓存（后端另有 60s dbq / 10min 止盈计划缓存）
-        st.session_state.pop("_dash_cache", None)
-        st.session_state.pop("_tp_cache", None)
-        st.rerun()
-with top3:
-    if st.button("手动触发每日挖掘", type="primary", use_container_width=True):
-        render.submit_task("daily_pipeline", label="每日挖掘")
+render.time_text("当前数据更新于", datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M"))
 
 SEVERITY_MAP = {"info": "一般", "warning": "警告", "critical": "严重"}
 ACTION_MAP = {"hold": "持有", "reduce": "减仓", "exit": "清仓"}
@@ -197,9 +195,6 @@ with tab_overview:
             except Exception as exc:
                 _fail("核心指标", exc)
 
-        # 全局批量操作区（模块1 下方）：一键收起/展开今日概览全部 7 个模块
-        _MOD_KEYS = ("ov_overview", "ov_market", "ov_positions", "ov_alerts",
-                     "ov_sectors", "ov_cands", "ov_reviews")
     @st.fragment
     def _module_market() -> None:
         """模块2：今日操作提示（市况五维，折叠后标题栏仍显示总分）"""
@@ -418,6 +413,12 @@ with tab_overview:
                 _fail("近期复盘动态", exc)
 
 
+    # 批次2：今日概览模块按关注度重排——顶部数据概览 → 持仓与操作建议 → 紧急告警日志
+    #         → 今日操作提示（市况五维）→ 今日热门板块 → 今日候选与建仓机会 → 近期复盘动态
+    # 今日概览 7 个模块 key（模块级，供「全部展开/收起」批量栏使用；
+    # 批次2 修复：原定义在 _module_overview fragment 内部导致模块级引用 NameError）
+    _MOD_KEYS = ("ov_overview", "ov_market", "ov_positions", "ov_alerts",
+                 "ov_sectors", "ov_cands", "ov_reviews")
     # 模块1：顶部数据概览组（5 张指标卡：候选/持仓/告警/盈亏/市况评分）
     _module_overview()
     _m1, _m2, _m3 = st.columns([1.1, 1.1, 4], vertical_alignment="center")
@@ -436,7 +437,7 @@ with tab_overview:
     with _m3:
         st.caption("模块默认展开，点击标题栏可单独收起/展开；刷新页面恢复默认。")
 
-    # 模块2：今日操作提示（市况五维）——折叠后标题栏仍显示总分
+    # 市况数据预取（供「今日操作提示」模块标题栏显示总分；模块调用前就绪）
     _mc = None
     try:
         _mc = _module("market_condition")
@@ -446,14 +447,20 @@ with tab_overview:
     if _mc:
         _mc_meta = (f"市况评分 {_mc['total_score']} 分 · {_mc.get('band', '')}"
                     f" · 候选池上限 {_mc['cap']} 只")
-    _module_market()
+
+    # 模块3：持仓与操作建议（批次2 上移为第 2 个模块）
     _module_positions()
+    # 模块4：紧急告警日志
     _module_alerts()
+    # 模块2：今日操作提示（市况五维）——折叠后标题栏仍显示总分
+    _module_market()
+    # 模块5：今日热门板块
     with render.fold_module("ov_sectors", "今日热门板块", default_open=False):
         hot_sector_board()
 
     # 模块6：今日候选与建仓机会（次要信息，默认收纳）
     _module_cands()
+    # 模块7：近期复盘动态
     _module_reviews()
 # ---------------- Tab 3：性能统计 ----------------
 with tab_perf:

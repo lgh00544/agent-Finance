@@ -17,7 +17,11 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("评分报告（ScoreAgent）")
+# ===== 批次2：页面头部收敛为 page_header 单行范式 =====
+render.page_header(
+    "评分报告（ScoreAgent）",
+    caption="ScoreAgent 五维评分（A/B/C 分级 + 风险清单）；表格选行后详情即时切换，零网络请求。",
+)
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
@@ -48,9 +52,11 @@ def _score_detail_card(r: dict) -> None:
             render.stat_cards([{"label": "综合分", "value": r["score"]}])
             render.badge(f"{grade} 级" if grade else "未评级", badge_tone)
 
-        # 分区一：五维分项评分（结构为 {维度: {score, verdict/advice}} 的字段才进表；
-        # v3.0 白盒：verdict 结论 + advice 建议；旧数据 comment 兼容兜底）
-        with render.fold_module(f"score_dims_{r['id']}", "五维分项评分", default_open=True):
+        # 批次2：详情分区 Tab 化（默认停在「五维分项评分」；附属研判按数据存在与否条件加入；
+        # 原始 JSON 折叠保留在 Tab 区之外最底部，字段与文案零删减仅换容器）
+        def _tab_dims():
+            # 五维分项评分（结构为 {维度: {score, verdict/advice}} 的字段才进表；
+            # v3.0 白盒：verdict 结论 + advice 建议；旧数据 comment 兼容兜底）
             dims = {k: v for k, v in d.items() if isinstance(v, dict) and "score" in v}
             if dims:
                 dim_df = pd.DataFrame([
@@ -66,36 +72,40 @@ def _score_detail_card(r: dict) -> None:
             if d.get("final_advice"):
                 render.dimension_bars(None, final_advice=d.get("final_advice"))
 
-        # 分区二：候选研判附属区（评分记录内嵌候选结论时展示；缺失则整段不渲染）
-        if (d.get("confidence_tier") or d.get("stock_type")
-                or any(d.get(k) for k in ("macro_view", "meso_view", "micro_view"))
-                or d.get("position_hint") or d.get("focus_type")):
-            with render.fold_module(f"score_extra_{r['id']}", "事实依据与操作建议（附属研判）",
-                                    default_open=False):
-                if d.get("confidence_tier"):
-                    st.markdown(f"- **K202 信心度检查**：{d['confidence_tier']}"
-                                + (f"（参考 {d.get('confidence_pct')}%）"
-                                   if d.get("confidence_pct") else ""))
-                if d.get("stock_type"):
-                    st.markdown(f"- **派发期校验（标的类型定位）**：{d['stock_type']}")
-                if any(d.get(k) for k in ("macro_view", "meso_view", "micro_view")):
-                    st.markdown(f"- **三维验证**：宏观 {d.get('macro_view') or '（无）'}；"
-                                f"中观 {d.get('meso_view') or '（无）'}；"
-                                f"微观 {d.get('micro_view') or '（无）'}")
-                if d.get("position_hint") or d.get("focus_type"):
-                    if d.get("focus_type"):
-                        st.markdown(f"- **关注类型**：{d['focus_type']}")
-                    if d.get("position_hint"):
-                        st.markdown(f"- **参考建议**：{d['position_hint']}")
+        def _tab_extra():
+            # 候选研判附属区（评分记录内嵌候选结论时展示）
+            if d.get("confidence_tier"):
+                st.markdown(f"- **K202 信心度检查**：{d['confidence_tier']}"
+                            + (f"（参考 {d.get('confidence_pct')}%）"
+                               if d.get("confidence_pct") else ""))
+            if d.get("stock_type"):
+                st.markdown(f"- **派发期校验（标的类型定位）**：{d['stock_type']}")
+            if any(d.get(k) for k in ("macro_view", "meso_view", "micro_view")):
+                st.markdown(f"- **三维验证**：宏观 {d.get('macro_view') or '（无）'}；"
+                            f"中观 {d.get('meso_view') or '（无）'}；"
+                            f"微观 {d.get('micro_view') or '（无）'}")
+            if d.get("position_hint") or d.get("focus_type"):
+                if d.get("focus_type"):
+                    st.markdown(f"- **关注类型**：{d['focus_type']}")
+                if d.get("position_hint"):
+                    st.markdown(f"- **参考建议**：{d['position_hint']}")
 
-        # 分区三：风险清单（三级详情区，默认收起）
-        with render.fold_module(f"score_risk_{r['id']}", "风险提示", default_open=False):
+        def _tab_risk():
+            # 风险清单（三级详情区）
             risks = r.get("risk_list") or []
             if risks:
                 for risk in risks:
                     st.markdown(f"- {risk}")
             else:
                 st.markdown("（无）")
+
+        _sections = [("五维分项评分", _tab_dims)]
+        if (d.get("confidence_tier") or d.get("stock_type")
+                or any(d.get(k) for k in ("macro_view", "meso_view", "micro_view"))
+                or d.get("position_hint") or d.get("focus_type")):
+            _sections.append(("事实依据与操作建议", _tab_extra))
+        _sections.append(("风险提示", _tab_risk))
+        render.detail_tabs(_sections, key=f"score_tabs_{r['id']}", default_index=0)
 
         # 原始数据永久折叠在最底部
         render.raw_json_expander(

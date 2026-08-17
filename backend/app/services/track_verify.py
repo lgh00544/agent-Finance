@@ -34,6 +34,9 @@ _WIN_LOW = 40.0              # 总体胜率 < 40% → 胜率过低异常
 _MIN_SAMPLE = 3              # 分组样本下限（低于不参与异常判定/模板建议，防小样本误判）
 _LOCK_TTL = 7200             # 主链路锁（2 小时，覆盖一次完整验证）
 _MAX_ERRORS = 20             # 单次链路错误记录上限（防日志与响应膨胀）
+_PERF_SUMMARY_TTL = 1800     # 选股表现摘要缓存（30 分钟，与组合哨兵同节奏）
+_PERF_SUMMARY_SAMPLE = 20    # 选股表现回顾样本数（近 20 只有到期数据的候选）
+_PERIOD_LABELS = {"t3": "T+3", "t5": "T+5", "t10": "T+10"}
 
 
 # ==================== T+N 计算（纯函数，可单测） ====================
@@ -180,6 +183,68 @@ def build_stats_json(stats: dict, anomalies: list[dict]) -> str:
     """stats + anomalies → 紧凑 JSON 字符串（LLM user prompt 与缓存键共用）"""
     return json.dumps({"stats": stats, "anomalies": anomalies},
                       ensure_ascii=False, default=str)
+
+
+def get_selection_performance_summary(period: str = "t5") -> str:
+    """选股表现回顾（紧凑文本，供 DiscoverAgent 注入；单向只读本模块统计，不改任何逻辑）。
+    读 repo.list_track_verify() → 过滤 {period}_pct IS NOT NULL → select_date DESC 取前 20
+    → compute_stats → detect_anomalies → 格式化紧凑文本；结果缓存 _PERF_SUMMARY_TTL 秒。
+    口径：近 20 只有到期数据的候选（近期感知），与前端/API 全量口径有意不同，禁止统一。
+    无数据/读取失败 → 返回空字符串（调用方不注入、不报错、不阻塞）。"""
+    key = f"selection:perf_summary:{period}"
+    try:
+        cached = cache.get(key)
+        if cached:
+            return cached
+        rows = repo.list_track_verify()
+    except Exception as exc:  # noqa: BLE001 读失败不阻塞注入
+        logger.warning("选股表现摘要读取失败（跳过注入）: %s", exc)
+        return ""
+    items = [r for r in rows if r.get(f"{period}_pct") is not None]
+    if not items:
+        return ""
+    # list_track_verify 已按 select_date DESC 排序，过滤后前 20 即最近 20 只有到期数据的候选
+    stats = compute_stats(items[:_PERF_SUMMARY_SAMPLE], period=period)
+    text = _format_perf_summary(stats, detect_anomalies(stats),
+                                _PERIOD_LABELS.get(period, "T+N"))
+    if text:
+        try:
+            cache.set(key, text, _PERF_SUMMARY_TTL)
+        except Exception as exc:  # noqa: BLE001 缓存失败不影响注入
+            logger.warning("选股表现摘要缓存写入失败: %s", exc)
+    return text
+
+
+def _format_perf_summary(stats: dict, anomalies: list[dict], period_label: str = "T+5") -> str:
+    """统计 + 异常 → 紧凑文本（客观事实；win_rate/avg_pct/pl_ratio 为 None 时降级不报错；
+    分评级仅展示样本≥3 的档位；异常只列事实 desc+data，不给结论）。"""
+    n = stats.get("n") or 0
+    if n == 0:
+        return ""
+    wr, avg, pl = stats.get("win_rate"), stats.get("avg_pct"), stats.get("pl_ratio")
+    wr_txt = f"{wr:.1f}%" if wr is not None else "（无数据）"
+    avg_txt = f"{avg:+.2f}%" if avg is not None else "（无数据）"
+    pl_txt = f"{pl:.2f}" if pl is not None else "无亏损样本"
+    lines = [f"近 {n} 只候选：{period_label}胜率 {wr_txt} / 平均涨幅 {avg_txt} / 盈亏比 {pl_txt}"]
+    ratings = []
+    for r in ("A", "B", "C"):  # 只取 A/B/C 档，过滤「未知」等其他键
+        g = stats.get("by_rating", {}).get(r)
+        if g and g.get("n", 0) >= _MIN_SAMPLE:
+            rw, ra = g.get("win_rate"), g.get("avg_pct")
+            ratings.append(
+                f"{r} 档：胜率 {f'{rw:.1f}%' if rw is not None else '（无数据）'}"
+                f"（n={g['n']}）平均涨幅 {f'{ra:+.2f}%' if ra is not None else '（无数据）'}")
+    if ratings:
+        lines.append("分评级（各档样本≥3）：" + " ｜ ".join(ratings))
+    if anomalies:
+        lines.append("异常提示（仅列事实，不做结论）：")
+        for a in anomalies:
+            data = a.get("data") or {}
+            facts = "；".join(f"{k} {v}" for k, v in data.items())
+            lines.append(f"- {a.get('desc', '')}：{facts}")
+    lines.append("以上为你的近期选股表现回顾，请结合表现适当调整筛选严格度"
+                 "（表现差时提高标准，表现好时保持）。此为参考信息，不改变已有规则。")
+    return "\n".join(lines)
 
 
 # ==================== 建议生成（LLM 为主 + 确定性模板兜底 + 来源标记） ====================

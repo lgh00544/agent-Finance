@@ -117,6 +117,74 @@ def collect_market_data() -> dict:
         logger.warning("研判-涨跌家数失败: %s", exc)
         raw["market_advance_decline"] = "（数据缺失）"
 
+    # 6) 隔夜美股（催化传导链数据源；1 次请求，60s 缓存）
+    try:
+        raw["us_market"] = source.fetch_us_market_overnight()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("研判-隔夜美股失败: %s", exc)
+        raw["us_market"] = {"available": False, "note": "数据缺失"}
+
+    # 7) 主线板块箱位（箱位双视角数据源；涨幅前5 + 进取池涨幅前3，去重限10）
+    try:
+        top_boards = []
+        if raw.get("board_top"):
+            top_boards = [b.get("board_name", "") for b in raw["board_top"] if b.get("board_name")]
+        rg = raw.get("risk_groups") or {}
+        # 修正：classify_board_groups 的 aggressive 是 list[str]（板块名本身），对字符串 .get()
+        # 必抛 AttributeError → 整段被 except 捕获静默失效；直接取字符串（isinstance 防御）
+        aggressive_boards = [b for b in (rg.get("aggressive") or []) if isinstance(b, str)][:3]
+        board_list = list(dict.fromkeys(top_boards + aggressive_boards))[:10]  # 去重限10
+        raw["board_box_positions"] = source.fetch_board_box_positions(board_list)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("研判-板块箱位失败: %s", exc)
+        raw["board_box_positions"] = {"note": "数据缺失"}
+
+    # 8) 两市总成交额量倍（量能成色数据源；东财口径，复用现有缓存）
+    try:
+        raw["market_total_ratio"] = source.fetch_market_total_volume_ratio()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("研判-两市量倍失败: %s", exc)
+        raw["market_total_ratio"] = {"available": False, "note": "数据缺失"}
+
+    # 9) 主线板块内个股抽样（个股三维验证数据源；涨幅前3板块成分股取涨幅前5只）
+    try:
+        if raw.get("board_top"):
+            spot = source.fetch_spot_universe()  # 复用现有快照缓存（60s）
+            sample_stocks = []
+            for board in raw["board_top"][:3]:
+                board_name = board.get("board_name", "")
+                if not board_name:
+                    continue
+                cons = source.fetch_industry_cons(board_name)  # 3600s 缓存
+                if cons is None or cons.empty:
+                    continue
+                code_col = "代码" if "代码" in cons.columns else ("code" if "code" in cons.columns else None)
+                if not code_col:
+                    continue
+                codes = cons[code_col].astype(str).tolist()[:30]  # 每板块取前30只成分股
+                if spot is not None and not spot.empty:
+                    col_map = {"code": "代码" if "代码" in spot.columns else "code",
+                               "name": "名称" if "名称" in spot.columns else "name",
+                               "change_pct": "涨跌幅" if "涨跌幅" in spot.columns else "change_pct",
+                               "volume_ratio": "量比" if "量比" in spot.columns else "volume_ratio"}
+                    board_stocks = spot[spot[col_map["code"]].astype(str).isin(codes)]
+                    if not board_stocks.empty and col_map["change_pct"] in board_stocks.columns:
+                        top_stocks = board_stocks.nlargest(5, col_map["change_pct"])
+                        for _, r in top_stocks.iterrows():
+                            sample_stocks.append({
+                                "name": str(r.get(col_map["name"], "")),
+                                "code": str(r.get(col_map["code"], "")),
+                                "change_pct": float(r.get(col_map["change_pct"], 0)),
+                                "volume_ratio": float(r.get(col_map["volume_ratio"], 0))
+                                if col_map["volume_ratio"] in board_stocks.columns else None,
+                            })
+            raw["sample_stocks"] = sample_stocks[:5]  # 总共最多5只
+        else:
+            raw["sample_stocks"] = []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("研判-个股抽样失败: %s", exc)
+        raw["sample_stocks"] = []
+
     return raw
 
 
@@ -153,6 +221,51 @@ def raw_to_text(raw: dict) -> str:
 
     ad = raw.get("market_advance_decline")
     lines.append(f"全市场涨跌家数: {ad if isinstance(ad, str) else ad}")
+
+    # 隔夜美股
+    us = raw.get("us_market") or {}
+    if isinstance(us, dict) and us.get("available") is False:
+        lines.append("隔夜美股: 数据缺失")
+    elif isinstance(us, dict):
+        idx_list = us.get("indices") or []
+        stk_list = us.get("stocks") or []
+        idx_str = "、".join(f"{i.get('name')} {f'{i.get('change_pct'):+.2f}%' if i.get('change_pct') is not None else '数据缺失'}"
+                            for i in idx_list)
+        stk_str = "、".join(f"{s.get('name')} {f'{s.get('change_pct'):+.2f}%' if s.get('change_pct') is not None else '数据缺失'}"
+                            for s in stk_list)
+        lines.append(f"隔夜美股({us.get('date', '')}): 指数[{idx_str}]；关键个股[{stk_str}]")
+
+    # 两市量倍
+    mtr = raw.get("market_total_ratio") or {}
+    if isinstance(mtr, dict) and mtr.get("available") is False:
+        lines.append("两市成交额量倍: 数据缺失")
+    elif isinstance(mtr, dict):
+        lines.append(f"两市成交额量倍: {mtr.get('ratio', '数据缺失')}"
+                     f"（{mtr.get('note', '')}，当日约{mtr.get('amount', '数据缺失')}亿）")
+
+    # 板块箱位
+    bbp = raw.get("board_box_positions") or {}
+    if isinstance(bbp, dict) and bbp.get("note") == "数据缺失":
+        lines.append("板块箱位: 数据缺失")
+    elif isinstance(bbp, dict):
+        box_lines = []
+        for bname, bdata in bbp.items():
+            if isinstance(bdata, dict):
+                box_lines.append(f"{bname}(主箱位{bdata.get('main_box_pct', '缺失')}%"
+                                 f"·60日{bdata.get('box60_pct', '缺失')}%)")
+        lines.append(f"板块箱位(主箱位/60日箱位): {'、'.join(box_lines) if box_lines else '数据缺失'}")
+
+    # 个股抽样
+    ss = raw.get("sample_stocks") or []
+    if ss:
+        stock_lines = []
+        for s in ss:
+            vr = f"量比{s.get('volume_ratio')}" if s.get("volume_ratio") else "量比缺失"
+            stock_lines.append(f"{s.get('name')}({s.get('code')}) {s.get('change_pct', '缺失')}% {vr}")
+        lines.append(f"主线板块个股抽样(涨幅前5): {'、'.join(stock_lines)}")
+    else:
+        lines.append("主线板块个股抽样: 数据缺失")
+
     return "\n".join(lines)
 
 
@@ -171,15 +284,36 @@ def market_intel_node(state: StockAgentState) -> StockAgentState:
             ttl_seconds=86400,
             model_level=ModelLevel.DEEP,
         )
+        # 合并新字段到 dict 列（签名不变，不需要改 repo.py；空值防御：字段为空不并入，
+        # 避免 prompt 未注入期间写入空 key；getattr 兼容旧格式输出/测试替身缺新字段）
+        volume_signal = output.volume_signal or {}
+        operative_meaning = output.operative_meaning or {}
+
+        volume_character = getattr(output, "volume_character", "") or ""
+        main_structure = getattr(output, "main_structure", {}) or {}
+        box_view = getattr(output, "box_view", {}) or {}
+        stock_verification = getattr(output, "stock_verification", []) or []
+
+        if volume_character:
+            volume_signal["量能成色"] = volume_character
+        if main_structure:
+            volume_signal["主线结构"] = main_structure
+        if box_view:
+            operative_meaning["箱位理解"] = box_view
+        if stock_verification:
+            operative_meaning["个股验证"] = stock_verification
+
         repo.upsert_market_intel(
             date_key, output.phase, output.core_conflict, output.risk_appetite,
-            output.volume_signal or {}, output.operative_meaning or {},
+            volume_signal, operative_meaning,
             output.next_day_watch or {}, output.summary, raw)
+
+        # state 同步带上新字段（供链路即时引用）
         state["market_intel"] = {
             "trade_date": date_key, "phase": output.phase,
             "core_conflict": output.core_conflict, "risk_appetite": output.risk_appetite,
-            "volume_signal": output.volume_signal or {},
-            "operative_meaning": output.operative_meaning or {},
+            "volume_signal": volume_signal,
+            "operative_meaning": operative_meaning,
             "next_day_watch": output.next_day_watch or {},
             "summary": output.summary,
         }

@@ -60,7 +60,12 @@ def test_page_renders(page):
         at.session_state["_total_asset"] = 100000.0
     at.run()
     assert not at.exception, f"{page} 渲染异常: {at.exception}"
-    assert at.title[0].value == _TITLES[page]
+    # 批次2：部分页面头部已收敛为 page_header（st.markdown 渲染 H1 标题而非 st.title），
+    # 标题断言改为「st.title 或 markdown 任一处包含页标题文本」，不删除用例、不降低覆盖
+    title_text = _TITLES[page]
+    rendered = [t.value for t in at.title] + [m.value for m in at.markdown if m.value]
+    assert any(title_text in r for r in rendered), \
+        f"{page} 页标题未渲染: {title_text}（st.title={[t.value for t in at.title]}）"
 
 
 def test_candidate_page_interactives():
@@ -123,7 +128,10 @@ def test_home_page_renders():
                            default_timeout=180)
     at.run()
     assert not at.exception, f"首页渲染异常: {at.exception}"
-    assert at.title[0].value == "单人 A 股全生命周期决策 Agent 系统"
+    # 批次2：首页头部已收敛为 page_header（st.markdown 渲染 H1 标题），断言改为 markdown 文本
+    rendered = [m.value for m in at.markdown if m.value]
+    assert any("单人 A 股全生命周期决策 Agent 系统" in r for r in rendered), \
+        "首页 page_header 标题未渲染"
 
 
 def test_top_bar_format_helpers():
@@ -239,7 +247,10 @@ def test_agent_chat_page_renders():
     at = AppTest.from_file(str(PAGES_DIR / "10_Agent对话.py"), default_timeout=180)
     at.run()
     assert not at.exception, f"10_Agent对话.py 渲染异常: {at.exception}"
-    assert at.title[0].value == "Agent 专属对话（调教 · 答疑 · 知识沉淀）"
+    # 批次3：头部已收敛为 page_header（st.markdown 渲染 H1），断言改为 markdown 文本
+    rendered = [m.value for m in at.markdown if m.value]
+    assert any("Agent 专属对话（调教 · 答疑 · 知识沉淀）" in r for r in rendered), \
+        "Agent对话 page_header 标题未渲染"
     tabs = [t.label for t in at.tabs]
     for name in ("文字提问", "规则调教", "多模态学习", "对话历史"):
         assert name in tabs, f"缺少标签页: {name}"
@@ -268,7 +279,9 @@ def test_hot_money_page_renders():
     at = AppTest.from_file(str(PAGES_DIR / "5_游资追踪.py"), default_timeout=180)
     at.run()
     assert not at.exception, f"5_游资追踪.py 渲染异常: {at.exception}"
-    assert at.title[0].value == "游资追踪（Hot Money）"
+    # 批次3：头部已收敛为 page_header（st.markdown 渲染 H1），断言改为 markdown 文本
+    rendered = [m.value for m in at.markdown if m.value]
+    assert any("游资追踪（Hot Money）" in r for r in rendered), "游资追踪 page_header 标题未渲染"
     # fold_module 标题渲染为 markdown（折叠开关是「收起/展开」按钮），按标题文本断言
     texts = " ".join(str(m.value) for m in at.markdown)
     for name in ("游资胜率迭代（自进化 · 人工审核后生效）",
@@ -686,11 +699,11 @@ def test_candidate_page_batch_panel_opens(monkeypatch):
     at = AppTest.from_file(str(PAGES_DIR / "1_每日候选池.py"), default_timeout=180)
     at.run()
     assert not at.exception, f"候选池页渲染异常: {at.exception}"
-    # 顶部按钮存在
-    assert any(b.label == "批量验证对话" for b in at.button), \
+    # 顶部按钮存在（批次2：按钮已移入 page_header primary_actions，label 带 emoji 前缀，用子串匹配）
+    assert any("批量验证对话" in b.label for b in at.button), \
         f"缺少「批量验证对话」按钮: {[b.label for b in at.button]}"
     # 点击展开面板
-    next(b for b in at.button if b.label == "批量验证对话").click()
+    next(b for b in at.button if "批量验证对话" in b.label).click()
     at.run()
     assert not at.exception, f"展开批量面板后异常: {at.exception}"
     assert any(s.label == "提问范围" for s in at.selectbox), "批量面板未渲染「提问范围」下拉"

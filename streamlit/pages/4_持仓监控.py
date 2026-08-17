@@ -16,7 +16,18 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("持仓监控（MonitorAgent）")
+# ===== 批次2：页面头部收敛为 page_header 单行范式（标题+说明+操作按钮组）=====
+_hdr = render.page_header(
+    "持仓监控（MonitorAgent）",
+    primary_actions=[{"label": "⚡ 立即刷新监控", "key": "hdr_mon"}],
+    secondary_actions=[{"label": "🔄 手动刷新行情", "key": "hdr_refresh"}],
+)
+if _hdr["primary"] == 0:
+    api.submit_task("monitor_all")
+    st.toast("全量持仓监控已提交后台，完成后顶部任务状态区会提示；"
+             "新信号会自动落库并在告警日志页展示")
+if _hdr["secondary"] == 0:
+    st.rerun()
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
@@ -78,11 +89,25 @@ def _signal_time(label: str, time_str: str | None, signal: dict) -> None:
                       highlight=urgent)
 
 
-def render_sell_decision(d: dict) -> None:
-    """卖出决策 → 自然语言分段（v3.0：维度归因 + 综合评估置顶，旧数据缺省自动跳过）"""
+def render_sell_decision(d: dict, shares: int | None = None) -> None:
+    """卖出决策 → 自然语言分段（v3.0：维度归因 + 综合评估置顶，旧数据缺省自动跳过）
+    shares: 当前持仓股数（合并展示口径）；仅 action=partial 且 reduce_ratio 有效时展示减仓建议，
+    持仓股数缺失或为 0 时不展示、不报错。"""
     action = ACTION_MAP.get(d.get("action"), d.get("action"))
     conf = CONF_MAP.get(d.get("confidence"), d.get("confidence"))
     st.markdown(f"**卖出决策：{action}**（置信度 {conf}）")
+    # 减仓比例建议（仅 action=partial；持仓股数缺失/为 0 不展示不报错）
+    ratio = d.get("reduce_ratio")
+    if d.get("action") == "partial" and isinstance(ratio, (int, float)) and 0 < float(ratio) <= 1:
+        hold_shares = int(shares or 0)
+        if hold_shares > 0:
+            sell_shares, remain = render.reduce_share_plan(float(ratio), hold_shares)
+            pct = round(float(ratio) * 100)
+            st.markdown(
+                f"**建议减仓：{pct}%**（约 {sell_shares:,} 股 / {sell_shares // 100} 手）\n\n"
+                f"当前持仓 {hold_shares:,} 股 → 建议卖出 {sell_shares:,} 股 → "
+                f"减仓后剩余 {remain:,} 股（{remain // 100} 手）"
+            )
     # v3.0 白盒维度归因：维度数组 + 综合评估（主结论）
     render.dimension_bars(d.get("dimensions"), final_advice=d.get("final_advice"))
     if d.get("reasons"):
@@ -280,7 +305,7 @@ def _operation_card(g: dict, total_capital: float, total_market_value: float) ->
         sell_result = st.session_state.get(f"sell_result_{hid}")
         if sell_result:
             st.markdown("决策仅供参考，卖出必须由你人工执行。")
-            render_sell_decision(sell_result)
+            render_sell_decision(sell_result, shares=g["total_shares"])
             _signal_time("信号生成时间", st.session_state.get(f"sell_time_{hid}"), sell_result)
             render.raw_json_expander(sell_result, key=f"raw_sell_{hid}")
         sell_hist = api.sell_decisions(hid)
@@ -355,16 +380,21 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float,
                       key=f"{pfx}optype_{hid}")
 
     if op == "记录加仓":
+        # 批次2：必填字段（价格/股数）首行 2 列，选填字段（日期/备注）收进「更多参数」折叠
         c1, c2 = st.columns(2)
         with c1:
             with st.container(key=f"{pfx}fld_add_price_{hid}"):
                 add_price = st.number_input("成交价格 *", min_value=0.0, step=0.01,
                                             key=f"{pfx}addp_{hid}")
+        with c2:
             add_shares = st.number_input("操作股数 *（100 整数倍）", min_value=0, step=100,
                                          key=f"{pfx}adds_{hid}")
-        with c2:
-            add_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}addd_{hid}")
-            add_note = st.text_input("操作备注（可选）", key=f"{pfx}addn_{hid}")
+        with st.expander("更多参数（日期/备注）", expanded=False):
+            c3, c4 = st.columns(2)
+            with c3:
+                add_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}addd_{hid}")
+            with c4:
+                add_note = st.text_input("操作备注（可选）", key=f"{pfx}addn_{hid}")
 
         errs = {}
         if add_price <= 0:
@@ -429,11 +459,15 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float,
             with st.container(key=f"{pfx}fld_red_price_{hid}"):
                 red_price = st.number_input("成交价格 *", min_value=0.0, step=0.01,
                                             key=f"{pfx}redp_{hid}")
+        with c2:
             red_shares = st.number_input("减仓股数 *（100 整数倍，≤ 持仓）", min_value=0,
                                          max_value=cur_shares, step=100, key=f"{pfx}reds_{hid}")
-        with c2:
-            red_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}redd_{hid}")
-            red_note = st.text_input("操作备注（可选）", key=f"{pfx}redn_{hid}")
+        with st.expander("更多参数（日期/备注）", expanded=False):
+            c3, c4 = st.columns(2)
+            with c3:
+                red_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}redd_{hid}")
+            with c4:
+                red_note = st.text_input("操作备注（可选）", key=f"{pfx}redn_{hid}")
 
         errs = {}
         if red_price <= 0:
@@ -472,14 +506,15 @@ def _operation_panel(g: dict, total_capital: float, total_market_value: float,
                 render.msg_card("err", "减仓记录失败", "请核对输入后重试。", detail=exc)
 
     elif op == "记录清仓":
-        c1, c2 = st.columns(2)
-        with c1:
-            with st.container(key=f"{pfx}fld_close_price_{hid}"):
-                close_price = st.number_input("成交价格 *", min_value=0.0, step=0.01,
-                                              key=f"{pfx}closep_{hid}")
-            close_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}closed_{hid}")
-        with c2:
-            close_note = st.text_input("清仓原因（可选）", key=f"{pfx}closen_{hid}")
+        with st.container(key=f"{pfx}fld_close_price_{hid}"):
+            close_price = st.number_input("成交价格 *", min_value=0.0, step=0.01,
+                                          key=f"{pfx}closep_{hid}")
+        with st.expander("更多参数（日期/原因）", expanded=False):
+            c3, c4 = st.columns(2)
+            with c3:
+                close_date = st.text_input("成交日期（YYYY-MM-DD，默认当日）", key=f"{pfx}closed_{hid}")
+            with c4:
+                close_note = st.text_input("清仓原因（可选）", key=f"{pfx}closen_{hid}")
         errs = {}
         if close_price <= 0:
             errs["close_price"] = "成交价格必须大于 0"
@@ -558,19 +593,9 @@ try:
     view = api.holding_quotes()
     rows = view.get("rows") or []
 
-    # 顶部操作行：左=行情更新时间，右=高频操作按钮
-    t1, t2, t3 = st.columns([3, 1, 1])
-    with t1:
-        st.caption(f"行情最后更新时间：{view.get('quote_time') or '—'}"
-                   "（实时行情约 60 秒缓存，可点击右侧手动刷新）")
-    with t2:
-        if st.button("手动刷新行情", use_container_width=True):
-            st.rerun()
-    with t3:
-        if st.button("立即刷新监控", type="primary", use_container_width=True):
-            api.submit_task("monitor_all")
-            st.toast("全量持仓监控已提交后台，完成后顶部任务状态区会提示；"
-                     "新信号会自动落库并在告警日志页展示")
+    # 行情更新时间（刷新/监控按钮已上移 page_header）
+    st.caption(f"行情最后更新时间：{view.get('quote_time') or '—'}"
+               "（实时行情约 60 秒缓存，可点击右侧「手动刷新行情」）")
 
     tab_hold, tab_alert, tab_hist = st.tabs(["当前持仓", "告警记录", "历史持仓"])
 
@@ -623,16 +648,31 @@ try:
                 if show_op:
                     with st.container(border=True):
                         render.section_title(f"持仓操作 {label}")
+                        # 批次2：高频操作前置（从 _operation_card 内提前到面板首行）
+                        hid = c["id"]
+                        _op_act = render.quick_actions(f"hold_op_{key}", [
+                            {"label": "⚡ 立即执行监控", "type": "primary"},
+                            {"label": "🧠 生成卖出决策", "type": "secondary"},
+                        ])
+                        if _op_act == 0:
+                            with st.spinner("LLM 研判中..."):
+                                _mr = api.monitor_holding(hid)
+                                st.session_state[f"mon_result_{hid}"] = _mr.get("signal") or {}
+                                st.session_state[f"mon_time_{hid}"] = _now_min()
+                        if _op_act == 1:
+                            api.submit_task("sell_decision", {"holding_id": hid})
+                            st.toast("卖出决策任务已提交后台，完成后顶部任务状态区会提示")
+                        _mon_result = st.session_state.get(f"mon_result_{hid}")
+                        if _mon_result:
+                            render_monitor_signal(_mon_result)
+                            _signal_time("信号生成时间", st.session_state.get(f"mon_time_{hid}"),
+                                         _mon_result)
+                            render.raw_json_expander(_mon_result, key=f"raw_mon_{hid}")
                         _operation_panel(g, total_capital, total_market_value, pfx="row")
                 if opened:
                     with st.container(border=True):
-                        with st.container(border=True):
-                            render.section_title("历史明细（数据库原始记录）")
-                            detail = pd.DataFrame([_detail_row(r) for r in g["records"]])
-                            st.dataframe(detail, width="stretch", hide_index=True)
-                            st.caption("明细为数据库原始记录（包含被自动忽略的重复录入），仅查看不删除；"
-                                       "合并行的行情计算基于加权平均成本与总股数。")
-                        with st.container(border=True):
+                        # 批次2：详情三块垂直堆叠 → detail_tabs（3 分区 ≤6 → st.tabs，切换零请求）
+                        def _tab_tp_plan():
                             render.section_title("止盈与仓位计划（与系统概览同源，自动留痕）")
                             try:
                                 tp_plans = {p["holding_id"]: p
@@ -651,8 +691,22 @@ try:
                             if not _tp_shown:
                                 st.caption("止盈计划暂不可用（计算服务未就绪），"
                                            "可稍后重试或手动刷新行情。")
-                        with st.container(border=True):
+
+                        def _tab_ops():
                             _operation_card(g, total_capital, total_market_value)
+
+                        def _tab_history():
+                            render.section_title("历史明细（数据库原始记录）")
+                            detail = pd.DataFrame([_detail_row(r) for r in g["records"]])
+                            st.dataframe(detail, width="stretch", hide_index=True)
+                            st.caption("明细为数据库原始记录（包含被自动忽略的重复录入），仅查看不删除；"
+                                       "合并行的行情计算基于加权平均成本与总股数。")
+
+                        render.detail_tabs([
+                            ("止盈与仓位计划", _tab_tp_plan),
+                            ("操作与流水", _tab_ops),
+                            ("历史明细", _tab_history),
+                        ], key=f"hold_tabs_{key}", default_index=0)
 
             hold_keys = [f"hold_{g['current']['id']}" for g in groups]
             render.batch_fold_bar("hold", hold_keys,
@@ -754,11 +808,11 @@ except Exception as exc:
     render.dismissible_error("持仓数据加载失败", "请确认后端服务运行正常后点击「重试」刷新。",
                              detail=exc, retry_key="retry_holdings", dismiss_key="hold_main")
 
-# ============ 截图识别快速录入（OCR 仅文字识别回填，必须人工核对后入库）============
-st.subheader("截图识别快速录入")
-st.caption("上传券商持仓截图 → 多模态识别自动整理为结构化表格（代码/名称/股数/成本/市价/盈亏）"
-           "→ 表格内直接核对修正 → 确认创建持仓。识别结果不会自动落库，请务必人工确认；"
-           "市场研判仍由 LLM 完成，OCR 仅是快捷录入工具。")
+# ============ 快速录入（OCR 截图识别 / 手动录入 二选一）============
+st.subheader("快速录入持仓（截图识别 / 手动录入）")
+ocr_tab, manual_tab = st.tabs(["📷 截图识别", "✍️ 手动录入"])
+
+
 
 
 def _ocr_row_to_dict(r: dict) -> dict:
@@ -787,187 +841,191 @@ def _mark_missing(row: pd.Series) -> list:
     return [""] * len(row)
 
 
-try:
-    ocr_info = api.ocr_status()
-except Exception as exc:
-    ocr_info = {"enabled": False, "available": False, "reason": f"状态查询失败: {exc}"}
+with ocr_tab:
+    st.caption("上传券商持仓截图 → 多模态识别自动整理为结构化表格（代码/名称/股数/成本/市价/盈亏）"
+               "→ 表格内直接核对修正 → 确认创建持仓。识别结果不会自动落库，请务必人工确认；"
+               "市场研判仍由 LLM 完成，OCR 仅是快捷录入工具。")
+    try:
+        ocr_info = api.ocr_status()
+    except Exception as exc:
+        ocr_info = {"enabled": False, "available": False, "reason": f"状态查询失败: {exc}"}
 
-if not ocr_info.get("enabled"):
-    render.msg_card("info", "OCR 识别未启用",
-                    f"{ocr_info.get('reason')}；可继续使用下方手动录入。")
-elif not ocr_info.get("available"):
-    render.msg_card("warn", "OCR 暂不可用",
-                    f"{ocr_info.get('reason')}；可继续使用下方手动录入。")
-else:
-    uploaded = st.file_uploader("上传券商持仓截图（png/jpg/jpeg/bmp/webp，尽量清晰、避开弹窗遮挡）",
-                                type=["png", "jpg", "jpeg", "bmp", "webp"], key="ocr_upload")
-    if uploaded is not None:
-        # 检测到新上传 → 清除旧识别结果，触发重新识别
-        if st.session_state.get("ocr_file_id") != uploaded.file_id:
-            st.session_state["ocr_file_id"] = uploaded.file_id
-            st.session_state.pop("ocr_result", None)
+    if not ocr_info.get("enabled"):
+        render.msg_card("info", "OCR 识别未启用",
+                        f"{ocr_info.get('reason')}；可继续使用下方手动录入。")
+    elif not ocr_info.get("available"):
+        render.msg_card("warn", "OCR 暂不可用",
+                        f"{ocr_info.get('reason')}；可继续使用下方手动录入。")
+    else:
+        uploaded = st.file_uploader("上传券商持仓截图（png/jpg/jpeg/bmp/webp，尽量清晰、避开弹窗遮挡）",
+                                    type=["png", "jpg", "jpeg", "bmp", "webp"], key="ocr_upload")
+        if uploaded is not None:
+            # 检测到新上传 → 清除旧识别结果，触发重新识别
+            if st.session_state.get("ocr_file_id") != uploaded.file_id:
+                st.session_state["ocr_file_id"] = uploaded.file_id
+                st.session_state.pop("ocr_result", None)
 
-        if "ocr_result" not in st.session_state:
-            with st.spinner("OCR 识别中（MiniMax 云端识别，稍候）..."):
-                try:
-                    st.session_state["ocr_result"] = api.ocr_holding(uploaded.getvalue(), uploaded.name)
-                except Exception as exc:
-                    render.error_card("OCR 识别失败", "可重新上传截图重试，或使用下方手动录入。",
-                                      detail=exc, retry_key="retry_ocr")
-                    st.session_state["ocr_result"] = None
+            if "ocr_result" not in st.session_state:
+                with st.spinner("OCR 识别中（MiniMax 云端识别，稍候）..."):
+                    try:
+                        st.session_state["ocr_result"] = api.ocr_holding(uploaded.getvalue(), uploaded.name)
+                    except Exception as exc:
+                        render.error_card("OCR 识别失败", "可重新上传截图重试，或使用下方手动录入。",
+                                          detail=exc, retry_key="retry_ocr")
+                        st.session_state["ocr_result"] = None
 
-        result = st.session_state.get("ocr_result")
-        if result is not None:
-            rows = result.get("recognized") or []
-            if not rows:
-                render.msg_card("warn", "未识别到有效的持仓字段",
-                                "可能截图不清晰或被遮挡，请下方手动补全。")
-                with st.expander("查看原始识别内容（排查用）"):
-                    st.code(result.get("raw_text", ""), language=None)
+            result = st.session_state.get("ocr_result")
+            if result is not None:
+                rows = result.get("recognized") or []
+                if not rows:
+                    render.msg_card("warn", "未识别到有效的持仓字段",
+                                    "可能截图不清晰或被遮挡，请下方手动补全。")
+                    with st.expander("查看原始识别内容（排查用）"):
+                        st.code(result.get("raw_text", ""), language=None)
+                else:
+                    st.markdown("**识别结果（已自动整理为结构化表格；点击单元格可直接修改修正识别偏差）**")
+                    df = pd.DataFrame([_ocr_row_to_dict(r) for r in rows])
+                    edited = st.data_editor(
+                        df.style.apply(_mark_missing, axis=1),
+                        column_config={
+                            "股票代码": st.column_config.TextColumn("股票代码", width="small"),
+                            "股票名称": st.column_config.TextColumn("股票名称", width="medium"),
+                            "持仓数量": st.column_config.NumberColumn("持仓数量（股）", format="%d"),
+                            "持仓成本价": st.column_config.NumberColumn("持仓成本价", format="%.2f"),
+                            "当前市价": st.column_config.NumberColumn("当前市价", format="%.2f"),
+                            "持仓盈亏金额": st.column_config.NumberColumn("持仓盈亏金额", format="%.2f"),
+                            "持仓盈亏比例": st.column_config.NumberColumn("持仓盈亏比例（%）", format="%.2f"),
+                            "状态": st.column_config.TextColumn("状态", width="small"),
+                        },
+                        hide_index=True, num_rows="fixed", width="stretch", key="ocr_editor")
+                    st.caption("红色标注的行存在缺失字段（状态列显示「需补全」），请点击补全后再确认创建；"
+                               "识别结果仅供参考，创建前请务必核对。")
+                    with st.expander("查看原始识别内容（排查用）"):
+                        st.code(result.get("raw_text", ""), language=None)
+
+                    st.markdown("**录入参数（批次统一，可修改）**")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        entry_date = st.text_input("建仓日期（YYYY-MM-DD）", key="ocr_batch_date")
+                        stop_loss = st.number_input("止损参考价（可选）", min_value=0.0, step=0.01,
+                                                    key="ocr_batch_sl")
+                        take_profit = st.number_input("止盈参考价（可选）", min_value=0.0, step=0.01,
+                                                      key="ocr_batch_tp")
+                    with c2:
+                        target_pct = st.number_input("目标仓位 %（可选）", min_value=0.0, max_value=100.0,
+                                                     step=1.0, key="ocr_batch_tpct")
+                        note = st.text_input("备注（可选）", key="ocr_batch_note")
+
+                    confirmed = st.button("确认创建持仓（人工核对无误后批量入库，识别结果不会自动落库）")
+                    if confirmed:
+                        errors, valid = [], []
+                        for i, r in edited.iterrows():
+                            code = str(r["股票代码"] or "").strip()
+                            name = str(r["股票名称"] or "").strip()
+                            # 字段有效性统一判定：0（清仓）为合法值，不标为缺失
+                            if not (code and name and render.field_ok(r["持仓数量"])
+                                    and render.field_ok(r["持仓成本价"])):
+                                errors.append(f"第 {i + 1} 行（{code or '未知代码'} {name or '未知名称'}）："
+                                              f"代码/名称/股数/成本价 需补全")
+                                continue
+                            valid.append({
+                                "stock_code": code, "stock_name": name,
+                                "entry_date": entry_date or "2026-01-01",
+                                "entry_price": float(r["持仓成本价"]), "shares": int(r["持仓数量"]),
+                                "stop_loss": float(stop_loss), "take_profit": float(take_profit),
+                                "target_pct": float(target_pct), "note": note or "OCR 截图识别批量录入"})
+                        if errors:
+                            render.msg_card("err", "以下条目需补全后重试（未写入任何持仓）",
+                                            "；".join(errors))
+                        else:
+                            for v in valid:
+                                api.add_holding(v)
+                            st.success(f"已保存 {len(valid)} 条持仓（截图已自动清理，未长期存储）")
+                            st.session_state.pop("ocr_result", None)
+                            st.session_state.pop("ocr_file_id", None)
+                            st.rerun()
+
+                # ===== 账户汇总（OCR 提取截图顶部汇总栏，人工核对确认后才保存为账户基准） =====
+                account = result.get("account")
+                if account:
+                    st.markdown("**截图识别：账户汇总**（识别结果仅供参考，请核对修正后保存；"
+                                "保存后顶部状态栏的总资产/可用资金/整体仓位切换为券商真实值）")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        with st.container(key="fld_ocr_total"):
+                            total_asset = st.number_input("总资产（元）*", min_value=0.0, step=1000.0,
+                                                          value=float(account.get("total_asset") or 0.0),
+                                                          key="ocr_acc_total")
+                        render.field_error("ocr_total", render.get_field_error("ocr_total"),
+                                           "请输入正确的资产数值")
+                    with c2:
+                        available_cash = st.number_input("可用资金（元）", min_value=0.0, step=1000.0,
+                                                         value=float(account.get("available_cash") or 0.0),
+                                                         key="ocr_acc_cash")
+                    with c3:
+                        position_pct = st.number_input("整体仓位比例（%）", min_value=0.0, max_value=100.0,
+                                                       step=1.0,
+                                                       value=float(account.get("position_pct") or 0.0),
+                                                       key="ocr_acc_pct")
+                    if st.button("保存账户基准（人工确认无误后落库）", key="ocr_save_baseline"):
+                        if total_asset <= 0:
+                            render.set_field_errors({"ocr_total": "总资产必须大于 0，请核对修正后再保存"})
+                            st.rerun()
+                        else:
+                            render.set_field_errors({})
+                            api.save_account_baseline({
+                                "total_asset": total_asset, "available_cash": available_cash,
+                                "position_pct": position_pct, "source": "ocr"})
+                            st.success("账户基准已保存，顶部状态栏将自动切换为券商真实值（可点击「账户明细」查看）。")
+
+with manual_tab:
+    st.caption("系统不自动下单，交易必须人工执行")
+    with st.form("add_holding"):
+        c1, c2 = st.columns(2)
+        with c1:
+            with st.container(key="fld_hold_code"):
+                code = st.text_input("股票代码 *")
+            render.field_error("hold_code", render.get_field_error("hold_code"),
+                               "请输入 6 位数字股票代码，如 603993")
+            with st.container(key="fld_hold_name"):
+                name = st.text_input("股票名称 *")
+            render.field_error("hold_name", render.get_field_error("hold_name"),
+                               "请输入股票名称")
+            entry_date = st.text_input("建仓日期（YYYY-MM-DD）")
+            with st.container(key="fld_hold_price"):
+                entry_price = st.number_input("平均成本价 *", min_value=0.0, step=0.01)
+            render.field_error("hold_price", render.get_field_error("hold_price"),
+                               "平均成本价必须大于 0")
+        with c2:
+            with st.container(key="fld_hold_shares"):
+                shares = st.number_input("股数 *", min_value=100, step=100)
+            render.field_error("hold_shares", render.get_field_error("hold_shares"),
+                               "股数必须大于 0")
+            stop_loss = st.number_input("止损参考价", min_value=0.0, step=0.01)
+            take_profit = st.number_input("止盈参考价", min_value=0.0, step=0.01)
+            target_pct = st.number_input("目标仓位 %", min_value=0.0, max_value=100.0, step=1.0)
+        note = st.text_input("备注（可引用建仓计划）")
+        render.field_summary(label_map={"hold_code": "股票代码", "hold_name": "股票名称",
+                                        "hold_price": "平均成本价", "hold_shares": "股数"})
+        submitted = st.form_submit_button("保存持仓")
+        if submitted:
+            errs = {}
+            if not code.strip():
+                errs["hold_code"] = "股票代码不能为空"
+            if not name.strip():
+                errs["hold_name"] = "股票名称不能为空"
+            if entry_price <= 0:
+                errs["hold_price"] = "平均成本价必须大于 0"
+            if shares <= 0:
+                errs["hold_shares"] = "股数必须大于 0"
+            if errs:
+                render.set_field_errors(errs)
             else:
-                st.markdown("**识别结果（已自动整理为结构化表格；点击单元格可直接修改修正识别偏差）**")
-                df = pd.DataFrame([_ocr_row_to_dict(r) for r in rows])
-                edited = st.data_editor(
-                    df.style.apply(_mark_missing, axis=1),
-                    column_config={
-                        "股票代码": st.column_config.TextColumn("股票代码", width="small"),
-                        "股票名称": st.column_config.TextColumn("股票名称", width="medium"),
-                        "持仓数量": st.column_config.NumberColumn("持仓数量（股）", format="%d"),
-                        "持仓成本价": st.column_config.NumberColumn("持仓成本价", format="%.2f"),
-                        "当前市价": st.column_config.NumberColumn("当前市价", format="%.2f"),
-                        "持仓盈亏金额": st.column_config.NumberColumn("持仓盈亏金额", format="%.2f"),
-                        "持仓盈亏比例": st.column_config.NumberColumn("持仓盈亏比例（%）", format="%.2f"),
-                        "状态": st.column_config.TextColumn("状态", width="small"),
-                    },
-                    hide_index=True, num_rows="fixed", width="stretch", key="ocr_editor")
-                st.caption("红色标注的行存在缺失字段（状态列显示「需补全」），请点击补全后再确认创建；"
-                           "识别结果仅供参考，创建前请务必核对。")
-                with st.expander("查看原始识别内容（排查用）"):
-                    st.code(result.get("raw_text", ""), language=None)
-
-                st.markdown("**录入参数（批次统一，可修改）**")
-                c1, c2 = st.columns(2)
-                with c1:
-                    entry_date = st.text_input("建仓日期（YYYY-MM-DD）", key="ocr_batch_date")
-                    stop_loss = st.number_input("止损参考价（可选）", min_value=0.0, step=0.01,
-                                                key="ocr_batch_sl")
-                    take_profit = st.number_input("止盈参考价（可选）", min_value=0.0, step=0.01,
-                                                  key="ocr_batch_tp")
-                with c2:
-                    target_pct = st.number_input("目标仓位 %（可选）", min_value=0.0, max_value=100.0,
-                                                 step=1.0, key="ocr_batch_tpct")
-                    note = st.text_input("备注（可选）", key="ocr_batch_note")
-
-                confirmed = st.button("确认创建持仓（人工核对无误后批量入库，识别结果不会自动落库）")
-                if confirmed:
-                    errors, valid = [], []
-                    for i, r in edited.iterrows():
-                        code = str(r["股票代码"] or "").strip()
-                        name = str(r["股票名称"] or "").strip()
-                        # 字段有效性统一判定：0（清仓）为合法值，不标为缺失
-                        if not (code and name and render.field_ok(r["持仓数量"])
-                                and render.field_ok(r["持仓成本价"])):
-                            errors.append(f"第 {i + 1} 行（{code or '未知代码'} {name or '未知名称'}）："
-                                          f"代码/名称/股数/成本价 需补全")
-                            continue
-                        valid.append({
-                            "stock_code": code, "stock_name": name,
-                            "entry_date": entry_date or "2026-01-01",
-                            "entry_price": float(r["持仓成本价"]), "shares": int(r["持仓数量"]),
-                            "stop_loss": float(stop_loss), "take_profit": float(take_profit),
-                            "target_pct": float(target_pct), "note": note or "OCR 截图识别批量录入"})
-                    if errors:
-                        render.msg_card("err", "以下条目需补全后重试（未写入任何持仓）",
-                                        "；".join(errors))
-                    else:
-                        for v in valid:
-                            api.add_holding(v)
-                        st.success(f"已保存 {len(valid)} 条持仓（截图已自动清理，未长期存储）")
-                        st.session_state.pop("ocr_result", None)
-                        st.session_state.pop("ocr_file_id", None)
-                        st.rerun()
-
-            # ===== 账户汇总（OCR 提取截图顶部汇总栏，人工核对确认后才保存为账户基准） =====
-            account = result.get("account")
-            if account:
-                st.markdown("**截图识别：账户汇总**（识别结果仅供参考，请核对修正后保存；"
-                            "保存后顶部状态栏的总资产/可用资金/整体仓位切换为券商真实值）")
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    with st.container(key="fld_ocr_total"):
-                        total_asset = st.number_input("总资产（元）*", min_value=0.0, step=1000.0,
-                                                      value=float(account.get("total_asset") or 0.0),
-                                                      key="ocr_acc_total")
-                    render.field_error("ocr_total", render.get_field_error("ocr_total"),
-                                       "请输入正确的资产数值")
-                with c2:
-                    available_cash = st.number_input("可用资金（元）", min_value=0.0, step=1000.0,
-                                                     value=float(account.get("available_cash") or 0.0),
-                                                     key="ocr_acc_cash")
-                with c3:
-                    position_pct = st.number_input("整体仓位比例（%）", min_value=0.0, max_value=100.0,
-                                                   step=1.0,
-                                                   value=float(account.get("position_pct") or 0.0),
-                                                   key="ocr_acc_pct")
-                if st.button("保存账户基准（人工确认无误后落库）", key="ocr_save_baseline"):
-                    if total_asset <= 0:
-                        render.set_field_errors({"ocr_total": "总资产必须大于 0，请核对修正后再保存"})
-                        st.rerun()
-                    else:
-                        render.set_field_errors({})
-                        api.save_account_baseline({
-                            "total_asset": total_asset, "available_cash": available_cash,
-                            "position_pct": position_pct, "source": "ocr"})
-                        st.success("账户基准已保存，顶部状态栏将自动切换为券商真实值（可点击「账户明细」查看）。")
-
-st.divider()
-st.subheader("录入人工建仓（系统不自动下单，交易必须人工执行）")
-with st.form("add_holding"):
-    c1, c2 = st.columns(2)
-    with c1:
-        with st.container(key="fld_hold_code"):
-            code = st.text_input("股票代码 *")
-        render.field_error("hold_code", render.get_field_error("hold_code"),
-                           "请输入 6 位数字股票代码，如 603993")
-        with st.container(key="fld_hold_name"):
-            name = st.text_input("股票名称 *")
-        render.field_error("hold_name", render.get_field_error("hold_name"),
-                           "请输入股票名称")
-        entry_date = st.text_input("建仓日期（YYYY-MM-DD）")
-        with st.container(key="fld_hold_price"):
-            entry_price = st.number_input("平均成本价 *", min_value=0.0, step=0.01)
-        render.field_error("hold_price", render.get_field_error("hold_price"),
-                           "平均成本价必须大于 0")
-    with c2:
-        with st.container(key="fld_hold_shares"):
-            shares = st.number_input("股数 *", min_value=100, step=100)
-        render.field_error("hold_shares", render.get_field_error("hold_shares"),
-                           "股数必须大于 0")
-        stop_loss = st.number_input("止损参考价", min_value=0.0, step=0.01)
-        take_profit = st.number_input("止盈参考价", min_value=0.0, step=0.01)
-        target_pct = st.number_input("目标仓位 %", min_value=0.0, max_value=100.0, step=1.0)
-    note = st.text_input("备注（可引用建仓计划）")
-    render.field_summary(label_map={"hold_code": "股票代码", "hold_name": "股票名称",
-                                    "hold_price": "平均成本价", "hold_shares": "股数"})
-    submitted = st.form_submit_button("保存持仓")
-    if submitted:
-        errs = {}
-        if not code.strip():
-            errs["hold_code"] = "股票代码不能为空"
-        if not name.strip():
-            errs["hold_name"] = "股票名称不能为空"
-        if entry_price <= 0:
-            errs["hold_price"] = "平均成本价必须大于 0"
-        if shares <= 0:
-            errs["hold_shares"] = "股数必须大于 0"
-        if errs:
-            render.set_field_errors(errs)
-        else:
-            render.set_field_errors({})
-            result = api.add_holding({
-                "stock_code": code.strip(), "stock_name": name.strip(),
-                "entry_date": entry_date or "2026-01-01",
-                "entry_price": float(entry_price), "shares": int(shares),
-                "stop_loss": float(stop_loss), "take_profit": float(take_profit),
-                "target_pct": float(target_pct), "note": note})
-            st.success(f"持仓已保存 ID={result['id']}")
+                render.set_field_errors({})
+                result = api.add_holding({
+                    "stock_code": code.strip(), "stock_name": name.strip(),
+                    "entry_date": entry_date or "2026-01-01",
+                    "entry_price": float(entry_price), "shares": int(shares),
+                    "stop_loss": float(stop_loss), "take_profit": float(take_profit),
+                    "target_pct": float(target_pct), "note": note})
+                st.success(f"持仓已保存 ID={result['id']}")

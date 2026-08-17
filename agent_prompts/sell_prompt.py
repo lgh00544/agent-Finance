@@ -20,6 +20,7 @@ from agent_prompts.common import ROLE_BASE, TRADE_STYLE, json_requirement
 SCHEMA_DESC = """{
   "stock_code": "600519",
   "action": "hold / partial / sell",
+  "reduce_ratio": "0.33（仅 action=partial 时输出 0.0-1.0；hold/sell 为 null）",
   "confidence": "high / medium / low",
   "reasons": ["决策依据1...", "决策依据2..."],
   "exit_price_zone": "建议卖出价格区间或触发条件",
@@ -46,11 +47,30 @@ SYSTEM_PROMPT = f"""{ROLE_BASE}
 2. 三类动作的判断要点：
    - sell（卖出清仓）：趋势明确破坏、触发止损、基本面/重大利空出现实质恶化、盈亏与风险收益比严重失衡；
    - partial（部分减仓）：风险开始显现但趋势尚未完全破坏、已达部分止盈目标、需要降低单票暴露；
+     此时必须给出 reduce_ratio 建议减仓比例（见【减仓比例研判 reduce_ratio】）；
    - hold（继续持有）：趋势完好、信号积极、风险可控，暂无离场理由；
 3. 卖出决策必须给出具体价格区间或触发条件（结合当前价位、关键均线、前期高低点），便于人工执行；
 4. 若无把握或信息不足，倾向 hold 并如实标注低置信度，不要为了给出结论而强行建议卖出；
 5. check_list 中提示人工卖出前必须核对的事项（当日是否可卖、仓位占比、税费、资金安排等），
-   绝不建议任何不执行核对的盲目操作。
+   绝不建议任何不执行核对的盲目操作；
+6. 组合风险上下文（若有）作为组合级参考参与研判（见【组合风险上下文感知】），
+   但个股结论仍以个股自身数据为主，不因组合状态而无依据改变个股动作。
+
+【减仓比例研判 reduce_ratio（参考权重，非死条件）】
+1. action=hold 或 sell → reduce_ratio 必须为 null（清仓不需要比例）；
+2. action=partial → reduce_ratio 取值 0.2-0.6 之间，参考：
+   - 信号刚出现、趋势未完全破坏 → 0.25-0.33（减 1/4 到 1/3）；
+   - 多维偏离（3 维及以上风险）+ 浮盈较大 → 0.4-0.5（减仓近半）；
+   - 组合级回撤触发 + 个股信号偏负 → 偏上限；
+3. 不建议单次 partial 减仓超过 0.6（超过就该直接 sell）；
+4. 以上比例为参考权重，你可根据具体情况调整，但必须在 reasons 中说明调整理由。
+
+【组合风险上下文感知（参考权重，非死条件；单向只读）】
+1. 用户输入含【组合风险上下文】时，必须在决策中引用组合状态；
+2. 组合当日回撤预警触发（drawdown_alert=True）→ 个股 partial 阈值更敏感，reduce_ratio 偏上限；
+3. 集中度预警触发（concentration_alert=True）→ 同板块个股优先减仓；
+4. 组合状态正常 → 不影响个股决策，正常研判；
+5. 组合风险上下文缺失/标注「组合数据不可用」→ 如实标注，不影响个股独立研判。
 
 【强制规则（防乱清仓，无条件遵守）】
 1. **游资撤离/净卖只触发「减仓预警」（partial）**；「清仓」（sell）必须同时满足双条件：
@@ -74,8 +94,10 @@ N 为 verdict=风险 的维度数（0-5 如实统计）。reasons 保留为决�
 {json_requirement(SCHEMA_DESC)}"""
 
 
-def build_user_prompt(holding_info: str, monitor_signals: str, plan_info: str, quote_pack: str) -> str:
-    """holding_info: 持仓基础信息；monitor_signals: 持仓期间监控信号历史；plan_info: 建仓计划记录；quote_pack: 最新行情与指标"""
+def build_user_prompt(holding_info: str, monitor_signals: str, plan_info: str, quote_pack: str,
+                      portfolio_risk_context: str = "（无）") -> str:
+    """holding_info: 持仓基础信息；monitor_signals: 持仓期间监控信号历史；plan_info: 建仓计划记录；
+    quote_pack: 最新行情与指标；portfolio_risk_context: 组合风险上下文（PortfolioSentinel 快照，缺失传「（无）」）"""
     return f"""【持仓信息】
 {holding_info}
 
@@ -86,4 +108,7 @@ def build_user_prompt(holding_info: str, monitor_signals: str, plan_info: str, q
 {plan_info}
 
 【最新行情与指标】（原始数据与纯数学指标）
-{quote_pack}"""
+{quote_pack}
+
+【组合风险上下文】（PortfolioSentinel 最近快照，只读参考；缺失不影响个股独立研判）
+{portfolio_risk_context}"""

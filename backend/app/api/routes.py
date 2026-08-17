@@ -53,6 +53,12 @@ def _task_daily_pipeline(params: dict) -> dict:
             "date": date_key}
 
 
+def _task_experience_worker(params: dict) -> dict:
+    """手动触发经验沉淀识别（强制跑 Worker 全流程，忽略积压门）"""
+    from app.services.experience_worker import worker_run
+    return worker_run(force=True)
+
+
 _TASK_KINDS: dict[str, tuple[str, object]] = {
     "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
     "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
@@ -80,6 +86,7 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "track_verify": ("候选池T+N验证", lambda p: _task_track_verify(False)),
     "track_backfill": ("候选池T+N历史回填", lambda p: _task_track_verify(True)),
     "track_suggest": ("选股验证建议生成", lambda p: _task_track_suggest()),
+    "experience_worker": ("经验沉淀识别", lambda p: _task_experience_worker()),
 }
 
 
@@ -447,6 +454,15 @@ def candidates_tradeable(date: Optional[str] = None, limit: int = 200):
 
     trade_date = date or time.strftime("%Y-%m-%d")
     return candidate_tradeable.tradeable_view(trade_date, limit)
+
+
+@router.get("/candidate/concentration")
+def candidate_concentration(date: Optional[str] = None):
+    """候选行业集中度（只读 detail.enriched.industry）：
+    {total, groups, max_concentration, max_industry, coverage}；coverage<50% 时前端不展示集中度"""
+    from app.services import pre_market_screen
+
+    return pre_market_screen.candidate_industry_concentration(date)
 
 
 @router.get("/scores")
@@ -1284,3 +1300,103 @@ def chat_learn_confirm(body: ChatLearnConfirmBody):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return result
+
+
+# ==================== 经验沉淀闭环 API（M1-M5 前端数据源） ====================
+
+class ExperienceReviewBody(BaseModel):
+    action: str = Field(description="approve=批准 / reject=驳回")
+    note: str = Field(default="", description="驳回原因必填（留痕）")
+
+
+class ExperienceConfigBody(BaseModel):
+    config: dict = Field(description="key-value 配置（key 须为 DEFAULTS 已知项）")
+
+
+@router.get("/experience/pending")
+def experience_pending(status: str | None = None, stage: str | None = None, limit: int = 50):
+    """M1 沉淀队列（只读看板；pending 灰·processing 蓝·done 绿，按阶段筛选）"""
+    return repo.list_pending_experience(status=status, stage=stage, limit=limit)
+
+
+@router.post("/experience/worker/run")
+def experience_worker_run():
+    """M1 立即触发识别（异步后台任务；同类型活跃时 409 拒绝防并发）"""
+    return _submit_task("experience_worker", {})
+
+
+@router.get("/experience/list")
+def experience_list(status: str | None = None, stage: str | None = None,
+                    auto_merged: int | None = None, limit: int = 100):
+    """M4 经验库列表（按状态/阶段/自动合并筛选）"""
+    return repo.list_experience(status=status, stage=stage, auto_merged=auto_merged, limit=limit)
+
+
+@router.get("/experience/search")
+def experience_search(stage: str | None = None, query: str | None = None, k: int = 5):
+    """经验检索（FTS5/LIKE，仅 active；供 M4 搜索框与注入联查）"""
+    return repo.search_experience(stage=stage, query=query, k=k)
+
+@router.get("/experience/config")
+def experience_config_get():
+    """M5 设置读取（当前生效值 = DB experience_config 覆盖 + 默认）"""
+    from app.services.experience_worker import DEFAULTS, _cfg
+    return {k: _cfg(k) for k in DEFAULTS}
+
+
+@router.post("/experience/config")
+def experience_config_set(body: ExperienceConfigBody):
+    """M5 设置写入（key-value 热加载，无需重启；key 须为 DEFAULTS 已知项）"""
+    from app.services.experience_worker import DEFAULTS
+    invalid = [k for k in body.config if k not in DEFAULTS]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"未知配置项: {invalid}")
+    for k, v in body.config.items():
+        repo.set_config(k, str(v))
+    return {"ok": True, "config": {k: str(v) for k, v in body.config.items()}}
+
+
+@router.get("/experience/{eid}")
+def experience_detail(eid: int):
+    """单条经验（含来源 pending 摘要）"""
+    item = repo.get_experience(eid)
+    if item is None:
+        raise HTTPException(status_code=404, detail="经验不存在")
+    return item
+
+
+@router.post("/experience/{eid}/review")
+def experience_review(eid: int, body: ExperienceReviewBody):
+    """M2/M3 审核：approve→active；reject→rejected（原因必填留痕）。仅 pending_review 可操作。"""
+    item = repo.get_experience(eid)
+    if item is None:
+        raise HTTPException(status_code=404, detail="经验不存在")
+    if item["status"] != "pending_review":
+        raise HTTPException(status_code=409,
+                            detail=f"仅待审核条目可审核（当前 {item['status']}）")
+    if body.action == "approve":
+        repo.update_experience_status(eid, "active", reviewer="sir",
+                                      action="approve", note=body.note or "")
+        return {"id": eid, "status": "active"}
+    if body.action == "reject":
+        if not (body.note or "").strip():
+            raise HTTPException(status_code=400, detail="驳回必须填写原因（留痕可追溯）")
+        repo.update_experience_status(eid, "rejected", reviewer="sir",
+                                      action="reject", note=body.note)
+        return {"id": eid, "status": "rejected"}
+    raise HTTPException(status_code=400, detail="action 仅支持 approve/reject")
+
+
+@router.post("/experience/{eid}/rollback")
+def experience_rollback(eid: int):
+    """M4 回滚：仅「已生效且自动合并」可回滚 → rolled_back + review_log(rollback)；
+    回滚后 status 过滤使检索不再命中（误合并可恢复）。"""
+    item = repo.get_experience(eid)
+    if item is None:
+        raise HTTPException(status_code=404, detail="经验不存在")
+    if item["status"] != "active" or item["auto_merged"] != 1:
+        raise HTTPException(status_code=409,
+                            detail="仅「已生效且自动合并」的经验可回滚（误合并恢复入口）")
+    repo.update_experience_status(eid, "rolled_back", reviewer="sir",
+                                  action="rollback", note="M4 人工回滚")
+    return {"id": eid, "status": "rolled_back"}

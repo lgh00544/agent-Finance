@@ -6,7 +6,7 @@ JSON 字段用 Text 存储（SQLAlchemy JSON 在 SQLite/MySQL 均可，但 MySQL
 from datetime import datetime
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Float, Index, Integer, String, Text, UniqueConstraint,
+    JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
@@ -559,3 +559,87 @@ class LhbOriginalFlow(Base):
     confidence: Mapped[float] = mapped_column(Float, default=1.0)     # 官方=1.0/第三方=0.8/社区=0.5
     source: Mapped[str] = mapped_column(String(16), default="eastmoney")  # sse/szse/eastmoney
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+# ==================== 经验沉淀闭环（自动识别 → 分层审核 → 检索注入） ====================
+# 时间戳统一用 DateTime + _now()（datetime），与全库既有惯例一致；
+# 原执行指令草案用 String(24)+_now() 会存 datetime 对象到 VARCHAR 列，按实际代码惯例修正。
+
+
+class PendingExperience(Base):
+    """经验沉淀待处理队列（热路径单行写入，离线 Worker 消费）
+    status: pending(待处理) / processing(Worker 认领中) / done(已处理，含失败=done+error)"""
+    __tablename__ = "pending_experience"
+    __table_args__ = (
+        Index("ix_pending_status_id", "status", "id"),   # 认领批次按状态+ID 顺序
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str | None] = mapped_column(String(64))          # 来源任务标识 kind:trade_date
+    stage: Mapped[str] = mapped_column(String(8))                    # 选股/建仓/持仓
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    summary: Mapped[str | None] = mapped_column(Text)                # 热路径摘要（零分析）
+    artifacts_ref: Mapped[str | None] = mapped_column(Text)          # 产物引用（记录 ID，非全文）
+    status: Mapped[str] = mapped_column(String(12), default="pending")
+    error: Mapped[str | None] = mapped_column(Text)                  # Worker 失败原因（done+error 表示）
+
+
+class Experience(Base):
+    """沉淀经验（四态：pending_review 待审核 / active 已生效 / rejected 驳回 / rolled_back 已回滚）
+    auto_merged=1 表示低影响自动合并（可回滚 + 留痕 review_log）。"""
+    __tablename__ = "experience"
+    __table_args__ = (
+        Index("ix_experience_status_stage", "status", "stage"),
+        Index("ix_experience_stage_id", "stage", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(128))
+    body: Mapped[str] = mapped_column(Text)
+    stage: Mapped[str] = mapped_column(String(8))
+    tags: Mapped[str | None] = mapped_column(Text)                   # JSON 数组或逗号分隔
+    impact: Mapped[str] = mapped_column(String(8), default="low")    # high/low
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    auto_merged: Mapped[int] = mapped_column(Integer, default=0)
+    source_pending_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pending_experience.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending_review")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ReviewLog(Base):
+    """审核留痕（approve/reject/auto_merge/rollback，可追溯）"""
+    __tablename__ = "review_log"
+    __table_args__ = (
+        Index("ix_reviewlog_exp", "experience_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experience_id: Mapped[int | None] = mapped_column(
+        ForeignKey("experience.id"), nullable=True)
+    action: Mapped[str] = mapped_column(String(16))                  # approve/reject/auto_merge/rollback
+    reviewer: Mapped[str] = mapped_column(String(16))                # sir/auto
+    at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class WorkerRun(Base):
+    """Worker 运行记录（每次消费批次的开始/结束/处理数/状态）"""
+    __tablename__ = "worker_run"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(12), default="running")  # running/success/failed
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class ExperienceConfig(Base):
+    """经验沉淀设置中心（key-value 热加载，改后无需重启；M5 前端设置落地）"""
+    __tablename__ = "experience_config"
+
+    key: Mapped[str] = mapped_column(String(48), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

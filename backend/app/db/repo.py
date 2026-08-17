@@ -14,10 +14,11 @@ from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
-    BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable, Holding,
-    HotMoneyProfile, LhbOriginalFlow, MarketCondition, MarketIntel,
-    NewsArticle, PositionPlan, PrivateKnowledge, ReviewResult, RuleChange, SellDecision,
-    StockCandidate, StockScore, TradeProfile, TradeRecord, _now,
+    BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
+    Experience, ExperienceConfig, Holding, HotMoneyProfile, LhbOriginalFlow,
+    MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
+    PrivateKnowledge, ReviewLog, ReviewResult, RuleChange, SellDecision,
+    StockCandidate, StockScore, TradeProfile, TradeRecord, WorkerRun, _now,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -136,6 +137,24 @@ def get_latest_market_condition() -> dict | None:
         ).scalar_one_or_none()
         if row is None:
             return None
+        cap, band = market_band_info(row.total_score)
+        return {"trade_date": row.trade_date, "total_score": row.total_score,
+                "band": band, "cap": row.cap, "dims": row.dims,
+                "summary": row.summary, "created_at": str(row.created_at)}
+
+
+def get_prev_market_condition() -> dict | None:
+    """上一期市况评分（倒序第二条；表空/仅一条 → 返回 None，调用方对应维度跳过不报错）。
+    用于市况切换检测：与 get_latest_market_condition 各自取最近两条，不假设两表同日对齐。"""
+    from app.core.config import market_band_info
+
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(MarketCondition).order_by(MarketCondition.trade_date.desc()).limit(2)
+        ).scalars().all()
+        if len(rows) < 2:
+            return None
+        row = rows[1]
         cap, band = market_band_info(row.total_score)
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
@@ -427,9 +446,11 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
         db.commit()
         db.refresh(row)
         _invalidate("alert")
-        # 推理留痕：monitor 信号研判（signal 全量含 reasons/risks/key_levels）
-        reasoning_trace.trace_alert(stock_code, stock_name, _now().strftime("%Y-%m-%d"),
-                                    alert_type, severity, message, action, signal or {})
+        # 推理留痕仅 monitor 信号（LLM 研判）：pre_market/market_shift 等代码级检测
+        # 无 LLM 研判，不写留痕（避免污染推理留痕视图）
+        if source == "monitor":
+            reasoning_trace.trace_alert(stock_code, stock_name, _now().strftime("%Y-%m-%d"),
+                                        alert_type, severity, message, action, signal or {})
         return row.id
 
 
@@ -824,7 +845,8 @@ def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
             return [{"stock_code": r.stock_code, "stock_name": r.stock_name,
                      "trade_date": r.trade_date, "rank": r.rank,
                      "reasons": r.reasons, "risk_notice": r.risk_notice,
-                     "detail": r.detail or {}, "created_at": str(r.created_at)} for r in rows]
+                     "detail": r.detail or {}, "snapshot": r.snapshot or {},
+                     "created_at": str(r.created_at)} for r in rows]
 
     return _dbq("candidate", {"date": date, "limit": limit}, _load)
 
@@ -1688,3 +1710,276 @@ def hot_money_fingerprint() -> str:
         n = db.execute(select(func.count()).select_from(LhbOriginalFlow)).scalar_one()
         last = db.execute(select(func.max(LhbOriginalFlow.created_at))).scalar_one()
     return f"{n}:{last.strftime('%Y%m%d%H%M%S') if last else '0'}"
+
+
+# ==================== 经验沉淀闭环（pending → worker → experience → review_log → 检索注入） ====================
+
+def add_pending_experience(task_id, stage, summary, artifacts_ref) -> int:
+    """热路径经验沉淀写入：单行 INSERT，零分析。失败由调用方静默降级（不阻塞主任务）。"""
+    with SessionLocal() as db:
+        row = PendingExperience(task_id=task_id, stage=stage, summary=summary,
+                                artifacts_ref=artifacts_ref, status="pending")
+        db.add(row)
+        db.commit()
+        _invalidate("pending_experience")
+        return row.id
+
+
+def list_pending_experience(status=None, stage=None, limit=50) -> list:
+    """待处理队列只读列表（最新在前）"""
+    with SessionLocal() as db:
+        stmt = select(PendingExperience)
+        if status:
+            stmt = stmt.where(PendingExperience.status == status)
+        if stage:
+            stmt = stmt.where(PendingExperience.stage == stage)
+        stmt = stmt.order_by(PendingExperience.id.desc()).limit(limit)
+        rows = db.execute(stmt).scalars().all()
+        return [_pending_row(r) for r in rows]
+
+
+def _pending_row(r) -> dict:
+    return dict(id=r.id, task_id=r.task_id, stage=r.stage, summary=r.summary,
+                artifacts_ref=r.artifacts_ref, status=r.status, error=r.error,
+                created_at=str(r.created_at))
+
+
+def claim_pending_batch(batch_size=20) -> list:
+    """原子认领下一批 pending：逐行 UPDATE ... WHERE id=? AND status='pending'（防并发双跑）。
+    返回认领成功行的 dict 列表；并发下重复执行不会重复消费。"""
+    with SessionLocal() as db:
+        pending = db.execute(
+            select(PendingExperience).where(PendingExperience.status == "pending")
+            .order_by(PendingExperience.id).limit(batch_size)).scalars().all()
+        claimed = []
+        for row in pending:
+            res = db.execute(
+                PendingExperience.__table__.update()
+                .where(PendingExperience.id == row.id,
+                       PendingExperience.status == "pending")
+                .values(status="processing"))
+            if res.rowcount == 1:
+                claimed.append(_pending_row(row))
+        if claimed:
+            db.commit()
+            _invalidate("pending_experience")
+        return claimed
+
+
+def release_pending(id, error=None) -> None:
+    """处理完成：标 done + 可选 error（失败也标 done，error 记录原因，不残留 processing）"""
+    with SessionLocal() as db:
+        row = db.execute(select(PendingExperience).where(PendingExperience.id == id)
+                         ).scalar_one_or_none()
+        if row is None:
+            return
+        row.status = "done"
+        row.error = error
+        db.commit()
+        _invalidate("pending_experience")
+
+
+def watchdog_reset_stale_processing(older_than_hours=2.0) -> int:
+    """看门狗：processing 超时（默认 2h）复位为 pending，防 Worker 崩溃卡死队列。返回复位条数"""
+    from datetime import datetime, timedelta
+    cutoff = datetime.now() - timedelta(hours=older_than_hours)
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(PendingExperience).where(
+                PendingExperience.status == "processing",
+                PendingExperience.created_at < cutoff)).scalars().all()
+        for row in rows:
+            row.status = "pending"
+            row.error = "watchdog_timeout"
+        if rows:
+            db.commit()
+            _invalidate("pending_experience")
+        return len(rows)
+
+
+def pending_backlog_count() -> int:
+    """待处理队列积压数（Digest 积压触发判断）"""
+    with SessionLocal() as db:
+        return db.execute(
+            select(func.count()).select_from(PendingExperience)
+            .where(PendingExperience.status == "pending")).scalar_one()
+
+
+def insert_experience(title, body, stage, tags, impact, confidence,
+                      auto_merged=0, source_pending_id=None, status="pending_review") -> int:
+    """插入沉淀经验；FTS 触发器自动同步索引。返回 experience.id"""
+    tags_json = json.dumps(tags, ensure_ascii=False) if isinstance(tags, (list, tuple)) else tags
+    with SessionLocal() as db:
+        row = Experience(title=title, body=body, stage=stage, tags=tags_json,
+                         impact=impact, confidence=float(confidence),
+                         auto_merged=auto_merged, source_pending_id=source_pending_id,
+                         status=status)
+        db.add(row)
+        db.commit()
+        _invalidate("experience")
+        return row.id
+
+
+def list_experience(status=None, stage=None, auto_merged=None, limit=50) -> list:
+    """经验库列表（最新在前）"""
+    with SessionLocal() as db:
+        stmt = select(Experience)
+        if status:
+            stmt = stmt.where(Experience.status == status)
+        if stage:
+            stmt = stmt.where(Experience.stage == stage)
+        if auto_merged is not None:
+            stmt = stmt.where(Experience.auto_merged == auto_merged)
+        stmt = stmt.order_by(Experience.id.desc()).limit(limit)
+        rows = db.execute(stmt).scalars().all()
+        return [_exp_row(r) for r in rows]
+
+
+def get_experience(id) -> dict:
+    """单条经验（含来源 pending 摘要，供 UI/审核展示）"""
+    with SessionLocal() as db:
+        row = db.execute(select(Experience).where(Experience.id == id)).scalar_one_or_none()
+        if row is None:
+            return None
+        out = _exp_row(row)
+        if row.source_pending_id:
+            pend = db.execute(select(PendingExperience).where(
+                PendingExperience.id == row.source_pending_id)).scalar_one_or_none()
+            if pend:
+                out["source_summary"] = pend.summary
+                out["source_task_id"] = pend.task_id
+        return out
+
+
+def _exp_row(r) -> dict:
+    return dict(id=r.id, title=r.title, body=r.body, stage=r.stage, tags=r.tags,
+                impact=r.impact, confidence=r.confidence, auto_merged=r.auto_merged,
+                source_pending_id=r.source_pending_id, status=r.status,
+                created_at=str(r.created_at),
+                last_reviewed_at=str(r.last_reviewed_at) if r.last_reviewed_at else None)
+
+
+def update_experience_status(id, status, reviewer=None, action=None, note=None) -> None:
+    """状态流转 + 写 review_log（同事务）；last_reviewed_at 刷新"""
+    with SessionLocal() as db:
+        row = db.execute(select(Experience).where(Experience.id == id)).scalar_one_or_none()
+        if row is None:
+            return
+        row.status = status
+        row.last_reviewed_at = _now()
+        if action and reviewer:
+            db.add(ReviewLog(experience_id=id, action=action, reviewer=reviewer, note=note))
+        db.commit()
+        _invalidate("experience")
+        _invalidate("review_log")
+
+
+def experience_version() -> str:
+    """经验版本感知（e{count}:{max_id}），供 LLM 缓存键追加，经验变更后缓存自动失效"""
+    with SessionLocal() as db:
+        count = db.execute(select(func.count()).select_from(Experience)).scalar_one()
+        max_id = db.execute(select(func.max(Experience.id))).scalar_one()
+        return f"e{count}:{max_id or 0}"
+
+
+def write_review_log(experience_id, action, reviewer, note=None) -> None:
+    """独立审核留痕（auto_merge/rollback 等）"""
+    with SessionLocal() as db:
+        db.add(ReviewLog(experience_id=experience_id, action=action,
+                         reviewer=reviewer, note=note))
+        db.commit()
+        _invalidate("review_log")
+
+
+def start_worker_run() -> int:
+    """Worker 运行记录开始，返回 run_id"""
+    with SessionLocal() as db:
+        row = WorkerRun(status="running")
+        db.add(row)
+        db.commit()
+        return row.id
+
+
+def finish_worker_run(run_id, processed_count, status, error=None) -> None:
+    """Worker 运行记录结束（ended_at/processed_count/status/error）"""
+    with SessionLocal() as db:
+        row = db.execute(select(WorkerRun).where(WorkerRun.id == run_id)).scalar_one_or_none()
+        if row is None:
+            return
+        row.ended_at = _now()
+        row.processed_count = processed_count
+        row.status = status
+        row.error = error
+        db.commit()
+
+
+def search_experience(stage=None, tags=None, query=None, k=5, status="active") -> list:
+    """经验检索注入：SQLite 用 FTS5 MATCH（rank 相关度），中文整串匹配差时自动降级 LIKE；
+    MySQL 模式直接 LIKE 检索（标注检索精度降级）。仅取 status 指定的经验。"""
+    if settings.db_backend != "sqlite":
+        return _search_experience_like(stage, tags, query, k, status)
+    if query and str(query).strip():
+        params: dict = {"status": status, "k": int(k)}
+        sql = ("SELECT e.* FROM experience_fts f JOIN experience e ON e.id=f.rowid "
+               "WHERE e.status=:status")
+        if stage:
+            sql += " AND e.stage=:stage"
+            params["stage"] = stage
+        sql += " AND experience_fts MATCH :query ORDER BY rank LIMIT :k"
+        params["query"] = str(query)
+        try:
+            with SessionLocal() as db:
+                rows = db.execute(text(sql), params).mappings().all()
+                if rows:
+                    return [_exp_map_row(r) for r in rows]
+        except Exception:  # noqa: BLE001 FTS 语法/整串匹配失败 → 降级 LIKE
+            logger.warning("FTS5 检索失败（降级 LIKE）: %s", str(query)[:60])
+    return _search_experience_like(stage, tags, query, k, status)
+
+
+def _search_experience_like(stage=None, tags=None, query=None, k=5, status="active") -> list:
+    """LIKE 兜底检索（FTS 不可用/未命中；MySQL 降级模式）"""
+    with SessionLocal() as db:
+        stmt = select(Experience).where(Experience.status == status)
+        if stage:
+            stmt = stmt.where(Experience.stage == stage)
+        if tags:
+            stmt = stmt.where(Experience.tags.like(f"%{tags}%"))
+        if query and str(query).strip():
+            kw = f"%{str(query)}%"
+            stmt = stmt.where(Experience.title.like(kw) | Experience.body.like(kw))
+        stmt = stmt.order_by(Experience.id.desc()).limit(k)
+        rows = db.execute(stmt).scalars().all()
+        return [_exp_row(r) for r in rows]
+
+
+def _exp_map_row(r) -> dict:
+    """FTS JOIN 原始行映射（RowMapping → 统一 dict）"""
+    return dict(id=r["id"], title=r["title"], body=r["body"], stage=r["stage"],
+                tags=r["tags"], impact=r["impact"], confidence=r["confidence"],
+                auto_merged=r["auto_merged"], source_pending_id=r["source_pending_id"],
+                status=r["status"], created_at=str(r["created_at"]),
+                last_reviewed_at=str(r["last_reviewed_at"]) if r["last_reviewed_at"] else None)
+
+
+# ==================== 经验沉淀设置中心（key-value 热加载） ====================
+
+def get_config(key: str, default: str | None = None) -> str | None:
+    """读取配置值（无记录返回 default）；经验 Worker 每次运行前热加载，无需重启"""
+    with SessionLocal() as db:
+        row = db.execute(select(ExperienceConfig).where(ExperienceConfig.key == key)
+                         ).scalar_one_or_none()
+        return row.value if row else default
+
+
+def set_config(key: str, value: str) -> None:
+    """写入/覆盖配置（key 为主键，幂等 upsert）"""
+    with SessionLocal() as db:
+        row = db.execute(select(ExperienceConfig).where(ExperienceConfig.key == key)
+                         ).scalar_one_or_none()
+        if row is None:
+            row = ExperienceConfig(key=key, value=value)
+            db.add(row)
+        else:
+            row.value = value
+        db.commit()

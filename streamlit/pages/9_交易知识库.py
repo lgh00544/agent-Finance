@@ -15,14 +15,15 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("交易知识库（统一调教·私有战法）")
+# ===== 批次3：页面头部收敛为 page_header 单行范式 =====
+render.page_header(
+    "交易知识库（统一调教·私有战法）",
+    caption="私有交易经验/战法/心得：六个 Agent 每次启动任务自动检索对应标签知识注入研判上下文；"
+            "保存/删除立即生效（版本号使 LLM 缓存自动失效），无需重启服务。",
+)
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
-
-st.caption("这里存放你的私有交易经验、战法、心得。六个 Agent（挖掘/评分/建仓/监控/卖出/复盘）"
-           "每次启动任务都会自动检索对应标签的知识注入研判上下文；"
-           "保存/删除立即生效（版本号使 LLM 缓存自动失效），无需重启服务。")
 
 AGENTS = ["all", "discover", "score", "position", "monitor", "sell", "review"]
 
@@ -111,7 +112,7 @@ with tab_list:
                     default_open=True,
                     batch=("kb", [f"kb_{r['id']}" for r in rows]) if rows else None):
                 if not rows:
-                    st.caption("当前过滤条件下无匹配条目。")
+                    render.empty_state("当前过滤条件下无匹配条目。", icon="🔍")
                 else:
                     def _kb_detail(r: dict, _i: int) -> None:
                         key = f"kb_{r['id']}"

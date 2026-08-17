@@ -32,7 +32,12 @@ render.apply_global_theme()
 # 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
 render.top_status_bar()
 
-st.title("交易复盘（ReviewAgent）")
+# ===== 批次3：页面头部收敛为 page_header（黑盒展示规范保持）=====
+render.page_header(
+    "交易复盘（ReviewAgent）",
+    caption="黑盒总览：主界面只暴露结果与可执行建议（综合评级/一句话总结/指标卡/建议清单/走势图）；"
+            "算法与根因细节在「详情与历史记录」深层折叠 + 专业视图开关。建议一键采纳/驳回，人工审核后生效。",
+)
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
 render.task_status_area()
@@ -817,7 +822,7 @@ with render.fold_module("overview", "本期复盘总览",
             else:
                 trend = _trend_df(window_rows)
                 if trend is None:
-                    st.caption("该窗口暂无复盘数据，历史走势待数据积累后呈现。")
+                    render.empty_state("该窗口暂无复盘数据，历史走势待数据积累后呈现。", icon="📈")
                 else:
                     tc1, tc2 = st.columns(2)
                     with tc1:
@@ -828,6 +833,8 @@ with render.fold_module("overview", "本期复盘总览",
                         if "累计盈亏比" in trend.columns:
                             st.line_chart(trend[["累计盈亏比"]], height=240)
                         else:
+                            # 保留 caption：半宽列内子图占位（左侧胜率图已渲染），
+                            # empty_state 虚线框在此 2 列布局下视觉过重
                             st.caption("暂无亏损样本，盈亏比曲线待积累。")
 
 # ================= 走势变动分析（黑盒结果区：一句话结论 + 分层归因 + 对应改善建议） =================
@@ -1123,166 +1130,179 @@ with render.fold_module("detail_hist", "详情与历史记录",
                                            dot=dot, meta=meta, scope="rev"):
                     with st.container(border=True):
                         render.trace_line("复盘生成时间", r.get("created_at"), source="LLM 生成")
-                        # 分区一：计划兑现度（入场逻辑 vs 实际走势，黑盒可见的结论区）
-                        with st.container(border=True):
+                        # 批次3：详情分区 Tab 化（仍收在「详情与历史记录」折叠内；黑盒规范不变：
+                        # 止盈比对/离场归因等算法细节仍仅专业视图可见；采纳/驳回逻辑零改动）
+                        suggestion = (r["feedback"] or {}).get("profile_suggestion")
+                        adopted = r.get("suggest_status") == "adopted"
+
+                        def _tab_pva():
+                            # 计划兑现度（入场逻辑 vs 实际走势，黑盒可见的结论区）
                             render.section_title("计划兑现度")
                             render.render_dict(r["plan_vs_actual"])
                             if pro_view:  # 完整留痕仅专业视图可见
                                 render.raw_json_expander(r["plan_vs_actual"], key=f"raw_pva_{r['id']}")
-                        if pro_view:
-                            # 分区一·补：止盈计划兑现比对（预判止盈位 vs 实际卖出价，留痕追溯）
-                            with st.container(border=True):
-                                render.section_title("止盈计划兑现比对（留痕追溯）")
-                                tp_trace = None
-                                try:
-                                    for t in api.traces(code=r["stock_code"], date=r["exit_date"],
-                                                        limit=5) or []:
-                                        if t.get("source_module") == "position_monitor":
-                                            tp_trace = t
-                                            break
-                                except Exception:  # noqa: BLE001 留痕接口失败降级提示
-                                    tp_trace = None
-                                if tp_trace:
-                                    try:
-                                        concl = json.loads(tp_trace.get("final_conclusion") or "{}")
-                                    except (json.JSONDecodeError, TypeError):
-                                        concl = {}
-                                    tp1, tp2 = concl.get("tp1"), concl.get("tp2")
-                                    st.markdown(f"- 预判第一止盈位：**{render.num(tp1 or '—')} 元**；"
-                                                f"第二止盈位：**{render.num(tp2 or '—')} 元**"
-                                                f"（留痕 {str(tp_trace.get('create_time') or '')[:16]}，"
-                                                "source_module=position_monitor）",
-                                                unsafe_allow_html=True)
-                                    exit_prices = []
-                                    try:
-                                        for tr in api.holding_trades(r.get("holding_id") or 0) or []:
-                                            if tr.get("side") == "sell" and tr.get("price"):
-                                                exit_prices.append(float(tr["price"]))
-                                    except Exception:  # noqa: BLE001 流水失败降级提示
-                                        pass
-                                    if exit_prices:
-                                        avg = sum(exit_prices) / len(exit_prices)
-                                        if tp1 and tp2 and avg >= tp2:
-                                            verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} ≥ "
-                                                       f"第二止盈位 {render.num(tp2)}："
-                                                       "到达波段目标，超预期兑现")
-                                        elif tp1 and avg >= tp1:
-                                            verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} ≥ "
-                                                       f"第一止盈位 {render.num(tp1)}："
-                                                       "分档锁利生效")
-                                        else:
-                                            verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} "
-                                                       f"低于第一止盈位 {render.num(tp1 or '—')}："
-                                                       "未触发止盈分档")
-                                        st.markdown(f"- 实际卖出：{render.num(len(exit_prices))} 笔，"
-                                                    f"均价 {render.num(f'{avg:,.2f}')} 元",
-                                                    unsafe_allow_html=True)
-                                        st.markdown(f"- **比对结论**：{verdict}", unsafe_allow_html=True)
-                                    else:
-                                        st.caption("无卖出流水记录，无法比对实际卖出价。")
-                                else:
-                                    st.caption("离场日无 position_monitor 留痕（止盈计划功能上线前的"
-                                               "历史离场，无法回溯预判止盈位；留痕数据可供复盘进化"
-                                               "Agent 后续做止盈准确率统计）。")
-                            # 分区二：离场决策维度归因（白盒；回溯 SellAgent 离场决策的维度依据）
-                            with st.container(border=True):
-                                render.section_title("离场决策维度归因（白盒追溯）")
-                                sell_hist = []
-                                try:
-                                    sell_hist = api.sell_decisions(r.get("holding_id") or 0) or []
-                                except Exception:  # noqa: BLE001 决策接口失败降级提示，不阻塞复盘
-                                    sell_hist = []
-                                sell_d = (sell_hist[0].get("decision") or {}) if sell_hist else {}
-                                if sell_d:
-                                    render.dimension_bars(sell_d.get("dimensions"),
-                                                          final_advice=sell_d.get("final_advice"))
-                                    if sell_d.get("reasons"):
-                                        st.markdown("**决策依据**")
-                                        for i, rr in enumerate(sell_d["reasons"], 1):
-                                            st.markdown(f"{i}. {rr}")
-                                    render.time_text("决策时间", sell_hist[0].get("created_at"))
-                                else:
-                                    st.caption("无离场卖出决策记录（手动卖出或历史数据），"
-                                               "维度归因留痕在「持仓监控」页生成卖出决策后自动记录。")
 
-                        # 分区三：经验教训
-                        with st.container(border=True):
+                        def _tab_tp():
+                            # 止盈计划兑现比对（预判止盈位 vs 实际卖出价，留痕追溯；仅专业视图可见）
+                            render.section_title("止盈计划兑现比对（留痕追溯）")
+                            tp_trace = None
+                            try:
+                                for t in api.traces(code=r["stock_code"], date=r["exit_date"],
+                                                    limit=5) or []:
+                                    if t.get("source_module") == "position_monitor":
+                                        tp_trace = t
+                                        break
+                            except Exception:  # noqa: BLE001 留痕接口失败降级提示
+                                tp_trace = None
+                            if tp_trace:
+                                try:
+                                    concl = json.loads(tp_trace.get("final_conclusion") or "{}")
+                                except (json.JSONDecodeError, TypeError):
+                                    concl = {}
+                                tp1, tp2 = concl.get("tp1"), concl.get("tp2")
+                                st.markdown(f"- 预判第一止盈位：**{render.num(tp1 or '—')} 元**；"
+                                            f"第二止盈位：**{render.num(tp2 or '—')} 元**"
+                                            f"（留痕 {str(tp_trace.get('create_time') or '')[:16]}，"
+                                            "source_module=position_monitor）",
+                                            unsafe_allow_html=True)
+                                exit_prices = []
+                                try:
+                                    for tr in api.holding_trades(r.get("holding_id") or 0) or []:
+                                        if tr.get("side") == "sell" and tr.get("price"):
+                                            exit_prices.append(float(tr["price"]))
+                                except Exception:  # noqa: BLE001 流水失败降级提示
+                                    pass
+                                if exit_prices:
+                                    avg = sum(exit_prices) / len(exit_prices)
+                                    if tp1 and tp2 and avg >= tp2:
+                                        verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} ≥ "
+                                                   f"第二止盈位 {render.num(tp2)}："
+                                                   "到达波段目标，超预期兑现")
+                                    elif tp1 and avg >= tp1:
+                                        verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} ≥ "
+                                                   f"第一止盈位 {render.num(tp1)}："
+                                                   "分档锁利生效")
+                                    else:
+                                        verdict = (f"实际卖出均价 {render.num(f'{avg:,.2f}')} "
+                                                   f"低于第一止盈位 {render.num(tp1 or '—')}："
+                                                   "未触发止盈分档")
+                                    st.markdown(f"- 实际卖出：{render.num(len(exit_prices))} 笔，"
+                                                f"均价 {render.num(f'{avg:,.2f}')} 元",
+                                                unsafe_allow_html=True)
+                                    st.markdown(f"- **比对结论**：{verdict}", unsafe_allow_html=True)
+                                else:
+                                    st.caption("无卖出流水记录，无法比对实际卖出价。")
+                            else:
+                                st.caption("离场日无 position_monitor 留痕（止盈计划功能上线前的"
+                                           "历史离场，无法回溯预判止盈位；留痕数据可供复盘进化"
+                                           "Agent 后续做止盈准确率统计）。")
+
+                        def _tab_sell():
+                            # 离场决策维度归因（白盒；回溯 SellAgent 离场决策维度依据；仅专业视图可见）
+                            render.section_title("离场决策维度归因（白盒追溯）")
+                            sell_hist = []
+                            try:
+                                sell_hist = api.sell_decisions(r.get("holding_id") or 0) or []
+                            except Exception:  # noqa: BLE001 决策接口失败降级提示，不阻塞复盘
+                                sell_hist = []
+                            sell_d = (sell_hist[0].get("decision") or {}) if sell_hist else {}
+                            if sell_d:
+                                render.dimension_bars(sell_d.get("dimensions"),
+                                                      final_advice=sell_d.get("final_advice"))
+                                if sell_d.get("reasons"):
+                                    st.markdown("**决策依据**")
+                                    for i, rr in enumerate(sell_d["reasons"], 1):
+                                        st.markdown(f"{i}. {rr}")
+                                render.time_text("决策时间", sell_hist[0].get("created_at"))
+                            else:
+                                st.caption("无离场卖出决策记录（手动卖出或历史数据），"
+                                           "维度归因留痕在「持仓监控」页生成卖出决策后自动记录。")
+
+                        def _tab_lesson():
+                            # 经验教训
                             render.section_title("经验教训")
                             st.markdown(r["lesson"] or "（无）")
-                        # 分区三：筛选偏好微调建议
-                        with st.container(border=True):
+
+                        def _tab_feedback():
+                            # 筛选偏好微调建议
                             render.section_title("筛选偏好微调建议")
                             render.render_dict(r["feedback"])
                             if pro_view:  # 完整留痕仅专业视图可见
                                 render.raw_json_expander(r["feedback"], key=f"raw_fb_{r['id']}")
 
-                        # 分区四：交易偏好优化建议（版本迭代 + 采纳/驳回，人工审核后生效）
-                        suggestion = (r["feedback"] or {}).get("profile_suggestion")
-                        adopted = r.get("suggest_status") == "adopted"
+                        def _tab_sugg():
+                            # 交易偏好优化建议（版本迭代 + 采纳/驳回，人工审核后生效）
+                            render.section_title("交易偏好优化建议（人工审核后生效）")
+                            st.markdown(f"第 {r.get('suggest_iteration', 1)} 版 · "
+                                        f"状态：{suggest}：修改 `{suggestion['field']}` → "
+                                        f"{suggestion['value']}")
+                            if pro_view:  # 推导理由仅专业视图可见
+                                st.caption(f"理由：{suggestion['reason']}")
+
+                            if pro_view:  # 迭代历史深层收敛
+                                history = r.get("suggest_history") or []
+                                if history:
+                                    with st.expander(f"查看迭代历史（共 {len(history)} 轮，默认收起）"):
+                                        for h in reversed(history):
+                                            it = h.get("suggestion") or {}
+                                            if it:
+                                                st.markdown(f"**第 {h.get('iteration')} 版**：修改 "
+                                                            f"`{it.get('field')}` → {it.get('value')}")
+                                                st.caption(f"建议理由：{it.get('reason')}")
+                                            else:
+                                                st.markdown(f"**第 {h.get('iteration')} 版**：无字段建议")
+                                            st.warning(f"驳回原因：{h.get('reject_reason')}")
+                                            st.divider()
+
+                            if adopted:
+                                st.success("该建议已采纳并写入偏好档案，全部 Agent 立即生效。")
+                            else:
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    if st.button("采纳建议并更新偏好档案", key=f"adopt_{r['id']}"):
+                                        result = api.adopt_review(r["id"])
+                                        st.success(f"已采纳：{result['field']}，"
+                                                   f"偏好档案版本 v{result['version']}，立即生效")
+                                        st.rerun()
+                                with c2:
+                                    if st.button("驳回", key=f"reject_btn_{r['id']}"):
+                                        st.session_state[f"show_reject_{r['id']}"] = True
+                                        st.rerun()
+                                if st.session_state.get(f"show_reject_{r['id']}"):
+                                    with st.form(key=f"reject_form_{r['id']}"):
+                                        reason = st.text_area(
+                                            "驳回原因（必填，多行）",
+                                            placeholder="例如：不认可该结论 / 不符合我的交易风格"
+                                                        " / 规则过于严格",
+                                            key=f"reject_reason_{r['id']}")
+                                        # 驳回原因必填：原位标红 + 填写指引，不整段报错
+                                        render.field_error(
+                                            f"reject_{r['id']}",
+                                            render.get_field_error(f"reject_{r['id']}"),
+                                            "驳回原因必填，请说明不认可的具体理由")
+                                        if st.form_submit_button("提交驳回，让 AI 重新思考",
+                                                                 type="primary"):
+                                            if not reason.strip():
+                                                render.set_field_errors(
+                                                    {f"reject_{r['id']}": "驳回原因不能为空"})
+                                            else:
+                                                render.set_field_errors({})
+                                                res = api.reject_review(r["id"], reason.strip())
+                                                st.success("已驳回，AI 重思考任务已提交后台"
+                                                           f"（{res.get('task_id')}），"
+                                                           "完成后顶部任务状态区会提示。")
+                                                st.session_state.pop(f"show_reject_{r['id']}", None)
+                                                st.rerun()
+
+                        _sections = [("计划兑现度", _tab_pva)]
+                        if pro_view:
+                            _sections.append(("止盈比对", _tab_tp))
+                            _sections.append(("离场维度归因", _tab_sell))
+                        _sections.append(("经验教训", _tab_lesson))
+                        _sections.append(("偏好微调", _tab_feedback))
                         if suggestion:
-                            with st.container(border=True):
-                                render.section_title("交易偏好优化建议（人工审核后生效）")
-                                st.markdown(f"第 {r.get('suggest_iteration', 1)} 版 · "
-                                            f"状态：{suggest}：修改 `{suggestion['field']}` → "
-                                            f"{suggestion['value']}")
-                                if pro_view:  # 推导理由仅专业视图可见
-                                    st.caption(f"理由：{suggestion['reason']}")
-
-                                if pro_view:  # 迭代历史深层收敛
-                                    history = r.get("suggest_history") or []
-                                    if history:
-                                        with st.expander(f"查看迭代历史（共 {len(history)} 轮，默认收起）"):
-                                            for h in reversed(history):
-                                                it = h.get("suggestion") or {}
-                                                if it:
-                                                    st.markdown(f"**第 {h.get('iteration')} 版**：修改 "
-                                                                f"`{it.get('field')}` → {it.get('value')}")
-                                                    st.caption(f"建议理由：{it.get('reason')}")
-                                                else:
-                                                    st.markdown(f"**第 {h.get('iteration')} 版**：无字段建议")
-                                                st.warning(f"驳回原因：{h.get('reject_reason')}")
-                                                st.divider()
-
-                                if adopted:
-                                    st.success("该建议已采纳并写入偏好档案，全部 Agent 立即生效。")
-                                else:
-                                    c1, c2 = st.columns(2)
-                                    with c1:
-                                        if st.button("采纳建议并更新偏好档案", key=f"adopt_{r['id']}"):
-                                            result = api.adopt_review(r["id"])
-                                            st.success(f"已采纳：{result['field']}，"
-                                                       f"偏好档案版本 v{result['version']}，立即生效")
-                                            st.rerun()
-                                    with c2:
-                                        if st.button("驳回", key=f"reject_btn_{r['id']}"):
-                                            st.session_state[f"show_reject_{r['id']}"] = True
-                                            st.rerun()
-                                    if st.session_state.get(f"show_reject_{r['id']}"):
-                                        with st.form(key=f"reject_form_{r['id']}"):
-                                            reason = st.text_area(
-                                                "驳回原因（必填，多行）",
-                                                placeholder="例如：不认可该结论 / 不符合我的交易风格"
-                                                            " / 规则过于严格",
-                                                key=f"reject_reason_{r['id']}")
-                                            # 驳回原因必填：原位标红 + 填写指引，不整段报错
-                                            render.field_error(
-                                                f"reject_{r['id']}",
-                                                render.get_field_error(f"reject_{r['id']}"),
-                                                "驳回原因必填，请说明不认可的具体理由")
-                                            if st.form_submit_button("提交驳回，让 AI 重新思考",
-                                                                     type="primary"):
-                                                if not reason.strip():
-                                                    render.set_field_errors(
-                                                        {f"reject_{r['id']}": "驳回原因不能为空"})
-                                                else:
-                                                    render.set_field_errors({})
-                                                    res = api.reject_review(r["id"], reason.strip())
-                                                    st.success("已驳回，AI 重思考任务已提交后台"
-                                                               f"（{res.get('task_id')}），"
-                                                               "完成后顶部任务状态区会提示。")
-                                                    st.session_state.pop(f"show_reject_{r['id']}", None)
-                                                    st.rerun()
-
+                            _sections.append(("优化建议", _tab_sugg))
+                        render.detail_tabs(_sections, key=f"review_tabs_{r['id']}", default_index=0)
             t1, t2, t3 = st.tabs(["每日复盘报告", "失效标的明细", "分评级分组统计"])
             with t1:
                 if not list_rows:
