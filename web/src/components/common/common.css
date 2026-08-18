@@ -36,6 +36,9 @@
 .stat-value.warn {
   color: var(--warn);
 }
+.stat-value.info {
+  color: var(--info);
+}
 .stat-value.err {
   color: var(--err);
 }
