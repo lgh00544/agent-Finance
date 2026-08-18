@@ -2,7 +2,6 @@ import { Routes, Route } from 'react-router-dom'
 import { AppShell } from '@/components/layout/AppShell'
 import {
   AgentChatPage,
-  AlertsPage,
   ExperiencePage,
   HotMoneyPage,
   KnowledgePage,
@@ -15,6 +14,7 @@ import PlansPage from '@/pages/PlansPage'
 import ScoresPage from '@/pages/ScoresPage'
 import OverviewPage from '@/pages/OverviewPage'
 import MarketIntelPage from '@/pages/MarketIntelPage'
+import AlertsPage from '@/pages/AlertsPage'
 
 /** 13 条路由（对齐 Streamlit 导航；7_个人交易偏好 未注册跳过） */
 export default function App() {
