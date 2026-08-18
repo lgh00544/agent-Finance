@@ -40,3 +40,30 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+
+# ================= React SPA 静态挂载（web/dist 存在时同源单入口；不存在优雅降级仅 API 模式） =================
+from pathlib import Path
+
+from fastapi import HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
+
+if WEB_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="web-assets")
+
+    @app.get("/", include_in_schema=False)
+    async def web_index():
+        return FileResponse(WEB_DIST / "index.html")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def web_spa(full_path: str):
+        # API 前缀兜底：未匹配到的 /api/* 明确 404，不落入 index.html
+        if full_path.startswith("api/") or full_path == "api":
+            raise HTTPException(status_code=404, detail="API 路径不存在")
+        f = WEB_DIST / full_path
+        if f.is_file():
+            return FileResponse(f)
+        # SPA 路由：所有非文件路径回退 index.html（前端路由接管）
+        return FileResponse(WEB_DIST / "index.html")
