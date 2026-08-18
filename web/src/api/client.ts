@@ -8,8 +8,8 @@ export class ConflictError extends Error {
   }
 }
 
-/** GET/PUT 默认 60s 超时 */
-const api = axios.create({ baseURL: '/api', timeout: 60_000 })
+/** GET/PUT 默认 15s 超时（止血：原 60s 让 akshare hang 拖首屏到 49s；本地 DB 查询秒回，15s 足够） */
+const api = axios.create({ baseURL: '/api', timeout: 15_000 })
 /** POST 默认 600s（后台任务长耗时） */
 const apiPost = axios.create({ baseURL: '/api', timeout: 600_000 })
 /** OCR 上传 180s */

@@ -6,12 +6,14 @@
   匹配失败时降级拉该板块成分股，按涨跌幅取最大者（缓存复用，不重复请求）；
 - 数据源失败返回空表 + error 标注，由前端显示「数据加载中/上次缓存值」。
 """
+import concurrent.futures
 import logging
 import time
 
 import pandas as pd
 
 from app.datasource.akshare_source import get_datasource
+from app.datasource.base import DataSourceError
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +23,25 @@ INDEX_CODES = ["sh000001", "sz399001", "sz399006"]
 
 HOT_SECTOR_COUNT = 5  # 首页「今日热门板块」看板数量
 
+# 指数行情超时控制：akshare 冷启动约 36s，10s 硬超时走降级不阻塞首屏
+_INDEX_FETCH_TIMEOUT = 10.0  # 秒
+# 模块级线程池单例（禁 with 块：shutdown(wait=True) 会抵消超时效果；后台线程自然结束，结果可写入 60s 缓存供下次命中）
+_INDEX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="idx-fetch")
+
 
 def index_quotes() -> dict:
     """三大指数实时行情 + 更新时间；失败返回空列表 + error 标注（前端降级展示）"""
     now_min = time.strftime("%Y-%m-%d %H:%M")
     try:
-        df = get_datasource().fetch_index_spot()
+        ds = get_datasource()
+        fut = _INDEX_POOL.submit(ds.fetch_index_spot)
+        try:
+            df = fut.result(timeout=_INDEX_FETCH_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            # 超时：后台线程继续跑完，结果可能写入 60s 缓存供下次命中；
+            # 显式抛 DataSourceError 让上层降级 + 断路器正常计数（不裸抛 TimeoutError 避免 500）
+            logger.warning("指数行情获取超时（>%.0fs），走降级", _INDEX_FETCH_TIMEOUT)
+            raise DataSourceError(f"指数行情获取超时（>{_INDEX_FETCH_TIMEOUT:.0f}s）")
     except Exception as exc:  # noqa: BLE001 行情失败不阻塞页面，返回空表由前端标注
         logger.warning("指数行情获取失败: %s", exc)
         return {"indices": [], "updated_at": now_min, "error": f"指数行情获取失败（{type(exc).__name__}）"}

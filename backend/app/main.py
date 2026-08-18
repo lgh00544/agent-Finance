@@ -3,6 +3,7 @@ FastAPI 入口：lifespan 启动日志/建表/APScheduler 调度
 启动命令: uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,7 +14,7 @@ from app.core.logging import setup_logging
 from app.db import repo
 from app.db.session import init_db
 from app.scheduler.jobs import start_scheduler, stop_scheduler
-from app.services import reasoning_trace
+from app.services import market_view, reasoning_trace
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,16 @@ async def lifespan(app: FastAPI):
     init_db()
     repo.seed_default_hot_money_profiles()  # 游资档案种子（幂等，席位名仅作模糊匹配参考）
     start_scheduler()
+
+    # 首屏预热：三大指数后台异步拉取（akshare 冷启动约 36s，后台跑不阻塞启动；
+    # 失败静默降级，60s 缓存命中后首屏秒回）
+    def _warm_index_quotes() -> None:
+        try:
+            market_view.index_quotes()
+        except Exception:  # noqa: BLE001 预热失败不阻塞启动
+            logger.debug("指数行情预热失败（忽略）", exc_info=True)
+    threading.Thread(target=_warm_index_quotes, name="warm-index-quotes", daemon=True).start()
+
     logger.info("系统启动完成")
     yield
     stop_scheduler()

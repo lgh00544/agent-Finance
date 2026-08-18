@@ -26,14 +26,14 @@ export function TopStatusBar() {
     queryFn: marketIndices,
     refetchInterval: 30_000,
     staleTime: 25_000,
-    retry: 1,
+    retry: 0,
   })
   const { data: sysHealth } = useQuery({
     queryKey: ['health'],
     queryFn: health,
     refetchInterval: 30_000,
     staleTime: 25_000,
-    retry: 1,
+    retry: 0,
   })
   // 经验待审核徽章：60s 节流（staleTime 60s + refetchInterval 60s），list 长度近似；
   // 接口失败 select 抛错 → data 为 undefined → 徽章隐藏（静默降级不显示不报错）
@@ -42,7 +42,7 @@ export function TopStatusBar() {
     queryFn: () => getExperienceList('pending_review', undefined, undefined, 1000),
     refetchInterval: 60_000,
     staleTime: 60_000,
-    retry: 1,
+    retry: 0,
     select: (rows) => (rows ?? []).length,
   })
 
