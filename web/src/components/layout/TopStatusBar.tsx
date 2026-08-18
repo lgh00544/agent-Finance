@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { marketIndices } from '@/api/market'
 import { health } from '@/api/system'
+import { getExperienceList } from '@/api/experience'
 import { money, sign } from '@/utils/format'
 
 /** 北京时间（每秒更新） */
@@ -34,6 +35,16 @@ export function TopStatusBar() {
     staleTime: 25_000,
     retry: 1,
   })
+  // 经验待审核徽章：60s 节流（staleTime 60s + refetchInterval 60s），list 长度近似；
+  // 接口失败 select 抛错 → data 为 undefined → 徽章隐藏（静默降级不显示不报错）
+  const { data: expPending = undefined } = useQuery({
+    queryKey: ['exp-pending-review-count'],
+    queryFn: () => getExperienceList('pending_review', undefined, undefined, 1000),
+    refetchInterval: 60_000,
+    staleTime: 60_000,
+    retry: 1,
+    select: (rows) => (rows ?? []).length,
+  })
 
   const list = indices?.indices ?? []
   const ok = !!sysHealth && sysHealth.status === 'ok'
@@ -64,6 +75,12 @@ export function TopStatusBar() {
         <span className={ok ? 'tsb-ok-dot' : 'tsb-err-dot'} />
         系统{ok ? '正常' : '异常'}
       </span>
+      {expPending !== undefined ? (
+        <span className="tsb-item">
+          <span>经验待审核</span>
+          <b className={expPending > 0 ? 'tsb-up' : 'tsb-mute'}>{expPending}</b>
+        </span>
+      ) : null}
       <span className="tsb-item">
         北京时间 <b>{now}</b>
       </span>
