@@ -1,7 +1,6 @@
 import { Routes, Route } from 'react-router-dom'
 import { AppShell } from '@/components/layout/AppShell'
 import {
-  AgentChatPage,
   KnowledgePage,
   RuleChangesPage,
 } from '@/pages'
@@ -15,6 +14,7 @@ import AlertsPage from '@/pages/AlertsPage'
 import ExperiencePage from '@/pages/ExperiencePage'
 import ReviewsPage from '@/pages/ReviewsPage'
 import HotMoneyPage from '@/pages/HotMoneyPage'
+import AgentChatPage from '@/pages/AgentChatPage'
 
 /** 13 条路由（对齐 Streamlit 导航；7_个人交易偏好 未注册跳过） */
 export default function App() {
