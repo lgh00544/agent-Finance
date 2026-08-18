@@ -5,7 +5,6 @@ import {
   AlertsPage,
   CandidatesPage,
   ExperiencePage,
-  HoldingsPage,
   HotMoneyPage,
   KnowledgePage,
   MarketIntelPage,
@@ -15,6 +14,7 @@ import {
   RuleChangesPage,
   ScoresPage,
 } from '@/pages'
+import HoldingsPage from '@/pages/HoldingsPage'
 
 /** 13 条路由（对齐 Streamlit 导航；7_个人交易偏好 未注册跳过） */
 export default function App() {
