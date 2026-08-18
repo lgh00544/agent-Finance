@@ -185,23 +185,54 @@ def trace_candidate(stock_code: str, stock_name: str, trade_date: str,
 
 def trace_score(stock_code: str, stock_name: str, trade_date: str,
                 score: float, grade: str, detail: dict, risk_list: list) -> None:
-    """ScoreAgent：五维分项研判 = dimensions[].verdict/advice（旧数据 comment 兜底），
-    按维度归入技术/资金/基本面；v3.0 final_advice 进 final_conclusion"""
+    """ScoreAgent：因子/维度分项研判留痕。
+    v4.0 新格式：detail["factors"] 列表（factor/score/reason/signal）→ 按因子归入技术/资金/基本面；
+    v3.0 旧格式：detail["维度名"] 字典（score/verdict/advice/comment）→ 按维度名归入（兼容历史数据）；
+    final_advice + potential_flag + cross_validation_note 进 final_conclusion"""
     detail = detail or {}
-    by_name = {name: _dim_text(v) for name, v in detail.items() if isinstance(v, dict)}
+
+    # ---- v4.0 新格式：factors 列表 ----
+    factors_list = detail.get("factors")
+    if factors_list and isinstance(factors_list, list):
+        by_factor = {}
+        for f in factors_list:
+            if isinstance(f, dict):
+                fname = f.get("factor", "")
+                reason = f.get("reason", "") or f.get("advice", "")
+                by_factor[fname] = f"{reason}（{f.get('signal', '')}，{f.get('score', '')}分）"
+        technical = _line(by_factor.get("动量"), by_factor.get("催化"))
+        capital = by_factor.get("资金面", "")
+        fundamental = _line(by_factor.get("基本面质量"), by_factor.get("估值"),
+                           by_factor.get("主线契合"))
+        extra_conclusion = {}
+        if detail.get("potential_flag"):
+            extra_conclusion["potential_flag"] = True
+        if detail.get("cross_validation_note"):
+            extra_conclusion["cross_validation"] = detail["cross_validation_note"]
+    else:
+        # ---- v3.0 旧格式：维度名字典（兼容历史数据）----
+        by_name = {name: _dim_text(v) for name, v in detail.items() if isinstance(v, dict)}
+        technical = _line(by_name.get("技术趋势"), by_name.get("舆情风险"))
+        capital = by_name.get("资金流向", "")
+        fundamental = _line(by_name.get("基本面"), by_name.get("行业景气"))
+        extra_conclusion = {}
+
+    final_conclusion = {"score": score, "grade": grade,
+                        "final_advice": detail.get("final_advice", "")}
+    final_conclusion.update(extra_conclusion)
+
     submit({
         "stock_code": stock_code, "stock_name": stock_name,
         "source_module": "score", "generate_date": trade_date,
         "fact_basis": _j(detail),
-        "technical_reasoning": _line(by_name.get("技术趋势"), by_name.get("舆情风险")),
-        "capital_reasoning": by_name.get("资金流向", ""),
-        "fundamental_reasoning": _line(by_name.get("基本面"), by_name.get("行业景气")),
+        "technical_reasoning": technical,
+        "capital_reasoning": capital,
+        "fundamental_reasoning": fundamental,
         "risk_reasoning": _line(*(risk_list or [])),
         "rule_refs": "",
-        "final_conclusion": _j({"score": score, "grade": grade,
-                                "final_advice": detail.get("final_advice", "")}),
+        "final_conclusion": _j(final_conclusion),
         "confidence": 0.0,
-        "data_source": "行情/财务/资金流/新闻原始数据 + LLM 五维打分",
+        "data_source": "行情/财务/资金流/新闻原始数据 + LLM 六因子透明评分",
         "ext_info": "",
     })
 

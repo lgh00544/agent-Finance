@@ -40,7 +40,7 @@ TIER_MAP = {"强烈推荐": "A", "建议关注": "B", "谨慎观察": "C"}
 TIER_LABEL = {"A": "A 强烈推荐", "B": "B 建议关注", "C": "C 谨慎观察"}
 TIER_DOT = {"A": "tier-a", "B": "tier-b", "C": "tier-c"}
 _SORT = {"A": 0, "B": 1, "C": 2}
-_TRACE_MODULE = {"discover": "选股研判", "score": "五维评分", "position": "建仓方案",
+_TRACE_MODULE = {"discover": "选股研判", "score": "六因子评分", "position": "建仓方案",
                  "alert": "监控预警", "review": "交易复盘", "sell": "卖出决策"}
 
 CACHE_KEY = "candidates"

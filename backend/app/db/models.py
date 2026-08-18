@@ -61,7 +61,8 @@ class CandidateTrackVerify(Base):
     """候选池标的 T+N 自动追踪验证（选股效果闭环·代码侧客观统计）
     口径：T+N 涨跌幅 = (选中日后第 N 个交易日收盘 / 选中日收盘基准 − 1) × 100；
     最大回撤 = 相对 base_close_price 的区间最低收盘回撤（services/track_verify.py 注释）。
-    is_finished: 0=追踪中 / 1=已到期收尾（T+10 数据齐全即收尾）。"""
+    is_finished: 0=追踪中 / 1=已到期收尾（T+10 数据齐全即收尾）。
+    factor_scores: 因子评分快照（仅因子回测校准闭环用，旧数据为空）。"""
     __tablename__ = "candidate_track_verify"
     __table_args__ = (
         UniqueConstraint("stock_code", "select_date", name="uq_track_code_date"),
@@ -79,6 +80,7 @@ class CandidateTrackVerify(Base):
     t10_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_drawdown: Mapped[float | None] = mapped_column(Float, nullable=True)  # 相对基准最大回撤 %
     verify_result: Mapped[dict] = mapped_column(SafeJSON, default=dict)     # 周期胜负/回撤明细（见服务层）
+    factor_scores: Mapped[dict | None] = mapped_column(SafeJSON, nullable=True)  # 因子评分快照（仅因子回测校准闭环用，旧数据为空）
     is_finished: Mapped[int] = mapped_column(Integer, default=0)        # 0=追踪中 / 1=已到期收尾
     update_time: Mapped[str] = mapped_column(String(16), default="")    # YYYY-MM-DD HH:mm
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -95,6 +97,8 @@ class MarketCondition(Base):
     dims: Mapped[dict] = mapped_column(SafeJSON, default=dict)           # 五维明细（LLM 输出）
     cap: Mapped[int] = mapped_column(Integer)                        # 当日候选池上限（档位映射）
     summary: Mapped[str] = mapped_column(Text, default="")           # 市况综述（LLM 输出）
+    # 选中日后下一交易日沪深300收盘涨跌幅 %；None=未回填/非交易日（准确率闭环数据沉淀）
+    next_day_index_pct: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

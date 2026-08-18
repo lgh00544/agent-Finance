@@ -62,6 +62,14 @@ def track_verify_job() -> None:
     logger.info("候选T+N验证完成: %s", safe)
     cache.set("job:last_track_verify", today, 86400)
 
+    # 评级重做-C：因子分回填（幂等，已有则跳过；不阻塞主任务）
+    try:
+        backfill_result = track_verify.backfill_factor_scores()
+        if backfill_result["filled"] > 0:
+            logger.info("因子分回填: %s", backfill_result)
+    except Exception as exc:  # noqa: BLE001 回填失败不阻塞主任务
+        logger.warning("因子分回填失败: %s", exc)
+
 
 def market_intel_job() -> None:
     """每日收盘后市场研判（16:20，独立于每日挖掘；当天已生成则跳过，幂等）"""
@@ -114,6 +122,30 @@ def pre_market_screen_job() -> None:
         logger.error("盘前快筛失败: %s", exc)
     finally:
         cache.release_lock("pre_market_screen")
+
+
+def market_accuracy_job() -> None:
+    """市况方向命中率数据沉淀（每日 15:30 收盘定稿后）：回填 market_condition 的
+    '次日沪深300涨跌幅' 数据列（幂等；历史行首次运行自动全量回填）。
+    纯数据回填，无 LLM 调用；失败不阻塞其他任务。"""
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        logger.info("今天 %s 非交易日，跳过市况次日指数回填", today)
+        return
+    if not cache.acquire_lock("market_accuracy", ttl_seconds=3600):
+        logger.info("market_accuracy 锁被占用，跳过本次")
+        return
+    try:
+        from app.services import market_accuracy
+
+        result = market_accuracy.fill_market_condition_next_day()
+        cache.set("job:last_market_accuracy", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        logger.info("市况次日指数回填完成: %s（今日 %s）", result.get("filled"),
+                    result.get("today"))
+    except Exception as exc:  # noqa: BLE001 回填失败不阻塞其他任务
+        logger.error("市况次日指数回填失败: %s", exc)
+    finally:
+        cache.release_lock("market_accuracy")
 
 
 def daily_discover_job() -> None:
@@ -310,6 +342,11 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=9, minute=25,
                       id="pre_market_screen", name="盘前快筛",
                       replace_existing=True, misfire_grace_time=300)
+    # 工作日 15:30 市况次日指数回填（收盘定稿后；幂等，首次自动回填全部历史行）
+    scheduler.add_job(market_accuracy_job, "cron",
+                      day_of_week="mon-fri", hour=15, minute=30,
+                      id="market_accuracy", name="市况次日指数回填",
+                      replace_existing=True, misfire_grace_time=3600)
     # 经验沉淀：每日 02:00 主跑（与现有任务零冲突）+ 每 30 分钟积压探针（内部积压门判断，轻量）
     scheduler.add_job(experience_worker_job, "cron", hour=2, minute=0,
                       args=[True], id="experience_worker", name="经验沉淀识别",
@@ -354,4 +391,5 @@ def job_status() -> list[dict]:
     out.append({"id": "last_portfolio_sentinel", "name": "最近组合哨兵", "next_run": cache.get("job:last_portfolio_sentinel")})
     out.append({"id": "last_track_verify", "name": "最近候选验证", "next_run": cache.get("job:last_track_verify")})
     out.append({"id": "last_pre_market", "name": "最近盘前快筛", "next_run": cache.get("job:last_pre_market")})
+    out.append({"id": "last_market_accuracy", "name": "最近市况回填", "next_run": cache.get("job:last_market_accuracy")})
     return out

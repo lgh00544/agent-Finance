@@ -67,6 +67,8 @@ def init_db() -> None:
     _ensure_hot_money_profile_columns()
     _ensure_holding_high_price()
     _ensure_alert_log_source()
+    _ensure_market_condition_next_day()
+    _add_factor_scores_column()
     _ensure_indexes()
 
 
@@ -298,6 +300,40 @@ def _ensure_alert_log_source(eng=None) -> None:
             # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
             try:
                 conn.exec_driver_sql("ALTER TABLE alert_log ADD COLUMN source VARCHAR(16) DEFAULT 'monitor'")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _ensure_market_condition_next_day(eng=None) -> None:
+    """幂等补齐 market_condition.next_day_index_pct 列（市况次日指数回填，准确率闭环；
+    仅增量加列，不重建表不丢数据；旧数据为 NULL=未回填）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(market_condition)")}
+            if "next_day_index_pct" not in existing:
+                conn.exec_driver_sql("ALTER TABLE market_condition ADD COLUMN next_day_index_pct FLOAT")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql("ALTER TABLE market_condition ADD COLUMN next_day_index_pct FLOAT")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _add_factor_scores_column(eng=None) -> None:
+    """幂等补齐 candidate_track_verify.factor_scores 列（因子回测校准闭环；
+    仅增量加列，不重建表不丢数据；旧数据为 NULL=无因子分诚实留空）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(candidate_track_verify)")}
+            if "factor_scores" not in existing:
+                conn.exec_driver_sql("ALTER TABLE candidate_track_verify ADD COLUMN factor_scores JSON")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql("ALTER TABLE candidate_track_verify ADD COLUMN factor_scores JSON")
             except Exception:  # noqa: BLE001 列已存在
                 pass
 
