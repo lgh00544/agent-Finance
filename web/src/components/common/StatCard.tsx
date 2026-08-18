@@ -5,8 +5,8 @@ interface StatCardProps {
   label: string
   value: ReactNode
   sub?: string
-  /** up=红(涨/盈) down=绿(跌/亏) ok/warn/err/mute */
-  tone?: 'up' | 'down' | 'ok' | 'warn' | 'err' | 'mute'
+  /** up=红(涨/盈) down=绿(跌/亏) ok/warn/err/info/mute */
+  tone?: 'up' | 'down' | 'ok' | 'warn' | 'err' | 'info' | 'mute'
 }
 
 /** 指标卡（标题+数值+副文，支持涨跌色；对齐 Streamlit stat_cards） */

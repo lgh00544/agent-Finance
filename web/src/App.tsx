@@ -3,7 +3,6 @@ import { AppShell } from '@/components/layout/AppShell'
 import {
   AgentChatPage,
   AlertsPage,
-  CandidatesPage,
   ExperiencePage,
   HotMoneyPage,
   KnowledgePage,
@@ -15,6 +14,7 @@ import {
   ScoresPage,
 } from '@/pages'
 import HoldingsPage from '@/pages/HoldingsPage'
+import CandidatesPage from '@/pages/CandidatesPage'
 
 /** 13 条路由（对齐 Streamlit 导航；7_个人交易偏好 未注册跳过） */
 export default function App() {
