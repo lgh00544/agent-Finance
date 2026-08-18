@@ -97,8 +97,9 @@ def market_intel(date: str | None = None) -> dict:
 
 
 def market_intel_dates(limit: int = 30) -> list[str]:
-    """已生成市场研判的日期列表（最新在前）"""
-    return _get("/api/market_intel/dates", {"limit": limit}).get("dates") or []
+    """已生成市场研判的日期列表（最新在前）。
+    后端返回裸数组（React 兼容；原包裹 {"dates": [...]} 已废弃）"""
+    return _get("/api/market_intel/dates", {"limit": limit}) or []
 
 
 def market_indices() -> dict:
@@ -134,8 +135,9 @@ def candidates(date: str | None = None, limit: int | None = None) -> list:
 
 
 def candidate_dates(limit: int = 30) -> list:
-    """候选池可选日期（去重降序，最新在前）：默认只加载最新一天，切换日期按需查询"""
-    return (_get("/api/candidates/dates", {"limit": limit}) or {}).get("dates") or []
+    """候选池可选日期（去重降序，最新在前）：默认只加载最新一天，切换日期按需查询。
+    后端返回裸数组（React 兼容；原包裹 {"dates": [...]} 已废弃）"""
+    return _get("/api/candidates/dates", {"limit": limit}) or []
 
 
 def candidate_tradeable(date: str | None = None, limit: int = 200) -> dict:
