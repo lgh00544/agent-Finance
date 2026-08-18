@@ -4,7 +4,6 @@ import {
   AgentChatPage,
   HotMoneyPage,
   KnowledgePage,
-  ReviewsPage,
   RuleChangesPage,
 } from '@/pages'
 import HoldingsPage from '@/pages/HoldingsPage'
@@ -15,6 +14,7 @@ import OverviewPage from '@/pages/OverviewPage'
 import MarketIntelPage from '@/pages/MarketIntelPage'
 import AlertsPage from '@/pages/AlertsPage'
 import ExperiencePage from '@/pages/ExperiencePage'
+import ReviewsPage from '@/pages/ReviewsPage'
 
 /** 13 条路由（对齐 Streamlit 导航；7_个人交易偏好 未注册跳过） */
 export default function App() {
