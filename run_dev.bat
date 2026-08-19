@@ -10,8 +10,8 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set PY=D:\self\.venv\Scripts\python.exe
-set ST=D:\self\.venv\Scripts\streamlit.exe
+set PY=D:\space\self\self\.venv\Scripts\python.exe
+set ST=D:\space\self\self\.venv\Scripts\streamlit.exe
 
 if not exist "%PY%" (
     echo [ERROR] venv python not found: %PY%
@@ -56,7 +56,9 @@ echo.
 echo ============================================================
 echo  [3/3] 启动 Streamlit 面板 (http://127.0.0.1:8501)
 echo ============================================================
-"%ST%" run streamlit\app.py
+rem streamlit.exe 启动器在本机 Python 3.14 下会静默退出（exit 1 无输出），
+rem 改走 python -m streamlit 稳定启动
+"%PY%" -m streamlit run streamlit\app.py
 
 echo.
 echo Streamlit 已退出，如需停止 backend 请关闭 "stock-backend" 窗口。
