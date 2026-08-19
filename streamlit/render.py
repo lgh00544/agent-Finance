@@ -540,6 +540,16 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
   .top-status-bar { font-size: 0.8rem; padding: 6px 12px; }
   .top-status-bar .bar-group-label { display: none; }
 }
+/* 今日行动清单 */
+.action-brief {}
+.brief-section { margin-bottom: 16px; }
+.brief-section-title { font-size: 14px; font-weight: 600; color: var(--text-2); margin-bottom: 8px; }
+.brief-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.brief-item:last-child { border-bottom: none; }
+.brief-icon { font-size: 16px; }
+.brief-text { flex: 1; font-size: 13px; }
+.brief-detail { font-size: 12px; color: var(--text-mute); }
+.brief-empty { font-size: 13px; color: var(--text-mute); padding: 8px 0; }
 </style>
 """
 
@@ -902,6 +912,91 @@ def dismissible_error(title: str, message: str = "", detail=None,
 def section_title(text: str) -> None:
     """详情分区小标题（左侧主色竖条 + 统一字号）"""
     st.markdown(f'<div class="section-title">{text}</div>', unsafe_allow_html=True)
+
+
+def _esc_html(text) -> str:
+    """转义 HTML 特殊字符，防候选/持仓名称或 action_text 注入破坏结构"""
+    return (str(text or "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def action_brief(tradeable_items: list, position_briefs: list,
+                 market_summary: dict | None) -> None:
+    """今日行动清单：三区聚合展示（可建仓机会 / 持仓今日关注 / 市况速览）
+
+    参数：
+    - tradeable_items: candidate_tradeable.items 中 is_tradeable=True 的列表
+    - position_briefs: [{"code","name","status","status_tone","action_text","detail"}]
+    - market_summary: {"total_score","band","cap","summary"} 或 None
+
+    三区均不展开详情（每只一行），目的是"一屏看全"不是"一屏看全细节"。
+    """
+    parts: list[str] = []
+
+    # ===== A 区：可建仓机会 =====
+    parts.append('<div class="brief-section">')
+    parts.append('<div class="brief-section-title">可建仓机会</div>')
+    if tradeable_items:
+        for it in tradeable_items:
+            tier = it.get("tier") or ""
+            price_zone = it.get("price_zone") or ""
+            text = f"{it.get('stock_code','')} {it.get('stock_name','')} — {tier}级 · 可建仓"
+            if price_zone:
+                text += f"（首仓区间 {price_zone}）"
+            parts.append(
+                f'<div class="brief-item"><span class="brief-icon">✅</span>'
+                f'<span class="brief-text">{_esc_html(text)}</span></div>')
+    else:
+        parts.append('<div class="brief-empty">今日无可建仓标的，观察候选池即可</div>')
+    parts.append('</div>')
+
+    # ===== B 区：持仓今日关注 =====
+    parts.append('<div class="brief-section">')
+    parts.append('<div class="brief-section-title">持仓今日关注</div>')
+    non_info = [b for b in position_briefs if b.get("status_tone") != "info"]
+    if not position_briefs:
+        parts.append('<div class="brief-empty">暂无持仓</div>')
+    elif not non_info:
+        parts.append(
+            f'<div class="brief-empty">今日持仓无预警，正常持有（{len(position_briefs)} 只）</div>')
+    else:
+        for b in position_briefs:
+            icon = {"err": "🔴", "warn": "🟠", "info": "🟢", "mute": "⚪"}.get(
+                b.get("status_tone"), "⚪")
+            detail = _esc_html(b.get("detail", ""))
+            parts.append(
+                f'<div class="brief-item"><span class="brief-icon">{icon}</span>'
+                f'<span class="brief-text">{_esc_html(b.get("code",""))} '
+                f'{_esc_html(b.get("name",""))} — {_esc_html(b.get("action_text",""))}'
+                + (f'</span><span class="brief-detail">{detail}</span></div>'
+                   if detail else '</span></div>'))
+    parts.append('</div>')
+
+    # ===== C 区：市况速览 =====
+    parts.append('<div class="brief-section">')
+    parts.append('<div class="brief-section-title">市况速览</div>')
+    if not market_summary:
+        parts.append('<div class="brief-empty">市况数据暂不可用</div>')
+    else:
+        score = market_summary.get("total_score")
+        band = market_summary.get("band") or ""
+        cap = market_summary.get("cap")
+        summ = (market_summary.get("summary") or "")[:80]
+        head = "📊 市况评分"
+        if score is not None:
+            head += f" {score} 分"
+        head += f" · {band}" if band else ""
+        if cap is not None:
+            head += f" · 候选池上限 {cap} 只"
+        parts.append(f'<div class="brief-item"><span class="brief-icon">📊</span>'
+                     f'<span class="brief-text">{_esc_html(head)}</span></div>')
+        if summ:
+            parts.append(f'<div class="brief-detail">{_esc_html(summ)}</div>')
+    parts.append('</div>')
+
+    st.markdown('<div class="action-brief">' + "".join(parts) + '</div>',
+                unsafe_allow_html=True)
 
 
 # ================= 持仓止盈/仓位计划卡片（与系统概览/持仓监控页共用，同源展示） =================

@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -19,7 +20,7 @@ import { candidates } from '@/api/candidates'
 import { scores } from '@/api/scores'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard, StockLabel } from '@/components/common'
-import type { PositionPlan } from '@/types'
+import type { PositionPlan, StockScoreInfo } from '@/types'
 
 const { Text } = Typography
 
@@ -30,15 +31,52 @@ const STATUS_MAP: Record<string, { label: string; color: string }> = {
 }
 const GRADE_TONE: Record<string, string> = { A: 'red', B: 'orange', C: 'blue' }
 const SOURCE_LABEL: Record<string, string> = { candidate: '每日候选池', manual: '手动生成' }
+const FRESHNESS_LABEL: Record<string, { label: string; color: string }> = {
+  realtime: { label: '实时数据', color: 'green' },
+  cache30m: { label: '30分钟缓存', color: 'orange' },
+}
+
+/** 维度归因条（与候选池页同款渲染：名称 + 分数条 + 结论 + 建议） */
+function DimensionBars({ dims, finalAdvice }: { dims: Array<Record<string, unknown>>; finalAdvice?: unknown }) {
+  return (
+    <div>
+      {dims.length ? (
+        dims.map((d) => {
+          const score = Number(d.score ?? 0)
+          const verdict = String(d.verdict ?? '中性')
+          const color = verdict === '支持' ? 'var(--up)' : verdict === '风险' ? 'var(--warn)' : 'var(--text-mute)'
+          return (
+            <div key={String(d.dim)} style={{ marginBottom: 6 }}>
+              <Space>
+                <Text style={{ width: 90, fontWeight: 600 }}>{String(d.dim)}</Text>
+                <div className="conf-bar" style={{ width: 180 }}>
+                  <div className="conf-bar-fill high" style={{ width: `${Math.max(0, Math.min(100, score))}%`, background: color }} />
+                </div>
+                <Text type="secondary">{score.toFixed(0)}</Text>
+                <Tag color={verdict === '支持' ? 'red' : verdict === '风险' ? 'orange' : 'default'}>{verdict}</Tag>
+              </Space>
+              {d.advice ? <div style={{ marginLeft: 96 }}><Text type="secondary">{String(d.advice)}</Text></div> : null}
+            </div>
+          )
+        })
+      ) : (
+        <EmptyState text="暂无维度归因。" icon="📊" />
+      )}
+      {finalAdvice ? <Alert type="info" showIcon style={{ marginTop: 8 }} message={String(finalAdvice)} /> : null}
+    </div>
+  )
+}
 
 /** 计划详情展开：仓位分配 + 分档买入 + 止盈止损 + 建仓逻辑 + 生成依据 */
-function PlanExpand({ p }: { p: PositionPlan }) {
+function PlanExpand({ p, scoreMap }: { p: PositionPlan; scoreMap: Record<string, StockScoreInfo> }) {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const detail = (p.detail ?? {}) as Record<string, unknown>
   const quant = (detail.quant ?? {}) as Record<string, unknown>
   const batches = (quant.batches as Array<Record<string, unknown>>) ?? []
-  const grade = (detail.grade as string) ?? '—'
+  const dims = (detail.dimensions as Array<Record<string, unknown>>) ?? []
+  const grade = scoreMap[p.stock_code]?.grade ?? (detail.grade as string) ?? '—'
+  const freshness = detail.freshness as string | undefined
 
   const refresh = useTaskSubmit('position', () => {
     message.success('建仓方案重算任务已提交后台')
@@ -52,6 +90,9 @@ function PlanExpand({ p }: { p: PositionPlan }) {
           onClick={() => refresh.submit.mutate({ stock_code: p.stock_code, stock_name: p.stock_name ?? '' })}>
           手动刷新本计划（击穿缓存重算）
         </Button>
+        {freshness ? (
+          <Tag color={FRESHNESS_LABEL[freshness]?.color ?? 'default'}>{FRESHNESS_LABEL[freshness]?.label ?? freshness}</Tag>
+        ) : null}
       </Space>
 
       {quant.current_price != null ? (
@@ -81,6 +122,23 @@ function PlanExpand({ p }: { p: PositionPlan }) {
               { title: '股数', dataIndex: 'shares', width: 80, render: (v) => v ?? '—' },
               { title: '累计占比%', dataIndex: 'cum_pct', width: 90, render: (v) => v ?? '—' },
             ]} />
+          <div style={{ marginTop: 8, fontSize: 13 }}>
+            合计：总投入 <Text strong>{String(quant.total_amount ?? '—')} 元</Text>，
+            总持股 <Text strong>{String(quant.total_shares ?? '—')} 股</Text>，
+            不突破 C1 单票上限 <Text strong>{String(quant.position_cap_pct ?? '—')}%</Text>
+          </div>
+        </Card>
+      ) : p.batches?.length ? (
+        <Card size="small" title="分档买入明细（旧数据，LLM 比例明细）" style={{ background: 'var(--bg-input)', marginBottom: 8 }}>
+          <Text type="secondary">（旧数据，量化字段不可用——仅展示 LLM 比例明细）</Text>
+          <Table size="small" rowKey={(r) => String((r as Record<string, unknown>).tranche ?? Math.random())} pagination={false}
+            dataSource={p.batches as Array<Record<string, unknown>>}
+            columns={[
+              { title: '批次', dataIndex: 'tranche', width: 80 },
+              { title: '价格区间', dataIndex: 'price_zone', width: 120 },
+              { title: '资金占比%', dataIndex: 'ratio_pct', width: 100 },
+              { title: '触发条件', dataIndex: 'trigger_note' },
+            ]} />
         </Card>
       ) : null}
 
@@ -97,10 +155,28 @@ function PlanExpand({ p }: { p: PositionPlan }) {
         </Card>
       ) : null}
 
-      {grade !== '—' ? (
+      {(grade !== '—') ? (
         <Card size="small" title="生成依据（评级依据）" style={{ background: 'var(--bg-input)' }}>
-          <div>综合评级：<Tag color={GRADE_TONE[grade] ?? 'default'}>{grade} 级</Tag>
+          <div style={{ marginBottom: 6 }}>综合评级：<Tag color={GRADE_TONE[grade] ?? 'default'}>{grade} 级</Tag>
+            {scoreMap[p.stock_code]?.score != null ? ` ${scoreMap[p.stock_code].score} 分` : ''}
+            {scoreMap[p.stock_code] ? '（评分报告同源数据）' : ''}
             {quant.confidence != null ? ` 置信 ${String(quant.confidence)}` : ''}
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <Text strong>风险提示：</Text>
+            <div>
+              {((scoreMap[p.stock_code]?.risk_list as string[]) ?? []).length > 0 ? (
+                ((scoreMap[p.stock_code]?.risk_list as string[]) ?? []).map((risk, i) => (
+                  <div key={i} style={{ marginLeft: 12 }}>- ⚠️ {risk}</div>
+                ))
+              ) : (
+                <Text type="secondary">（该轮未输出）</Text>
+              )}
+            </div>
+          </div>
+          <div>
+            <Text strong>维度归因（白盒，主结论）：</Text>
+            <DimensionBars dims={dims} finalAdvice={detail.final_advice} />
           </div>
         </Card>
       ) : null}
@@ -109,17 +185,16 @@ function PlanExpand({ p }: { p: PositionPlan }) {
 }
 
 /** 新建建仓方案弹窗（候选池选择 / 手动输入） */
-function NewPlanModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+function NewPlanModal({ open, onClose, scoreMap }: { open: boolean; onClose: () => void; scoreMap: Record<string, StockScoreInfo> }) {
   const { message } = App.useApp()
   const [form] = Form.useForm()
   const { data: candRows } = useQuery({ queryKey: ['candidates'], queryFn: () => candidates(undefined, 50) })
-  const { data: scoreMap } = useQuery({ queryKey: ['scores-all'], queryFn: () => scores(undefined, undefined, 500) })
   const gen = useTaskSubmit('position', () => {
     message.success('建仓方案生成任务已提交后台')
     form.resetFields()
     onClose()
   })
-  const gradeOf = (code: string) => (scoreMap ?? []).find((s) => s.stock_code === code)?.grade
+  const gradeOf = (code: string) => scoreMap[code]?.grade
 
   const opts = (candRows ?? []).map((c) => ({
     label: `${c.stock_code} ${c.stock_name ?? ''}（${gradeOf(c.stock_code) ?? '—'} 级）`,
@@ -156,13 +231,41 @@ function NewPlanModal({ open, onClose }: { open: boolean; onClose: () => void })
 /** 建仓计划页（Phase 2） */
 export function PlansPage() {
   const [status, setStatus] = useState('全部')
+  const [date, setDate] = useState('全部日期')
+  const [grade, setGrade] = useState('全部评级')
+  const [source, setSource] = useState('全部来源')
   const [newOpen, setNewOpen] = useState(false)
+  const [page, setPage] = useState(1)
 
   const { data: rows, isError, error, refetch } = useQuery({ queryKey: ['plans'], queryFn: () => plans(undefined, 200) })
+  const { data: scoreRows } = useQuery({ queryKey: ['scores-all'], queryFn: () => scores(undefined, undefined, 500) })
+
+  const scoreMap = (scoreRows ?? []).reduce<Record<string, StockScoreInfo>>((m, s) => {
+    if (s.stock_code) m[s.stock_code] = s
+    return m
+  }, {})
+
+  // 筛选条件变化 → 分页重置到第一页
+  useEffect(() => { setPage(1) }, [status, date, grade, source])
 
   if (isError) return <ErrorCard title="建仓计划加载失败" message={error?.message} onRetry={() => refetch()} />
-  const shown = (rows ?? []).filter((p) => status === '全部' || STATUS_MAP[p.status ?? '']?.label === status)
-  if (!shown.length) return <EmptyState text="暂无建仓方案。可点击「新建建仓方案」生成。" icon="🧭" />
+
+  const dates = Array.from(new Set((rows ?? []).map((p) => p.plan_date || (p.created_at ?? '').slice(0, 10)).filter(Boolean))).sort((a, b) => b.localeCompare(a))
+
+  let shown = (rows ?? []).filter((p) => status === '全部' || STATUS_MAP[p.status ?? '']?.label === status)
+  if (date !== '全部日期') shown = shown.filter((p) => (p.plan_date || '') === date)
+  if (grade !== '全部评级') {
+    shown = shown.filter((p) => {
+      const g = scoreMap[p.stock_code]?.grade ?? ''
+      if (grade === '未评级') return !g
+      return g === grade
+    })
+  }
+  if (source !== '全部来源') {
+    shown = shown.filter((p) => (p.source || 'manual') === source)
+  }
+
+  if (!shown.length) return <EmptyState text="暂无匹配的建仓方案。可点击「新建建仓方案」生成。" icon="🧭" />
 
   const cols = [
     {
@@ -183,21 +286,35 @@ export function PlansPage() {
     { title: '生成时间', dataIndex: 'created_at', width: 150, render: (v: string) => String(v ?? '').slice(0, 16) },
   ]
 
+  const sourceOpts = ['全部来源', '每日候选池', '手动生成'].map((s) => ({ label: s, value: s === '每日候选池' ? 'candidate' : s === '手动生成' ? 'manual' : s }))
+
   return (
     <div>
       <Space style={{ marginBottom: 10 }} wrap>
         <Select value={status} onChange={(v) => setStatus(v)} style={{ width: 120 }}
           options={['全部', '待评估', '已采纳', '已放弃'].map((s) => ({ label: s, value: s }))} />
+        <Select value={date} onChange={(v) => setDate(v)} style={{ width: 130 }}
+          options={[{ label: '全部日期', value: '全部日期' }, ...dates.map((d) => ({ label: d, value: d }))]} />
+        <Select value={grade} onChange={(v) => setGrade(v)} style={{ width: 120 }}
+          options={[
+            { label: '全部评级', value: '全部评级' },
+            { label: 'A 级', value: 'A' },
+            { label: 'B 级', value: 'B' },
+            { label: 'C 级', value: 'C' },
+            { label: '未评级', value: '未评级' },
+          ]} />
+        <Select value={source} onChange={(v) => setSource(v)} style={{ width: 130 }} options={sourceOpts} />
         <Button type="primary" onClick={() => setNewOpen(true)}>新建建仓方案</Button>
         <Button onClick={() => refetch()}>刷新</Button>
         <Text type="secondary">共 {shown.length} 条计划 · 仅 B 级及以上标的可生成（后端强校验）</Text>
       </Space>
       <Table<PositionPlan>
+        key={`${status}|${date}|${grade}|${source}`}
         rowKey="id" size="small" dataSource={shown} columns={cols}
-        pagination={{ pageSize: 20 }}
-        expandable={{ expandedRowRender: (p) => <PlanExpand p={p} /> }}
+        pagination={{ pageSize: 20, current: page, onChange: setPage }}
+        expandable={{ expandedRowRender: (p) => <PlanExpand p={p} scoreMap={scoreMap} /> }}
       />
-      <NewPlanModal open={newOpen} onClose={() => setNewOpen(false)} />
+      <NewPlanModal open={newOpen} onClose={() => setNewOpen(false)} scoreMap={scoreMap} />
     </div>
   )
 }

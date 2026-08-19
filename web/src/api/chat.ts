@@ -1,5 +1,5 @@
 import { get, post, upload, UPLOAD_CHAT_TIMEOUT } from './client'
-import type { ChatAgentMeta, ChatMessage } from '@/types'
+import type { BatchAskMeta, ChatAgentMeta, ChatMessage } from '@/types'
 
 /** GET /api/agent-chat/agents */
 export const chatAgents = (): Promise<ChatAgentMeta[]> => get('/agent-chat/agents')
@@ -11,6 +11,18 @@ export const chatHistory = (agent: string, limit = 50, messageType?: string): Pr
     limit,
     ...(messageType ? { message_type: messageType } : {}),
   })
+
+/** 取某条批量回答消息的完整 meta（含 adjust_plan/共性/差异/建议）；按 assistant_msg_id 回查历史 */
+export async function batchMetaByAssistantId(mid?: number): Promise<BatchAskMeta | undefined> {
+  if (!mid) return undefined
+  try {
+    const msgs = await chatHistory('discover', 50, 'batch')
+    const hit = msgs.find((m) => m.id === mid)
+    return (hit?.meta as BatchAskMeta | undefined) ?? undefined
+  } catch {
+    return undefined
+  }
+}
 
 /** POST /api/agent-chat/batch-ask（异步任务，返回 task_id） */
 export const batchAsk = (

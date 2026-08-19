@@ -112,6 +112,13 @@ class MarketIntelOutput(BaseModel):
 _FACTOR_NAMES = {"动量", "催化", "估值", "主线契合", "资金面", "基本面质量"}
 
 
+class PrefilterOutput(BaseModel):
+    """两段式粗筛输出（LIGHT 低成本预判；保守主义：宁漏成本不可漏票）。
+    keep_codes 为空 = 回退全量精打（安全阀 1，防误杀）。"""
+    keep_codes: list[str] = Field(default_factory=list, description="建议精打名单（候选代码列表）")
+    reason: str = Field(default="", description="一句话说明本次粗筛取舍（可空）")
+
+
 class ScoreFactor(BaseModel):
     """v4.0 透明多因子评分项：每因子 0-10 + 打分依据 + 信号方向"""
     factor: str = Field(

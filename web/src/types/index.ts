@@ -156,7 +156,12 @@ export interface Holding {
   stop_loss?: number | null
   take_profit?: number | null
   target_pct?: number | null
+  market_value?: number | null
+  pnl_amount?: number | null
+  pnl_pct?: number | null
   status?: string
+  /** 前端去重合并标记：当前有效 / 重复录入（已自动忽略） / 历史买入 */
+  _dedupe_status?: string
   created_at?: string
   [k: string]: unknown
 }
@@ -349,6 +354,36 @@ export interface ChatMessage {
   scope_note?: string
   meta?: Record<string, unknown>
   created_at?: string
+  [k: string]: unknown
+}
+
+/** 批量验证对话：任务结果（ask_batch 返回标量结果） */
+export interface BatchAskResult {
+  user_msg_id?: number
+  assistant_msg_id?: number
+  batch_id?: number
+  scope?: string
+  date?: string
+  count?: number
+  answer?: string
+  confidence?: number
+  sources?: string
+  scope_note?: string
+  [k: string]: unknown
+}
+
+/** 批量验证对话：助理消息完整 meta（含共性/差异/建议/调整方案，按 assistant_msg_id 回查） */
+export interface BatchAskMeta {
+  scope?: string
+  date?: string
+  count?: number
+  scope_note?: string
+  adjust_plan?: Array<Record<string, unknown>>
+  common_points?: string[]
+  differences?: string[]
+  suggestions?: string[]
+  confidence?: number
+  sources?: string[]
   [k: string]: unknown
 }
 

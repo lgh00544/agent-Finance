@@ -99,6 +99,50 @@ class MiniMaxClient:
                     time.sleep(delay)
         raise RuntimeError(f"MiniMax 多模态请求失败: {last_err}")
 
+    def chat_text(self, system: str, user: str, max_tokens: int = 2048) -> tuple[str, dict]:
+        """纯文本 chat（无 image 字段）：供经验沉淀 Worker 等文本抽取场景复用 MiniMax-M3。
+
+        复用 _CHAT_PATH/_TIMEOUT/_RETRY_DELAYS（1.5s/3.0s 指数退避）；
+        先带 response_format=json_object 请求，若 API 返回 400 说明不支持该参数，
+        捕获后去掉 response_format 重试一次（普通文本）；返回 (content, usage_dict) 供成本统计。
+        失败抛 RuntimeError（中文信息），由上层降级。"""
+        url = f"{settings.minimax_base_url.rstrip('/')}{_CHAT_PATH}"
+        headers = {"Authorization": f"Bearer {settings.minimax_api_key}"}
+        base_payload = {
+            "model": settings.minimax_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "thinking": {"type": "disabled"},
+        }
+        last_err: Exception | None = None
+        for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+            try:
+                payload = {**base_payload, "response_format": {"type": "json_object"}}
+                resp = requests.post(url, json=payload, headers=headers, timeout=_TIMEOUT)
+                if resp.status_code == 400:
+                    # 不支持 response_format：去参重试一次（普通文本）
+                    logger.warning("MiniMax 文本请求 response_format 400，去掉重试（第 %d 次）", attempt)
+                    resp = requests.post(url, json=base_payload, headers=headers, timeout=_TIMEOUT)
+                resp.raise_for_status()
+                data = resp.json()
+                content = str(data["choices"][0]["message"]["content"])
+                usage = data.get("usage") or {}
+                usage_dict = {
+                    "prompt_tokens": usage.get("prompt_tokens") or 0,
+                    "completion_tokens": usage.get("completion_tokens") or 0,
+                    "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
+                }
+                return content, usage_dict
+            except Exception as exc:  # noqa: BLE001 网络/服务端/格式异常统一重试
+                last_err = exc
+                logger.warning("MiniMax 文本请求第 %d 次失败: %s", attempt, exc)
+                if attempt < len(_RETRY_DELAYS):
+                    time.sleep(delay)
+        raise RuntimeError(f"MiniMax 文本请求失败: {last_err}")
+
 
 _client: MiniMaxClient | None = None
 _client_lock = threading.Lock()

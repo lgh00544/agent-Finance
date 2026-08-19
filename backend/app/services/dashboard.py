@@ -42,6 +42,19 @@ def _agent_suggestions() -> list:
              "created_at": str(s.created_at)} for s in suggestions]
 
 
+def _module_tradeable_view() -> dict:
+    """当日可建仓判定视图（只读：只取已落库判定，不触发 ensure_if_missing 懒补算；
+    补算留给候选池页/每日挖掘，首页首屏零额外计算）"""
+    trade_date = time.strftime("%Y-%m-%d")
+    try:
+        items = repo.list_candidate_tradeable(trade_date, limit=50)
+        return {"date": trade_date,
+                "count": sum(1 for i in items if i.get("is_tradeable")),
+                "total": len(items), "items": items}
+    except Exception:  # noqa: BLE001 失败返回空 items 不阻塞聚合整体
+        return {"date": trade_date, "count": 0, "items": [], "total": 0}
+
+
 def _module(fn):
     """模块执行器：失败仅标注 error，不中断其他模块"""
     try:
@@ -61,6 +74,7 @@ def build_dashboard() -> dict:
         "holdings": lambda: repo.list_holdings(status="holding"),
         "alerts": lambda: repo.list_alerts(limit=100),
         "candidates": lambda: repo.list_candidates(limit=5),
+        "candidate_tradeable": _module_tradeable_view,
         "scores": lambda: repo.list_scores(limit=200),
         "plans": lambda: repo.list_plans(limit=3),
         "reviews": lambda: repo.list_reviews(limit=3),

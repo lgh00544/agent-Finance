@@ -5,6 +5,7 @@
 import logging
 import time
 
+from app.core.config import settings
 from app.datasource.akshare_source import AkshareSource
 from app.graph.graphs import get_graph
 from app.graph.state import StockAgentState
@@ -244,6 +245,15 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
     discover_result = run_discover(date_key)
     candidates = discover_result.get("candidates") or []
 
+    # 两段式粗筛（默认关闭，零回归）：score_two_stage=True 时用 LIGHT 粗筛 + 保留上限，
+    # 仅对子集深打分省 token；False 时 score_cands 即全量，行为与原路径一致。
+    score_cands = candidates
+    if settings.score_two_stage:
+        from app.agents.score import prefilter_candidates
+
+        score_cands = prefilter_candidates(candidates, date_key)[:settings.score_two_stage_keep]
+        logger.info("两段式粗筛: 候选 %s → 精打 %s 只", len(candidates), len(score_cands))
+
     def _score_one(cand: dict) -> dict | None:
         try:
             res = run_score(cand["stock_code"], cand["stock_name"], date_key)
@@ -255,20 +265,20 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
             return None
 
     scores = []
-    if len(candidates) >= _PARALLEL_SCORE_MIN:
-        with ThreadPoolExecutor(max_workers=min(_PARALLEL_SCORE_MAX, len(candidates))) as pool:
-            futures = [pool.submit(_score_one, cand) for cand in candidates]
+    if len(score_cands) >= _PARALLEL_SCORE_MIN:
+        with ThreadPoolExecutor(max_workers=min(_PARALLEL_SCORE_MAX, len(score_cands))) as pool:
+            futures = [pool.submit(_score_one, cand) for cand in score_cands]
             for fut in as_completed(futures):
                 item = fut.result()
                 if item:
                     scores.append(item)
     else:
-        for cand in candidates:
+        for cand in score_cands:
             item = _score_one(cand)
             if item:
                 scores.append(item)
-    logger.info("批量打分完成: %s/%s（并行模式: %s）", len(scores), len(candidates),
-                len(candidates) >= _PARALLEL_SCORE_MIN)
+    logger.info("批量打分完成: %s/%s（并行模式: %s）", len(scores), len(score_cands),
+                len(score_cands) >= _PARALLEL_SCORE_MIN)
 
     # 三级同源联动：B 级及以上候选自动生成建仓计划（run_position 内含 B 级 30min 缓存
     # 与 C 级门槛，同一套算法无两套标准；单股失败不阻塞主链路）

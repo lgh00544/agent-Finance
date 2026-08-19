@@ -240,7 +240,7 @@ def test_node_no_alerts_no_feishu(monkeypatch):
 # ==================== 5. 失败降级 ====================
 
 def test_node_failure_degrades(monkeypatch):
-    """LLM 调用失败：仅标注 error，不抛断，不落脏数据"""
+    """LLM 调用失败：标注 error、不抛断；规则信号（回撤/集中度）触发则落 rule_fallback 兜底告警（B 项新行为）"""
     from app.agents import portfolio_sentinel as ps
 
     _insert_holding("600519", "贵州茅台", 10.0, 100)
@@ -256,4 +256,9 @@ def test_node_failure_degrades(monkeypatch):
     monkeypatch.setattr(ps, "agent_call", _boom)
     state = ps.portfolio_sentinel_node({"trade_date": DATE})
     assert "组合哨兵失败" in (state.get("error") or "")
-    assert repo.list_alerts(limit=10) == []  # 不落脏数据
+    # 单持仓 → 集中度 100%>40% 触发规则信号 → B 项兜底必须落库（硬风险不因 LLM 失败而丢）
+    rules = [r for r in repo.list_alerts(limit=20)
+             if r.get("alert_type") == "rule_fallback"]
+    assert len(rules) == 1
+    assert rules[0]["source"] == "portfolio_sentinel"
+    assert "规则兜底" in rules[0]["message"]

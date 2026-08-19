@@ -13,9 +13,13 @@ import json
 import logging
 import time
 
+from pydantic import BaseModel
+
 from app.agents.schemas import ExperienceDraft, RouteConflict
+from app.core.config import settings
 from app.db import repo
 from app.llm.structured import ModelLevel, llm_call_json
+from app.services import llm_stats
 from agent_prompts import experience_prompt
 
 logger = logging.getLogger(__name__)
@@ -71,6 +75,33 @@ def _split_tags(raw) -> set:
         except (json.JSONDecodeError, TypeError):
             pass
     return {t.strip() for t in txt.replace(",", " ").split() if t.strip()}
+
+
+def _llm_extract(system: str, user: str, schema) -> BaseModel:
+    """LLM 结构化抽取统一入口（提供方可配置，默认 minimax 失败自动降级 deepseek flash）。
+
+    - provider=minimax：调 MiniMaxClient().chat_text() → schema.model_validate_json(content)；
+      任何异常/校验失败/空响应 → 降级 llm_call_json(LIGHT) 重试一次；
+    - provider=deepseek：保持原 llm_call_json(LIGHT) 行为（回归零差异）。
+    - MiniMax 成功路径记录 MiniMax-M3 的 usage 成本（缺 usage 记 0）。
+    """
+    if settings.experience_worker_provider == "minimax":
+        try:
+            from app.services.multimodal import MiniMaxClient
+            content, usage = MiniMaxClient().chat_text(system, user)
+            if content and content.strip():
+                parsed = schema.model_validate_json(content)
+                llm_stats.record(
+                    "MiniMax-M3",
+                    int(usage.get("prompt_cache_hit_tokens") or 0),
+                    int(usage.get("prompt_tokens") or 0),
+                    int(usage.get("completion_tokens") or 0),
+                )
+                return parsed
+            logger.warning("MiniMax 抽取空响应，降级 deepseek flash")
+        except Exception as exc:  # noqa: BLE001 MiniMax 无密钥/失败/校验失败 → 降级
+            logger.warning("MiniMax 抽取失败（降级 deepseek flash）: %s", exc)
+    return llm_call_json(system, user, schema, model_level=ModelLevel.LIGHT)
 
 
 def route_draft(draft: ExperienceDraft, pending_id: int) -> dict:
@@ -134,8 +165,7 @@ def _conflict_check(draft: ExperienceDraft) -> dict:
                         "body": (c["body"] or "")[:200]} for c in cands[:5]],
     }, ensure_ascii=False)
     try:
-        res = llm_call_json(experience_prompt.ROUTE_PROMPT, user, RouteConflict,
-                            model_level=ModelLevel.LIGHT)
+        res = _llm_extract(experience_prompt.ROUTE_PROMPT, user, RouteConflict)
         return {"conflict": res.conflict, "conflicting_ids": res.conflicting_ids,
                 "reason": res.reason}
     except Exception as exc:  # noqa: BLE001 冲突判定失败不阻断自动合并（可回滚兜底）
@@ -150,8 +180,7 @@ def _process_item(item: dict) -> None:
                        "summary": item["summary"], "artifacts_ref": item["artifacts_ref"]},
                       ensure_ascii=False)
     try:
-        draft = llm_call_json(experience_prompt.EXTRACT_SYSTEM, user, ExperienceDraft,
-                              model_level=ModelLevel.LIGHT)
+        draft = _llm_extract(experience_prompt.EXTRACT_SYSTEM, user, ExperienceDraft)
     except Exception as exc:  # noqa: BLE001 抽取失败标 done+error，不残留 processing
         logger.warning("经验抽取失败 pending=%s: %s", pending_id, exc)
         repo.release_pending(pending_id, error=f"extract_failed: {exc}")

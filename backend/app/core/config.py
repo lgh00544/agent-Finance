@@ -9,7 +9,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[2]  # backend/
@@ -112,6 +112,30 @@ class Settings(BaseSettings):
     minimax_base_url: str = "https://api.minimax.chat/v1"  # 官方 OpenAI 兼容端点（国际站 api.minimaxi.com/v1）
     minimax_model: str = "MiniMax-M3"  # 模型 ID（官方文档 ID 含连字符）
     minimax_ocr_enable: bool = True    # true=默认优先 MiniMax 云端识别持仓截图，失败自动回退本地；false=强制仅用本地 PaddleOCR
+
+    # ---------- 模型体系优化（2026-08-18，默认 fail-closed：全部关闭/原行为） ----------
+    # 经验沉淀 Worker 识别提供方：minimax=用 MiniMax-M3（云端，不占本地算力，失败自动降级 deepseek flash）；
+    # deepseek=原行为（llm_call_json LIGHT）。非法值回退 minimax。
+    experience_worker_provider: str = "minimax"
+    # Score 两段式粗筛：false=原行为（零回归）；true=LIGHT 粗筛后仅精打前 N 只（上线前必须先过回放误杀率 <5% 门槛）
+    score_two_stage: bool = False
+    score_two_stage_keep: int = 12  # 粗筛后保留上限（1≤keep≤20，非法值回退 12）
+    # 模型成本单价（元/百万 tokens；默认 0=不计成本，按官网定价填写后生效）
+    deepseek_cached_input_price: float = 0.0  # DeepSeek 缓存命中输入价
+    deepseek_input_price: float = 0.0         # DeepSeek 未命中输入价
+    deepseek_output_price: float = 0.0
+    minimax_input_price: float = 0.0
+    minimax_output_price: float = 0.0
+
+    @field_validator("experience_worker_provider")
+    @classmethod
+    def _validate_worker_provider(cls, v: str) -> str:
+        return v if v in ("minimax", "deepseek") else "minimax"
+
+    @field_validator("score_two_stage_keep")
+    @classmethod
+    def _clamp_keep(cls, v: int) -> int:
+        return 12 if not (1 <= v <= 20) else v
 
     # ---------- 日志（自动轮转，防无限增长）----------
     log_level: str = "INFO"

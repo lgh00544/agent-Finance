@@ -213,7 +213,8 @@ def raw_to_text(raw: dict) -> str:
 
 def portfolio_sentinel_node(state: StockAgentState) -> StockAgentState:
     """组合哨兵节点：聚合客观数据 → LLM 组合研判（LIGHT）→ 告警落库 + 飞书推送。
-    无持仓直接跳过（正常状态不报错）；失败仅打 warning 标注 state.error，不抛断。"""
+    无持仓直接跳过（正常状态不报错）；失败仅打 warning 标注 state.error，不抛断。
+    LLM 研判不可用但规则告警（回撤/集中度）已触发时，走 rule_fallback 兜底仅推最硬信号。"""
     today = state.get("trade_date") or _today()
     try:
         raw = collect_portfolio_data()
@@ -222,15 +223,20 @@ def portfolio_sentinel_node(state: StockAgentState) -> StockAgentState:
                                            "reason": "无持仓，组合哨兵跳过"}
             logger.info("组合哨兵跳过（无持仓）: %s", today)
             return state
-        output = agent_call(
-            agent="portfolio_sentinel",
-            cache_key=f"portfolio_sentinel:{today}:{int(time.time() // 600)}",
-            system_prompt=portfolio_sentinel_prompt.SYSTEM_PROMPT,
-            user_prompt=portfolio_sentinel_prompt.build_user_prompt(raw_to_text(raw)),
-            schema=PortfolioSentinelOutput,
-            ttl_seconds=_TTL_SECONDS,
-            model_level=ModelLevel.LIGHT,
-        )
+        try:
+            output = agent_call(
+                agent="portfolio_sentinel",
+                cache_key=f"portfolio_sentinel:{today}:{int(time.time() // 600)}",
+                system_prompt=portfolio_sentinel_prompt.SYSTEM_PROMPT,
+                user_prompt=portfolio_sentinel_prompt.build_user_prompt(raw_to_text(raw)),
+                schema=PortfolioSentinelOutput,
+                ttl_seconds=_TTL_SECONDS,
+                model_level=ModelLevel.LIGHT,
+            )
+        except Exception as exc:  # noqa: BLE001 LLM 不可用 → 规则兜底保命（仅异常分支）
+            logger.error("组合哨兵 LLM 研判不可用（%s），进入规则兜底分支", exc)
+            _rule_fallback_alert(raw, today)
+            raise
         result = output.model_dump()
         state["portfolio_sentinel"] = {"trade_date": today, **result}
         # 暴露组合风险快照供 SellAgent 只读消费（30 分钟 TTL，与巡检节奏一致；仅暴露已算好的结果，不改判断逻辑）
@@ -245,6 +251,32 @@ def portfolio_sentinel_node(state: StockAgentState) -> StockAgentState:
         logger.warning("组合哨兵失败: %s", exc)
         state["error"] = f"组合哨兵失败: {exc}"
     return state
+
+
+def _rule_fallback_alert(raw: dict, today: str) -> None:
+    """LLM 研判不可用 + 规则信号触发时，推送最硬的确定性兜底告警并落库（当日去重）。
+    纯代码判定（回撤<-3%/集中度>40%），不做任何复杂研判；复杂逻辑仍归 LLM。"""
+    p = raw.get("portfolio") or {}
+    drawdown = bool(p.get("drawdown_alert"))
+    concentration = bool(p.get("concentration_alert"))
+    if not (drawdown or concentration):
+        return
+    flags = []
+    if drawdown:
+        flags.append(f"组合回撤 {p.get('total_pnl_pct')}%（<-3%）")
+    if concentration:
+        flags.append(f"集中度 {p.get('max_sector_pct')}%（>40%）")
+    msg = "⚠️ LLM 研判不可用，此为规则兜底预警（回撤/集中度阈值触发）：" + "；".join(flags)
+    severity = "critical" if drawdown else "warning"
+    dedup_key = f"PORTFOLIO:rule_fallback:{today}"
+    pushed = False
+    if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
+        pushed = push_alert("组合哨兵", "PORTFOLIO", "rule_fallback", severity, msg, "review")
+    repo.insert_alert("PORTFOLIO", "组合哨兵", "rule_fallback", severity, msg, "review",
+                      {"rule_fallback": True, "drawdown_alert": drawdown,
+                       "concentration_alert": concentration}, pushed=pushed, source=_ALERT_SOURCE)
+    logger.error("组合哨兵规则兜底告警落库: %s（回撤=%s 集中度=%s，pushed=%s）",
+                 today, drawdown, concentration, pushed)
 
 
 def _persist_alerts(raw: dict, result: dict, today: str) -> None:
