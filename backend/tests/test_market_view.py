@@ -6,6 +6,7 @@
 """
 import pandas as pd
 import pytest
+from unittest import mock
 
 from app.services import holding_view, market_view
 
@@ -56,89 +57,44 @@ def test_index_quotes_empty_df(monkeypatch):
     assert data["indices"] == [] and data["error"] is None
 
 
-# ================= 今日热门板块 =================
+# ================= 今日热门板块（v2：读 sector_snapshot DB 兜底） =================
 
-def _board_spot():
-    return pd.DataFrame([
-        {"board_name": "半导体", "change_pct": 3.2, "leading_stock": "中芯国际"},
-        {"board_name": "电池", "change_pct": 1.1, "leading_stock": "宁德时代"},
-        {"board_name": "银行", "change_pct": -0.5, "leading_stock": "招商银行"},
-        {"board_name": "白酒", "change_pct": 2.4, "leading_stock": "贵州茅台"},
-        {"board_name": "证券", "change_pct": 1.8, "leading_stock": "东方财富"},
-        {"board_name": "军工", "change_pct": 0.9, "leading_stock": "航发动力"},
-        {"board_name": "煤炭", "change_pct": 4.5, "leading_stock": "中国神华"},
-    ])
-
-
-def _spot_universe():
-    return pd.DataFrame([
-        {"code": "688981", "name": "中芯国际", "price": 60.0},
-        {"code": "600519", "name": "贵州茅台", "price": 1550.0},
-        {"code": "300059", "name": "东方财富", "price": 18.0},
-        {"code": "601088", "name": "中国神华", "price": 38.0},
-        {"code": "600036", "name": "招商银行", "price": 35.0},
-        {"code": "300750", "name": "宁德时代", "price": 210.0},
-        {"code": "600893", "name": "航发动力", "price": 45.0},
-    ])
-
-
-class _Source:
-    def __init__(self, boards, spot, cons=None, cons_map=None):
-        self._boards, self._spot, self._cons, self._cons_map = boards, spot, cons, cons_map or {}
-
-    def fetch_industry_spot(self):
-        return self._boards
-
-    def fetch_spot_universe(self):
-        return self._spot
-
-    def fetch_industry_cons(self, board_name):
-        if self._cons is None:
-            raise RuntimeError("成分股不可用")
-        return self._cons.get(board_name, pd.DataFrame())
-
-
-def test_hot_sectors_top5_sorted_with_leading(monkeypatch):
-    """涨幅前 5 客观排序；领涨龙头代码由全市场快照名称匹配解析"""
-    monkeypatch.setattr(market_view, "get_datasource",
-                        lambda: _Source(_board_spot(), _spot_universe()))
-    data = market_view.hot_sectors()
+def test_hot_sectors_delegates_to_snapshot(monkeypatch):
+    """hot_sectors 委托 sector_snapshot.get_hot_sectors_with_fallback，返回 4 字段"""
+    fb = {"sectors": [{"board_name": "半导体", "change_pct": 3.2,
+                       "leading_stock": "中芯国际", "leading_code": "688981",
+                       "rank_no": 1, "source": "em"}],
+          "updated_at": "2026-08-19 13:00:00", "stale": False, "error": None}
+    with mock.patch("app.services.sector_snapshot.get_hot_sectors_with_fallback",
+                    return_value=fb):
+        data = market_view.hot_sectors()
     assert data["error"] is None
-    names = [b["board_name"] for b in data["sectors"]]
-    assert names == ["煤炭", "半导体", "白酒", "证券", "电池"]  # 按涨幅降序取前5
-    lead = {b["board_name"]: b for b in data["sectors"]}
-    assert lead["半导体"]["leading_code"] == "688981"
-    assert lead["白酒"]["leading_code"] == "600519"
-    assert len(data["sectors"]) == 5
+    assert data["sectors"][0]["board_name"] == "半导体"
+    assert data["sectors"][0]["leading_code"] == "688981"
+    assert data["stale"] is False
+    assert set(data.keys()) == {"sectors", "updated_at", "stale", "error"}
 
 
-def test_hot_sectors_leading_fallback_cons(monkeypatch):
-    """龙头名称不在快照 → 降级拉成分股按涨幅取最大（代码）"""
-    boards = _board_spot().copy()
-    boards.loc[boards["board_name"] == "白酒", "leading_stock"] = "五粮液"  # 名称不在快照
-    spot = pd.DataFrame([{"code": "600519", "name": "贵州茅台", "price": 1550.0}])
-    cons = pd.DataFrame([
-        {"code": "600887", "name": "伊利股份", "change_pct": 1.2},
-        {"code": "600600", "name": "青岛啤酒", "change_pct": 3.8},
-    ])
-    monkeypatch.setattr(market_view, "get_datasource",
-                        lambda: _Source(boards, spot, cons={"白酒": cons}))
-    data = market_view.hot_sectors()
-    b = {x["board_name"]: x for x in data["sectors"]}["白酒"]
-    assert b["leading_code"] == "600600"  # 涨幅最大成分股
+def test_hot_sectors_propagates_stale(monkeypatch):
+    """DB 有陈旧数据 → hot_sectors 透传 stale=true"""
+    fb = {"sectors": [{"board_name": "A", "change_pct": 1.0, "leading_stock": "x",
+                       "leading_code": "1", "rank_no": 1, "source": "em"}],
+          "updated_at": "2026-08-19 09:00:00", "stale": True, "error": None}
+    with mock.patch("app.services.sector_snapshot.get_hot_sectors_with_fallback",
+                    return_value=fb):
+        data = market_view.hot_sectors()
+    assert data["stale"] is True
 
 
-def test_hot_sectors_failure_returns_error(monkeypatch):
-    """板块行情失败：空列表 + error 标注（前端显示降级提示）"""
-
-    def _boom():
-        raise RuntimeError("东财限流")
-
-    monkeypatch.setattr(market_view, "get_datasource",
-                        lambda: type("S", (), {"fetch_industry_spot": lambda self: _boom()})())
-    data = market_view.hot_sectors()
+def test_hot_sectors_error_path(monkeypatch):
+    """非交易时段/失败 → hot_sectors 保留 error 标注（前端显示降级提示）"""
+    fb = {"sectors": [], "updated_at": "", "stale": False,
+          "error": "非交易时段，板块行情暂不可用"}
+    with mock.patch("app.services.sector_snapshot.get_hot_sectors_with_fallback",
+                    return_value=fb):
+        data = market_view.hot_sectors()
     assert data["sectors"] == []
-    assert data["error"] and "行业板块行情获取失败" in data["error"]
+    assert data["error"] == "非交易时段，板块行情暂不可用"
 
 
 # ================= 账户摘要（双数据路径） =================

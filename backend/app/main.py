@@ -14,7 +14,7 @@ from app.core.logging import setup_logging
 from app.db import repo
 from app.db.session import init_db
 from app.scheduler.jobs import start_scheduler, stop_scheduler
-from app.services import market_view, reasoning_trace
+from app.services import holding_view, market_view, reasoning_trace
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,15 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 预热失败不阻塞启动
             logger.debug("指数行情预热失败（忽略）", exc_info=True)
     threading.Thread(target=_warm_index_quotes, name="warm-index-quotes", daemon=True).start()
+
+    # 持仓页 cold-start 预热：akshare 冷启动约 32s > 前端 15s 超时，后台跑不阻塞启动；
+    # 失败静默降级，复用短缓存后首次 /api/holdings/quotes 秒回（不改 holding_view 内部逻辑）
+    def _warm_holding_quotes() -> None:
+        try:
+            holding_view.build_holding_view()
+        except Exception:  # noqa: BLE001 预热失败不阻塞启动
+            logger.debug("持仓行情预热失败（忽略）", exc_info=True)
+    threading.Thread(target=_warm_holding_quotes, name="warm-holding-quotes", daemon=True).start()
 
     logger.info("系统启动完成")
     yield

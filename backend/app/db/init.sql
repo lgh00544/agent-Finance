@@ -249,3 +249,20 @@ CREATE TABLE IF NOT EXISTS candidate_track_verify (
     KEY idx_track_code (stock_code),
     KEY idx_track_status (is_finished, select_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 首页今日热门板块快照（5 分钟一次落库；首页只读，DB 兜底解决 akshare 失败 5 灰条）
+-- 与 backend/app/db/models.py 的 SectorSnapshot 一致
+CREATE TABLE IF NOT EXISTS sector_snapshot (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,                -- YYYY-MM-DD（与 stock_candidate 一致）
+    sector_name VARCHAR(64) NOT NULL,
+    change_pct FLOAT NOT NULL,
+    leading_stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    leading_stock_code VARCHAR(16) NOT NULL DEFAULT '',
+    source VARCHAR(8) NOT NULL DEFAULT '',           -- 'em' / 'sina' / 'mix'
+    rank_no INT NOT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_sector_date_name (trade_date, sector_name),
+    KEY ix_sector_date_rank (trade_date, rank_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

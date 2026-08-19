@@ -66,36 +66,20 @@ def index_quotes() -> dict:
 
 
 def hot_sectors() -> dict:
-    """今日涨幅前 5 行业板块（客观排序，非主观筛选）+ 领涨龙头（代码+名称）+ 更新时间"""
-    now_min = time.strftime("%Y-%m-%d %H:%M")
-    try:
-        board_df = get_datasource().fetch_industry_spot()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("行业板块行情获取失败: %s", exc)
-        return {"sectors": [], "updated_at": now_min, "error": f"行业板块行情获取失败（{type(exc).__name__}）"}
+    """今日涨幅前 5 行业板块 + 领涨龙头（前端只读聚合）
 
-    if board_df is None or board_df.empty or "board_name" not in board_df.columns:
-        return {"sectors": [], "updated_at": now_min, "error": None}
-
-    boards = []
-    for _, r in board_df.iterrows():
-        try:
-            change_pct = float(r.get("change_pct"))
-        except (TypeError, ValueError):
-            continue
-        boards.append({"board_name": str(r["board_name"]).strip(),
-                       "change_pct": round(change_pct, 2),
-                       "leading_stock": str(r.get("leading_stock") or "").strip()})
-    boards.sort(key=lambda b: b["change_pct"], reverse=True)
-
-    name_to_code = _spot_name_map()
-    sectors = []
-    for b in boards[:HOT_SECTOR_COUNT]:
-        leading_code = name_to_code.get(b["leading_stock"])
-        if not leading_code and b["leading_stock"]:
-            leading_code = _leading_from_cons(b["board_name"])
-        sectors.append({**b, "leading_code": leading_code or ""})
-    return {"sectors": sectors, "updated_at": now_min, "error": None}
+    v2 改造：不再每次裸打 akshare，改为读 sector_snapshot DB（由 sector_refresh_job 每 5 分钟落库）；
+    DB 空 + 交易时段触发一次 refresh 兜底；DB 空 + 非交易时段返回空。
+    """
+    from app.services.sector_snapshot import get_hot_sectors_with_fallback
+    result = get_hot_sectors_with_fallback()
+    # 字段对齐：原 API 响应 {sectors, updated_at, error}；stale 为 v2 新增字段（向后兼容）
+    return {
+        "sectors": result.get("sectors", []),
+        "updated_at": result.get("updated_at", ""),
+        "stale": result.get("stale", False),
+        "error": result.get("error"),
+    }
 
 
 def _spot_name_map() -> dict[str, str]:

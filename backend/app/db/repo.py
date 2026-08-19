@@ -17,8 +17,8 @@ from app.db.models import (
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
     Experience, ExperienceConfig, Holding, HotMoneyProfile, LhbOriginalFlow,
     MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
-    PrivateKnowledge, ReviewLog, ReviewResult, RuleChange, SellDecision,
-    StockCandidate, StockScore, TradeProfile, TradeRecord, WorkerRun, _now,
+    PrivateKnowledge, ReviewLog, ReviewResult, RuleChange, SectorSnapshot,
+    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord, WorkerRun, _now,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -196,6 +196,73 @@ def get_prev_market_condition() -> dict | None:
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
+
+
+def upsert_sector_snapshot(rows: list[dict]) -> int:
+    """upsert 板块快照（trade_date+sector_name 唯一键冲突时全量覆盖）
+
+    rows 每项字段：trade_date/sector_name/change_pct/leading_stock_name/
+                   leading_stock_code/source/rank_no
+    返回成功写入行数。
+    单次最多 5 条，按 trade_date 一次性「删后插」简单稳，不做 ORM merge。
+    """
+    if not rows:
+        return 0
+    trade_date = rows[0].get("trade_date", "")
+    if not trade_date:
+        return 0
+    with SessionLocal() as db:
+        # 按 trade_date 全删后插（5 条小数据，简单稳，避免按行 upsert 循环）
+        db.execute(
+            text("DELETE FROM sector_snapshot WHERE trade_date = :d"),
+            {"d": trade_date},
+        )
+        for r in rows:
+            db.add(SectorSnapshot(
+                trade_date=r["trade_date"],
+                sector_name=r["sector_name"],
+                change_pct=r["change_pct"],
+                leading_stock_name=r.get("leading_stock_name", ""),
+                leading_stock_code=r.get("leading_stock_code", ""),
+                source=r.get("source", ""),
+                rank_no=r["rank_no"],
+            ))
+        db.commit()
+    return len(rows)
+
+
+def list_sector_snapshot_by_date(trade_date: str, limit: int = 5) -> list[dict]:
+    """按交易日取板块快照（按 rank_no 升序），首页热路径 O(limit)"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorSnapshot)
+            .where(SectorSnapshot.trade_date == trade_date)
+            .order_by(SectorSnapshot.rank_no.asc())
+            .limit(limit)
+        ).scalars().all()
+        return [
+            {
+                "board_name": r.sector_name,
+                "change_pct": r.change_pct,
+                "leading_stock": r.leading_stock_name,
+                "leading_code": r.leading_stock_code,
+                "rank_no": r.rank_no,
+                "source": r.source,
+            }
+            for r in result
+        ]
+
+
+def get_sector_snapshot_updated_at(trade_date: str) -> str | None:
+    """取该交易日最近一次更新时间（用于判断是否 stale，格式 YYYY-MM-DD HH:MM:SS）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(SectorSnapshot.updated_at)
+            .where(SectorSnapshot.trade_date == trade_date)
+            .order_by(SectorSnapshot.updated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        return str(row) if row is not None else None
 
 
 # ==================== 市场研判底座（market_intel，每日收盘后 1 次 + 手动入口） ====================

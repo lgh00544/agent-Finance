@@ -647,3 +647,27 @@ class ExperienceConfig(Base):
     key: Mapped[str] = mapped_column(String(48), primary_key=True)
     value: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SectorSnapshot(Base):
+    """首页今日热门板块快照（5 分钟一次落库；首页只读）
+
+    表结构：sector_snapshot
+    作用：解决 akshare 实时接口 14% 失败率导致首页 5 灰条（DB 兜底永远有值）
+    """
+    __tablename__ = "sector_snapshot"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "sector_name", name="uq_sector_date_name"),
+        Index("ix_sector_date_rank", "trade_date", "rank_no"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    sector_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    change_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    leading_stock_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    leading_stock_code: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    source: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    rank_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

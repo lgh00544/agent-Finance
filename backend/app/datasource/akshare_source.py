@@ -979,14 +979,14 @@ class AkshareSource(DataSource):
             # 新浪行业板块（东财限流降级，列名与东财差异经 _BOARD_COLS 兼容）
             return self._call_with_timeout(ak.stock_sector_spot, indicator="新浪行业")
         df = self._fetch("industry_spot", "industry_spot", primary, ttl_seconds=600, fallback=fallback,
-                         normalize=lambda d: _normalize(d, _BOARD_COLS))
+                         normalize=lambda d: _normalize(d, _BOARD_COLS), kind="snapshot")
         return _to_json_safe(df)
 
     def fetch_industry_cons(self, board_name: str) -> pd.DataFrame:
         def call():
             return self._call_with_timeout(ak.stock_board_industry_cons_em, symbol=board_name)
         df = self._fetch(f"industry_cons:{board_name}", "industry_cons", call, ttl_seconds=3600,
-                         normalize=lambda d: _normalize(d, _CONS_COLS))
+                         normalize=lambda d: _normalize(d, _CONS_COLS), kind="snapshot")
         return _to_json_safe(df)
 
     # ---------------- 主线板块箱位（主箱位 × 60 日箱位双视角，≤10 个板块） ----------------
