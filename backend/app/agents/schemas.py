@@ -2,7 +2,7 @@
 5 个 Agent 的结构化输出模型（pydantic 严格校验，强制 JSON）
 所有市场研判结论均出自 LLM，模型定义只约束结构，不含任何业务阈值。
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ================= DiscoverAgent 潜力发掘 =================
@@ -108,24 +108,57 @@ class MarketIntelOutput(BaseModel):
                     "'basis'(一句依据)。数据缺失的个股也要列出，verdict标注'数据不足'")
 
 
-# ================= ScoreAgent 多维打分 =================
-class ScoreDimension(BaseModel):
-    """v3.0 白盒维度归因：单维度结论（资金流向维度内部体现游资信号）"""
-    dim: str = Field(description="维度名（固定五维）：基本面/技术趋势/资金流向/舆情风险/行业景气")
-    score: int = Field(ge=0, le=100, description="该维度得分 0-100")
-    verdict: str = Field(default="中性", description="该维度结论三态：支持/中性/风险")
-    advice: str = Field(default="", description="该维度针对性建议（1 句话，引用具体数据）")
+# ================= ScoreAgent 六因子透明评分 =================
+_FACTOR_NAMES = {"动量", "催化", "估值", "主线契合", "资金面", "基本面质量"}
+
+
+class PrefilterOutput(BaseModel):
+    """两段式粗筛输出（LIGHT 低成本预判；保守主义：宁漏成本不可漏票）。
+    keep_codes 为空 = 回退全量精打（安全阀 1，防误杀）。"""
+    keep_codes: list[str] = Field(default_factory=list, description="建议精打名单（候选代码列表）")
+    reason: str = Field(default="", description="一句话说明本次粗筛取舍（可空）")
+
+
+class ScoreFactor(BaseModel):
+    """v4.0 透明多因子评分项：每因子 0-10 + 打分依据 + 信号方向"""
+    factor: str = Field(
+        description="因子名（固定六因子）：动量/催化/估值/主线契合/资金面/基本面质量")
+    score: int = Field(ge=0, le=10, description="该因子得分 0-10（整数）")
+    reason: str = Field(
+        description="打分依据（引用具体数据，如 'MA20上方多头排列，MACD金叉，5日涨幅3.2%'，中文 30-80 字）")
+    signal: str = Field(
+        pattern="^(看多|中性|看空)$",
+        description="该因子信号方向：看多/中性/看空")
 
 
 class ScoreOutput(BaseModel):
+    """v4.0 六因子透明评分体系"""
     stock_code: str
     stock_name: str
-    score: int = Field(ge=0, le=100, description="综合得分 0-100")
+    score: int = Field(ge=0, le=100,
+        description="综合得分 0-100（六因子加权汇总，权重见 prompt）")
     grade: str = Field(pattern="^[ABC]$", description="综合评级 A/B/C")
-    dimensions: list[ScoreDimension] = Field(description="五个维度评分明细（dim/score/verdict/advice）")
+    factors: list[ScoreFactor] = Field(
+        description="六因子评分明细（factor/score/reason/signal），恰好 6 项")
+    potential_flag: bool = Field(default=False,
+        description="潜力标识：催化因子≥7 且 动量因子≤4 = 催化尚未被定价，值得重点关注")
+    cross_validation_note: str = Field(default="",
+        description="与 DiscoverAgent 选股逻辑的交叉验证结论（一段话，引用 Discover 理由与 Score 因子对比）")
     risk_list: list[str] = Field(description="风险清单（减持/质押/立案/业绩暴雷/估值过高等）")
     final_advice: str = Field(default="",
-        description="综合评估（v3.0）：「综合评估：N/5 维支持，总分 XX 分（X 级），结论，止损-8%，主要风险…」")
+        description="综合评估：「综合评估：N/6 因子看多，总分 XX 分（X 级），结论，止损-8%，主要风险…」；"
+                    "potential_flag=true 时追加「⚠️ 潜力标识：催化强但动量弱，可能尚未被定价」")
+
+    @model_validator(mode="after")
+    def _check_six_factors(self):
+        """强校验：factors 必须恰好为六因子且名称固定。
+        校验失败抛 ValidationError → 走 llm_call_json 既有重试机制（structured.py:84-131），
+        不新增崩溃路径。"""
+        names = [f.factor for f in self.factors]
+        if len(names) != 6 or set(names) != _FACTOR_NAMES:
+            raise ValueError(
+                f"factors 必须恰好为六因子且名称固定，收到 {names}（期望 {sorted(_FACTOR_NAMES)}）")
+        return self
 
 
 # ================= PositionAgent 仓位规划 =================

@@ -30,6 +30,15 @@ _DRAWDOWN_THRESHOLD_PCT = -3.0   # 组合总盈亏 < -3% 触发回撤预警（�
 _CONCENTRATION_THRESHOLD = 0.40  # 同板块持仓合计占总市值 > 40% 触发集中度预警（参考权重）
 _TTL_SECONDS = 600               # 巡检 LLM 缓存 10 分钟（与巡检频率同节奏）
 _ALERT_SOURCE = "portfolio_sentinel"  # alert_log.source 标记（复用现有 alert 表）
+# 组合键：系统当前为单一隐式持仓（state/repo/holding 表均无 portfolio_id 字段），
+# 用常量 "main" 作默认组合键（键形如 portfolio_sentinel:2026-08-20:main），
+# 满足多组合键格式 + 未来扩展；不改 DB、不加字段（stack F 静默缓存隔离）。
+PORTFOLIO_ID = "main"
+
+# 组合告警三态色（参考权重，非死条件：仅供 LLM 综合判断，不计硬性交易动作）
+_ALERT_GREEN = "green"
+_ALERT_YELLOW = "yellow"
+_ALERT_RED = "red"
 
 
 def _today() -> str:
@@ -174,6 +183,13 @@ def collect_portfolio_data() -> dict | None:
     for code, sector in sector_map.items():
         sector_boards[sector] = _board_match(board_df, sector)
 
+    drawdown_decomp = compute_drawdown_decomposition(PORTFOLIO_ID, today, total_pnl_pct)
+    concentration_warning = None
+    if concentration_alert and max_sector_pct is not None:
+        concentration_warning = f"同板块持仓占比 {max_sector_pct}% > {_CONCENTRATION_THRESHOLD * 100}% 阈值"
+    portfolio_alert_level = (_ALERT_RED if drawdown_alert
+                             else _ALERT_YELLOW if concentration_alert else _ALERT_GREEN)
+
     return {
         "trade_date": today,
         "hold_period_days": _pref_hold_days(),
@@ -182,10 +198,53 @@ def collect_portfolio_data() -> dict | None:
                       "total_mv": round(total_mv, 2),
                       "total_pnl_pct": total_pnl_pct,
                       "max_sector_pct": max_sector_pct,
+                      "sector_exposure_pct": (round(max_sector_pct / 100, 3)
+                                              if max_sector_pct is not None else None),
                       "drawdown_alert": drawdown_alert,
-                      "concentration_alert": concentration_alert},
+                      "concentration_alert": concentration_alert,
+                      "concentration_warning": concentration_warning,
+                      "portfolio_alert_level": portfolio_alert_level,
+                      "drawdown_decomp": drawdown_decomp},
         "sector_boards": sector_boards,
     }
+
+
+def compute_drawdown_decomposition(portfolio_id: str, trade_date: str,
+                                   portfolio_pnl_pct: float | None) -> dict:
+    """组合回撤/收益分解：拆为 系统性(市场β) + 特异性(个股α)（供 Monitor/Review 注入）。
+
+    返回 {"data": {"system": float|None, "alpha": float|None}, "missing_data": [...]}
+    - system: 归因于市场（沪深300 当日涨跌幅）的部分（β≈1 近似口径，参考权重非死条件）
+    - alpha: 组合收益 - system（特异性贡献）
+    - 沪深300 或组合收益缺失 → system/alpha 均 None + missing_data（不编造，K223 事实为先）
+
+    仅提供分解事实，不触发任何硬性交易动作；LLM 依据该事实做综合判断。
+    """
+    missing: list[str] = []
+    if portfolio_pnl_pct is None:
+        return {"data": {"system": None, "alpha": None}, "missing_data": ["portfolio_pnl_pct"]}
+    # 沪深300 当日涨跌幅作为市场基准（batch F 已将该指数加入 data source）
+    csi = _fetch_csi300_change_pct()
+    if csi is None:
+        return {"data": {"system": None, "alpha": None},
+                "missing_data": ["csi300_index"]}
+    system = round(csi, 2)
+    alpha = round(portfolio_pnl_pct - csi, 2)
+    return {"data": {"system": system, "alpha": alpha}, "missing_data": missing}
+
+
+def _fetch_csi300_change_pct() -> float | None:
+    """沪深300 当日涨跌幅（市场 β 基准）；取不到返回 None（不编造）。"""
+    try:
+        from app.services import market_view
+        quote = market_view.index_quotes()
+        for it in quote.get("indices") or []:
+            if it.get("code") == "sh000300":
+                v = it.get("change_pct")
+                return float(v) if v is not None else None
+    except Exception as exc:  # noqa: BLE001 指数获取失败仅标记缺失，不阻塞
+        logger.warning("组合回撤分解 沪深300 获取失败: %s", exc)
+    return None
 
 
 def raw_to_text(raw: dict) -> str:
@@ -213,7 +272,8 @@ def raw_to_text(raw: dict) -> str:
 
 def portfolio_sentinel_node(state: StockAgentState) -> StockAgentState:
     """组合哨兵节点：聚合客观数据 → LLM 组合研判（LIGHT）→ 告警落库 + 飞书推送。
-    无持仓直接跳过（正常状态不报错）；失败仅打 warning 标注 state.error，不抛断。"""
+    无持仓直接跳过（正常状态不报错）；失败仅打 warning 标注 state.error，不抛断。
+    LLM 研判不可用但规则告警（回撤/集中度）已触发时，走 rule_fallback 兜底仅推最硬信号。"""
     today = state.get("trade_date") or _today()
     try:
         raw = collect_portfolio_data()
@@ -222,20 +282,26 @@ def portfolio_sentinel_node(state: StockAgentState) -> StockAgentState:
                                            "reason": "无持仓，组合哨兵跳过"}
             logger.info("组合哨兵跳过（无持仓）: %s", today)
             return state
-        output = agent_call(
-            agent="portfolio_sentinel",
-            cache_key=f"portfolio_sentinel:{today}:{int(time.time() // 600)}",
-            system_prompt=portfolio_sentinel_prompt.SYSTEM_PROMPT,
-            user_prompt=portfolio_sentinel_prompt.build_user_prompt(raw_to_text(raw)),
-            schema=PortfolioSentinelOutput,
-            ttl_seconds=_TTL_SECONDS,
-            model_level=ModelLevel.LIGHT,
-        )
+        try:
+            output = agent_call(
+                agent="portfolio_sentinel",
+                cache_key=f"portfolio_sentinel:{today}:{PORTFOLIO_ID}",  # 多键隔离（trade_date × portfolio_id）
+                system_prompt=portfolio_sentinel_prompt.SYSTEM_PROMPT,
+                user_prompt=portfolio_sentinel_prompt.build_user_prompt(raw_to_text(raw)),
+                schema=PortfolioSentinelOutput,
+                ttl_seconds=_TTL_SECONDS,
+                model_level=ModelLevel.LIGHT,
+            )
+        except Exception as exc:  # noqa: BLE001 LLM 不可用 → 规则兜底保命（仅异常分支）
+            logger.error("组合哨兵 LLM 研判不可用（%s），进入规则兜底分支", exc)
+            _rule_fallback_alert(raw, today)
+            raise
         result = output.model_dump()
         state["portfolio_sentinel"] = {"trade_date": today, **result}
         # 暴露组合风险快照供 SellAgent 只读消费（30 分钟 TTL，与巡检节奏一致；仅暴露已算好的结果，不改判断逻辑）
         cache.set("portfolio_sentinel:last_risk",
                   json.dumps(result.get("portfolio_risk") or {}, ensure_ascii=False, default=str), 1800)
+        _write_overview_snapshot(raw, today)
         _persist_alerts(raw, result, today)
         logger.info("组合哨兵完成: %s 板块预警 %s 条 / 时间止损 %s 条 / 组合回撤 %s / 集中度 %s",
                     today, len(result["sector_alerts"]), len(result["time_stop_alerts"]),
@@ -245,6 +311,68 @@ def portfolio_sentinel_node(state: StockAgentState) -> StockAgentState:
         logger.warning("组合哨兵失败: %s", exc)
         state["error"] = f"组合哨兵失败: {exc}"
     return state
+
+
+def _overview_snapshot_key(trade_date: str) -> str:
+    """组合告警概览缓存键（多键隔离：trade_date × portfolio_id）。
+    供 Monitor/ReviewAgent collect 段只读（不写判断逻辑，仅喂已有事实）。"""
+    return f"portfolio_sentinel:overview:{trade_date}:{PORTFOLIO_ID}"
+
+
+def _write_overview_snapshot(raw: dict, today: str) -> None:
+    """把组合级事实（告警三态色 / 集中度警示 / 板块暴露 / 回撤分解）写入缓存，
+    供 Monitor/ReviewAgent collect 段读取。只写算好的既有事实，不改判断路径。
+    TTL 60s（随巡检节奏，供页面/Agent 短程读取）。"""
+    p = raw.get("portfolio") or {}
+    overview = {
+        "portfolio_alert_level": p.get("portfolio_alert_level") or _ALERT_GREEN,
+        "concentration_warning": p.get("concentration_warning"),
+        "sector_exposure_pct": p.get("sector_exposure_pct"),
+        "drawdown_decomp": p.get("drawdown_decomp"),
+        "total_pnl_pct": p.get("total_pnl_pct"),
+        "max_sector_pct": p.get("max_sector_pct"),
+        "trade_date": today,
+    }
+    cache.set(_overview_snapshot_key(today),
+              json.dumps(overview, ensure_ascii=False, default=str), 600)
+
+
+def read_portfolio_overview(trade_date: str) -> dict:
+    """Monitor/ReviewAgent collect 段只读组合告警概览；无快照或解析失败返回空 dict（不阻断）。"""
+    try:
+        raw = cache.get(_overview_snapshot_key(trade_date or _today()))
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 组合快照读取失败仅返回空，不阻断个股 collect
+        return {}
+
+
+def _rule_fallback_alert(raw: dict, today: str) -> None:
+    """LLM 研判不可用 + 规则信号触发时，推送最硬的确定性兜底告警并落库（当日去重）。
+    纯代码判定（回撤<-3%/集中度>40%），不做任何复杂研判；复杂逻辑仍归 LLM。"""
+    p = raw.get("portfolio") or {}
+    drawdown = bool(p.get("drawdown_alert"))
+    concentration = bool(p.get("concentration_alert"))
+    if not (drawdown or concentration):
+        return
+    flags = []
+    if drawdown:
+        flags.append(f"组合回撤 {p.get('total_pnl_pct')}%（<-3%）")
+    if concentration:
+        flags.append(f"集中度 {p.get('max_sector_pct')}%（>40%）")
+    msg = "⚠️ LLM 研判不可用，此为规则兜底预警（回撤/集中度阈值触发）：" + "；".join(flags)
+    severity = "critical" if drawdown else "warning"
+    dedup_key = f"PORTFOLIO:rule_fallback:{today}"
+    pushed = False
+    if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
+        pushed = push_alert("组合哨兵", "PORTFOLIO", "rule_fallback", severity, msg, "review")
+    repo.insert_alert("PORTFOLIO", "组合哨兵", "rule_fallback", severity, msg, "review",
+                      {"rule_fallback": True, "drawdown_alert": drawdown,
+                       "concentration_alert": concentration}, pushed=pushed, source=_ALERT_SOURCE)
+    logger.error("组合哨兵规则兜底告警落库: %s（回撤=%s 集中度=%s，pushed=%s）",
+                 today, drawdown, concentration, pushed)
 
 
 def _persist_alerts(raw: dict, result: dict, today: str) -> None:

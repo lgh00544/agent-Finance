@@ -1,16 +1,16 @@
 import { useState } from 'react'
 import {
-  App,
   Alert,
+  App,
   Button,
   Card,
+  Collapse,
   Descriptions,
   Drawer,
   Form,
   Input,
   InputNumber,
   Modal,
-  Radio,
   Space,
   Table,
   Tabs,
@@ -26,11 +26,11 @@ import {
   holdingQuotes,
   holdingTrades,
   holdings,
-  monitorHolding,
   sellDecisions,
   takeProfitPlan,
 } from '@/api/holdings'
 import { alerts } from '@/api/alerts'
+import { marketIndices } from '@/api/market'
 import { ocrHolding, ocrStatus } from '@/api/ocr'
 import { saveAccountBaseline } from '@/api/account'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
@@ -40,122 +40,436 @@ import type { Holding } from '@/types'
 
 const { Text } = Typography
 
+// ===== 知识库风控红线（仅前端黄色提示，不阻断；最终以后端为准） =====
+const C3_LOSS_PCT = 0.92   // C3 止损 = 成本 × 0.92（永久红线）
+const C1_CAP_PCT = 60.0    // C1：总仓位上限
+const C2_CAP_PCT = 30.0    // C2：单票仓位上限
+const E2_INDEX_BAR = 4000.0 // E2：沪指 < 4000 = 防御期，仓位软上限 20%
+const E2_SOFT_CAP = 20.0
+
+const ACTION_MAP: Record<string, string> = {
+  hold: '持有', reduce: '减仓', exit: '清仓', partial: '部分减仓', sell: '卖出清仓',
+}
+const CONF_MAP: Record<string, string> = { high: '高', medium: '中', low: '低' }
+
 /** 涨跌色（中国股市惯例：正红负绿） */
 function pnlColor(v: number | null | undefined): string {
   if (v == null) return 'var(--text)'
   return v > 0 ? 'var(--up)' : v < 0 ? 'var(--down)' : 'var(--text)'
 }
 
-/** ============ 操作区：加仓/减仓/清仓/成本修正 ============ */
-function HoldingOpsForm({ h }: { h: Holding }) {
-  const { message } = App.useApp()
+/** ===== 需求 A：同代码去重合并（纯展示层，数据库原始记录保留） ===== */
+export interface MergedRow {
+  code: string
+  records: Holding[]
+  keep: Holding[]
+  current: Holding
+  total_shares: number
+  weighted_price: number | null
+}
+
+function dedupeAndMerge(rows: Holding[]): MergedRow[] {
+  const groups: Record<string, Holding[]> = {}
+  for (const r of rows) {
+    groups[r.stock_code] ??= []
+    groups[r.stock_code].push(r)
+  }
+  const merged: MergedRow[] = []
+  for (const code of Object.keys(groups)) {
+    const items = [...groups[code]].sort((a, b) =>
+      String(a.entry_date ?? '').localeCompare(String(b.entry_date ?? '')) ||
+      String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
+    const byDate: Record<string, Holding[]> = {}
+    for (const it of items) {
+      byDate[it.entry_date ?? ''] ??= []
+      byDate[it.entry_date ?? ''].push(it)
+    }
+    // 同建仓日期重复录入 → 仅保留录入时间最晚一条
+    const keep = Object.values(byDate).map((g) =>
+      g.reduce((max, x) => (String(x.created_at ?? '') >= String(max.created_at ?? '') ? x : max)))
+      .sort((a, b) => String(a.entry_date ?? '').localeCompare(String(b.entry_date ?? '')) ||
+        String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
+    // 当前有效 = 建仓日期最新且录入时间最晚的那笔
+    const current = keep[keep.length - 1]
+    const total_shares = keep.reduce((s, k) => s + Number(k.shares || 0), 0)
+    const weighted_price = total_shares
+      ? keep.reduce((s, k) => s + Number(k.entry_price || 0) * Number(k.shares || 0), 0) / total_shares
+      : null
+    const dupDates = new Set(Object.entries(byDate).filter(([, g]) => g.length > 1).map(([d]) => d))
+    const tagged = items.map((it) => ({
+      ...it,
+      _dedupe_status: it.id === current.id
+        ? '当前有效'
+        : (it.entry_date ?? '') in dupDates
+          ? '重复录入（已自动忽略）'
+          : '历史买入',
+    }))
+    merged.push({ code, records: tagged, keep, current, total_shares, weighted_price })
+  }
+  merged.sort((a, b) =>
+    String(a.current.entry_date ?? '').localeCompare(String(b.current.entry_date ?? '')) ||
+    String(a.current.created_at ?? '').localeCompare(String(b.current.created_at ?? '')))
+  return merged
+}
+
+/** 上证指数（E2 防御期判断；拉取失败返回 null 不阻塞） */
+function useShanghaiIndex() {
+  const { data } = useQuery({ queryKey: ['market-indices'], queryFn: marketIndices, staleTime: 60_000 })
+  const idx = (data?.indices ?? []).find((i) => String(i.name ?? '').includes('上证'))
+  return typeof idx?.price === 'number' ? idx.price : null
+}
+
+/** 加仓/减仓风控黄色警告（C2/C1/E2；C3 单独处理） */
+function positionWarnings(opts: {
+  newShares: number
+  currentPrice: number | null
+  totalCapital: number
+  otherMv: number
+  shanghai: number | null
+}): string[] {
+  const { newShares, currentPrice, totalCapital, otherMv, shanghai } = opts
+  if (!totalCapital || totalCapital <= 0 || currentPrice == null) return []
+  const mv_new = newShares * currentPrice
+  const mv_total_new = otherMv + mv_new
+  const c2 = mv_new / totalCapital * 100
+  const c1 = mv_total_new / totalCapital * 100
+  const warns: string[] = []
+  if (c2 > C2_CAP_PCT) warns.push(`单票仓位将达 ${c2.toFixed(1)}%，超过 C2 上限 ${C2_CAP_PCT.toFixed(0)}%（C2）`)
+  if (c1 > C1_CAP_PCT) warns.push(`总仓位将达 ${c1.toFixed(1)}%，超过 C1 上限 ${C1_CAP_PCT.toFixed(0)}%（C1）`)
+  if (shanghai != null && shanghai < E2_INDEX_BAR && c1 > E2_SOFT_CAP) {
+    warns.push(`防御期（沪指 ${shanghai.toFixed(0)} < ${E2_INDEX_BAR.toFixed(0)}）仓位软上限 ${E2_SOFT_CAP.toFixed(0)}%，当前预计 ${c1.toFixed(1)}%`)
+  }
+  return warns
+}
+
+/** 操作提交前的 Modal.confirm 二次确认（人工 fail-closed，必含「仅记录，不触发实盘交易」） */
+function confirmOp(modal: ReturnType<typeof App.useApp>['modal'], opts: {
+  title: string
+  warns: string[]
+  fieldsText: string
+  onOk: () => void
+}): void {
+  const blocks = [
+    ...opts.warns.map((w) => `⚠️ ${w}`),
+    `**请核对以下录入信息：**\n${opts.fieldsText}`,
+    '⚠️ 仅记录，不触发实盘交易；确认后按知识库规则自动重算风控档位并留痕（K223 可追溯）。',
+  ]
+  modal.confirm({
+    title: opts.title,
+    width: 460,
+    okText: '确认记录',
+    cancelText: '取消',
+    onOk: opts.onOk,
+    content: <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{blocks.join('\n\n')}</pre>,
+  })
+}
+
+/** ============ 需求 B：4 种手动持仓操作（按钮组 + 各自 Modal） ============ */
+function HoldingOps({ h, currentPrice, totalCapital, otherMv, shanghai }: {
+  h: Holding
+  currentPrice: number | null
+  totalCapital: number
+  otherMv: number
+  shanghai: number | null
+}) {
+  const { message, modal } = App.useApp()
   const qc = useQueryClient()
-  const [opType, setOpType] = useState('add')
+  const [opening, setOpening] = useState<null | 'add' | 'reduce' | 'exit' | 'cost'>(null)
   const [form] = Form.useForm()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['holding-quotes'] })
 
   const runOp = useMutation({
     mutationFn: (values: Record<string, unknown>) => {
-      if (opType === 'add') return holdingAdd(h.id, values)
-      if (opType === 'exit') return exitHolding(h.id, values)
-      return holdingCost(h.id, values)
+      if (opening === 'add') return holdingAdd(h.id, values)
+      if (opening === 'reduce' || opening === 'exit') {
+        const close = opening === 'exit'
+        return exitHolding(h.id, {
+          price: values.price,
+          shares: close ? h.shares ?? 0 : values.shares,
+          trade_date: values.trade_date,
+          note: values.note ?? '',
+        })
+      }
+      return holdingCost(h.id, { cost_price: values.cost_price, reason: values.reason })
     },
     onSuccess: () => {
       message.success('操作已记录，风控档位已自动重算')
       form.resetFields()
+      setOpening(null)
       invalidate()
     },
     onError: (e: Error) => message.error(e.message),
   })
 
-  const mon = useMutation({
-    mutationFn: () => monitorHolding(h.id),
-    onSuccess: () => {
-      message.success('监控信号已生成')
-      invalidate()
-    },
-    onError: (e: Error) => message.error(e.message),
-  })
+  const openOp = (type: 'add' | 'reduce' | 'exit' | 'cost') => {
+    form.resetFields()
+    form.setFieldsValue({ trade_date: new Date().toISOString().slice(0, 10) })
+    setOpening(type)
+  }
+
+  const onFinish = (v: Record<string, unknown>) => {
+    if (opening === 'add') {
+      const cur = currentPrice ?? (typeof h.current_price === 'number' ? h.current_price : null)
+      const oldShares = h.shares ?? 0
+      const newShares = oldShares + Number(v.shares)
+      const newCost = newShares
+        ? (Number(h.entry_price || 0) * oldShares + Number(v.price) * Number(v.shares)) / newShares
+        : 0
+      const warns = [...positionWarnings({
+        newShares,
+        currentPrice: cur, totalCapital, otherMv, shanghai,
+      })]
+      // C3 止损红线：成交价低于成本×0.92 时警告
+      if (newCost > 0 && Number(v.price) < newCost * C3_LOSS_PCT) {
+        warns.push(`成交价 ${Number(v.price)} 低于 C3 止损位（成本 ${newCost.toFixed(2)} × 0.92 = ${(newCost * C3_LOSS_PCT).toFixed(2)}），跌破止损红线加仓（C3）`)
+      }
+      if ((v.shares as number) % 100 !== 0) { message.warning('加仓股数必须为 100 的整数倍'); return }
+      confirmOp(modal, {
+        title: `确认加仓（仅记录，不触发实盘交易）`,
+        warns,
+        fieldsText: `成交价 ${Number(v.price)} × ${Number(v.shares)} 股\n日期 ${String(v.trade_date ?? '')}\n备注 ${String(v.note ?? '') || '（无）'}`,
+        onOk: () => runOp.mutate({ price: v.price, shares: v.shares, trade_date: v.trade_date, note: v.note ?? '' }),
+      })
+    } else if (opening === 'reduce' || opening === 'exit') {
+      const close = opening === 'exit'
+      const cur = currentPrice ?? (typeof h.current_price === 'number' ? h.current_price : null)
+      const sellShares = close ? (h.shares ?? 0) : Number(v.shares)
+      const remainShares = (h.shares ?? 0) - sellShares
+      const newShares = remainShares
+      const warns = [...positionWarnings({
+        newShares,
+        currentPrice: cur, totalCapital, otherMv, shanghai,
+      })]
+      if (!close && (v.shares as number) % 100 !== 0) { message.warning('卖出股数必须为 100 的整数倍'); return }
+      if (sellShares > (h.shares ?? 0)) { message.warning('卖出股数超过持仓'); return }
+      if (close && sellShares !== (h.shares ?? 0)) { message.warning('清仓应卖出全部持仓股数'); return }
+      confirmOp(modal, {
+        title: close ? '确认清仓（仅记录，不触发实盘交易）' : '确认减仓（仅记录，不触发实盘交易）',
+        warns,
+        fieldsText: `成交价 ${Number(v.price)} × ${sellShares} 股\n卖出后剩余 ${remainShares} 股\n日期 ${String(v.trade_date ?? '')}\n备注 ${String(v.note ?? '') || '（无）'}`,
+        onOk: () => runOp.mutate({ price: v.price, shares: sellShares, trade_date: v.trade_date, note: v.note ?? '' }),
+      })
+    } else if (opening === 'cost') {
+      const warns: string[] = []
+      if (Number(v.cost_price) <= 0) { message.warning('请输入正数成本价'); return }
+      if (!String(v.reason ?? '').trim()) { message.warning('必须填写修正原因（留痕追溯）'); return }
+      confirmOp(modal, {
+        title: '确认修正成本（仅记录，不触发实盘交易）',
+        warns,
+        fieldsText: `修正后成本价 ${Number(v.cost_price)}\n修正原因 ${String(v.reason)}`,
+        onOk: () => runOp.mutate({ cost_price: v.cost_price, reason: v.reason }),
+      })
+    }
+  }
 
   return (
-    <Card size="small" style={{ background: 'var(--bg-input)' }}>
-      <Space wrap style={{ marginBottom: 10 }}>
-        <Button size="small" type="primary" loading={mon.isPending} onClick={() => mon.mutate()}>
-          立即执行监控
-        </Button>
+    <>
+      <Space wrap style={{ marginBottom: 8 }}>
         <Tag color="blue">持仓 {h.shares ?? 0} 股</Tag>
         <Tag color="cyan">成本 {h.entry_price ?? '—'}</Tag>
         <Tag color="geekblue">现价 {h.current_price ?? '—'}</Tag>
       </Space>
-      <Radio.Group
-        value={opType}
-        onChange={(e) => setOpType(e.target.value)}
-        optionType="button"
-        size="small"
-        options={[
-          { label: '记录加仓', value: 'add' },
-          { label: '记录减仓/清仓', value: 'exit' },
-          { label: '成本修正', value: 'cost' },
-        ]}
-      />
-      <Form
-        form={form}
-        layout="inline"
-        style={{ marginTop: 10, rowGap: 8 }}
-        onFinish={(v) => runOp.mutate(v)}
-        initialValues={{ trade_date: new Date().toISOString().slice(0, 10) }}
-      >
-        <Form.Item name="price" label="成交价格" rules={[{ required: true, message: '必填' }]}>
-          <InputNumber min={0} step={0.01} placeholder="如 12.50" style={{ width: 110 }} />
-        </Form.Item>
-        {opType !== 'cost' && (
-          <Form.Item name="shares" label={opType === 'add' ? '股数(100倍)' : '卖出股数'} rules={[{ required: true, message: '必填' }]}>
-            <InputNumber min={100} step={100} style={{ width: 110 }} />
+      <Space wrap style={{ marginBottom: 10 }}>
+        <Button size="small" type="primary" onClick={() => openOp('add')}>加仓</Button>
+        <Button size="small" onClick={() => openOp('reduce')}>减仓</Button>
+        <Button size="small" danger onClick={() => openOp('exit')}>清仓</Button>
+        <Button size="small" onClick={() => openOp('cost')}>修正成本</Button>
+      </Space>
+      <Alert type="warning" showIcon style={{ fontSize: 12 }}
+        message="以上操作仅记录人工成交结果，系统不自动下单；操作后 C3 止损 / 移动止盈 / +5% / +10% 减仓档位按知识库规则自动重算并留痕（K223 可追溯）。" />
+
+      <Modal title={{
+        add: '记录加仓', reduce: '记录减仓', exit: '记录清仓', cost: '修正成本',
+      }[opening ?? 'add']} open={!!opening} onCancel={() => setOpening(null)} footer={null} width={460}>
+        <Form form={form} layout="vertical" onFinish={onFinish}>
+          {opening === 'add' || opening === 'reduce' || opening === 'exit' ? (
+            <>
+              <Form.Item name="price" label="成交价格 *" rules={[{ required: true, message: '必填' }]}>
+                <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
+              </Form.Item>
+              {opening !== 'exit' ? (
+                <Form.Item name="shares" label={opening === 'add' ? '操作股数 *（100 整数倍）' : '减仓股数 *（100 整数倍，≤ 持仓）'}
+                  rules={[{ required: true, message: '必填' }]}>
+                  <InputNumber min={100} step={100} style={{ width: '100%' }} max={opening === 'reduce' ? (h.shares ?? 0) : undefined} />
+                </Form.Item>
+              ) : (
+                <Form.Item label="清仓股数"><InputNumber value={h.shares ?? 0} disabled style={{ width: '100%' }} /></Form.Item>
+              )}
+              {opening === 'exit' ? (
+                <Form.Item name="note" label="清仓原因"><Input placeholder="可选" /></Form.Item>
+              ) : (
+                <Form.Item name="note" label="操作备注"><Input placeholder="可选" /></Form.Item>
+              )}
+            </>
+          ) : (
+            <>
+              <Form.Item name="cost_price" label="修正后成本价 *" rules={[{ required: true, message: '必填' }]}>
+                <InputNumber min={0} step={0.01} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="reason" label="修正原因 *（必填留痕）" rules={[{ required: true, message: '必填' }]}>
+                <Input />
+              </Form.Item>
+            </>
+          )}
+          <Form.Item name="trade_date" label="日期" initialValue={new Date().toISOString().slice(0, 10)}>
+            <Input type="date" style={{ width: '100%' }} />
           </Form.Item>
-        )}
-        {opType === 'cost' && (
-          <Form.Item name="reason" label="修正原因" rules={[{ required: true, message: '必填留痕' }]}>
-            <Input placeholder="如 实盘核对修正" style={{ width: 150 }} />
-          </Form.Item>
-        )}
-        {opType !== 'cost' && (
-          <Form.Item name="note" label="备注">
-            <Input placeholder="可选" style={{ width: 120 }} />
-          </Form.Item>
-        )}
-        <Form.Item>
-          <Button type="primary" htmlType="submit" loading={runOp.isPending} size="small">
-            确认{opType === 'add' ? '加仓' : opType === 'exit' ? '减仓/清仓' : '修正'}
+          <Button type="primary" htmlType="submit" loading={runOp.isPending} block>
+            提交（仅记录，不触发实盘交易）
           </Button>
-        </Form.Item>
-      </Form>
-      {opType === 'exit' && (
-        <Alert type="warning" showIcon style={{ marginTop: 8, fontSize: 12 }}
-          message="卖出/清仓仅记录人工成交结果，系统不自动下单；清仓将移入历史持仓并触发复盘。" />
-      )}
-    </Card>
+        </Form>
+      </Modal>
+    </>
   )
 }
 
+/** 卖出前检查红黄状态（检查清单项目色） */
+function checkColor(it: string | { label?: string; ok?: boolean }): string {
+  if (typeof it !== 'object' || it == null || (it as { ok?: boolean }).ok === undefined) return 'var(--text)'
+  return (it as { ok: boolean }).ok ? 'var(--ok)' : 'var(--err)'
+}
+
+/** 卖出决策完整渲染（需求 C：render_sell_decision 结构） */
+function SellDecisionDetail({ d, shares }: { d: Record<string, unknown>; shares: number }) {
+  const action = ACTION_MAP[String(d.action ?? '')] ?? String(d.action ?? '—')
+  const conf = CONF_MAP[String(d.confidence ?? '')] ?? String(d.confidence ?? '—')
+  const reduceRatio = Number(d.reduce_ratio)
+  const dims = (d.dimensions as Array<Record<string, unknown>>) ?? []
+  const reasons = (d.reasons as string[]) ?? []
+  const checkList = (d.check_list as Array<string | { label?: string; ok?: boolean }>) ?? []
+  const isPartial = d.action === 'partial' && !Number.isNaN(reduceRatio) && reduceRatio > 0 && reduceRatio <= 1 && shares > 0
+  // 100 股向上取整，不超持仓
+  let sellShares = 0
+  let remainShares = 0
+  if (isPartial) {
+    sellShares = Math.ceil((shares * reduceRatio) / 100) * 100
+    if (sellShares < 100) sellShares = 100
+    if (sellShares > shares) sellShares = shares
+    remainShares = shares - sellShares
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <Text strong>卖出决策：{action}</Text>
+        <Tag style={{ marginLeft: 8 }} color="blue">置信度 {conf}</Tag>
+      </div>
+
+      {isPartial ? (
+        <Card size="small" style={{ marginBottom: 8, background: 'var(--bg-input)' }}>
+          <div><Text strong>建议减仓：{Math.round(reduceRatio * 100)}%</Text>
+            <Text type="secondary">（约 {sellShares.toLocaleString()} 股 / {Math.floor(sellShares / 100)} 手）</Text>
+          </div>
+          <div style={{ marginTop: 4 }}>
+            当前持仓 {shares.toLocaleString()} 股 → 建议卖出 {sellShares.toLocaleString()} 股 →
+            减仓后剩余 {remainShares.toLocaleString()} 股（{Math.floor(remainShares / 100)} 手）
+          </div>
+        </Card>
+      ) : null}
+
+      {dims.length ? (
+        <Card size="small" title="维度归因" style={{ marginBottom: 8, background: 'var(--bg-input)' }}>
+          {dims.map((dm) => {
+            const score = Number(dm.score ?? 0)
+            const verdict = String(dm.verdict ?? '')
+            const color = verdict === '支持' ? 'var(--up)' : verdict === '风险' ? 'var(--warn)' : 'var(--text-mute)'
+            return (
+              <div key={String(dm.dim)} style={{ marginBottom: 6 }}>
+                <Space>
+                  <Text style={{ width: 100, fontWeight: 600 }}>{String(dm.dim ?? '维度')}</Text>
+                  <div className="conf-bar" style={{ width: 180 }}>
+                    <div className="conf-bar-fill high" style={{ width: `${Math.max(0, Math.min(100, score))}%`, background: color }} />
+                  </div>
+                  <Text type="secondary">{score.toFixed(0)}</Text>
+                  {verdict ? <Tag>{verdict}</Tag> : null}
+                </Space>
+                {dm.advice ? <div style={{ marginLeft: 108 }}><Text type="secondary">{String(dm.advice)}</Text></div> : null}
+              </div>
+            )
+          })}
+          {d.final_advice ? (
+            <Alert type="info" showIcon style={{ marginTop: 6 }} message={String(d.final_advice)} />
+          ) : null}
+        </Card>
+      ) : d.final_advice ? (
+        <Alert type="info" showIcon style={{ marginBottom: 8 }} message={String(d.final_advice)} />
+      ) : null}
+
+      {reasons.length ? (
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>研判依据：</Text>
+          {reasons.map((r, i) => <div key={i} style={{ marginLeft: 12 }}>{i + 1}. {r}</div>)}
+        </div>
+      ) : null}
+
+      {d.exit_price_zone ? (
+        <div style={{ marginBottom: 8 }}><Text strong>卖出价位区间：</Text>{String(d.exit_price_zone)}</div>
+      ) : null}
+      {d.risk_warning ? (
+        <div style={{ marginBottom: 8 }}><Text strong>风险提示：</Text><Text type="danger">{String(d.risk_warning)}</Text></div>
+      ) : null}
+
+      {checkList.length ? (
+        <div>
+          <Text strong>卖出前检查清单：</Text>
+          {checkList.map((it, i) => {
+            const label = typeof it === 'string' ? it : String(it.label ?? '')
+            const ok = typeof it === 'object' && it != null ? (it as { ok?: boolean }).ok : undefined
+            return <div key={i} style={{ marginLeft: 12, color: checkColor(it) }}>{ok != null ? (ok ? '✅' : '⚠️') : '-'} {label}</div>
+          })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** ============ 卖出决策历史（折叠区，每条可展开完整渲染） ============ */
+function SellDecisionHistory({ hid, shares }: { hid: number; shares: number }) {
+  const { data: hist } = useQuery({
+    queryKey: ['sell-decisions', hid],
+    queryFn: () => sellDecisions(hid),
+  })
+  const items = ((hist ?? []) as Array<Record<string, unknown>>).slice(0, 10).map((s, i) => {
+    const d = (s.decision as Record<string, unknown>) ?? {}
+    const action = ACTION_MAP[String(d.action ?? '')] ?? String(d.action ?? '—')
+    const conf = CONF_MAP[String(d.confidence ?? '')] ?? String(d.confidence ?? '—')
+    return {
+      key: String(s.id ?? i),
+      label: (
+        <Space>
+          <Text strong>【{action}】</Text>
+          <Text type="secondary">置信 {conf}</Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>{String(s.created_at ?? '').slice(0, 16)}</Text>
+        </Space>
+      ),
+      children: <SellDecisionDetail d={d} shares={shares} />,
+    }
+  })
+  if (!items.length) return <Text type="secondary">（暂无卖出决策）</Text>
+  return <Collapse ghost size="small" items={items} />
+}
+
 /** ============ 详情抽屉：操作 + 流水 + 止盈计划 + 卖出决策历史 ============ */
-function HoldingDrawer({ h, open, onClose }: { h: Holding | null; open: boolean; onClose: () => void }) {
+function HoldingDrawer({ h, open, onClose, totalCapital, otherMv, shanghai }: {
+  h: Holding | null
+  open: boolean
+  onClose: () => void
+  totalCapital: number
+  otherMv: number
+  shanghai: number | null
+}) {
   const { data: trades } = useQuery({
     queryKey: ['holding-trades', h?.id],
     queryFn: () => holdingTrades(h!.id),
     enabled: !!h,
   })
   const { data: tpPlans } = useQuery({ queryKey: ['take-profit-plan'], queryFn: () => takeProfitPlan() })
-  const { data: sellHist } = useQuery({
-    queryKey: ['sell-decisions', h?.id],
-    queryFn: () => sellDecisions(h!.id),
-    enabled: !!h,
-  })
   const tp = (tpPlans?.rows ?? []).find((p) => p.holding_id === h?.id)
-
   if (!h) return null
   return (
-    <Drawer title={<StockLabel code={h.stock_code} name={h.stock_name} />} open={open} onClose={onClose} width={560}>
-      <HoldingOpsForm h={h} />
+    <Drawer title={<StockLabel code={h.stock_code} name={h.stock_name} />} open={open} onClose={onClose} width={600}>
+      <HoldingOps h={h} currentPrice={h.current_price ?? null} totalCapital={totalCapital}
+        otherMv={otherMv} shanghai={shanghai} />
       {tp ? (
         <Card size="small" title="止盈与仓位计划" style={{ marginTop: 12, background: 'var(--bg-input)' }}>
           <Descriptions size="small" column={2} items={[
@@ -170,7 +484,7 @@ function HoldingDrawer({ h, open, onClose }: { h: Holding | null; open: boolean;
         {trades?.length ? (
           trades.slice(0, 20).map((t: Record<string, unknown>) => (
             <div key={String(t.id)} style={{ fontSize: 13, marginBottom: 4 }}>
-              <Tag color={t.side === 'buy' ? 'green' : 'red'}>{String(t.side)}</Tag>
+              <Tag color={t.side === 'buy' ? 'green' : t.side === 'sell' ? 'red' : 'blue'}>{String(t.side)}</Tag>
               {String(t.shares)} 股 @ {String(t.price)} · {String(t.trade_date ?? '')}
               {t.note ? <Text type="secondary">（{String(t.note)}）</Text> : null}
             </div>
@@ -179,27 +493,14 @@ function HoldingDrawer({ h, open, onClose }: { h: Holding | null; open: boolean;
           <Text type="secondary">（暂无操作流水）</Text>
         )}
       </Card>
-      <Card size="small" title={`卖出决策历史（${sellHist?.length ?? 0}，仅供参考）`} style={{ marginTop: 12, background: 'var(--bg-input)' }}>
-        {sellHist?.length ? (
-          sellHist.slice(0, 10).map((s: Record<string, unknown>) => {
-            const d = (s.decision as Record<string, unknown>) ?? {}
-            return (
-              <div key={String(s.id)} style={{ fontSize: 13, marginBottom: 6 }}>
-                <Text>【{String(d.action ?? '—')}】置信 {String(d.confidence ?? '—')}</Text>
-                <div><Text type="secondary">{String(d.exit_price_zone ?? d.risk_warning ?? '')}</Text></div>
-                {d.final_advice ? <div><Text type="secondary">{String(d.final_advice)}</Text></div> : null}
-              </div>
-            )
-          })
-        ) : (
-          <Text type="secondary">（暂无卖出决策）</Text>
-        )}
+      <Card size="small" title="卖出决策历史（仅供参考，卖出由人工执行）" style={{ marginTop: 12, background: 'var(--bg-input)' }}>
+        <SellDecisionHistory hid={h.id} shares={h.shares ?? 0} />
       </Card>
     </Drawer>
   )
 }
 
-/** ============ 卖出决策两步确认 ============ */
+/** ============ 卖出决策两步确认（需求 C 入口） ============ */
 function SellDecisionBtn({ hid, size = 'small' as const }: { hid: number; size?: 'small' | 'middle' }) {
   const { message, modal } = App.useApp()
   const qc = useQueryClient()
@@ -223,7 +524,7 @@ function SellDecisionBtn({ hid, size = 'small' as const }: { hid: number; size?:
   )
 }
 
-/** ============ 当前持仓表 ============ */
+/** ============ 当前持仓表（需求 A：去重合并） ============ */
 function HoldingsTable() {
   const [drawerH, setDrawerH] = useState<Holding | null>(null)
   const { data, isError, error, refetch } = useQuery({
@@ -231,42 +532,57 @@ function HoldingsTable() {
     queryFn: holdingQuotes,
     refetchInterval: 60_000,
   })
+  const shanghai = useShanghaiIndex()
   const rows = data?.rows ?? []
   if (isError) return <ErrorCard title="持仓数据加载失败" message={error?.message} onRetry={() => refetch()} />
   if (!rows.length) return <EmptyState text="暂无持仓。可通过「录入人工建仓」创建。" icon="📭" />
 
-  const cols = [
+  const merged = dedupeAndMerge(rows)
+  const totalCapital = data?.total_capital ?? 0
+  const totalAllMv = merged.reduce((s, m) => s + (m.current.market_value ?? 0), 0)
+
+  const cols: Record<string, unknown>[] = [
     {
       title: '股票', key: 'stock', width: 150,
-      render: (_: unknown, r: Holding) => <StockLabel code={r.stock_code} name={r.stock_name} />,
+      render: (_: unknown, m: MergedRow) => <StockLabel code={m.code} name={m.current.stock_name} />,
     },
-    { title: '建仓日', dataIndex: 'entry_date', width: 96 },
+    {
+      title: '建仓日', key: 'entry', width: 96,
+      render: (_: unknown, m: MergedRow) => String(m.current.entry_date ?? '—'),
+    },
+    {
+      title: '总股数', key: 'shares', width: 88,
+      render: (_: unknown, m: MergedRow) => <Text strong>{(m.total_shares ?? 0).toLocaleString()}</Text>,
+    },
+    {
+      title: '加权成本', key: 'cost', width: 90,
+      render: (_: unknown, m: MergedRow) => m.weighted_price != null ? m.weighted_price.toFixed(2) : '—',
+    },
     {
       title: '现价', key: 'price', width: 88,
-      render: (_: unknown, r: Holding) => (
-        <Text style={{ color: pnlColor(r.current_price) }}>{r.current_price ?? '—'}</Text>
+      render: (_: unknown, m: MergedRow) => (
+        <Text style={{ color: pnlColor(m.current.current_price) }}>{m.current.current_price ?? '—'}</Text>
       ),
     },
     {
       title: '盈亏', key: 'pnl', width: 150,
-      render: (_: unknown, r: Holding) => {
-        const p = r.current_price
-        const w = r.entry_price
-        if (p == null || !w) return '—'
-        const amt = (Number(p) - Number(w)) * (r.shares ?? 0)
-        const pctv = (Number(p) - Number(w)) / Number(w) * 100
+      render: (_: unknown, m: MergedRow) => {
+        const p = m.current.current_price
+        if (p == null || m.weighted_price == null) return '—'
+        const amt = (Number(p) - m.weighted_price) * (m.total_shares ?? 0)
+        const pctv = m.weighted_price > 0 ? (Number(p) - m.weighted_price) / m.weighted_price * 100 : 0
         return <Text style={{ color: pnlColor(amt) }}>{moneySigned(amt)}（{pctv >= 0 ? '+' : ''}{pctv.toFixed(2)}%）</Text>
       },
     },
-    { title: '止损', dataIndex: 'stop_loss', width: 80, render: (v: unknown) => v ?? '—' },
-    { title: '止盈', dataIndex: 'take_profit', width: 80, render: (v: unknown) => v ?? '—' },
-    { title: '目标仓位', key: 'target', width: 88, render: (_: unknown, r: Holding) => (r.target_pct ? `${r.target_pct}%` : '—') },
+    { title: '止损', key: 'sl', width: 76, render: (_: unknown, m: MergedRow) => m.current.stop_loss ?? '—' },
+    { title: '止盈', key: 'tp', width: 76, render: (_: unknown, m: MergedRow) => m.current.take_profit ?? '—' },
+    { title: '目标仓位', key: 'target', width: 88, render: (_: unknown, m: MergedRow) => (m.current.target_pct ? `${m.current.target_pct}%` : '—') },
     {
       title: '操作', key: 'ops', width: 190,
-      render: (_: unknown, r: Holding) => (
+      render: (_: unknown, m: MergedRow) => (
         <Space size={4}>
-          <Button size="small" type="primary" onClick={() => setDrawerH(r)}>详情/操作</Button>
-          <SellDecisionBtn hid={r.id} />
+          <Button size="small" type="primary" onClick={() => setDrawerH(m.current)}>详情/操作</Button>
+          <SellDecisionBtn hid={m.current.id} />
         </Space>
       ),
     },
@@ -274,13 +590,31 @@ function HoldingsTable() {
 
   return (
     <>
-      <Space style={{ marginBottom: 8 }}>
+      <Space style={{ marginBottom: 8 }} wrap>
         <Text type="secondary">行情最后更新：{data?.quote_time ?? '—'}（约 60s 缓存）</Text>
         <Button size="small" onClick={() => refetch()}>刷新行情</Button>
       </Space>
-      <Table<Holding> rowKey="id" size="small" columns={cols} dataSource={rows}
-        pagination={false} />
-      <HoldingDrawer h={drawerH} open={!!drawerH} onClose={() => setDrawerH(null)} />
+      <Table<MergedRow> rowKey={(m) => m.code} size="small" columns={cols} dataSource={merged}
+        pagination={false}
+        expandable={{
+          expandedRowRender: (m) => (
+            <Card size="small" title={`历史笔次（${m.records.length}，可审计）`} style={{ background: 'var(--bg-input)' }}>
+              {m.records.map((it) => (
+                <div key={it.id} style={{ fontSize: 13, marginBottom: 4 }}>
+                  <Tag color={it._dedupe_status === '当前有效' ? 'green' : it._dedupe_status === '重复录入（已自动忽略）' ? 'orange' : 'default'}>
+                    {String(it._dedupe_status ?? '')}
+                  </Tag>
+                  {String(it.entry_date ?? '')} · {it.entry_price ?? '—'} 元 · {Number(it.shares ?? 0).toLocaleString()} 股
+                  {it.created_at ? <Text type="secondary">（录入 {String(it.created_at).slice(0, 16)}）</Text> : null}
+                </div>
+              ))}
+            </Card>
+          ),
+        }} />
+      <HoldingDrawer h={drawerH} open={!!drawerH} onClose={() => setDrawerH(null)}
+        totalCapital={totalCapital}
+        otherMv={totalAllMv - (drawerH?.market_value ?? 0)}
+        shanghai={shanghai} />
     </>
   )
 }

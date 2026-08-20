@@ -6,27 +6,43 @@
   匹配失败时降级拉该板块成分股，按涨跌幅取最大者（缓存复用，不重复请求）；
 - 数据源失败返回空表 + error 标注，由前端显示「数据加载中/上次缓存值」。
 """
+import concurrent.futures
 import logging
 import time
 
 import pandas as pd
 
 from app.datasource.akshare_source import get_datasource
+from app.datasource.base import DataSourceError
 
 logger = logging.getLogger(__name__)
 
-# 顶部状态栏三大指数（代码 → 展示名）
-INDEX_NAMES = {"sh000001": "上证指数", "sz399001": "深证成指", "sz399006": "创业板指"}
-INDEX_CODES = ["sh000001", "sz399001", "sz399006"]
+# 顶部状态栏指数（代码 → 展示名；含沪深300 作组合回撤分解的市场基准）
+INDEX_NAMES = {"sh000001": "上证指数", "sz399001": "深证成指",
+               "sz399006": "创业板指", "sh000300": "沪深300"}
+INDEX_CODES = ["sh000001", "sz399001", "sz399006", "sh000300"]
 
 HOT_SECTOR_COUNT = 5  # 首页「今日热门板块」看板数量
+
+# 指数行情超时控制：akshare 冷启动约 36s，10s 硬超时走降级不阻塞首屏
+_INDEX_FETCH_TIMEOUT = 10.0  # 秒
+# 模块级线程池单例（禁 with 块：shutdown(wait=True) 会抵消超时效果；后台线程自然结束，结果可写入 60s 缓存供下次命中）
+_INDEX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="idx-fetch")
 
 
 def index_quotes() -> dict:
     """三大指数实时行情 + 更新时间；失败返回空列表 + error 标注（前端降级展示）"""
     now_min = time.strftime("%Y-%m-%d %H:%M")
     try:
-        df = get_datasource().fetch_index_spot()
+        ds = get_datasource()
+        fut = _INDEX_POOL.submit(ds.fetch_index_spot)
+        try:
+            df = fut.result(timeout=_INDEX_FETCH_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            # 超时：后台线程继续跑完，结果可能写入 60s 缓存供下次命中；
+            # 显式抛 DataSourceError 让上层降级 + 断路器正常计数（不裸抛 TimeoutError 避免 500）
+            logger.warning("指数行情获取超时（>%.0fs），走降级", _INDEX_FETCH_TIMEOUT)
+            raise DataSourceError(f"指数行情获取超时（>{_INDEX_FETCH_TIMEOUT:.0f}s）")
     except Exception as exc:  # noqa: BLE001 行情失败不阻塞页面，返回空表由前端标注
         logger.warning("指数行情获取失败: %s", exc)
         return {"indices": [], "updated_at": now_min, "error": f"指数行情获取失败（{type(exc).__name__}）"}
@@ -51,36 +67,20 @@ def index_quotes() -> dict:
 
 
 def hot_sectors() -> dict:
-    """今日涨幅前 5 行业板块（客观排序，非主观筛选）+ 领涨龙头（代码+名称）+ 更新时间"""
-    now_min = time.strftime("%Y-%m-%d %H:%M")
-    try:
-        board_df = get_datasource().fetch_industry_spot()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("行业板块行情获取失败: %s", exc)
-        return {"sectors": [], "updated_at": now_min, "error": f"行业板块行情获取失败（{type(exc).__name__}）"}
+    """今日涨幅前 5 行业板块 + 领涨龙头（前端只读聚合）
 
-    if board_df is None or board_df.empty or "board_name" not in board_df.columns:
-        return {"sectors": [], "updated_at": now_min, "error": None}
-
-    boards = []
-    for _, r in board_df.iterrows():
-        try:
-            change_pct = float(r.get("change_pct"))
-        except (TypeError, ValueError):
-            continue
-        boards.append({"board_name": str(r["board_name"]).strip(),
-                       "change_pct": round(change_pct, 2),
-                       "leading_stock": str(r.get("leading_stock") or "").strip()})
-    boards.sort(key=lambda b: b["change_pct"], reverse=True)
-
-    name_to_code = _spot_name_map()
-    sectors = []
-    for b in boards[:HOT_SECTOR_COUNT]:
-        leading_code = name_to_code.get(b["leading_stock"])
-        if not leading_code and b["leading_stock"]:
-            leading_code = _leading_from_cons(b["board_name"])
-        sectors.append({**b, "leading_code": leading_code or ""})
-    return {"sectors": sectors, "updated_at": now_min, "error": None}
+    v2 改造：不再每次裸打 akshare，改为读 sector_snapshot DB（由 sector_refresh_job 每 5 分钟落库）；
+    DB 空 + 交易时段触发一次 refresh 兜底；DB 空 + 非交易时段返回空。
+    """
+    from app.services.sector_snapshot import get_hot_sectors_with_fallback
+    result = get_hot_sectors_with_fallback()
+    # 字段对齐：原 API 响应 {sectors, updated_at, error}；stale 为 v2 新增字段（向后兼容）
+    return {
+        "sectors": result.get("sectors", []),
+        "updated_at": result.get("updated_at", ""),
+        "stale": result.get("stale", False),
+        "error": result.get("error"),
+    }
 
 
 def _spot_name_map() -> dict[str, str]:

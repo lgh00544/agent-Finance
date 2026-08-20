@@ -19,8 +19,12 @@ from app.db.models import Holding
 from app.graph.state import StockAgentState
 from app.services.feishu import push_alert
 from app.services.indicator import compute_indicators
+from app.agents.portfolio_sentinel import read_portfolio_overview
 
 logger = logging.getLogger(__name__)
+
+# LLM 研判不可用时的纯规则兜底阈值（floating loss %）：最硬的一条确定性保命信号
+_RULE_FALLBACK_LOSS_PCT = -5.0
 
 
 def collect_quote(state: StockAgentState) -> StockAgentState:
@@ -153,6 +157,8 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
     real_time = state.get("real_time") or {}
     stale = bool(state.get("quote_stale"))
     math = _trade_math(real_time.get("price"), holding)
+    # 组合联动（batch F）：读组合哨兵告警概览（多键隔离快照），供个股判断参考；无快照为空 dict 不阻断
+    po = read_portfolio_overview(today)
     real_time_block = {
         **real_time, **math,
         "数据状态": "实时（TTL 30s 内缓存）" if not stale else "数据暂未更新（实时源不可用，以下为最近一次有效数据）",
@@ -163,28 +169,53 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         "近期K线": indicators.get("recent_klines", [])[-15:],
         # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
         "游资聚合": state.get("hot_money"),
+        # 组合联动（batch F）：组合告警三态色 / 集中度警示 / 板块暴露占比（缺失不注入，避免噪音）
+        **({k: po[k] for k in ("portfolio_alert_level", "concentration_warning", "sector_exposure_pct")
+           if k in po and po[k] is not None and po[k] != ""}),
     }
     news_context = "\n".join(
         f"{n.get('published_at')} {n.get('title')}" for n in (state.get("news_report") or [])) or "（无）"
 
     # 盘中监控 LLM 调用节流（短 TTL 缓存，与监控频率同节奏）
     cache_key = f"{code}:{today}:{time.strftime('%H')}"
-    output = agent_call(
-        agent="monitor",
-        cache_key=cache_key,
-        system_prompt=monitor_prompt.SYSTEM_PROMPT,
-        user_prompt=monitor_prompt.build_user_prompt(
-            holding_info, _compact(quote_data), news_context),
-        schema=MonitorOutput,
-        ttl_seconds=max(60, settings.monitor_llm_cache_minutes * 60),
-        model_level=ModelLevel.LIGHT,
-    )
+    try:
+        output = agent_call(
+            agent="monitor",
+            cache_key=cache_key,
+            system_prompt=monitor_prompt.SYSTEM_PROMPT,
+            user_prompt=monitor_prompt.build_user_prompt(
+                holding_info, _compact(quote_data), news_context),
+            schema=MonitorOutput,
+            ttl_seconds=max(60, settings.monitor_llm_cache_minutes * 60),
+            model_level=ModelLevel.LIGHT,
+        )
+    except Exception as exc:  # noqa: BLE001 LLM 不可用 → 规则兜底保命（仅异常分支）
+        logger.error("监控 LLM 研判不可用（%s），进入规则兜底分支: %s", exc, code)
+        _rule_fallback_alert(code, name, today, math)
+        raise
 
     state["holding_signal"] = output.model_dump()
     state["stage"] = "holding_monitor"
     state["trace"] = [*state.get("trace", []),
                       f"信号: {output.action}({output.severity}) {output.alert_type}"]
     return state
+
+
+def _rule_fallback_alert(code: str, name: str, today: str, math: dict) -> None:
+    """LLM 研判不可用 + 浮亏超硬性止损红线时，推送最硬的一条确定性兜底告警并落库（当日去重）。
+    只覆盖「浮亏 ≤ -5%」这一条确定性信号，不做任何复杂判定；复杂研判仍归 LLM。"""
+    pnl = math.get("pnl_pct")
+    if pnl is None or pnl > _RULE_FALLBACK_LOSS_PCT:
+        return
+    msg = (f"⚠️ LLM 研判不可用，此为规则兜底预警：{name}({code}) 浮亏 "
+           f"{pnl}%（≤{_RULE_FALLBACK_LOSS_PCT}%），触及硬性止损红线。")
+    dedup_key = f"{code}:rule_fallback:{today}"
+    pushed = False
+    if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
+        pushed = push_alert(name, code, "rule_fallback", "critical", msg, "exit")
+    repo.insert_alert(code, name, "rule_fallback", "critical", msg, "exit",
+                      {"rule_fallback": True, "pnl_pct": pnl}, pushed=pushed)
+    logger.error("监控规则兜底告警落库: %s（浮亏 %s%%，pushed=%s）", code, pnl, pushed)
 
 
 def push_alert_node(state: StockAgentState) -> StockAgentState:

@@ -3,6 +3,8 @@
 【测试策略】写入为异步批量（工作线程），所有断言前先 reasoning_trace.flush() 同步排空；
 flush 幂等，测试间互不影响。rule_refs 仅 discover 先行（其余模块为空串）。
 """
+import json
+
 import pytest
 from sqlalchemy import func, select
 
@@ -88,6 +90,35 @@ def test_score_mapping_dimension_split():
     assert "减持风险" in t.risk_reasoning
     assert '"score": 78.0' in t.final_conclusion
     assert "综合评估：3/5 维支持" in t.final_conclusion
+
+
+def test_score_mapping_v4_factors():
+    """v4.0 六因子格式留痕：factors 列表 → 技术/资金/基本面归因 + potential_flag/cross_validation"""
+    detail = {
+        "factors": [
+            {"factor": "动量", "score": 7, "reason": "MA20多头排列", "signal": "看多"},
+            {"factor": "催化", "score": 8, "reason": "政策利好", "signal": "看多"},
+            {"factor": "估值", "score": 5, "reason": "PE偏高", "signal": "中性"},
+            {"factor": "主线契合", "score": 6, "reason": "板块跑赢大盘", "signal": "中性"},
+            {"factor": "资金面", "score": 7, "reason": "主力净流入", "signal": "看多"},
+            {"factor": "基本面质量", "score": 8, "reason": "ROE 25%", "signal": "看多"},
+        ],
+        "potential_flag": True,
+        "cross_validation_note": "与Discover选股逻辑一致",
+        "final_advice": "综合评估：4/6 因子看多，总分 78 分（B 级）",
+    }
+    reasoning_trace.trace_score("600109", "测试股109", "2026-08-05",
+                                78.0, "B", detail, ["PE偏高"])
+    reasoning_trace.flush()
+    t = _trace("600109", "score")
+    assert t is not None
+    assert "MA20多头排列" in t.technical_reasoning
+    assert "政策利好" in t.technical_reasoning
+    assert "主力净流入" in t.capital_reasoning
+    assert "ROE 25%" in t.fundamental_reasoning
+    concl = json.loads(t.final_conclusion)
+    assert concl["potential_flag"] is True
+    assert concl["cross_validation"] == "与Discover选股逻辑一致"
 
 
 def test_plan_alert_review_sell_mapping():

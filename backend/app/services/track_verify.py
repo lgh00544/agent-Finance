@@ -38,6 +38,18 @@ _PERF_SUMMARY_TTL = 1800     # 选股表现摘要缓存（30 分钟，与组合�
 _PERF_SUMMARY_SAMPLE = 20    # 选股表现回顾样本数（近 20 只有到期数据的候选）
 _PERIOD_LABELS = {"t3": "T+3", "t5": "T+5", "t10": "T+10"}
 
+# ==================== 因子回测校准闭环（评级重做-C） ====================
+_FACTOR_NAMES = ("动量", "催化", "估值", "主线契合", "资金面", "基本面质量")
+_FACTOR_HIGH = 7        # 高分阈值（≥7 为高分组）
+_FACTOR_LOW = 3         # 低分阈值（≤3 为低分组）
+_FACTOR_MIN_GROUP = 3   # 每组最少样本（沿用 _MIN_SAMPLE，防小样本误判）
+_CALIBRATION_THRESHOLD = 5.0   # avg_pct 差值超过此值才生成校准建议
+_CALIBRATION_TTL = 3600        # 因子校准摘要缓存（1 小时）
+_FACTOR_DEFAULT_WEIGHTS = {
+    "动量": "20%", "催化": "20%", "估值": "15%",
+    "主线契合": "15%", "资金面": "15%", "基本面质量": "15%",
+}
+
 
 # ==================== T+N 计算（纯函数，可单测） ====================
 
@@ -143,7 +155,8 @@ def compute_stats(rows: list[dict], period: str = "t5") -> dict:
 def detect_anomalies(stats: dict) -> list[dict]:
     """确定性异常检测（供建议生成注入；全部要求样本≥3 防小样本误判）：
     - consecutive_decline: 按日期时间序胜率连续 3 期下降（每期样本≥3）
-    - rating_inversion:    A/C 两档样本均≥3 且 C 档 avg_pct > A 档 avg_pct（评级倒挂）
+    - rating_inversion:    评级 A/B/C 两两对比，高评级档 avg_pct < 低评级档 avg_pct
+                           （评级越高反而涨得越差 → 倒挂）。pair 语义统一为"高<低"（如 "A<C"=A 档低于 C 档）
     - win_rate_low:        总体胜率 < 40% 且 n≥3
     返回 [{type, desc, data}]（data 为事实数值，模板建议引用）"""
     anomalies: list[dict] = []
@@ -160,14 +173,18 @@ def detect_anomalies(stats: dict) -> list[dict]:
                               "data": {d: by_date[d]["win_rate"] for d in usable[-3:]}})
 
     by_rating = stats.get("by_rating", {})
-    a, c = by_rating.get("A"), by_rating.get("C")
-    if (a and c and a["n"] >= _MIN_SAMPLE and c["n"] >= _MIN_SAMPLE
-            and a["avg_pct"] is not None and c["avg_pct"] is not None
-            and c["avg_pct"] > a["avg_pct"]):
-        anomalies.append({"type": "rating_inversion",
-                          "desc": "C 档平均涨幅高于 A 档（评级正相关性倒挂）",
-                          "data": {"A": {"n": a["n"], "avg_pct": a["avg_pct"]},
-                                   "C": {"n": c["n"], "avg_pct": c["avg_pct"]}}})
+    # 全档位两两对比（只保留"高评级在前、低评级在后"），倒挂判定统一为 high_avg < low_avg
+    for high, low in (("A", "B"), ("A", "C"), ("B", "C")):
+        hi, lo = by_rating.get(high), by_rating.get(low)
+        if not (hi and lo and hi["n"] >= _MIN_SAMPLE and lo["n"] >= _MIN_SAMPLE
+                and hi["avg_pct"] is not None and lo["avg_pct"] is not None):
+            continue
+        if lo["avg_pct"] > hi["avg_pct"]:
+            anomalies.append({"type": "rating_inversion",
+                              "desc": f"{low} 档平均涨幅高于 {high} 档（评级正相关性倒挂）",
+                              "data": {"pair": f"{high}<{low}",
+                                       high: {"n": hi["n"], "avg_pct": hi["avg_pct"]},
+                                       low: {"n": lo["n"], "avg_pct": lo["avg_pct"]}}})
 
     if stats["n"] >= _MIN_SAMPLE and stats["win_rate"] is not None \
             and stats["win_rate"] < _WIN_LOW:
@@ -247,6 +264,226 @@ def _format_perf_summary(stats: dict, anomalies: list[dict], period_label: str =
     return "\n".join(lines)
 
 
+# ==================== 因子回测校准闭环（评级重做-C） ====================
+
+def _group_stats_simple(pcts: list[float]) -> dict:
+    """简化的组统计（只算 n/wins/win_rate/avg_pct）"""
+    n = len(pcts)
+    if n == 0:
+        return {"n": 0, "wins": 0, "win_rate": None, "avg_pct": None}
+    wins = sum(1 for p in pcts if p > 0)
+    return {
+        "n": n,
+        "wins": wins,
+        "win_rate": round(wins / n * 100, 1),
+        "avg_pct": round(sum(pcts) / n, 2),
+    }
+
+
+def compute_factor_correlation(rows: list[dict], period: str = "t5") -> dict:
+    """因子相关性分析（纯函数，可单测）。
+
+    输入：track_verify 行列表（需含 factor_scores 和 {period}_pct）
+    输出：{
+        "period": "t5",
+        "n_total": 40,           # 总行数
+        "n_with_factors": 25,    # 有因子分的行数
+        "factors": {
+            "动量": {
+                "high": {"n": 8, "win_rate": 62.5, "avg_pct": 2.1},
+                "low":  {"n": 5, "win_rate": 40.0, "avg_pct": -1.2},
+                "status": "effective",   # effective/ineffective/neutral/insufficient_sample
+                "win_rate_diff": 22.5,
+                "avg_pct_diff": 3.3
+            },
+            ...
+        },
+        "calibration_notes": [...]
+    }
+
+    口径：
+    - 高分组 = 该因子分值 ≥ 7 的候选；低分组 = 该因子分值 ≤ 3 的候选
+    - 每组样本 < 3 → status="insufficient_sample"，不参与比较
+    - win_rate_diff = high.win_rate - low.win_rate（>10pp = effective, <-10pp = ineffective）
+    - avg_pct_diff = high.avg_pct - low.avg_pct
+    """
+    col = f"{period}_pct"
+    # 只取有因子分且有 T+N 数据的行
+    usable = []
+    for r in rows:
+        fs = r.get("factor_scores")
+        pct = r.get(col)
+        if not isinstance(fs, list) or not fs or pct is None:
+            continue
+        # 转为 {因子名: 分值} 字典
+        factor_map = {}
+        for f in fs:
+            if isinstance(f, dict) and f.get("factor"):
+                try:
+                    factor_map[f["factor"]] = int(f.get("score", 0))
+                except (TypeError, ValueError):
+                    pass
+        if factor_map:
+            usable.append({"pct": float(pct), "factors": factor_map})
+
+    result = {
+        "period": period,
+        "n_total": len(rows),
+        "n_with_factors": len(usable),
+        "factors": {},
+        "calibration_notes": [],
+    }
+
+    for fname in _FACTOR_NAMES:
+        high_group = [u for u in usable if u["factors"].get(fname, -1) >= _FACTOR_HIGH]
+        low_group = [u for u in usable
+                     if 0 <= u["factors"].get(fname, -1) <= _FACTOR_LOW]
+
+        high_stats = _group_stats_simple([u["pct"] for u in high_group])
+        low_stats = _group_stats_simple([u["pct"] for u in low_group])
+
+        entry = {
+            "high": high_stats,
+            "low": low_stats,
+            "status": "insufficient_sample",
+            "win_rate_diff": None,
+            "avg_pct_diff": None,
+        }
+
+        if high_stats["n"] >= _FACTOR_MIN_GROUP and low_stats["n"] >= _FACTOR_MIN_GROUP:
+            wr_diff = (high_stats["win_rate"] or 0) - (low_stats["win_rate"] or 0)
+            ap_diff = (high_stats["avg_pct"] or 0) - (low_stats["avg_pct"] or 0)
+            entry["win_rate_diff"] = round(wr_diff, 1)
+            entry["avg_pct_diff"] = round(ap_diff, 2)
+            if wr_diff > 10:
+                entry["status"] = "effective"
+            elif wr_diff < -10:
+                entry["status"] = "ineffective"
+            else:
+                entry["status"] = "neutral"
+
+        result["factors"][fname] = entry
+
+        # 生成校准备注（仅对差 avg_pct_diff 超阈值且状态明确的有效/失效因子）
+        if entry["status"] in ("ineffective", "effective") \
+                and abs(entry["avg_pct_diff"] or 0) >= _CALIBRATION_THRESHOLD:
+            verb = "低于" if entry["status"] == "ineffective" else "高于"
+            result["calibration_notes"].append(
+                f"{fname}因子高分组的{_PERIOD_LABELS.get(period, 'T+N')}"
+                f"胜率 {high_stats['win_rate']}% {verb}低分组 {low_stats['win_rate']}%"
+                f"（差 {entry['win_rate_diff']}pp），平均涨幅差 {entry['avg_pct_diff']}pp，"
+                + ("因子预测力失效，建议人工复核权重"
+                   if entry["status"] == "ineffective" else "因子预测力有效")
+            )
+
+    return result
+
+
+def _template_calibration_suggestions(correlation: dict) -> list[dict]:
+    """因子校准建议模板（确定性，全部 suggestion_source=template）。
+    仅对 status=ineffective 且 avg_pct_diff 超阈值的因子生成建议。"""
+    out = []
+    period = correlation.get("period", "t5")
+    period_label = _PERIOD_LABELS.get(period, "T+N")
+    factors = correlation.get("factors", {})
+
+    ineffective = []
+    for fname, data in factors.items():
+        if data.get("status") == "ineffective" and abs(data.get("avg_pct_diff") or 0) >= _CALIBRATION_THRESHOLD:
+            ineffective.append(fname)
+            high = data["high"]
+            low = data["low"]
+            out.append({
+                "target_agent": "score", "target_kind": "prompt", "rule_type": "soft",
+                "priority": "high",
+                "rule_name": f"因子权重校准建议（{fname} 预测力失效）",
+                "current_value": f"{fname}因子参考权重约 {_FACTOR_DEFAULT_WEIGHTS.get(fname, '15%')}，"
+                                 f"高分组合格率 {high['win_rate']}%，低分组 {low['win_rate']}%",
+                "suggested_value": (f"{fname}因子高分组的{period_label}胜率 {high['win_rate']}% "
+                                    f"低于低分组 {low['win_rate']}%（差 {data['win_rate_diff']}pp），"
+                                    f"建议人工复核降低该因子权重"),
+                "reason": (f"统计显示 {fname} 因子高分组（≥7分）表现反而差于低分组（≤3分），"
+                           f"该因子对后续涨幅的预测力失效，可能误导评分"),
+                "evidence": (f"高分组 n={high['n']} 胜率 {high['win_rate']}% 平均 {high['avg_pct']}%，"
+                             f"低分组 n={low['n']} 胜率 {low['win_rate']}% 平均 {low['avg_pct']}%"),
+                "rule_text": (f"当 {fname} 因子高分组胜率持续低于低分组（差值>10pp 且 avg_pct 差>"
+                              f"{_CALIBRATION_THRESHOLD}pp）时，应在评分提示词中降低该因子权重，"
+                              f"直至因子预测力恢复后人工复核恢复"),
+                "problem_desc": f"{fname}因子与后续表现相关性倒挂，可能误导评级与仓位分配",
+                "expected_effect": "恢复因子与表现的正常相关性，失效期降低该因子对评分的影响",
+                "risk_note": "小样本可能为噪声，需连续 2 个统计期确认后才调整权重",
+                "file_path": "agent_prompts/score_prompt.py",
+                "insert_position": "六因子定义与参考权重段",
+            })
+
+    # 多因子同时失效 → 整体复核建议
+    if len(ineffective) >= 3:
+        out.append({
+            "target_agent": "score", "target_kind": "prompt", "rule_type": "soft",
+            "priority": "high",
+            "rule_name": f"评分体系整体复核建议（{len(ineffective)}个因子同时失效）",
+            "current_value": f"六因子中 {', '.join(ineffective)} 预测力失效",
+            "suggested_value": "建议人工全面复核评分体系，考虑调整因子结构或引入新因子",
+            "reason": "多个因子同时失效说明当前评分体系可能不适应近期市场环境",
+            "evidence": f"失效因子：{', '.join(ineffective)}",
+            "rule_text": "当六因子中≥3个因子预测力同时失效时，应触发评分体系整体复核",
+            "problem_desc": "评分体系整体预测力下降，多因子同时与后续表现脱钩",
+            "expected_effect": "及时识别评分体系系统性失效，避免持续误导",
+            "risk_note": "整体复核须人工执行，禁止系统自动改变因子结构",
+            "file_path": "agent_prompts/score_prompt.py",
+            "insert_position": "六因子定义段",
+        })
+
+    return out
+
+
+def get_factor_calibration(period: str = "t5") -> str:
+    """因子校准相关性摘要（紧凑文本，供 ScoreAgent build_user_prompt 注入）。
+    只读本模块统计，不改任何逻辑。无数据/读取失败 → 返回空字符串。"""
+    key = f"factor:calibration:{period}"
+    try:
+        cached = cache.get(key)
+        if cached:
+            return cached
+        rows = repo.list_track_verify(limit=500)
+    except Exception as exc:  # noqa: BLE001 读失败不阻塞注入
+        logger.warning("因子校准摘要读取失败（跳过注入）: %s", exc)
+        return ""
+
+    correlation = compute_factor_correlation(rows, period=period)
+    text = _format_calibration_text(correlation)
+    if text:
+        try:
+            cache.set(key, text, _CALIBRATION_TTL)
+        except Exception as exc:  # noqa: BLE001 缓存失败不影响注入
+            logger.warning("因子校准摘要缓存写入失败: %s", exc)
+    return text
+
+
+def _format_calibration_text(correlation: dict) -> str:
+    """因子相关性 → 紧凑文本（客观事实，不给结论性建议）。"""
+    n = correlation.get("n_with_factors", 0)
+    if n < _FACTOR_MIN_GROUP:
+        return ""
+    period_label = _PERIOD_LABELS.get(correlation.get("period", ""), "T+N")
+    lines = [f"因子校准相关性（{n} 个有因子分的样本，{period_label}周期）："]
+    for fname in _FACTOR_NAMES:
+        f = correlation.get("factors", {}).get(fname)
+        if not f or f.get("status") == "insufficient_sample":
+            continue
+        high, low = f["high"], f["low"]
+        status_map = {"effective": "有效", "ineffective": "失效", "neutral": "无显著差异"}
+        lines.append(
+            f"- {fname}：高分组({high['n']}只)胜率{high['win_rate']}%/均涨{high['avg_pct']}% "
+            f"vs 低分组({low['n']}只)胜率{low['win_rate']}%/均涨{low['avg_pct']}% → {status_map.get(f['status'], '未知')}"
+        )
+    if len(lines) <= 1:
+        return ""
+    lines.append("以上为因子预测力的历史统计事实，供你评分时参考。表现差的因子可适当降低权重，"
+                 "但不得增减因子数量。此为参考信息，不改变已有规则。")
+    return "\n".join(lines)
+
+
 # ==================== 建议生成（LLM 为主 + 确定性模板兜底 + 来源标记） ====================
 
 def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
@@ -257,19 +494,26 @@ def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
     for anom in anomalies:
         if anom["type"] == "rating_inversion":
             d = anom["data"]
+            pair = str(d.get("pair") or "")
+            # pair 语义：高<低，如 "A<C" → A 档低于 C 档（倒挂成立）。高评级在前、低评级在后
+            high, low = pair.split("<") if "<" in pair else ("高评级", "低评级")
+            hi, lo = d.get(high, {}), d.get(low, {})
+            hi_avg = hi.get("avg_pct")
+            lo_avg = lo.get("avg_pct")
             out.append({
                 "target_agent": "discover", "target_kind": "prompt", "rule_type": "soft",
                 "priority": "high",
-                "rule_name": "候选池评级正相关性校验（倒挂告警）",
+                "rule_name": f"候选池评级正相关性校验（{pair} 倒挂）",
                 "current_value": "评级 A/B/C 默认代表选股质量优劣，未单独校验与后续涨幅的相关性",
-                "suggested_value": f"C 档平均{period_label}涨幅 {d['C']['avg_pct']}% 高于 A 档 "
-                                   f"{d['A']['avg_pct']}%，需人工复核评级维度权重",
-                "reason": "统计显示 C 档平均涨幅高于 A 档，评级与后续表现相关性倒挂，可能误导仓位分配",
-                "evidence": (f"C 档 {d['C']['n']} 笔平均 {d['C']['avg_pct']}%，"
-                             f"A 档 {d['A']['n']} 笔平均 {d['A']['avg_pct']}%"),
-                "rule_text": ("候选评级 A/B/C 应体现选股质量差异：C 档平均 T+N 涨幅持续高于 A 档时，"
-                              "需人工复核评级维度权重并调整评分提示词；倒挂持续期间降低 A 档独占权重，"
-                              "以实际涨幅排序为准"),
+                "suggested_value": (f"{low} 档平均{period_label}涨幅 {lo_avg}% 高于 {high} 档 "
+                                    f"{hi_avg}%，需人工复核评级维度权重"),
+                "reason": (f"统计显示 {low} 档平均涨幅高于 {high} 档，评级与后续表现相关性倒挂，"
+                           f"可能误导仓位分配"),
+                "evidence": (f"{low} 档 {lo.get('n')} 笔平均 {lo_avg}%，"
+                             f"{high} 档 {hi.get('n')} 笔平均 {hi_avg}%"),
+                "rule_text": ("候选评级 A/B/C 应体现选股质量差异：低评级档平均 T+N 涨幅持续高于"
+                              "高评级档时，需人工复核评级维度权重并调整评分提示词；倒挂持续期间"
+                              "降低高评级档独占权重，以实际涨幅排序为准"),
                 "problem_desc": "评级体系与后续表现相关性倒挂，可能误导仓位分配与关注优先级",
                 "expected_effect": "恢复评级与表现的正常相关性，倒挂期避免高评级标的重仓",
                 "risk_note": "小样本周期倒挂可能为噪声，需连续 2 个统计期确认后才调整",
@@ -405,7 +649,8 @@ def _default_price_lookup(stock_code: str, select_date: str):
 
 def _init_candidates() -> int:
     """初始化：候选池中未追踪的全部 (code, select_date) 补齐追踪行（自愈）。
-    评级取 grade 优先、confidence_tier 兜底；基准价取选中日快照 price（无则 0 由计算兜底）。"""
+    评级取 grade 优先、confidence_tier 兜底；基准价取选中日快照 price（无则 0 由计算兜底）；
+    因子分从 stock_score.detail.factors 提取（无则 None 诚实留空，不造假）。"""
     initialized = 0
     for cand in repo.list_untracked_candidates():
         base = 0.0
@@ -414,10 +659,32 @@ def _init_candidates() -> int:
         except (TypeError, ValueError):
             base = 0.0
         rating = repo.get_candidate_rating(cand["stock_code"], cand["trade_date"])
+        # 评级重做-C：从 stock_score 提取六因子分值
+        factor_scores = repo.get_score_factors(cand["stock_code"], cand["trade_date"])
         repo.upsert_track_verify(cand["stock_code"], cand["stock_name"],
-                                 cand["trade_date"], rating, base)
+                                 cand["trade_date"], rating, base,
+                                 factor_scores=factor_scores)
         initialized += 1
     return initialized
+
+
+def backfill_factor_scores() -> dict:
+    """回填已有追踪行的 factor_scores（用于已存在但创建时未提取因子分的行）。
+    幂等：已有 factor_scores 的行跳过；无对应 stock_score 的行跳过。
+    返回 {"filled": int, "skipped": int, "no_score": int}"""
+    filled = skipped = no_score = 0
+    for row in repo.list_track_verify(limit=500):
+        if row.get("factor_scores"):  # 已有则跳过
+            skipped += 1
+            continue
+        factors = repo.get_score_factors(row["stock_code"], row["select_date"])
+        if factors is None:
+            no_score += 1
+            continue
+        repo.update_track_verify(row["id"], factor_scores=factors)
+        filled += 1
+    logger.info("因子分回填: %s", {"filled": filled, "skipped": skipped, "no_score": no_score})
+    return {"filled": filled, "skipped": skipped, "no_score": no_score}
 
 
 def _verify_rows(price_lookup) -> tuple[int, int, list[str]]:
@@ -481,9 +748,27 @@ def run_verify_chain(backfill: bool = False, price_lookup=None, llm_call=None) -
             rows = repo.list_track_verify()
             stats = compute_stats(rows, period="t5")
             anomalies = detect_anomalies(stats)
+            # 评级重做-C：因子相关性计算
+            correlation = compute_factor_correlation(rows, period="t5")
             result["stats"] = stats
             result["anomalies"] = anomalies
+            result["factor_correlation"] = correlation
             result["suggestions"] = generate_suggestions(stats, anomalies, llm_call=llm_call)
+            # 评级重做-C：因子校准建议（模板兜底，走人工审核闭环）
+            cal_suggestions = _template_calibration_suggestions(correlation)
+            for tpl in cal_suggestions:
+                if repo.has_pending_suggestion(tpl["rule_name"], tpl["target_agent"]):
+                    continue
+                repo.insert_agent_suggestion(
+                    0, tpl["target_agent"], tpl["rule_name"],
+                    tpl["current_value"], tpl["suggested_value"],
+                    tpl["reason"], tpl["evidence"],
+                    target_kind=tpl["target_kind"],
+                    rule_type=tpl["rule_type"], priority=tpl["priority"],
+                    problem_desc=tpl["problem_desc"], rule_text=tpl["rule_text"],
+                    expected_effect=tpl["expected_effect"], risk_note=tpl["risk_note"],
+                    file_path=tpl["file_path"], insert_position=tpl["insert_position"],
+                    suggestion_source="template")
         logger.info("候选T+N验证完成: 初始化%s 更新%s 到期%s 错误%s",
                     initialized, updated, finished_new, len(errors))
         return result

@@ -367,6 +367,125 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
                     border: 1px solid rgba(245, 158, 11, 0.35); }
 .dim-advice { font-size: 12px; color: var(--text-dim); line-height: 1.6;
               margin: 2px 0 0 5.5em; }
+/* ===== 六因子透明评分卡（v4.0 ScoreAgent 重构） ===== */
+.factor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin: 8px 0 12px;
+}
+.factor-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  transition: border-color 0.2s ease;
+}
+.factor-card:hover { border-color: var(--border-hi); }
+.factor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.factor-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.factor-score {
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.factor-score .max {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-mute);
+}
+.factor-bar {
+  height: 6px;
+  background: var(--bg-input);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 4px 0 8px;
+}
+.factor-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.factor-signal {
+  display: inline-block;
+  font-size: 11px;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.factor-signal.bull {
+  color: var(--up);
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+.factor-signal.bear {
+  color: var(--down);
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+.factor-signal.neutral {
+  color: var(--text-dim);
+  background: rgba(156, 163, 175, 0.12);
+  border: 1px solid var(--border);
+}
+.factor-reason {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+  margin-top: 6px;
+}
+/* 潜力标识横幅 */
+.potential-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  margin: 6px 0 10px;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 13px;
+  color: var(--warn);
+  font-weight: 600;
+}
+.potential-banner .ic { font-size: 16px; }
+/* 交叉验证结论卡 */
+.cross-validation-card {
+  border: 1px solid var(--primary-dim);
+  border-left: 3px solid var(--primary);
+  background: rgba(59, 130, 246, 0.06);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 8px 0;
+}
+.cross-validation-card .cv-title {
+  font-size: 12px;
+  color: var(--info);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.cross-validation-card .cv-body {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.7;
+}
+/* 响应式：窄屏因子卡降为 2 列 */
+@media (max-width: 768px) {
+  .factor-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .factor-score { font-size: 18px; }
+}
 /* 综合评估高亮卡（v3.0 主结论） */
 .advice-card { border: 1px solid var(--primary-dim); border-left: 3px solid var(--primary);
                background: rgba(59, 130, 246, 0.06); border-radius: 8px;
@@ -421,6 +540,16 @@ html, body, .stMarkdown, [data-testid="stMetricValue"], input, textarea, select,
   .top-status-bar { font-size: 0.8rem; padding: 6px 12px; }
   .top-status-bar .bar-group-label { display: none; }
 }
+/* 今日行动清单 */
+.action-brief {}
+.brief-section { margin-bottom: 16px; }
+.brief-section-title { font-size: 14px; font-weight: 600; color: var(--text-2); margin-bottom: 8px; }
+.brief-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.brief-item:last-child { border-bottom: none; }
+.brief-icon { font-size: 16px; }
+.brief-text { flex: 1; font-size: 13px; }
+.brief-detail { font-size: 12px; color: var(--text-mute); }
+.brief-empty { font-size: 13px; color: var(--text-mute); padding: 8px 0; }
 </style>
 """
 
@@ -785,6 +914,91 @@ def section_title(text: str) -> None:
     st.markdown(f'<div class="section-title">{text}</div>', unsafe_allow_html=True)
 
 
+def _esc_html(text) -> str:
+    """转义 HTML 特殊字符，防候选/持仓名称或 action_text 注入破坏结构"""
+    return (str(text or "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def action_brief(tradeable_items: list, position_briefs: list,
+                 market_summary: dict | None) -> None:
+    """今日行动清单：三区聚合展示（可建仓机会 / 持仓今日关注 / 市况速览）
+
+    参数：
+    - tradeable_items: candidate_tradeable.items 中 is_tradeable=True 的列表
+    - position_briefs: [{"code","name","status","status_tone","action_text","detail"}]
+    - market_summary: {"total_score","band","cap","summary"} 或 None
+
+    三区均不展开详情（每只一行），目的是"一屏看全"不是"一屏看全细节"。
+    """
+    parts: list[str] = []
+
+    # ===== A 区：可建仓机会 =====
+    parts.append('<div class="brief-section">')
+    parts.append('<div class="brief-section-title">可建仓机会</div>')
+    if tradeable_items:
+        for it in tradeable_items:
+            tier = it.get("tier") or ""
+            price_zone = it.get("price_zone") or ""
+            text = f"{it.get('stock_code','')} {it.get('stock_name','')} — {tier}级 · 可建仓"
+            if price_zone:
+                text += f"（首仓区间 {price_zone}）"
+            parts.append(
+                f'<div class="brief-item"><span class="brief-icon">✅</span>'
+                f'<span class="brief-text">{_esc_html(text)}</span></div>')
+    else:
+        parts.append('<div class="brief-empty">今日无可建仓标的，观察候选池即可</div>')
+    parts.append('</div>')
+
+    # ===== B 区：持仓今日关注 =====
+    parts.append('<div class="brief-section">')
+    parts.append('<div class="brief-section-title">持仓今日关注</div>')
+    non_info = [b for b in position_briefs if b.get("status_tone") != "info"]
+    if not position_briefs:
+        parts.append('<div class="brief-empty">暂无持仓</div>')
+    elif not non_info:
+        parts.append(
+            f'<div class="brief-empty">今日持仓无预警，正常持有（{len(position_briefs)} 只）</div>')
+    else:
+        for b in position_briefs:
+            icon = {"err": "🔴", "warn": "🟠", "info": "🟢", "mute": "⚪"}.get(
+                b.get("status_tone"), "⚪")
+            detail = _esc_html(b.get("detail", ""))
+            parts.append(
+                f'<div class="brief-item"><span class="brief-icon">{icon}</span>'
+                f'<span class="brief-text">{_esc_html(b.get("code",""))} '
+                f'{_esc_html(b.get("name",""))} — {_esc_html(b.get("action_text",""))}'
+                + (f'</span><span class="brief-detail">{detail}</span></div>'
+                   if detail else '</span></div>'))
+    parts.append('</div>')
+
+    # ===== C 区：市况速览 =====
+    parts.append('<div class="brief-section">')
+    parts.append('<div class="brief-section-title">市况速览</div>')
+    if not market_summary:
+        parts.append('<div class="brief-empty">市况数据暂不可用</div>')
+    else:
+        score = market_summary.get("total_score")
+        band = market_summary.get("band") or ""
+        cap = market_summary.get("cap")
+        summ = (market_summary.get("summary") or "")[:80]
+        head = "📊 市况评分"
+        if score is not None:
+            head += f" {score} 分"
+        head += f" · {band}" if band else ""
+        if cap is not None:
+            head += f" · 候选池上限 {cap} 只"
+        parts.append(f'<div class="brief-item"><span class="brief-icon">📊</span>'
+                     f'<span class="brief-text">{_esc_html(head)}</span></div>')
+        if summ:
+            parts.append(f'<div class="brief-detail">{_esc_html(summ)}</div>')
+    parts.append('</div>')
+
+    st.markdown('<div class="action-brief">' + "".join(parts) + '</div>',
+                unsafe_allow_html=True)
+
+
 # ================= 持仓止盈/仓位计划卡片（与系统概览/持仓监控页共用，同源展示） =================
 _TP_STATUS_TONE = {"持有观察": "mute", "接近止盈": "warn", "接近止损": "err", "减仓预警": "err"}
 _TP_GREEN = "#10B981"   # 止盈位（绿，与全站 ok/down 色一致）
@@ -957,6 +1171,76 @@ def _advice_card(final_advice: str) -> None:
     """综合评估高亮卡（v3.0 主结论）"""
     st.markdown(f'<div class="advice-card"><div class="advice-title">综合评估（主结论）</div>'
                 f'<div class="advice-body">{final_advice}</div></div>', unsafe_allow_html=True)
+
+
+# ================= 六因子透明评分卡（v4.0 ScoreAgent 重构） =================
+_FACTOR_SIGNAL_CLS = {"看多": "bull", "中性": "neutral", "看空": "bear"}
+_FACTOR_SIGNAL_COLOR = {"看多": "var(--up)", "中性": "var(--text-dim)", "看空": "var(--down)"}
+
+
+def factor_cards(
+    factors: list[dict],
+    potential_flag: bool = False,
+    cross_validation_note: str = "",
+    final_advice: str | None = None,
+) -> None:
+    """六因子透明评分卡（v4.0）：6 张因子卡 3×2 网格 + 潜力标识 + 交叉验证 + 综合评估。
+    每因子卡 = 因子名 + 分值(0-10) + 评分条 + 信号徽章 + 打分依据。
+    纯展示层映射，无任何研判语义；factors 为空或非 list 时不渲染因子网格。
+    """
+    factors = [f for f in (factors or []) if isinstance(f, dict)]
+    # 潜力标识横幅（代码层已推导，此处纯展示）
+    if potential_flag:
+        st.markdown(
+            '<div class="potential-banner">'
+            '<span class="ic">⚠️</span>'
+            '<span>潜力标识：催化强但动量弱，可能尚未被定价，值得关注</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    # 因子卡网格
+    if factors:
+        cards_html = []
+        for f in factors:
+            name = _esc(str(f.get("factor") or "因子"))
+            try:
+                score = float(f.get("score") or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            score = max(0.0, min(10.0, score))
+            signal = str(f.get("signal") or "中性")
+            reason = _esc(str(f.get("reason") or ""))
+            sig_cls = _FACTOR_SIGNAL_CLS.get(signal, "neutral")
+            sig_color = _FACTOR_SIGNAL_COLOR.get(signal, "var(--text-dim)")
+            width = f"{score * 10:.0f}%"
+            cards_html.append(
+                f'<div class="factor-card">'
+                f'<div class="factor-head">'
+                f'<span class="factor-name">{name}</span>'
+                f'<span class="factor-score">{score:.0f}<span class="max">/10</span></span>'
+                f'</div>'
+                f'<div class="factor-bar"><div class="factor-bar-fill" '
+                f'style="width:{width};background:{sig_color}"></div></div>'
+                f'<span class="factor-signal {sig_cls}">{signal}</span>'
+                f'<div class="factor-reason">{reason}</div>'
+                f'</div>'
+            )
+        st.markdown(
+            f'<div class="factor-grid">{"".join(cards_html)}</div>',
+            unsafe_allow_html=True,
+        )
+    # 交叉验证结论
+    if cross_validation_note:
+        st.markdown(
+            f'<div class="cross-validation-card">'
+            f'<div class="cv-title">交叉验证（与 DiscoverAgent 选股逻辑对比）</div>'
+            f'<div class="cv-body">{_esc(cross_validation_note)}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    # 综合评估（复用既有 _advice_card）
+    if final_advice:
+        _advice_card(final_advice)
 
 
 def svc_cards(connections: list[dict]) -> None:
@@ -1350,7 +1634,7 @@ def top_status_bar() -> None:
 
 # ================= 推理留痕卡片（结论卡默认展开 + 推理分层折叠，可解释化展示） =================
 
-_TRACE_MODULE_LABEL = {"discover": "选股研判", "score": "五维评分", "position": "建仓方案",
+_TRACE_MODULE_LABEL = {"discover": "选股研判", "score": "六因子评分", "position": "建仓方案",
                        "alert": "监控预警", "review": "交易复盘", "sell": "卖出决策"}
 _TRACE_LAYERS = (
     ("fact_basis", "事实依据（输入数据快照）", "fact"),

@@ -280,7 +280,7 @@ else:
                         else:
                             st.markdown("- 风险提示：（该轮未输出）")
                     # v3.0 白盒维度归因：维度数组 + 综合评估（主结论；旧数据缺省自动跳过）
-                    render.section_title("维度归因（五维白盒，主结论）")
+                    render.section_title("维度归因（六因子白盒，主结论）")
                     render.dimension_bars(detail.get("dimensions"),
                                           final_advice=detail.get("final_advice"))
 

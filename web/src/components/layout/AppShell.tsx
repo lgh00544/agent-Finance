@@ -3,10 +3,11 @@ import { Layout } from 'antd'
 import { Outlet } from 'react-router-dom'
 import { SideMenu } from './SideMenu'
 import { TopStatusBar } from './TopStatusBar'
+import { TaskDrawer } from './TaskDrawer'
 
 const { Sider, Content } = Layout
 
-/** 应用外壳：左侧固定侧边栏（可折叠）+ 顶部状态栏 + 主内容区（Outlet） */
+/** 应用外壳：左侧固定侧边栏（可折叠）+ 顶部状态栏 + 主内容区（Outlet）+ 全局任务面板 */
 export function AppShell() {
   const [collapsed, setCollapsed] = useState(false)
   return (
@@ -30,6 +31,8 @@ export function AppShell() {
           <Outlet />
         </Content>
       </Layout>
+      {/* 全局后台任务面板：所有路由可见，z-index 高于内容 */}
+      <TaskDrawer />
     </Layout>
   )
 }

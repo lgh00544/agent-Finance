@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   App,
   Alert,
@@ -12,12 +12,13 @@ import {
   Tag,
   Typography,
 } from 'antd'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { reviews } from '@/api/reviews'
+import { candidateTradeable } from '@/api/candidates'
 import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion } from '@/api/suggestions'
 import { trackVerifyDates, trackVerifyList, trackVerifyStats, runTrackVerify, runTrackSuggest } from '@/api/track'
-import { EmptyState, ErrorCard, StatCard, StatCardGrid, StockLabel } from '@/components/common'
-import type { ReviewInfo } from '@/types'
+import { EmptyState, ErrorCard, StatCard, StatCardGrid, StatusBadge, StockLabel } from '@/components/common'
+import type { ReviewInfo, TrackVerifyRow } from '@/types'
 
 const { Text } = Typography
 const SUG_STATUS: Record<string, { label: string; color: string }> = {
@@ -107,6 +108,8 @@ function TrackVerify() {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [date, setDate] = useState<string>()
+  const [sortKey, setSortKey] = useState<string>('rating-date')
+
   const { data: dates } = useQuery({ queryKey: ['tv-dates'], queryFn: () => trackVerifyDates() })
   const { data: rows } = useQuery({
     queryKey: ['tv-list', date],
@@ -115,31 +118,130 @@ function TrackVerify() {
   })
   const { data: stats } = useQuery({ queryKey: ['tv-stats'], queryFn: () => trackVerifyStats('t5') })
 
+  // —— 新增：按 select_date 批量跨查 candidate_tradeable，构建徽章索引 —— 只读
+  const distinctDates = useMemo(() => {
+    const s = new Set<string>()
+    for (const r of rows ?? []) {
+      const sd = String(r.select_date ?? '')
+      if (sd) s.add(sd)
+    }
+    return Array.from(s)
+  }, [rows])
+
+  const tradeableQueries = useQueries({
+    queries: distinctDates.map((d) => ({
+      queryKey: ['candidate-tradeable', d],
+      queryFn: () => candidateTradeable(d, 200),
+      enabled: distinctDates.length > 0,
+      staleTime: 60_000,
+      retry: 1,
+    })),
+  })
+
+  const tradeableMap = useMemo(() => {
+    const m = new Map<string, Record<string, unknown>>()
+    for (const q of tradeableQueries) {
+      const d = String(q.data?.date ?? '')
+      for (const it of (q.data?.items ?? [])) {
+        const code = String(it.stock_code ?? '')
+        if (code && d) m.set(`${d}_${code}`, it)
+      }
+    }
+    return m
+  }, [tradeableQueries])
+
+  // —— 新增：排序（前端 stable sort，不动后端默认顺序）
+  const sortedRows = useMemo(() => {
+    const arr = [...(rows ?? [])]
+    const ratingWeight = (v: unknown): number => {
+      const r = String(v ?? '').trim()
+      if (r === 'A') return 0
+      if (r === 'B') return 1
+      if (r === 'C') return 2
+      return 3
+    }
+    const getPct = (r: TrackVerifyRow, k: string): number | null => {
+      const v = (r as Record<string, unknown>)[k]
+      if (v == null) return null
+      const n = typeof v === 'number' ? v : Number(v)
+      return Number.isFinite(n) ? n : null
+    }
+    if (sortKey === 'rating-date') {
+      arr.sort((a, b) => {
+        const ra = ratingWeight(a.select_rating)
+        const rb = ratingWeight(b.select_rating)
+        if (ra !== rb) return ra - rb
+        return String(a.select_date ?? '').localeCompare(String(b.select_date ?? ''))
+      })
+    } else if (sortKey === 'date-rating') {
+      arr.sort((a, b) => {
+        const da = String(a.select_date ?? '')
+        const db = String(b.select_date ?? '')
+        if (da !== db) return db.localeCompare(da)  // 选中日降序
+        return ratingWeight(a.select_rating) - ratingWeight(b.select_rating)
+      })
+    } else if (sortKey === 't5-desc') {
+      arr.sort((a, b) => (getPct(b, 't5_pct') ?? -999) - (getPct(a, 't5_pct') ?? -999))
+    } else if (sortKey === 'dd-desc') {
+      arr.sort((a, b) => (Number(b.max_drawdown ?? -999)) - (Number(a.max_drawdown ?? -999)))
+    }
+    return arr
+  }, [rows, sortKey])
+
   const wr = stats?.win_rate
   const avg = stats?.avg_pct
   const runVerify = async () => { try { await runTrackVerify(false); message.success('T+N 验证已提交后台'); qc.invalidateQueries({ queryKey: ['tv-list'] }) } catch (e) { message.error(e instanceof Error ? e.message : '失败') } }
   const runSuggest = async () => { try { await runTrackSuggest(); message.success('建议生成已提交后台') } catch (e) { message.error(e instanceof Error ? e.message : '失败') } }
+
+  // 徽章样式：与 CandidatesPage 的 st-badge 系列同源
+  const renderBadge = (sd: string, code: string) => {
+    const it = tradeableMap.get(`${sd}_${code}`)
+    const label = String(it?.label ?? '')
+    if (!label) return <span style={{ color: '#bbb' }}>—</span>
+    const tone = label === '可建仓' ? 'ok' : label === '建议关注' ? 'info' : 'mute'
+    return <StatusBadge text={label} tone={tone} />
+  }
 
   return (
     <div>
       <Space style={{ marginBottom: 10 }} wrap>
         <Select placeholder="选择日期" style={{ width: 140 }} value={date ?? dates?.[0]} onChange={setDate}
           options={(dates ?? []).map((d) => ({ label: d, value: d }))} />
+        <Select
+          placeholder="排序"
+          style={{ width: 200 }}
+          value={sortKey}
+          onChange={setSortKey}
+          options={[
+            { label: '评级 A→C + 选中日', value: 'rating-date' },
+            { label: '选中日降序 + 评级', value: 'date-rating' },
+            { label: 'T+5 涨跌幅 高→低', value: 't5-desc' },
+            { label: '最大回撤 高→低', value: 'dd-desc' },
+          ]}
+        />
         <Button onClick={runVerify}>手动验证（T+N）</Button>
         <Button onClick={runSuggest}>生成建议</Button>
       </Space>
       <StatCardGrid>
-        <StatCard label="胜率" value={wr != null ? `${(wr * 100).toFixed(1)}%` : '无数据'}
-          tone={wr != null ? (wr >= 0.5 ? 'ok' : wr < 0.4 ? 'err' : 'warn') : 'mute'}
+        <StatCard label="胜率" value={wr != null ? `${wr.toFixed(1)}%` : '无数据'}
+          tone={wr != null ? (wr >= 50 ? 'ok' : wr < 40 ? 'err' : 'warn') : 'mute'}
           sub={`盈利 ${stats?.wins ?? 0} 笔 / 共 ${stats?.n ?? 0} 笔`} />
         <StatCard label="平均涨幅" value={avg != null ? `${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%` : '无数据'}
           tone={avg != null ? (avg > 0 ? 'up' : avg < 0 ? 'down' : 'mute') : 'mute'} />
         <StatCard label="盈亏比" value={stats?.pl_ratio != null ? stats.pl_ratio.toFixed(2) : '—'} tone="mute" />
         <StatCard label="样本量" value={stats?.n ?? 0} tone="mute" sub="T+5 已到期" />
       </StatCardGrid>
-      <Table size="small" rowKey="id" dataSource={rows ?? []} pagination={{ pageSize: 10 }}
+      <Table size="small" rowKey="id" dataSource={sortedRows} pagination={{ pageSize: 10 }}
         columns={[
-          { title: '股票', key: 'stock', render: (_: unknown, r: Record<string, unknown>) => <StockLabel code={String(r.stock_code ?? '')} name={String(r.stock_name ?? '')} /> },
+          { title: '股票', key: 'stock', render: (_: unknown, r: TrackVerifyRow) => <StockLabel code={String(r.stock_code ?? '')} name={String(r.stock_name ?? '')} /> },
+          { title: '评级', dataIndex: 'select_rating', width: 70, render: (v: unknown) => String(v ?? '').trim() || '—' },
+          {
+            title: '建仓级别',
+            key: 'tradeable_label',
+            width: 110,
+            render: (_: unknown, r: TrackVerifyRow) =>
+              renderBadge(String(r.select_date ?? ''), String(r.stock_code ?? '')),
+          },
           { title: '选中日', dataIndex: 'select_date', width: 100 },
           { title: 'T+3', dataIndex: 't3_pct', width: 70, render: (v: unknown) => v != null ? `${v}%` : '—' },
           { title: 'T+5', dataIndex: 't5_pct', width: 70, render: (v: unknown) => v != null ? `${v}%` : '—' },

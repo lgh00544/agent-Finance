@@ -281,7 +281,8 @@ def test_suggestions_template_fallback():
     stats = {"period": "t5", "n": 6, "win_rate": 50.0, "avg_pct": 0.0,
              "by_rating": {}, "by_date": {}}
     anomalies = [{"type": "rating_inversion", "desc": "倒挂",
-                  "data": {"A": {"n": 3, "avg_pct": 1.0},
+                  "data": {"pair": "A<C",
+                           "A": {"n": 3, "avg_pct": 1.0},
                            "C": {"n": 3, "avg_pct": 3.0}}}]
 
     def boom_llm(stats_json, anomaly_types):
@@ -290,10 +291,10 @@ def test_suggestions_template_fallback():
     out = tv.generate_suggestions(stats, anomalies, llm_call=boom_llm)
     assert len(out["fallbacks"]) == 1
     assert out["fallbacks"][0]["suggestion_source"] == "template"
-    assert out["fallbacks"][0]["rule_name"] == "候选池评级正相关性校验（倒挂告警）"
+    assert out["fallbacks"][0]["rule_name"] == "候选池评级正相关性校验（A<C 倒挂）"
     with SessionLocal() as db:
         row = db.execute(select(AgentSuggestion).where(
-            AgentSuggestion.rule_name == "候选池评级正相关性校验（倒挂告警）")).scalar_one()
+            AgentSuggestion.rule_name == "候选池评级正相关性校验（A<C 倒挂）")).scalar_one()
     assert row.suggestion_source == "template"
     assert "3.0" in row.evidence  # 模板条文携带事实数值
 

@@ -654,7 +654,7 @@ class AkshareSource(DataSource):
         return _to_json_safe(df[["date", "volume_ratio", "close"]].tail(days))
 
     def fetch_index_spot(self) -> pd.DataFrame:
-        """三大指数实时行情（东财指数快照：上证系列 + 深证系列，60s 缓存防限流）；
+        """三大指数 + 沪深300 实时行情（东财指数快照：上证系列 + 深证系列 + 中证系列，60s 缓存防限流）；
         顶部状态栏使用，返回含 code/name/price/change_pct 的 DataFrame。
         非交易日不请求实时接口，返回空表（顶部状态栏隐藏）。"""
         if not market_hours.snapshot_allowed():
@@ -664,6 +664,7 @@ class AkshareSource(DataSource):
             parts = [
                 ak.stock_zh_index_spot_em(symbol="上证系列指数"),
                 ak.stock_zh_index_spot_em(symbol="深证系列指数"),
+                ak.stock_zh_index_spot_em(symbol="中证系列指数"),  # 沪深300 等宽基（跨市场，不在上证/深证系列）
             ]
             return pd.concat(parts, ignore_index=True)
         def fallback():
@@ -674,7 +675,7 @@ class AkshareSource(DataSource):
                          normalize=lambda d: _normalize(d, _SPOT_COLS))
         if df is None or df.empty or "code" not in df.columns:
             return pd.DataFrame(columns=["code", "name", "price", "change_pct"])
-        keep = {"sh000001", "sz399001", "sz399006"}  # 上证指数/深证成指/创业板指
+        keep = {"sh000001", "sz399001", "sz399006", "sh000300"}  # 上证指数/深证成指/创业板指/沪深300
         out = df[df["code"].astype(str).isin(keep)]
         return _to_json_safe(out)
 
@@ -979,14 +980,14 @@ class AkshareSource(DataSource):
             # 新浪行业板块（东财限流降级，列名与东财差异经 _BOARD_COLS 兼容）
             return self._call_with_timeout(ak.stock_sector_spot, indicator="新浪行业")
         df = self._fetch("industry_spot", "industry_spot", primary, ttl_seconds=600, fallback=fallback,
-                         normalize=lambda d: _normalize(d, _BOARD_COLS))
+                         normalize=lambda d: _normalize(d, _BOARD_COLS), kind="snapshot")
         return _to_json_safe(df)
 
     def fetch_industry_cons(self, board_name: str) -> pd.DataFrame:
         def call():
             return self._call_with_timeout(ak.stock_board_industry_cons_em, symbol=board_name)
         df = self._fetch(f"industry_cons:{board_name}", "industry_cons", call, ttl_seconds=3600,
-                         normalize=lambda d: _normalize(d, _CONS_COLS))
+                         normalize=lambda d: _normalize(d, _CONS_COLS), kind="snapshot")
         return _to_json_safe(df)
 
     # ---------------- 主线板块箱位（主箱位 × 60 日箱位双视角，≤10 个板块） ----------------

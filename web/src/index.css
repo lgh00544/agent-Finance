@@ -117,6 +117,25 @@ th {
   font-weight: 700;
   color: var(--text);
 }
+/* 账户资产区：窄屏允许换行，不挤压右侧系统状态 */
+.tsb-assets {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+}
+@media (max-width: 1199px) {
+  .top-status-bar {
+    height: auto;
+    flex-wrap: wrap;
+    padding-top: 12px;
+    padding-bottom: 12px;
+    row-gap: 8px;
+  }
+  .tsb-assets {
+    order: 2;
+  }
+}
 .tsb-up {
   color: var(--up) !important;
   font-weight: 700;

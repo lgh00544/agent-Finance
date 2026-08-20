@@ -38,12 +38,14 @@ def _capture(monkeypatch, module, fake_output):
 def test_score_injects_hot_money(monkeypatch):
     """Score：data_pack 含「游资聚合」段（口径后缀字段），cache_key 含指纹"""
     from app.agents import score as score_mod
-    from app.agents.schemas import ScoreDimension, ScoreOutput
+    from app.agents.schemas import ScoreFactor, ScoreOutput
 
     out = ScoreOutput(stock_code="601138", stock_name="工业富联", score=70, grade="B",
-                      dimensions=[ScoreDimension(dim="基本面", score=70, verdict="中性",
-                                                 advice="估值合理")],
-                      risk_list=[], final_advice="综合评估：1/5 维支持")
+                      factors=[ScoreFactor(factor=n, score=i, reason=f"测试{n}", signal="中性")
+                               for i, n in enumerate(["动量", "催化", "估值", "主线契合",
+                                                      "资金面", "基本面质量"], 1)],
+                      potential_flag=False, cross_validation_note="",
+                      risk_list=[], final_advice="综合评估：1/6 因子看多")
     cap = _capture(monkeypatch, score_mod, out)
 
     from app.services import hot_money as hm_svc
@@ -62,12 +64,14 @@ def test_score_injects_hot_money(monkeypatch):
 def test_score_no_data_placeholder(monkeypatch):
     """Score：无游资数据 → data_pack 游资聚合为 null，但键存在（LLM 标中性）"""
     from app.agents import score as score_mod
-    from app.agents.schemas import ScoreDimension, ScoreOutput
+    from app.agents.schemas import ScoreFactor, ScoreOutput
 
     out = ScoreOutput(stock_code="600000", stock_name="无数据股", score=60, grade="C",
-                      dimensions=[ScoreDimension(dim="基本面", score=60, verdict="中性",
-                                                 advice="一般")],
-                      risk_list=[], final_advice="综合评估：0/5 维支持")
+                      factors=[ScoreFactor(factor=n, score=i, reason=f"测试{n}", signal="中性")
+                               for i, n in enumerate(["动量", "催化", "估值", "主线契合",
+                                                      "资金面", "基本面质量"], 1)],
+                      potential_flag=False, cross_validation_note="",
+                      risk_list=[], final_advice="综合评估：0/6 因子看多")
     cap = _capture(monkeypatch, score_mod, out)
     state = {"stock_code": "600000", "stock_name": "无数据股", "trade_date": "2026-08-09",
              "tech_index": {"recent_klines": []}, "finance_data": [], "fund_flow_rows": [],

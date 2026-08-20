@@ -40,7 +40,7 @@ TIER_MAP = {"强烈推荐": "A", "建议关注": "B", "谨慎观察": "C"}
 TIER_LABEL = {"A": "A 强烈推荐", "B": "B 建议关注", "C": "C 谨慎观察"}
 TIER_DOT = {"A": "tier-a", "B": "tier-b", "C": "tier-c"}
 _SORT = {"A": 0, "B": 1, "C": 2}
-_TRACE_MODULE = {"discover": "选股研判", "score": "五维评分", "position": "建仓方案",
+_TRACE_MODULE = {"discover": "选股研判", "score": "六因子评分", "position": "建仓方案",
                  "alert": "监控预警", "review": "交易复盘", "sell": "卖出决策"}
 
 CACHE_KEY = "candidates"
@@ -70,7 +70,10 @@ if not dates:
 # 顶部筛选行：左=日期选择 + 评级筛选（Tab 样式），操作按钮已上移 page_header
 f1, f2 = st.columns([1, 3])
 with f1:
-    date = st.selectbox("选择日期", dates, index=0)
+    # 固定 key 防重渲染返回 None；防御性校验：非法日期回退首日，杜绝候选池误加载全表
+    date = st.selectbox("选择日期", dates, index=0, key="_candidate_date_sel")
+    if date not in dates:
+        date = dates[0]
 with f2:
     filter_opt = st.segmented_control("评级筛选", ["全部候选", "可建仓 A+B", "观察 C"],
                                       default="全部候选")
@@ -247,7 +250,7 @@ with rows_area:
                 # 批次2：8 个垂直堆叠分区 → detail_tabs（>6 自动降级 selectbox，默认停在结论性分区）；
                 # 字段与文案零删减，仅换容器（风险点合并「核心风险点 + 风险初判」两类字段）
                 def _tab_dims():
-                    render.section_title("维度归因（五维白盒，主结论）")
+                    render.section_title("维度归因（六因子白盒，主结论）")
                     render.dimension_bars(detail.get("dimensions"),
                                           final_advice=detail.get("final_advice"))
 

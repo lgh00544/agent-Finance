@@ -1,8 +1,8 @@
-"""评分报告：ScoreAgent 五维评分（A/B/C 分级 + 风险清单，自然语言分段展示）
+"""评分报告：ScoreAgent 六因子透明评分（A/B/C 分级 + 因子卡 + 风险清单）
 
 列表-详情联动范式：上方总览表格（on_select 单选行，点击行详情立即切换，行高亮+左侧色条），
 下方仅渲染当前选中标的的详情卡片（数据全部来自本地已加载 rows，切换零请求）；
-详情分区卡片化（五维/K202/派发期/三维/操作建议/风险），原始 JSON 永久折叠在最底部。
+详情分区卡片化（六因子/K202/派发期/三维/操作建议/风险），原始 JSON 永久折叠在最底部。
 名称缺失的标的经只读补名接口自动补全（不写库），仍缺失的显示「名称待补」。
 纯展示层，不含任何二次判断逻辑。
 """
@@ -20,7 +20,7 @@ render.top_status_bar()
 # ===== 批次2：页面头部收敛为 page_header 单行范式 =====
 render.page_header(
     "评分报告（ScoreAgent）",
-    caption="ScoreAgent 五维评分（A/B/C 分级 + 风险清单）；表格选行后详情即时切换，零网络请求。",
+    caption="ScoreAgent 六因子透明评分（A/B/C 分级 + 因子卡 + 交叉验证）；表格选行后详情即时切换，零网络请求。",
 )
 
 # 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
@@ -52,25 +52,36 @@ def _score_detail_card(r: dict) -> None:
             render.stat_cards([{"label": "综合分", "value": r["score"]}])
             render.badge(f"{grade} 级" if grade else "未评级", badge_tone)
 
-        # 批次2：详情分区 Tab 化（默认停在「五维分项评分」；附属研判按数据存在与否条件加入；
+        # 详情分区 Tab 化（默认停在「六因子评分」；附属研判按数据存在与否条件加入；
         # 原始 JSON 折叠保留在 Tab 区之外最底部，字段与文案零删减仅换容器）
         def _tab_dims():
-            # 五维分项评分（结构为 {维度: {score, verdict/advice}} 的字段才进表；
-            # v3.0 白盒：verdict 结论 + advice 建议；旧数据 comment 兼容兜底）
-            dims = {k: v for k, v in d.items() if isinstance(v, dict) and "score" in v}
-            if dims:
-                dim_df = pd.DataFrame([
-                    {"维度": name, "得分": v.get("score", ""),
-                     "结论": v.get("verdict", ""),
-                     "研判依据": v.get("advice") or v.get("comment", "")}
-                    for name, v in dims.items()
-                ])
-                st.dataframe(dim_df, width="stretch", hide_index=True)
+            # 六因子评分（v4.0 新格式走 factor_cards；旧格式降级 DataFrame；
+            # 旧数据 comment 兼容兜底）
+            factors = d.get("factors")
+            if isinstance(factors, list) and factors:
+                render.factor_cards(
+                    factors=factors,
+                    potential_flag=bool(d.get("potential_flag")),
+                    cross_validation_note=d.get("cross_validation_note") or "",
+                    final_advice=d.get("final_advice"),
+                )
             else:
-                st.markdown("（该轮未输出分项明细）")
-            # v3.0 综合评估（主结论，高亮展示；旧数据缺省不渲染）
-            if d.get("final_advice"):
-                render.dimension_bars(None, final_advice=d.get("final_advice"))
+                # 旧格式降级：{维度名: {score, verdict, advice}} 字典 → DataFrame
+                dims = {k: v for k, v in d.items()
+                        if isinstance(v, dict) and "score" in v
+                        and k not in ("factors",)}
+                if dims:
+                    dim_df = pd.DataFrame([
+                        {"维度": name, "得分": v.get("score", ""),
+                         "结论": v.get("verdict", ""),
+                         "研判依据": v.get("advice") or v.get("comment", "")}
+                        for name, v in dims.items()
+                    ])
+                    st.dataframe(dim_df, width="stretch", hide_index=True)
+                else:
+                    st.markdown("（该轮未输出分项明细）")
+                if d.get("final_advice"):
+                    render.dimension_bars(None, final_advice=d.get("final_advice"))
 
         def _tab_extra():
             # 候选研判附属区（评分记录内嵌候选结论时展示）
@@ -99,7 +110,7 @@ def _score_detail_card(r: dict) -> None:
             else:
                 st.markdown("（无）")
 
-        _sections = [("五维分项评分", _tab_dims)]
+        _sections = [("六因子评分", _tab_dims)]
         if (d.get("confidence_tier") or d.get("stock_type")
                 or any(d.get(k) for k in ("macro_view", "meso_view", "micro_view"))
                 or d.get("position_hint") or d.get("focus_type")):

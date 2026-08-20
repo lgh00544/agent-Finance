@@ -46,6 +46,13 @@ render.time_text("当前数据更新于", datetime.now(CN_TZ).strftime("%Y-%m-%d
 SEVERITY_MAP = {"info": "一般", "warning": "警告", "critical": "严重"}
 ACTION_MAP = {"hold": "持有", "reduce": "减仓", "exit": "清仓"}
 SEV_ICON = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
+# 今日行动清单 · 持仓状态 → 行动文案（B 区核心；alerts 告警 message 可覆盖）
+_STATUS_ACTION = {
+    "接近止损": "🔴 止损预警：现价接近止损位，关注是否触发 C3 硬止损",
+    "减仓预警": "🔴 减仓预警：跌破 MA10，建议减仓规避波段调整",
+    "接近止盈": "🟠 止盈关注：接近第一止盈位，准备按分档锁利减仓",
+    "持有观察": "🟢 正常持有",
+}
 
 
 def _sev_icon(a: dict) -> str:
@@ -163,6 +170,94 @@ with tab_status:
 # ---------------- Tab 2：今日概览 ----------------
 with tab_overview:
     # ---- 一级模块（fragment 隔离：折叠/展开仅重跑自身模块，零网络请求） ----
+    @st.fragment
+    def _module_action_brief() -> None:
+        """今日行动清单（置顶）：可建仓机会 + 持仓今日关注 + 市况速览"""
+        with render.fold_module("ov_action", "今日行动清单",
+                                meta="每日一屏看全 · 可建仓 / 持仓关注 / 市况速览",
+                                default_open=True):
+            try:
+                # A区：可建仓机会（dashboard 只读模块，is_tradeable=True 的标的）
+                ct = _module("candidate_tradeable") or {}
+                tradeable_items = [i for i in (ct.get("items") or [])
+                                   if i.get("is_tradeable")]
+
+                # B区：持仓今日关注
+                holdings = _module("holdings") or []
+                alerts = _module("alerts") or []
+                # 取止盈计划（已有 _tp_plans() 60s 缓存函数，与模块3同源复用）
+                tp_plans = _tp_plans()
+                plan_by_code = {p["stock_code"]: p for p in tp_plans}
+                alert_by_code = {}
+                for a in alerts:
+                    if a.get("action") != "hold":
+                        alert_by_code.setdefault(a["stock_code"], a)
+
+                position_briefs = []
+                for h in holdings:
+                    code = h["stock_code"]
+                    plan = plan_by_code.get(code)
+                    mv_est = float(h.get("shares") or 0) * float(
+                        (plan or {}).get("current_price") or h.get("entry_price") or 0)
+                    if not plan:
+                        # 无止盈计划：降级用 alerts 判定
+                        a = alert_by_code.get(code)
+                        if a:
+                            position_briefs.append({
+                                "code": code, "name": h.get("stock_name", ""),
+                                "status": "告警", "status_tone": "err",
+                                "action_text": f"⚠️ {a.get('alert_type','')}",
+                                "detail": str(a.get("message",""))[:60],
+                                "_mv": mv_est,
+                            })
+                        else:
+                            position_briefs.append({
+                                "code": code, "name": h.get("stock_name",""),
+                                "status": "无数据", "status_tone": "mute",
+                                "action_text": "暂无止盈计划（行情未就绪）",
+                                "detail": "", "_mv": mv_est,
+                            })
+                    else:
+                        status = plan.get("status", "持有观察")
+                        tone = plan.get("status_tone", "info")
+                        action_text = _STATUS_ACTION.get(status, "🟢 正常持有")
+                        # 补充信号：有 action != hold 的告警时，告警 message 覆盖行动建议
+                        a = alert_by_code.get(code)
+                        if a:
+                            action_text = f"⚠️ {a.get('alert_type','')}"
+                        detail_parts = []
+                        if plan.get("current_price"):
+                            detail_parts.append(f"现价 {plan['current_price']}")
+                        if plan.get("tp1"):
+                            detail_parts.append(f"止盈 {plan['tp1']}")
+                        if plan.get("current_stop"):
+                            detail_parts.append(f"止损 {plan['current_stop']}")
+                        position_briefs.append({
+                            "code": code, "name": h.get("stock_name",""),
+                            "status": status, "status_tone": tone,
+                            "action_text": action_text,
+                            "detail": " / ".join(detail_parts),
+                            "_mv": mv_est,
+                        })
+
+                # 排序：err > warn > info > mute，同类按估算市值降序
+                _TONE_ORDER = {"err": 0, "warn": 1, "info": 2, "mute": 3}
+                position_briefs.sort(
+                    key=lambda x: (_TONE_ORDER.get(x["status_tone"], 9), -x.get("_mv", 0)))
+                for b in position_briefs:
+                    b.pop("_mv", None)
+
+                # C区：市况速览
+                mc = None
+                try:
+                    mc = _module("market_condition")
+                except Exception:
+                    mc = None
+
+                render.action_brief(tradeable_items, position_briefs, mc)
+            except Exception as exc:
+                _fail("今日行动清单", exc)
+
     @st.fragment
     def _module_overview() -> None:
         """模块1：顶部数据概览组（5 张指标卡：候选/持仓/告警/盈亏/市况评分）"""
@@ -415,10 +510,12 @@ with tab_overview:
 
     # 批次2：今日概览模块按关注度重排——顶部数据概览 → 持仓与操作建议 → 紧急告警日志
     #         → 今日操作提示（市况五维）→ 今日热门板块 → 今日候选与建仓机会 → 近期复盘动态
-    # 今日概览 7 个模块 key（模块级，供「全部展开/收起」批量栏使用；
+    # 今日概览 8 个模块 key（模块级，供「全部展开/收起」批量栏使用；
     # 批次2 修复：原定义在 _module_overview fragment 内部导致模块级引用 NameError）
-    _MOD_KEYS = ("ov_overview", "ov_market", "ov_positions", "ov_alerts",
+    _MOD_KEYS = ("ov_action", "ov_overview", "ov_market", "ov_positions", "ov_alerts",
                  "ov_sectors", "ov_cands", "ov_reviews")
+    # 今日行动清单（置顶，首屏第一眼）
+    _module_action_brief()
     # 模块1：顶部数据概览组（5 张指标卡：候选/持仓/告警/盈亏/市况评分）
     _module_overview()
     _m1, _m2, _m3 = st.columns([1.1, 1.1, 4], vertical_alignment="center")

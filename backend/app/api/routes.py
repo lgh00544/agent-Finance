@@ -297,8 +297,9 @@ def get_market_intel(date: str | None = None):
 
 @router.get("/market_intel/dates")
 def market_intel_dates(limit: int = 30):
-    """已生成市场研判的日期列表（最新在前，页面选日期）"""
-    return {"dates": repo.list_market_intel_dates(limit)}
+    """已生成市场研判的日期列表（最新在前，页面选日期）。
+    返回裸数组（原包裹 {"dates": [...]} 与前端期望 string[] 不一致，致 React SPA 黑屏）"""
+    return repo.list_market_intel_dates(limit)
 
 
 @router.get("/jobs/status")
@@ -442,8 +443,9 @@ def list_candidates(date: Optional[str] = None, limit: int = 50):
 
 @router.get("/candidates/dates")
 def candidate_dates(limit: int = 30):
-    """候选池可选日期（去重降序）：页面默认仅加载最新一天，切换日期再按需查询"""
-    return {"dates": repo.list_candidate_dates(limit)}
+    """候选池可选日期（去重降序）：页面默认仅加载最新一天，切换日期再按需查询。
+    返回裸数组（原包裹 {"dates": [...]} 与前端期望 string[] 不一致，致 React SPA 黑屏）"""
+    return repo.list_candidate_dates(limit)
 
 
 @router.get("/candidates/tradeable")

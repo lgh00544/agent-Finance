@@ -17,8 +17,8 @@ from app.db.models import (
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
     Experience, ExperienceConfig, Holding, HotMoneyProfile, LhbOriginalFlow,
     MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
-    PrivateKnowledge, ReviewLog, ReviewResult, RuleChange, SellDecision,
-    StockCandidate, StockScore, TradeProfile, TradeRecord, WorkerRun, _now,
+    PrivateKnowledge, ReviewLog, ReviewResult, RuleChange, SectorSnapshot,
+    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord, WorkerRun, _now,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -112,10 +112,31 @@ def get_candidate_snapshot(stock_code: str, trade_date: str) -> dict | None:
         return dict(row.snapshot or {}) if row else None
 
 
+def get_candidate_context(stock_code: str, trade_date: str) -> dict | None:
+    """候选标的选股上下文（ScoreAgent 交叉验证用；只读 detail + reasons，不影响候选列表契约）
+    返回 {reasons, confidence_tier, focus_type, final_advice}；无候选记录返回 None"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(StockCandidate).where(
+                StockCandidate.stock_code == stock_code,
+                StockCandidate.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        detail = row.detail or {}
+        return {
+            "reasons": row.reasons or [],
+            "confidence_tier": detail.get("confidence_tier", ""),
+            "focus_type": detail.get("focus_type", ""),
+            "final_advice": detail.get("final_advice", ""),
+        }
+
+
 # ==================== 市况评分（v2.0 Discover 前置步骤） ====================
 
 def upsert_market_condition(trade_date: str, total_score: int, dims: dict,
-                            cap: int, summary: str) -> None:
+                            cap: int, summary: str,
+                            next_day_index_pct: float | None = None) -> None:
     with SessionLocal() as db:
         row = db.execute(
             select(MarketCondition).where(MarketCondition.trade_date == trade_date)
@@ -124,6 +145,22 @@ def upsert_market_condition(trade_date: str, total_score: int, dims: dict,
             row = MarketCondition(trade_date=trade_date)
             db.add(row)
         row.total_score, row.dims, row.cap, row.summary = total_score, dims, cap, summary
+        # 防覆盖：仅在参数非 None 才写入，重跑 upsert 不抹掉已回填的次日指数
+        if next_day_index_pct is not None:
+            row.next_day_index_pct = next_day_index_pct
+        db.commit()
+
+
+def update_market_condition_next_day(trade_date: str, pct: float) -> None:
+    """写入 market_condition 某日期的次日沪深300涨跌%（回填链路用；按 trade_date 匹配行，
+    幂等由回填侧查询条件 next_day_index_pct IS NULL 保证，本函数不做条件判断）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(MarketCondition).where(MarketCondition.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        row.next_day_index_pct = pct
         db.commit()
 
 
@@ -159,6 +196,73 @@ def get_prev_market_condition() -> dict | None:
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
+
+
+def upsert_sector_snapshot(rows: list[dict]) -> int:
+    """upsert 板块快照（trade_date+sector_name 唯一键冲突时全量覆盖）
+
+    rows 每项字段：trade_date/sector_name/change_pct/leading_stock_name/
+                   leading_stock_code/source/rank_no
+    返回成功写入行数。
+    单次最多 5 条，按 trade_date 一次性「删后插」简单稳，不做 ORM merge。
+    """
+    if not rows:
+        return 0
+    trade_date = rows[0].get("trade_date", "")
+    if not trade_date:
+        return 0
+    with SessionLocal() as db:
+        # 按 trade_date 全删后插（5 条小数据，简单稳，避免按行 upsert 循环）
+        db.execute(
+            text("DELETE FROM sector_snapshot WHERE trade_date = :d"),
+            {"d": trade_date},
+        )
+        for r in rows:
+            db.add(SectorSnapshot(
+                trade_date=r["trade_date"],
+                sector_name=r["sector_name"],
+                change_pct=r["change_pct"],
+                leading_stock_name=r.get("leading_stock_name", ""),
+                leading_stock_code=r.get("leading_stock_code", ""),
+                source=r.get("source", ""),
+                rank_no=r["rank_no"],
+            ))
+        db.commit()
+    return len(rows)
+
+
+def list_sector_snapshot_by_date(trade_date: str, limit: int = 5) -> list[dict]:
+    """按交易日取板块快照（按 rank_no 升序），首页热路径 O(limit)"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorSnapshot)
+            .where(SectorSnapshot.trade_date == trade_date)
+            .order_by(SectorSnapshot.rank_no.asc())
+            .limit(limit)
+        ).scalars().all()
+        return [
+            {
+                "board_name": r.sector_name,
+                "change_pct": r.change_pct,
+                "leading_stock": r.leading_stock_name,
+                "leading_code": r.leading_stock_code,
+                "rank_no": r.rank_no,
+                "source": r.source,
+            }
+            for r in result
+        ]
+
+
+def get_sector_snapshot_updated_at(trade_date: str) -> str | None:
+    """取该交易日最近一次更新时间（用于判断是否 stale，格式 YYYY-MM-DD HH:MM:SS）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(SectorSnapshot.updated_at)
+            .where(SectorSnapshot.trade_date == trade_date)
+            .order_by(SectorSnapshot.updated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        return str(row) if row is not None else None
 
 
 # ==================== 市场研判底座（market_intel，每日收盘后 1 次 + 手动入口） ====================
@@ -915,7 +1019,8 @@ def list_candidate_dates(limit: int = 30) -> list[str]:
 # ==================== 候选池 T+N 验证（选股效果闭环·代码侧客观统计） ====================
 
 def upsert_track_verify(stock_code: str, stock_name: str, select_date: str,
-                        select_rating: str, base_close_price: float) -> int:
+                        select_rating: str, base_close_price: float,
+                        factor_scores: dict | None = None) -> int:
     """初始化追踪行：同 (code, select_date) 已存在则返回既有 id（幂等，重复执行安全）"""
     with SessionLocal() as db:
         row = db.execute(
@@ -926,7 +1031,8 @@ def upsert_track_verify(stock_code: str, stock_name: str, select_date: str,
         if row is None:
             row = CandidateTrackVerify(stock_code=stock_code, stock_name=stock_name,
                                        select_date=select_date, select_rating=select_rating,
-                                       base_close_price=base_close_price)
+                                       base_close_price=base_close_price,
+                                       factor_scores=factor_scores)
             db.add(row)
             db.commit()
             db.refresh(row)
@@ -936,6 +1042,7 @@ def upsert_track_verify(stock_code: str, stock_name: str, select_date: str,
 
 def update_track_verify(row_id: int, *, t3_pct=None, t5_pct=None, t10_pct=None,
                         max_drawdown=None, verify_result: dict | None = None,
+                        factor_scores: dict | None = None,
                         is_finished: int = 0) -> None:
     """增量更新已追踪行（未提供的参数保持原值）；update_time 取当前时间戳"""
     with SessionLocal() as db:
@@ -952,6 +1059,8 @@ def update_track_verify(row_id: int, *, t3_pct=None, t5_pct=None, t10_pct=None,
             row.max_drawdown = max_drawdown
         if verify_result is not None:
             row.verify_result = verify_result
+        if factor_scores is not None:
+            row.factor_scores = factor_scores
         row.is_finished = is_finished
         row.update_time = time.strftime("%Y-%m-%d %H:%M")
         db.commit()
@@ -996,6 +1105,7 @@ def list_track_verify(select_date: str = "", rating: str = "",
                      "base_close_price": r.base_close_price, "t3_pct": r.t3_pct,
                      "t5_pct": r.t5_pct, "t10_pct": r.t10_pct,
                      "max_drawdown": r.max_drawdown, "verify_result": r.verify_result or {},
+                     "factor_scores": r.factor_scores,
                      "is_finished": r.is_finished, "update_time": r.update_time,
                      "created_at": str(r.created_at)} for r in rows]
 
@@ -1017,6 +1127,30 @@ def list_track_verify_dates(limit: int = 30) -> list[str]:
             return list(rows)
 
     return _dbq("track_verify", {"dates": limit}, _load)
+
+
+def get_score_factors(stock_code: str, trade_date: str) -> list[dict] | None:
+    """从 stock_score.detail 提取六因子分值（只读，幂等）。
+    返回 [{"factor": "动量", "score": 7}, ...] 或 None（无评分/旧格式无 factors）。
+    当日评分优先，回退到最近一条过去评分。"""
+    with SessionLocal() as db:
+        score = db.execute(
+            select(StockScore).where(StockScore.stock_code == stock_code,
+                                     StockScore.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if score is None:
+            score = db.execute(
+                select(StockScore).where(StockScore.stock_code == stock_code)
+                .order_by(StockScore.trade_date.desc()).limit(1)
+            ).scalar_one_or_none()
+        if score is None:
+            return None
+        detail = score.detail or {}
+        factors = detail.get("factors")
+        if not isinstance(factors, list) or not factors:
+            return None
+        return [{"factor": f.get("factor", ""), "score": f.get("score", 0)}
+                for f in factors if isinstance(f, dict)]
 
 
 def get_candidate_rating(stock_code: str, trade_date: str) -> str:
