@@ -17,6 +17,7 @@ const KnowledgePage = lazy(() => import('@/pages/KnowledgePage'))
 const AgentChatPage = lazy(() => import('@/pages/AgentChatPage'))
 const RuleChangesPage = lazy(() => import('@/pages/RuleChangesPage'))
 const ExperiencePage = lazy(() => import('@/pages/ExperiencePage'))
+const ProfilePage = lazy(() => import('@/pages/ProfilePage'))
 
 /** 页面加载过渡（路由切换时的懒加载 fallback） */
 function PageLoading() {
@@ -46,6 +47,7 @@ export default function App() {
           <Route path="agent-chat" element={<AgentChatPage />} />
           <Route path="rule-changes" element={<RuleChangesPage />} />
           <Route path="experience" element={<ExperiencePage />} />
+          <Route path="profile" element={<ProfilePage />} />
           <Route path="*" element={<OverviewPage />} />
         </Route>
       </Routes>

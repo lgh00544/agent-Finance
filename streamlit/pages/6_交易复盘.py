@@ -576,6 +576,12 @@ except Exception:  # noqa: BLE001
 # ================= 选股效果验证（候选池 T+N 自动追踪·选股质量闭环） =================
 _PERIOD_LABELS = {"t3": "T+3", "t5": "T+5", "t10": "T+10"}
 
+# 评级→排序权重（A 最前，B 次之，C 与"未评级"靠后）——只在展示层用，不改判定
+_TV_SORT_RATING = {"A": 0, "B": 1, "C": 2}
+
+# 可建仓徽章 CSS class —— 与 1_每日候选池.py 同款样式，视觉一致
+_TV_BADGE_CLS = {"可建仓": "badge-ok", "建议关注": "badge-info", "观察": "badge-mute"}
+
 
 def _tv_pct(row: dict, period: str) -> float | None:
     v = row.get(f"{period}_pct")
@@ -626,6 +632,23 @@ with render.fold_module("track_verify", "选股效果验证（T+N 自动追踪�
             tv_rows = api.track_verify_list() or []
         except Exception:  # noqa: BLE001 后端未起降级为空态，不阻断页面
             tv_rows = []
+
+        # —— 可建仓徽章数据：按 track 行的 select_date 跨查 candidate_tradeable（只读已落库判定）
+        # 与候选池页的 _badge_html 同源视觉，不调判定、不补算、不缓存跨进程态。
+        tv_badges: dict[str, dict] = {}  # key = f"{select_date}_{stock_code}" → 带 label 的 item
+        if tv_rows:
+            # 批量按 select_date 分组调一次 api.candidate_tradeable(date=...)，
+            # 每个日期只调一次（通常 1-3 个日期），避免逐行 N+1
+            _select_dates = sorted({r.get("select_date", "") for r in tv_rows if r.get("select_date")})
+            for _sd in _select_dates:
+                try:
+                    _tview = api.candidate_tradeable(date=_sd, limit=200)
+                    for _it in (_tview.get("items") or []):
+                        _key = f"{_sd}_{_it.get('stock_code', '')}"
+                        tv_badges[_key] = _it
+                except Exception:  # noqa: BLE001 跨查失败仅降级无徽章，不阻塞追踪列表渲染
+                    pass  # 该日期判定未落库 → 该批次无徽章
+
         try:
             tv_stats = api.track_verify_stats(period)
         except Exception:  # noqa: BLE001
@@ -668,13 +691,19 @@ with render.fold_module("track_verify", "选股效果验证（T+N 自动追踪�
                 tv_dates = api.track_verify_dates() or []
             except Exception:  # noqa: BLE001
                 tv_dates = []
-            f1, f2, f3 = st.columns(3)
+            f1, f2, f3, f4 = st.columns(4)
             with f1:
                 f_rating = st.selectbox("评级", ["全部"] + ratings, key="_tv_f_rating")
             with f2:
                 f_status = st.selectbox("状态", ["全部", "追踪中", "已到期"], key="_tv_f_status")
             with f3:
                 f_date = st.selectbox("选中日", ["全部"] + list(tv_dates), key="_tv_f_date")
+            with f4:
+                f_sort = st.selectbox(
+                    "排序",
+                    ["评级 + 选中日（默认）", "选中日 + 评级", "T+N 涨跌幅 高→低", "最大回撤 高→低"],
+                    key="_tv_f_sort",
+                )
 
             def _tv_filter(row: dict) -> bool:
                 if f_rating != "全部":
@@ -690,6 +719,31 @@ with render.fold_module("track_verify", "选股效果验证（T+N 自动追踪�
                 return True
 
             shown = [r for r in tv_rows if _tv_filter(r)]
+
+            # —— 排序：仅在前端展示层做 stable sort，不动后端默认顺序
+            if shown:
+                if f_sort == "评级 + 选中日（默认）":
+                    shown.sort(
+                        key=lambda r: (_TV_SORT_RATING.get((r.get("select_rating") or "").strip(), 3),
+                                       r.get("select_date") or "")
+                    )
+                elif f_sort == "选中日 + 评级":
+                    shown.sort(
+                        key=lambda r: (r.get("select_date") or "",
+                                       _TV_SORT_RATING.get((r.get("select_rating") or "").strip(), 3)),
+                        reverse=True  # 选中日降序，让最新选入的排前
+                    )
+                elif f_sort.startswith("T+N 涨跌幅"):
+                    shown.sort(
+                        key=lambda r: (_tv_pct(r, period) if _tv_pct(r, period) is not None else -999),
+                        reverse=True
+                    )
+                elif f_sort.startswith("最大回撤"):
+                    shown.sort(
+                        key=lambda r: (r.get("max_drawdown") if r.get("max_drawdown") is not None else 999),
+                        reverse=True
+                    )
+
             if not shown:
                 render.empty_state("当前筛选条件下无追踪标的。", icon="🔍")
             else:
@@ -710,7 +764,18 @@ with render.fold_module("track_verify", "选股效果验证（T+N 自动追踪�
                 for r in shown:
                     pct = _tv_pct(r, period)
                     rating = (r.get("select_rating") or "").strip() or "未评级"
-                    title = f"{render.stock_label(r['stock_code'], r['stock_name'])} · {rating}"
+                    # 徽章：按 (select_date, stock_code) 跨查 candidate_tradeable 历史判定
+                    _tb_item = tv_badges.get(f"{r.get('select_date')}_{r.get('stock_code')}") or {}
+                    _tb_label = _tb_item.get("label") or ""
+                    _tb_cls = _TV_BADGE_CLS.get(_tb_label, "badge-mute")
+                    _badge_html = (
+                        f'<span class="badge {_tb_cls}">{_tb_label or "未判定"}</span>'
+                        if _tb_label else  # 未判定时不渲染徽章（避免历史回填日期无 tradeable 数据时全屏徽章噪音）
+                        ''
+                    )
+                    title = f"{render.stock_label(r['stock_code'], r['stock_name'])} · {rating}" + (
+                        f"　{_badge_html}" if _badge_html else ""
+                    )
                     subtitle = (f"{r.get('select_date')} · {_PERIOD_LABELS[period]} "
                                 f"{pct:+.2f}%" if pct is not None
                                 else f"{r.get('select_date')} · {_PERIOD_LABELS[period]} 未到周期")

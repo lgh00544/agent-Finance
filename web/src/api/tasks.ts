@@ -15,3 +15,7 @@ export const taskDetail = (tid: string): Promise<TaskInfo> => get(`/tasks/${tid}
 /** POST /api/tasks/{id}/retry */
 export const retryTask = (tid: string): Promise<{ task_id: string; status: string }> =>
   post(`/tasks/${tid}/retry`)
+
+/** POST /api/tasks/{id}/cancel —— 后端已实现（routes.py:250-257），仅包装 */
+export const cancelTask = (tid: string): Promise<{ task_id: string; status: string; canceled: boolean }> =>
+  post(`/tasks/${tid}/cancel`)

@@ -13,6 +13,7 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -28,6 +29,11 @@ const { Text } = Typography
 
 const TIER_MAP: Record<string, string> = { 强烈推荐: 'A', 建议关注: 'B', 谨慎观察: 'C' }
 const TIER_DOT: Record<string, string> = { A: 'red', B: 'orange', C: 'blue' }
+const LABEL_COLORS: Record<string, string> = {
+  '可建仓': 'green',
+  '建议关注': 'blue',
+  '观察': 'default',
+}
 
 const SCOPE_LABELS: Record<string, string> = {
   all: '全部候选',
@@ -250,7 +256,7 @@ function BatchVerifyPanel({ date, dayRows }: { date?: string; dayRows: Candidate
     if (batch.submit.data?.task_id) {
       message.info(`已提交批量验证任务（${batch.submit.data.task_id}）`)
     }
-  }, [batch.submit.data?.task_id])
+  }, [batch.submit.data?.task_id, message])
 
   const apply = async (bid?: number) => {
     if (!bid) return
@@ -482,6 +488,12 @@ export function CandidatesPage() {
   const [traceStock, setTraceStock] = useState<{ code: string; date: string } | null>(null)
 
   const { data: dates } = useQuery({ queryKey: ['candidate-dates'], queryFn: () => candidateDates(30) })
+  // 默认查询当天的候选池（dates[0] 是最新一天；异步回填避免首帧空态/未选中）
+  useEffect(() => {
+    if (!date && dates && dates.length > 0) {
+      setDate(dates[0])
+    }
+  }, [date, dates])
   const { data: rows } = useQuery({
     queryKey: ['candidates', date],
     queryFn: () => candidates(date),
@@ -511,7 +523,7 @@ export function CandidatesPage() {
     if (tid) {
       message.success(`已提交后台，请看右下角任务面板 #${tid.slice(-6)}`)
     }
-  }, [dig.submit.data?.task_id])
+  }, [dig.submit.data?.task_id, message])
 
   // 名称补全
   const codes = rows?.filter((r) => !r.stock_name || r.stock_name === r.stock_code).map((r) => r.stock_code) ?? []
@@ -569,8 +581,8 @@ export function CandidatesPage() {
         <StatCard label="可自动生成建仓计划" value={Number(tradeable?.plan_candidate_count ?? 0)}
           tone="info" sub="评级 A/B 且暂无方案" />
         <StatCard label="近期选股胜率"
-          value={wr != null ? `${(wr * 100).toFixed(1)}%` : '无数据'}
-          tone={wr != null ? (wr >= 0.5 ? 'ok' : wr < 0.4 ? 'err' : 'warn') : 'mute'}
+          value={wr != null ? `${wr.toFixed(1)}%` : '无数据'}
+          tone={wr != null ? (wr >= 50 ? 'ok' : wr < 40 ? 'err' : 'warn') : 'mute'}
           sub={`盈利 ${tvStats?.wins ?? 0} 笔 / 共 ${tvN} 笔（T+5 已到期）`} />
         <StatCard label="平均涨幅" value={avg != null ? `${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%` : '无数据'}
           tone={avg != null ? (avg > 0 ? 'up' : avg < 0 ? 'down' : 'mute') : 'mute'} sub="T+5 周期" />
@@ -608,12 +620,33 @@ export function CandidatesPage() {
           expandable={{ expandedRowRender: (r) => <CandidateExpand c={r} /> }}
           columns={[
             {
-              title: '排名/股票', key: 'stock', width: 200,
+              title: '排名/股票', key: 'stock', width: 280,
+              render: (_: unknown, r: Candidate) => {
+                const tv = (tradeableMap[r.stock_code] ?? {}) as Record<string, unknown>
+                const label = String(tv.label ?? '')
+                const block = String(tv.block_reason ?? '')
+                return (
+                  <Space size={6} wrap>
+                    <Text type="secondary">#{r.rank ?? '—'}</Text>
+                    <StockLabel code={r.stock_code} name={nameOf(r)} />
+                    {label ? (
+                      <Tooltip
+                        title={block || '评级 / 现价 / 风险三条件均满足，建议进入建仓阶段'}
+                        placement="top"
+                      >
+                        <Tag color={LABEL_COLORS[label] ?? 'default'} style={{ marginInlineEnd: 0 }}>
+                          {label}
+                        </Tag>
+                      </Tooltip>
+                    ) : null}
+                  </Space>
+                )
+              },
+            },
+            {
+              title: '创建时间', key: 'trade_date', width: 110,
               render: (_: unknown, r: Candidate) => (
-                <Space>
-                  <Text type="secondary">#{r.rank ?? '—'}</Text>
-                  <StockLabel code={r.stock_code} name={nameOf(r)} />
-                </Space>
+                <Text type="secondary" style={{ fontSize: 12 }}>{r.trade_date || '—'}</Text>
               ),
             },
             {

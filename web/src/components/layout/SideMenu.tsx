@@ -13,6 +13,7 @@ import {
   SafetyOutlined,
   StarOutlined,
   SyncOutlined,
+  UserOutlined,
 } from '@ant-design/icons'
 import { useLocation, useNavigate } from 'react-router-dom'
 import type { MenuProps } from 'antd'
@@ -53,6 +54,7 @@ const NAV_GROUPS: Array<{
       { path: '/agent-chat', label: 'Agent对话', icon: <MessageOutlined /> },
       { path: '/rule-changes', label: '规则变更记录', icon: <FileTextOutlined /> },
       { path: '/experience', label: '经验沉淀', icon: <ExperimentOutlined /> },
+      { path: '/profile', label: '个人交易偏好', icon: <UserOutlined /> },
     ],
   },
 ]

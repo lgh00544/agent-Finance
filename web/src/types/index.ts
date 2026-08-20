@@ -114,6 +114,7 @@ export interface CandidateTradeable {
   count?: number
   plan_candidate_count?: number
   total?: number
+  /** items 每项的 label 为判定标签，三态：'可建仓' | '建议关注' | '观察'；历史回填日期未落库时为空字符串。 */
   items?: Array<Record<string, unknown>>
   [k: string]: unknown
 }
@@ -282,6 +283,7 @@ export interface TrackVerifyStats {
   n?: number
   wins?: number
   losses?: number
+  /** 胜率，单位：0-100 的百分制数值（如 44.0 表示 44.0%）。前端展示时不要再乘以 100。 */
   win_rate?: number | null
   avg_pct?: number | null
   pl_ratio?: number | null

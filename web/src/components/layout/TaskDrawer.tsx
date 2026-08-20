@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  Alert,
   App,
   Badge,
   Button,
@@ -7,13 +8,14 @@ import {
   Drawer,
   Empty,
   Modal,
+  Progress,
   Space,
   Tag,
   Typography,
 } from 'antd'
 import { CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
-import { retryTask, taskDetail } from '@/api/tasks'
+import { cancelTask, retryTask, taskDetail } from '@/api/tasks'
 import { useRunningCount, useTasks, useTasksStore, type TaskEntry } from '@/store/tasksStore'
 
 const { Text } = Typography
@@ -33,6 +35,26 @@ export const KIND_LABELS: Record<string, string> = {
 export function kindLabel(kind?: string): string {
   if (!kind) return ''
   return KIND_LABELS[kind] ?? kind
+}
+
+/** 任务 kind → 预估总时长（秒）。用于伪进度展示，不假装精确。 */
+const KIND_ESTIMATED_SECONDS: Record<string, number> = {
+  daily_pipeline: 180,
+  batch_ask: 120,
+  position: 45,
+  score: 30,
+  sell_decision: 30,
+  monitor_all: 60,
+  portfolio_sentinel: 90,
+  market_intel: 45,
+}
+
+/** 伪进度：0~95，到上限卡死，不到 done 永远不满。 */
+function fakeProgressPct(kind: string | undefined, elapsedMs: number): number {
+  const totalSec = (kind && KIND_ESTIMATED_SECONDS[kind]) || 60
+  const raw = Math.min(1, elapsedMs / 1000 / totalSec)
+  // 上限 95%：done 之前永远不到 100%，防止"看着快完了"
+  return Math.round(raw * 100 * 0.95)
 }
 
 function fmtElapsed(ms: number): string {
@@ -120,6 +142,43 @@ export function TaskDrawer() {
     removeTask(entry.task_id)
   }
 
+  const doCancel = (entry: TaskEntry) => {
+    modal.confirm({
+      title: '取消任务',
+      content: `确认取消【${kindLabel(entry.kind)} #${shortId(entry.task_id)}】？取消后该任务标记为失败。`,
+      okText: '确认取消',
+      cancelText: '继续执行',
+      okButtonProps: { danger: true },
+      onOk: () =>
+        cancelTask(entry.task_id)
+          .then((r) => {
+            // 后端 cancel 后把 status 置 failed + canceled=true
+            // store 走 updateTask 走"正常失败"流程，触发既有 isHidden(30s) 与重试按钮
+            updateTask(r.task_id, {
+              status: 'failed',
+              error: '已手动取消',
+              finished_at: Date.now(),
+            })
+            message.success(`已取消：${kindLabel(entry.kind)} #${shortId(r.task_id)}`)
+          })
+          .catch((e: Error) => {
+            // 后端 400 = 任务已终态（done/failed），cancel 不可用
+            // toast 提示 + 立即拉一次真实状态刷新 store，消除"运行中"假象
+            message.error(`取消失败：${e.message}`)
+            taskDetail(entry.task_id)
+              .then((t) =>
+                updateTask(t.task_id, {
+                  status: t.status,
+                  error: t.error ?? null,
+                  result: t.result,
+                  finished_at: (t.status === 'done' || t.status === 'failed') ? Date.now() : undefined,
+                }),
+              )
+              .catch(() => {})
+          }),
+    })
+  }
+
   const doClearDone = () => {
     modal.confirm({
       title: '清空已完成任务',
@@ -196,12 +255,31 @@ export function TaskDrawer() {
                   <Button size="small" onClick={() => setDetailEntry(t)}>查看详情</Button>
                   <Button size="small" onClick={() => copyId(t.task_id)}>复制 ID</Button>
                   {t.status === 'failed' ? <Button size="small" danger onClick={() => doRetry(t)}>重试</Button> : null}
+                  {(t.status === 'pending' || t.status === 'running') ?
+                    <Button size="small" danger onClick={() => doCancel(t)}>取消</Button> : null}
                   {!runningNow ? <Button size="small" type="text" onClick={() => doRemove(t)}>移除</Button> : null}
                 </Space>
+                {(t.status === 'pending' || t.status === 'running') ? (
+                  <Progress
+                    percent={fakeProgressPct(t.kind, elapsed)}
+                    size="small"
+                    showInfo={false}
+                    strokeColor="var(--primary)"
+                    style={{ marginTop: 6 }}
+                  />
+                ) : null}
                 {t.error ? (
-                  <div style={{ marginTop: 8, color: 'var(--err)', fontSize: 12 }}>
-                    {t.error.length > 200 ? `${t.error.slice(0, 200)}…` : t.error}
-                  </div>
+                  <Alert
+                    type="error"
+                    showIcon
+                    message={t.status === 'failed' && t.error === '已手动取消' ? '已手动取消' : '执行失败'}
+                    description={
+                      <div style={{ maxHeight: 120, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                        {t.error}
+                      </div>
+                    }
+                    style={{ marginTop: 8 }}
+                  />
                 ) : null}
               </Card>
             )
