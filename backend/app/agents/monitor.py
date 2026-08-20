@@ -19,6 +19,7 @@ from app.db.models import Holding
 from app.graph.state import StockAgentState
 from app.services.feishu import push_alert
 from app.services.indicator import compute_indicators
+from app.agents.portfolio_sentinel import read_portfolio_overview
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,8 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
     real_time = state.get("real_time") or {}
     stale = bool(state.get("quote_stale"))
     math = _trade_math(real_time.get("price"), holding)
+    # 组合联动（batch F）：读组合哨兵告警概览（多键隔离快照），供个股判断参考；无快照为空 dict 不阻断
+    po = read_portfolio_overview(today)
     real_time_block = {
         **real_time, **math,
         "数据状态": "实时（TTL 30s 内缓存）" if not stale else "数据暂未更新（实时源不可用，以下为最近一次有效数据）",
@@ -166,6 +169,9 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         "近期K线": indicators.get("recent_klines", [])[-15:],
         # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
         "游资聚合": state.get("hot_money"),
+        # 组合联动（batch F）：组合告警三态色 / 集中度警示 / 板块暴露占比（缺失不注入，避免噪音）
+        **({k: po[k] for k in ("portfolio_alert_level", "concentration_warning", "sector_exposure_pct")
+           if k in po and po[k] is not None and po[k] != ""}),
     }
     news_context = "\n".join(
         f"{n.get('published_at')} {n.get('title')}" for n in (state.get("news_report") or [])) or "（无）"

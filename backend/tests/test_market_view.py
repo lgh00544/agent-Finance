@@ -23,17 +23,18 @@ def _index_spot():
     ])
 
 
-def test_index_quotes_filters_three_majors(monkeypatch):
-    """只保留三大指数且保持固定顺序（上证/深证/创业板），数值正确"""
+def test_index_quotes_filters_majors_with_csi300(monkeypatch):
+    """保留三大指数 + 沪深300（batch F 组合回撤分解的市场基准），保持固定顺序，数值正确"""
     monkeypatch.setattr(market_view, "get_datasource",
                         lambda: type("S", (), {"fetch_index_spot": lambda self: _index_spot()})())
     data = market_view.index_quotes()
     assert data["error"] is None
     codes = [it["code"] for it in data["indices"]]
-    assert codes == ["sh000001", "sz399001", "sz399006"]
+    assert codes == ["sh000001", "sz399001", "sz399006", "sh000300"]
     up = data["indices"][0]
     assert up["name"] == "上证指数" and up["price"] == 3456.78 and up["change_pct"] == 0.85
     assert data["indices"][1]["change_pct"] == -1.23
+    assert data["indices"][3]["code"] == "sh000300" and data["indices"][3]["name"] == "沪深300"
 
 
 def test_index_quotes_failure_returns_error(monkeypatch):

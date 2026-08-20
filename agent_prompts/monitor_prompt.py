@@ -53,6 +53,9 @@ def build_user_prompt(holding_info: str, quote_data: str, news_context: str) -> 
 
 【实时行情与技术指标】（最近 K 线 + 纯数学指标）
 {quote_data}
+（注：若 JSON 含 portfolio_alert_level / concentration_warning / sector_exposure_pct，
+表示组合级联动告警——组合风险上升时结合个股基本面审慎权衡，组合告警为参考权重，非一票否决；
+若不含则组合层面无告警或数据缺失，无需强行联想。）
 
 【最新新闻/公告】
 {news_context}

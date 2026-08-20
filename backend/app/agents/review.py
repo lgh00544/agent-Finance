@@ -16,6 +16,7 @@ from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
 from app.services import reasoning_trace
+from app.agents.portfolio_sentinel import read_portfolio_overview
 
 logger = logging.getLogger(__name__)
 
@@ -117,11 +118,37 @@ def collect_review(state: StockAgentState) -> StockAgentState:
         "hold_days": hold_days,
         "pnl_pct": pnl_pct,
         "price_stats": price_stats,
+        "portfolio_attribution": _portfolio_attribution(
+            code, pnl_pct, state.get("trade_date") or time.strftime("%Y-%m-%d")),
     }
     state["trace"] = [*state.get("trace", []),
                       f"复盘数据聚合: 持有{hold_days}天 盈亏{pnl_pct}% 信号{len(signal_rows)}条 "
                       f"卖出决策{len(sell_rows)}条 游资信号{len(hm_signals)}条"]
     return state
+
+
+def _portfolio_attribution(code: str, pnl_pct: float | None, trade_date: str) -> dict:
+    """该笔交易对组合 P&L 的贡献分解（batch F 组合联动）：{contrib_pct, alpha, drawdown_contrib}。
+
+    - contrib_pct：该股自身盈亏%（对组合收益的直接贡献，参考权重）
+    - alpha      ：该股盈亏扣除市场β后的超额（= pnl_pct − 市场成分 system）
+    - drawdown_contrib：该股对组合回撤的贡献（pnl<0 时为 pnl，否则 0）
+    组合概览缺失（无快照/无沪深300）→ 对应字段 None + missing_data，不编造（K223 事实为先）。
+    """
+    po = read_portfolio_overview(trade_date)
+    decomp = (po.get("drawdown_decomp") or {}) if isinstance(po.get("drawdown_decomp"), dict) else {}
+    system = decomp.get("system")
+    missing: list[str] = []
+    if pnl_pct is None:
+        missing.append("pnl_pct")
+    if system is None:
+        missing.append("csi300_index")
+    return {
+        "contrib_pct": pnl_pct,          # 该股对组合收益的贡献%（未做权重调整的简化口径，参考权重）
+        "alpha": round(pnl_pct - system, 2) if (pnl_pct is not None and system is not None) else None,
+        "drawdown_contrib": round(pnl_pct, 2) if (pnl_pct is not None and pnl_pct < 0) else 0.0,
+        "missing_data": missing,
+    }
 
 
 def llm_review(state: StockAgentState) -> StockAgentState:

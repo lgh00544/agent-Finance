@@ -31,6 +31,15 @@ def _clean():
         db.commit()
 
 
+@pytest.fixture(autouse=True)
+def _no_live_index(monkeypatch):
+    """batch F：回撤分解默认关联网上沪深300（避免打真实指数网络，测试确定性）；
+    需要取到指数的用例再手动 monkeypatch 覆盖。"""
+    from app.agents import portfolio_sentinel as ps
+
+    monkeypatch.setattr(ps, "_fetch_csi300_change_pct", lambda: None)
+
+
 def _insert_holding(code: str, name: str, entry_price: float, shares: int,
                     entry_date: str = "2026-08-01") -> int:
     return repo.insert_holding(code, name, entry_date, entry_price, shares,
@@ -262,3 +271,87 @@ def test_node_failure_degrades(monkeypatch):
     assert len(rules) == 1
     assert rules[0]["source"] == "portfolio_sentinel"
     assert "规则兜底" in rules[0]["message"]
+
+
+# ==================== 6. 批次F：多缓存键隔离（portfolio_id） ====================
+
+def test_cache_key_multi_key_isolated(monkeypatch):
+    """多键隔离：LLM 缓存键 + 组合概览快照键均含 {trade_date}:{PORTFOLIO_ID}（不再用时间片）"""
+    from app.agents import portfolio_sentinel as ps
+
+    _insert_holding("600519", "贵州茅台", 10.0, 100)
+    source = _FakeSource(
+        quotes={"600519": {"code": "600519", "price": 11.0, "change_pct": 1.0}},
+        sectors={"600519": "白酒"},
+    )
+    monkeypatch.setattr(ps, "get_datasource", lambda: source)
+    monkeypatch.setattr(ps, "_fetch_csi300_change_pct", lambda: -2.0)  # 沪深300 可取
+    captured = {}
+
+    def _fake_call(**kw):
+        captured["cache_key"] = kw["cache_key"]
+        return _sentinel_output()
+
+    monkeypatch.setattr(ps, "agent_call", _fake_call)
+
+    state = ps.portfolio_sentinel_node({"trade_date": DATE})
+    assert "error" not in state or not state["error"]
+    # LLM 缓存键 = portfolio_sentinel:{trade_date}:{portfolio_id}（main），不含时间片
+    assert captured["cache_key"] == f"portfolio_sentinel:{DATE}:{ps.PORTFOLIO_ID}"
+    assert ps.PORTFOLIO_ID == "main"
+    # 组合概览快照写入了隔离键，可被 read_portfolio_overview 读回
+    overview = ps.read_portfolio_overview(DATE)
+    assert overview.get("portfolio_alert_level") in ("green", "yellow", "red")
+    assert overview.get("sector_exposure_pct") is not None
+    assert "drawdown_decomp" in overview
+
+
+def test_overview_absent_returns_empty(monkeypatch):
+    """无组合快照（不同日期）→ read_portfolio_overview 返回空 dict，不阻断"""
+    from app.agents import portfolio_sentinel as ps
+
+    assert ps.read_portfolio_overview("2099-01-01") == {}
+
+
+# ==================== 7. 批次F：回撤分解（compute_drawdown_decomposition） ====================
+
+def test_drawdown_decomposition_missing_csi300(monkeypatch):
+    """沪深300 缺失 → system/alpha 均 None + missing_data=["csi300_index"]（不编造）"""
+    from app.agents import portfolio_sentinel as ps
+
+    monkeypatch.setattr(ps, "_fetch_csi300_change_pct", lambda: None)  # 指数取不到
+    res = ps.compute_drawdown_decomposition(ps.PORTFOLIO_ID, DATE, -5.0)
+    assert res["data"]["system"] is None
+    assert res["data"]["alpha"] is None
+    assert res["missing_data"] == ["csi300_index"]
+
+
+def test_drawdown_decomposition_math_boundary(monkeypatch):
+    """system+alpha 守恒：system=市场涨跌幅，alpha=组合收益−市场（β≈1 参考口径）"""
+    from app.agents import portfolio_sentinel as ps
+
+    # 组合 -5%，市场 -2% → system=-2, alpha=-3
+    index_val = {"v": -2.0}
+    monkeypatch.setattr(ps, "_fetch_csi300_change_pct", lambda: index_val["v"])
+    res = ps.compute_drawdown_decomposition(ps.PORTFOLIO_ID, DATE, -5.0)
+    assert res["data"]["system"] == -2.0
+    assert res["data"]["alpha"] == -3.0
+    assert round(res["data"]["system"] + res["data"]["alpha"], 2) == pytest.approx(-5.0)
+    assert res["missing_data"] == []
+
+    # 组合 +3%，市场 -1% → system=-1, alpha=+4（市场跌组合涨 → 正超额）
+    index_val["v"] = -1.0
+    res2 = ps.compute_drawdown_decomposition(ps.PORTFOLIO_ID, DATE, 3.0)
+    assert res2["data"]["system"] == -1.0
+    assert res2["data"]["alpha"] == 4.0
+
+
+def test_drawdown_decomposition_missing_pnl(monkeypatch):
+    """组合收益缺失 → missing_data=["portfolio_pnl_pct"]，system/alpha None"""
+    from app.agents import portfolio_sentinel as ps
+
+    monkeypatch.setattr(ps, "_fetch_csi300_change_pct", lambda: -2.0)
+    res = ps.compute_drawdown_decomposition(ps.PORTFOLIO_ID, DATE, None)
+    assert res["data"]["system"] is None
+    assert res["data"]["alpha"] is None
+    assert res["missing_data"] == ["portfolio_pnl_pct"]

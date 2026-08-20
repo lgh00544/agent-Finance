@@ -17,9 +17,10 @@ from app.datasource.base import DataSourceError
 
 logger = logging.getLogger(__name__)
 
-# 顶部状态栏三大指数（代码 → 展示名）
-INDEX_NAMES = {"sh000001": "上证指数", "sz399001": "深证成指", "sz399006": "创业板指"}
-INDEX_CODES = ["sh000001", "sz399001", "sz399006"]
+# 顶部状态栏指数（代码 → 展示名；含沪深300 作组合回撤分解的市场基准）
+INDEX_NAMES = {"sh000001": "上证指数", "sz399001": "深证成指",
+               "sz399006": "创业板指", "sh000300": "沪深300"}
+INDEX_CODES = ["sh000001", "sz399001", "sz399006", "sh000300"]
 
 HOT_SECTOR_COUNT = 5  # 首页「今日热门板块」看板数量
 
