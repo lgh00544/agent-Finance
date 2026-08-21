@@ -232,6 +232,110 @@ def get_selection_performance_summary(period: str = "t5") -> str:
     return text
 
 
+# ==================== 前瞻兑现对照事实（Discover 第 5 子 Agent 输入切片） ====================
+# 纯统计、零 LLM。为 shortlist 每只拼一段【前瞻对照事实】，供 Discover 终选做 延续/回归/回吐 判断。
+# 数据来源仅：初选威科夫列 + enrich 资金列 + candidate_track_verify（复用现有统计）。
+# 铁律：缺列/失败写「数据不足」，禁止编造、禁止 LLM 算这些数、禁止「延续概率 70%」这类模型分。
+#
+# 【D1 决策】同类 T+5 分组维度 = select_rating（A/B/C 信心档），非 pos_52w 位置桶。
+#   实测历史 candidate_track_verify 57 条仅 8 条 snapshot 含 pos_52w（其余早于威科夫列加入，
+#   stock_type 历史也从未落库）。按位置桶近期必然样本不足；select_rating 100% 落库且直接对应
+#   同类信念强度，故同类桶退回 confidence-tier 档。单测须锁死此边界。
+_HORIZON_MIN_SAMPLE = 5      # 同类桶样本下限（写入注入事实的阈值；以下写「样本不足」）
+_HORIZON_SELF_MAX = 2        # 自身历史入选最多展示次数
+
+
+def _fmt_float(v, suffix="%"):
+    """数值格式化：None/非数值 → '数据不足'；否则保留 1 位小数 + 后缀"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "数据不足"
+    if f != f:  # NaN
+        return "数据不足"
+    return f"{f:.1f}{suffix}"
+
+
+def build_horizon_context(shortlist: list[dict], data_enrichment: dict) -> str:
+    """逐 shortlist 候选组装【前瞻对照事实】文本段（供 Discover 终选注入）。
+    shortlist: LLM 初选输出（含威科夫列 pos_52w/pct_change_5d/dist_52w_high_pct/
+               ma20_pos_pct/ma60_pos_pct/vol_5_20 与 confidence_tier）；
+    data_enrichment: {code: enrich}，enrich 含 main_net_3d/5d/10d（有则给，无则标注不可用）。
+    返回多行文本；任何一只数据不足只影响该只，整段异常返回空串（调用方省略，终选退回今日行为）。"""
+    if not shortlist:
+        return ""
+    try:
+        track_rows = repo.list_track_verify(limit=500)
+    except Exception as exc:  # noqa: BLE001 读失败整段省略，不阻塞终选
+        logger.warning("前瞻对照统计读取失败（省略前瞻段）: %s", exc)
+        return ""
+
+    # 同类 T+5 分组：按 select_rating（A/B/C 信心档）→ _group_stats（样本含 t5_pct 才计入）
+    t5_by_rating: dict[str, list[dict]] = {}
+    self_history: dict[str, list[dict]] = {}
+    for r in track_rows:
+        code, date = r.get("stock_code"), r.get("select_date")
+        if r.get("t5_pct") is not None:
+            rating = (r.get("select_rating") or "").strip() or "未知"
+            t5_by_rating.setdefault(rating, []).append({"pct": r.get("t5_pct")})
+        if code and date:
+            self_history.setdefault(code, []).append(
+                {"select_date": date, "t3": r.get("t3_pct"), "t5": r.get("t5_pct")})
+    rating_stats = {k: _group_stats(v) for k, v in t5_by_rating.items()}
+    # 自身历史按 select_date 降序（list_track_verify 已按 select_date DESC）
+    for code in self_history:
+        self_history[code] = self_history[code][:_HORIZON_SELF_MAX]
+
+    blocks = []
+    for cand in shortlist:
+        code = cand.get("stock_code") or cand.get("code") or ""
+        name = cand.get("stock_name") or cand.get("name") or ""
+        enrich = data_enrichment.get(code) or {}
+
+        # —— 位置/量能行 ——
+        pos_line = (f"位置：5日斜率 {_fmt_float(cand.get('pct_change_5d'))}；"
+                    f"距52周高点 {_fmt_float(cand.get('dist_52w_high_pct'))}；"
+                    f"区间位置 {_fmt_float(cand.get('pos_52w'))}；"
+                    f"MA20 {_fmt_float(cand.get('ma20_pos_pct'))} / MA60 {_fmt_float(cand.get('ma60_pos_pct'))}；"
+                    f"量能5/20 {_fmt_float(cand.get('vol_5_20'))}")
+
+        # —— 资金行（3/5/10 日主力净额，enrich 无则标注不可用）——
+        m3, m5, m10 = (enrich.get("main_net_3d"), enrich.get("main_net_5d"),
+                       enrich.get("main_net_10d"))
+        money_val = lambda v: f"{float(v) / 100000000:.2f}亿" if v not in (None, "") else "无"  # noqa: E731
+        money_line = (f"资金：3/5/10日主力 {money_val(m3)}/{money_val(m5)}/{money_val(m10)}"
+                      + ("（当日主力资金可用）" if any(v not in (None, "") for v in (m3, m5, m10))
+                         else "（当日资金不可用）"))
+
+        # —— 同类 T+5（confidence-tier 桶）——
+        cand_rating = (cand.get("confidence_tier") or "").strip()
+        g = rating_stats.get(cand_rating) if cand_rating else None
+        if cand_rating and g and g.get("n", 0) >= _HORIZON_MIN_SAMPLE:
+            wr = f"{g['win_rate']:.1f}%" if g["win_rate"] is not None else "数据不足"
+            avg = f"{g['avg_pct']:+.2f}%" if g["avg_pct"] is not None else "数据不足"
+            peer_line = (f"同类T+5：桶={cand_rating} 档 样本={g['n']} 胜率={wr} 均收益={avg}"
+                         f"（{_HORIZON_MIN_SAMPLE} 个以上可用样本，可作为对照）")
+        else:
+            n_txt = f"（现有 {g['n']} 个）" if g and g.get("n") else ""
+            peer_line = f"同类T+5：桶={cand_rating or '未知'} 档 样本不足{n_txt}，禁止当作结论（需≥{_HORIZON_MIN_SAMPLE}）"
+
+        # —— 自身历史入选 ——
+        hist = self_history.get(code) or []
+        if hist:
+            parts = []
+            for h in hist:
+                t3 = f"{h['t3']:+.2f}%" if h.get("t3") is not None else "—"
+                t5 = f"{h['t5']:+.2f}%" if h.get("t5") is not None else "—"
+                parts.append(f"{h['select_date']} T3={t3} T5={t5}")
+            hist_line = "自身历史入选：" + "；".join(parts)
+        else:
+            hist_line = "自身历史入选：无"
+
+        blocks.append(f"【前瞻对照】{code} {name}\n{pos_line}\n{money_line}\n{peer_line}\n{hist_line}")
+
+    return "\n\n".join(blocks)
+
+
 def _format_perf_summary(stats: dict, anomalies: list[dict], period_label: str = "T+5") -> str:
     """统计 + 异常 → 紧凑文本（客观事实；win_rate/avg_pct/pl_ratio 为 None 时降级不报错；
     分评级仅展示样本≥3 的档位；异常只列事实 desc+data，不给结论）。"""

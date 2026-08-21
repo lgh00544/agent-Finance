@@ -29,6 +29,9 @@ const { Text } = Typography
 
 const TIER_MAP: Record<string, string> = { 强烈推荐: 'A', 建议关注: 'B', 谨慎观察: 'C' }
 const TIER_DOT: Record<string, string> = { A: 'red', B: 'orange', C: 'blue' }
+// 前瞻兑现三态徽章（与 confidence_tier 的 red/orange/blue 独立、不抢色；
+// 不用 var(--up)/var(--down) 红绿，避免与强烈推荐=红撞色、且延续/回吐语境用红绿会误导）
+const HORIZON_MAP: Record<string, string> = { 延续: 'success', 回归: 'default', 回吐: 'warning' }
 const LABEL_COLORS: Record<string, string> = {
   '可建仓': 'green',
   '建议关注': 'blue',
@@ -74,6 +77,12 @@ function CandidateExpand({ c }: { c: Candidate }) {
   })
 
   const tier = TIER_MAP[String(detail.confidence_tier ?? '')] ?? ''
+
+  // 前瞻兑现三态（有默认值即视为可展示；clarity=低 时徽章仍显示、note 为「数据不足」，不隐藏）
+  const horizonBias = String(detail.horizon_bias ?? '')
+  const horizonClarity = String(detail.horizon_clarity ?? '')
+  const horizonColor = HORIZON_MAP[horizonBias] ?? 'default'
+  const horizonNote = String(detail.horizon_note ?? '前瞻数据不足')
 
   // 各 Tab 内容块
   const dimsTab = (
@@ -173,6 +182,7 @@ function CandidateExpand({ c }: { c: Candidate }) {
     <div>
       <Space style={{ marginBottom: 10 }}>
         {tier ? <Tag color={TIER_DOT[tier]}>{tier} 级</Tag> : null}
+        {horizonBias ? <Tag color={horizonColor} title={`清晰度：${horizonClarity || '低'}`}>前瞻·{horizonBias}</Tag> : null}
         <Tag>{String(detail.stock_type ?? '未评级')}</Tag>
         <Button
           size="small"
@@ -183,6 +193,11 @@ function CandidateExpand({ c }: { c: Candidate }) {
           生成建仓方案
         </Button>
       </Space>
+      {horizonNote && horizonNote !== '前瞻数据不足' ? (
+        <Alert type="warning" showIcon style={{ marginBottom: 10 }} message={`前瞻：${horizonBias}（${horizonClarity || '低'}）—— ${horizonNote}`} />
+      ) : (
+        <Alert type="info" showIcon style={{ marginBottom: 10 }} message="前瞻：暂无足够数据（历史同类样本不足）" />
+      )}
       <Tabs defaultActiveKey="dims" size="small" items={items} />
     </div>
   )

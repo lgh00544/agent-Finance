@@ -83,6 +83,18 @@ def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: in
                                         risk_notice, snapshot, detail or {}, row.created_at)
 
 
+def get_candidate_detail(stock_code: str, trade_date: str) -> dict:
+    """读候选 detail（只读，幂等）。供 discover 终选构造 detail 时做防御式 merge：
+    在 {**existing, **new_detail} 中保留旧字段（confidence_tier/final_advice/dimensions/enriched 等），
+    防止整 dict 覆盖丢键。无记录返回 {}。"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(StockCandidate.detail).where(
+                StockCandidate.stock_code == stock_code, StockCandidate.trade_date == trade_date)
+        ).scalar_one_or_none()
+        return (row or {}) or {}
+
+
 def replace_day_candidates(codes: set[str], trade_date: str) -> int:
     """当日候选池快照替换：删除当日不在本次执行结果中的残留候选（不残留历史版本）。
     返回删除条数；仅删除 stock_code 不在 codes 中的记录，本次执行产物保留。"""

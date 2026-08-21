@@ -606,6 +606,15 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         logger.warning("游资聚合失败（降级跳过）: %s", exc)
     hm_text = hot_money_svc.build_hot_money_context(hm_aggs, date_key) if hm_aggs else ""
 
+    # 前瞻兑现对照事实注入（第 5 子 Agent 输入切片）：逐候选离组 延续/回归/回吐 判据的客观事实。
+    # 纯统计零 LLM（track_verify.build_horizon_context）；空串整段省略（终选退回今日行为，不阻塞）。
+    try:
+        from app.services.track_verify import build_horizon_context
+        horizon_text = build_horizon_context(shortlist, data_enrichment)
+    except Exception as exc:  # noqa: BLE001 组装失败降级省略前瞻段，不阻塞终选
+        logger.warning("前瞻对照事实组装失败（省略前瞻段）: %s", exc)
+        horizon_text = ""
+
     cap = state.get("market_cap")
     output = agent_call(
         agent="discover_final",
@@ -613,7 +622,7 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         system_prompt=discover_prompt.SYSTEM_PROMPT,
         user_prompt=discover_prompt.build_final_prompt(
             table, news_text, cap=cap, market_note=_market_note(state),
-            hot_money_context=hm_text),
+            hot_money_context=hm_text, horizon_context=horizon_text),
         schema=DiscoverOutput,
         ttl_seconds=86400,
         model_level=ModelLevel.DEEP,
@@ -627,11 +636,20 @@ def llm_final(state: StockAgentState) -> StockAgentState:
     trade_date = state.get("trade_date", _today())
     candidates = []
     for rank, cand in enumerate(final_list, start=1):
+        # 前瞻硬兜底（pydantic schema 无字段间约束，prompt 软约束不够，必须代码硬兜底防 LLM 自作主张）：
+        # 回吐 + 清晰度高/中 → 不得「强烈推荐」，强制降档建议关注 + 关注类型观察
+        clarity = (cand.horizon_clarity or "").strip()
+        if cand.horizon_bias == "回吐" and clarity in ("高", "中") \
+                and cand.confidence_tier == "强烈推荐":
+            cand.confidence_tier = "建议关注"
+            cand.focus_type = "观察"
+            logger.warning("[前瞻兜底] %s 回吐+清晰度%s → 强烈推荐降档建议关注",
+                           cand.stock_code, clarity)
         item = cand.model_dump()
         candidates.append(item)
         snapshot = next((u for u in state.get("universe") or []
                          if u.get("code") == cand.stock_code), {})
-        detail = {
+        new_detail = {
             "confidence_tier": cand.confidence_tier, "confidence_pct": cand.confidence_pct,
             "stock_type": cand.stock_type,
             # v3.0 白盒维度归因（主结论）：dimensions 数组 + final_advice 综合评估
@@ -643,8 +661,16 @@ def llm_final(state: StockAgentState) -> StockAgentState:
             "tech_view": cand.tech_view, "price_levels": cand.price_levels,
             "position_hint": cand.position_hint,
             "rule_refs": cand.rule_refs,
+            # 前瞻兑现三态（第 5 子 Agent 收口；缺则用 schema 默认，禁止静默丢键）
+            "horizon_bias": cand.horizon_bias,
+            "horizon_clarity": cand.horizon_clarity,
+            "horizon_note": cand.horizon_note,
             "enriched": data_enrichment.get(cand.stock_code) or {},
         }
+        # 防丢键：防御式 merge，保留既有 detail 中的旧字段（本批次只新增字段，不整 dict 覆盖）。
+        # 仅在本函数内封装；不改 repo.upsert_candidate 内部（被 Score/Monitor/ExperienceWorker 共用）。
+        existing = repo.get_candidate_detail(cand.stock_code, trade_date) or {}
+        detail = {**existing, **new_detail}
         repo.upsert_candidate(cand.stock_code, cand.stock_name, trade_date,
                               rank, [cand.reason], [cand.risk_notice], snapshot, detail)
     # 当日快照替换：删除当日不在本次执行结果中的残留候选，保证当日只保留最新一次执行产物。
