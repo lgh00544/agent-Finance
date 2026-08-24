@@ -86,11 +86,12 @@ class Settings(BaseSettings):
     min_amount: float = 1e8     # 最低成交额（元）：流动性刚性过滤
 
     # ---------- 市况评分 → 候选池上限档位（v2.0 前置步骤）----------
-    # 每档 [最低分, 最高分, 候选池上限, 档位名]；.env 可用 JSON 覆盖 MARKET_CAP_BANDS
+    # 每档 [最低分, 最高分, 候选池上限, 档位名, 宏观定级, 严格度]；
+    # .env 可用 JSON 覆盖 MARKET_CAP_BANDS（覆盖时列结构须同步为 6 列）
     market_cap_bands: list[list] = Field(
-        default=[[0, 20, 5, "防御期"], [21, 35, 10, "过渡期"],
-                 [36, 45, 15, "温和期"], [46, 50, 20, "强势期"]],
-        description="市况评分（0-50）档位映射：分数区间 → 候选池上限 → 档位名")
+        default=[[0, 20, 5, "防御期", "极差", "极严"], [21, 35, 10, "过渡期", "坏", "严格"],
+                 [36, 45, 15, "温和期", "中", "标准"], [46, 50, 20, "强势期", "好", "宽松"]],
+        description="市况评分（0-50）档位映射：分数区间 → 候选池上限 → 档位名 → 宏观定级 → 严格度")
 
     # ---------- 调度 ----------
     discover_hour: int = 16
@@ -220,10 +221,57 @@ def get_settings() -> Settings:
 settings = get_settings()
 
 
-def market_band_info(score: float) -> tuple[int, str]:
-    """市况评分 → (当日候选池上限, 档位名)。档位为人工设定映射，非市场判断。"""
-    for low, high, cap, name in settings.market_cap_bands:
+def market_band_info(score: float) -> tuple[int, str, str, str]:
+    """市况评分 → (候选池上限, 档位名, 宏观定级, 严格度)。档位为人工设定映射，非市场判断。"""
+    for low, high, cap, name, grade, strictness in settings.market_cap_bands:
         if low <= score <= high:
-            return int(cap), str(name)
+            return int(cap), str(name), str(grade), str(strictness)
     last = settings.market_cap_bands[-1]
-    return int(last[2]), str(last[3])
+    return int(last[2]), str(last[3]), str(last[4]), str(last[5])
+
+
+# ---------- 市况严格度（决策可信度增强） ----------
+# 严格度 → 可建仓门槛（tier_allowed）+ 额外硬校验（extra_checks）+ LLM prompt 措辞。
+# 宽松/标准硬门槛一致（A/B 建仓、C 观察），差异体现于选股措辞；严格/极严叠加胜率/净流入关卡。
+strictness_policy: dict[str, dict] = {
+    "宽松": {"tier_allowed": ["A", "B"], "extra_checks": [],
+            "prompt_phrase": "宽松选股·宽松门槛"},
+    "标准": {"tier_allowed": ["A", "B"], "extra_checks": [],
+            "prompt_phrase": "标准选股·常规门槛"},
+    "严格": {"tier_allowed": ["A"], "extra_checks": ["win_rate_5d>=40"],
+            "prompt_phrase": "严格选股·从严门槛"},
+    "极严": {"tier_allowed": ["A"], "extra_checks": ["win_rate_5d>=50", "main_net_5d>=1e8"],
+            "prompt_phrase": "只保留最强信号·极严门槛"},
+}
+
+# MarketIntel 修正映射：基底严格度 × risk_appetite → 最终严格度。
+# 只允许上调或保持，禁止因进取放宽（标准基底进取也不得下调到宽松）。
+market_intel_correction_map: dict[str, dict[str, str]] = {
+    "宽松": {"避险": "标准", "中性": "宽松", "进取": "宽松"},
+    "标准": {"避险": "严格", "中性": "标准", "进取": "标准"},
+    "严格": {"避险": "严格", "中性": "严格", "进取": "严格"},
+    "极严": {"避险": "极严", "中性": "极严", "进取": "极严"},
+}
+
+# phase 黑名单：命中即保持基底严格度，即使 risk_appetite=进取也不下调
+phase_blacklist: tuple[str, ...] = ("退潮", "出货", "弱势", "存量博弈")
+
+# 严格度 mapping 冻结留痕说明（写 review_log，变更需人工审核、可回滚）
+STRICTNESS_FREEZE_NOTE = (
+    "市况严格度 mapping 冻结：strictness_policy=" + str(strictness_policy)
+    + "；market_intel_correction_map=" + str(market_intel_correction_map)
+    + "；phase_blacklist=" + str(phase_blacklist))
+
+
+def apply_market_intel_correction(base_strictness: str,
+                                  market_intel: dict | None) -> str:
+    """MarketIntel 修正：五维评分基底 + 宏观 risk_appetite/phase → 最终严格度。
+    数据缺失/非三态/phase 命中黑名单 → 不修正退化基底。"""
+    if not market_intel:
+        return base_strictness
+    appetite = market_intel.get("risk_appetite")
+    if appetite not in market_intel_correction_map.get(base_strictness, {}):
+        return base_strictness
+    if any(kw in str(market_intel.get("phase") or "") for kw in phase_blacklist):
+        return base_strictness
+    return market_intel_correction_map[base_strictness][appetite]

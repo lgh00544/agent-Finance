@@ -191,7 +191,7 @@ def get_latest_market_condition() -> dict | None:
         ).scalar_one_or_none()
         if row is None:
             return None
-        cap, band = market_band_info(row.total_score)
+        cap, band, *_ = market_band_info(row.total_score)
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
@@ -209,7 +209,7 @@ def get_prev_market_condition() -> dict | None:
         if len(rows) < 2:
             return None
         row = rows[1]
-        cap, band = market_band_info(row.total_score)
+        cap, band, *_ = market_band_info(row.total_score)
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}

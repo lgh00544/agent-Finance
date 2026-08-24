@@ -21,15 +21,49 @@ def _db_ready():
 # ==================== 市况档位映射（人工映射表，纯规则） ====================
 
 def test_market_band_info_boundaries():
-    assert market_band_info(0) == (5, "防御期")
-    assert market_band_info(20) == (5, "防御期")
-    assert market_band_info(21) == (10, "过渡期")
-    assert market_band_info(35) == (10, "过渡期")
-    assert market_band_info(36) == (15, "温和期")
-    assert market_band_info(45) == (15, "温和期")
-    assert market_band_info(46) == (20, "强势期")
-    assert market_band_info(50) == (20, "强势期")
-    assert market_band_info(999) == (20, "强势期")  # 越界兜底取最末档
+    assert market_band_info(0) == (5, "防御期", "极差", "极严")
+    assert market_band_info(20) == (5, "防御期", "极差", "极严")
+    assert market_band_info(21) == (10, "过渡期", "坏", "严格")
+    assert market_band_info(35) == (10, "过渡期", "坏", "严格")
+    assert market_band_info(36) == (15, "温和期", "中", "标准")
+    assert market_band_info(45) == (15, "温和期", "中", "标准")
+    assert market_band_info(46) == (20, "强势期", "好", "宽松")
+    assert market_band_info(50) == (20, "强势期", "好", "宽松")
+    assert market_band_info(999) == (20, "强势期", "好", "宽松")  # 越界兜底取最末档
+    # P0 兼容：调用方必须以 `cap, band, *_` 解构 4 元组
+    cap, band, *_ = market_band_info(30)
+    assert cap == 10 and band == "过渡期"
+
+
+def test_market_band_info_reference():
+    # 验证清单固定点：30 分 → 过渡期/坏/严格，候选上限 10
+    assert market_band_info(30) == (10, "过渡期", "坏", "严格")
+
+
+def test_strictness_policy_shape():
+    from app.core.config import strictness_policy
+    assert strictness_policy["宽松"]["tier_allowed"] == ["A", "B"]
+    assert strictness_policy["标准"]["tier_allowed"] == ["A", "B"]
+    assert strictness_policy["严格"]["tier_allowed"] == ["A"]
+    assert strictness_policy["严格"]["extra_checks"] == ["win_rate_5d>=40"]
+    assert strictness_policy["极严"]["extra_checks"] == ["win_rate_5d>=50", "main_net_5d>=1e8"]
+    assert all(p["prompt_phrase"] for p in strictness_policy.values())
+
+
+def test_apply_market_intel_correction():
+    from app.core.config import apply_market_intel_correction
+    # 标准 + 避险 → 严格（上调）
+    assert apply_market_intel_correction("标准", {"risk_appetite": "避险"}) == "严格"
+    # 标准 + 进取 → 标准（收紧后不降为宽松）
+    assert apply_market_intel_correction("标准", {"risk_appetite": "进取"}) == "标准"
+    # 严格 + 进取 → 严格（不降）
+    assert apply_market_intel_correction("严格", {"risk_appetite": "进取"}) == "严格"
+    # None → 退化基底
+    assert apply_market_intel_correction("标准", None) == "标准"
+    # risk_appetite 非三态 → 不修正
+    assert apply_market_intel_correction("标准", {"risk_appetite": "乐观"}) == "标准"
+    # phase 黑名单命中：即使进取也保持基底（不降）
+    assert apply_market_intel_correction("宽松", {"risk_appetite": "进取", "phase": "存量博弈"}) == "宽松"
 
 
 # ==================== v2.0 输出 Schema（强制字段） ====================
