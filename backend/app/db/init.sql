@@ -280,3 +280,19 @@ CREATE TABLE IF NOT EXISTS quote_snapshot (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_quote_code (stock_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 派发期自动判定结果（每日 15:30 落库；Monitor/Sell/Score 注入参考；6 维快照 JSON）
+-- 与 backend/app/db/models.py 的 DistributionPhaseLog 一致
+CREATE TABLE IF NOT EXISTS distribution_phase_log (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    phase INT NOT NULL DEFAULT 0,
+    phase_label VARCHAR(16) NOT NULL DEFAULT '',
+    confidence VARCHAR(8) NOT NULL DEFAULT '',
+    six_dim JSON NULL,
+    missing_data JSON NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_dist_date_symbol (trade_date, symbol)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

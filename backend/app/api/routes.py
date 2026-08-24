@@ -1060,6 +1060,24 @@ def take_profit_plan(force: bool = False):
     return build_plans(force=force)
 
 
+# ================= 派发期判定（6 维自动判定；每日 15:30 落库，此端点实时查 / force 击穿） =================
+@router.get("/distribution_phase/{stock_code}")
+def distribution_phase(stock_code: str, force: bool = False):
+    """单只标的派发期自动判定：完整 6 维 + phase + confidence + missing_data（纯计算零 LLM）。
+    结果按 代码+日期 缓存 86400s，force=true 删除缓存键后重算（手动击穿）；
+    缺维返回 null + missing_data 标注，不补零不补均值。"""
+    from app.cache import cache
+    from app.services.distribution_phase import compute_distribution_phase
+    trade_date = time.strftime("%Y-%m-%d")
+    if force:
+        cache.delete(f"distribution_phase:{trade_date}:{stock_code}")
+    try:
+        return compute_distribution_phase(stock_code, trade_date)
+    except Exception as exc:  # noqa: BLE001 判定失败报 502，前端提示可稍后重试
+        logger.warning("派发期判定失败 %s: %s", stock_code, exc)
+        raise HTTPException(status_code=502, detail=f"派发期判定失败: {exc}")
+
+
 # ================= 游资追踪（游资档案 / 龙虎榜流水 / 留痕 / 权重迭代） =================
 @router.get("/hot-money/profiles")
 def hot_money_profiles(q: str = "", tier: str = ""):

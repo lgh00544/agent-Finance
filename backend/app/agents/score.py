@@ -196,9 +196,18 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 读取失败不阻塞评分
         logger.warning("因子校准摘要获取失败（降级跳过）: %s", exc)
 
+    # 派发期判定（batch D）：6 维自动判定事实（LLM 一票否决）；失败为 None 不阻断打分
+    distribution_phase_context = None
+    try:
+        from app.services.distribution_phase import compute_distribution_phase
+        distribution_phase_context = compute_distribution_phase(code, today)
+    except Exception as exc:  # noqa: BLE001 派发期判定失败跳过注入，不阻塞打分
+        logger.warning("派发期判定失败（跳过注入）: %s", exc)
+
     state["discover_context"] = discover_ctx
     state["market_intel_summary"] = intel_summary
     state["factor_calibration"] = factor_calibration
+    state["distribution_phase_context"] = distribution_phase_context
     state["trace"] = [*state.get("trace", []),
                       f"聚合完成: K线{len(kline)}行 财务{len(fin_rows)}期 资金流{len(ff_rows)}日 新闻{len(news_rows)}条"]
     return state
@@ -224,6 +233,8 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "行业板块行情": (state.get("basic_info") or {}).get("industry_spot", [])[:15],
         # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
         "游资聚合": state.get("hot_money"),
+        # 派发期判定（batch D）：6 维 + phase/confidence，供 LLM 单一票否决参考（缺失为 None）
+        "distribution_phase_context": state.get("distribution_phase_context"),
     }
 
     output = agent_call(
@@ -240,6 +251,17 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         ttl_seconds=86400,
         model_level=ModelLevel.DEEP,
     )
+
+    # ---- 派发期判定（batch D）：phase≥2 视为派发/砸盘风险，评分上限压至 90 + 追加风险提示 ----
+    # 不单独占一维（六因子维度不变），只做总分上限约束；缺失/失败不触发
+    _dist = state.get("distribution_phase_context") or {}
+    if int(_dist.get("phase") or 0) >= 2:
+        output.score = min(output.score, 90)
+        _trig = sum(1 for s in (_dist.get("six_dim") or {}).values() if s.get("triggered"))
+        _notice = (f"⚠️ 派发期判定: {_dist.get('phase_label') or '派发期'}（6维触发 {_trig} 项），"
+                   "评分上限压至 90，追高风险提示")
+        if _notice not in output.risk_list:
+            output.risk_list.append(_notice)
 
     # ---- v4.0 代码层推导 potential_flag（不信任 LLM 自报；factor 分值为 LLM 判断，flag 为事实换算）----
     _催化 = next((f.score for f in output.factors if f.factor == "催化"), 0)

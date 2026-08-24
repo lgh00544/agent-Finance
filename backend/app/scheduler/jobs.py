@@ -248,6 +248,43 @@ def sector_refresh_job() -> None:
         cache.release_lock("sector_refresh")
 
 
+def distribution_phase_job() -> None:
+    """派发期判定：每日 15:30 收盘后，遍历「今日候选 + 当前持仓」逐只判定落库
+
+    结果幂等落 distribution_phase_log（(trade_date, symbol) 唯一键覆盖）；
+    单只失败不阻断其余；锁防并发。
+    """
+    if not cache.acquire_lock("distribution_phase_auto", ttl_seconds=1800):
+        logger.info("distribution_phase_auto 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.distribution_phase import compute_distribution_phase
+        trade_date = time.strftime("%Y-%m-%d")
+        codes = {c.get("stock_code") for c in repo.list_candidates(trade_date, limit=200)
+                 if c.get("stock_code")}
+        codes |= {h.get("stock_code") for h in repo.list_holdings() if h.get("stock_code")}
+        codes = sorted(codes)
+        done, failed = 0, 0
+        for code in codes:
+            try:
+                r = compute_distribution_phase(code, trade_date)
+                repo.upsert_distribution_phase(
+                    trade_date, code, r.get("phase") or 0,
+                    r.get("phase_label") or "", r.get("confidence") or "",
+                    r.get("six_dim") or {}, r.get("missing_data") or [])
+                done += 1
+            except Exception as exc:  # noqa: BLE001 单只失败不阻断其余
+                logger.warning("派发期判定失败 %s: %s", code, exc)
+                failed += 1
+        cache.set("job:last_distribution_phase",
+                  time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        logger.info("派发期判定完成: 共%d只 成功%d 失败%d", len(codes), done, failed)
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("派发期判定异常: %s", exc)
+    finally:
+        cache.release_lock("distribution_phase_auto")
+
+
 def quote_snapshot_refresh_job() -> None:
     """持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁互不干扰）"""
     if not cache.acquire_lock("quote_snapshot_refresh", ttl_seconds=240):
@@ -417,6 +454,11 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-15", minute="*/5",
                       id="sector_refresh", name="板块快照刷新",
                       replace_existing=True, misfire_grace_time=300)
+    # 派发期判定：每日 15:30 收盘后逐只落库（6 维自动判定，供 Monitor/Sell/Score 参考）
+    scheduler.add_job(distribution_phase_job, "cron",
+                      day_of_week="mon-fri", hour=15, minute=30,
+                      id="distribution_phase", name="派发期判定",
+                      replace_existing=True, misfire_grace_time=3600)
     # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
     scheduler.add_job(quote_snapshot_refresh_job, "cron",
                       day_of_week="mon-fri", hour="9-15", minute="*/5",
@@ -447,5 +489,6 @@ def job_status() -> list[dict]:
     out.append({"id": "last_pre_market", "name": "最近盘前快筛", "next_run": cache.get("job:last_pre_market")})
     out.append({"id": "last_market_accuracy", "name": "最近市况回填", "next_run": cache.get("job:last_market_accuracy")})
     out.append({"id": "last_sector_refresh", "name": "最近板块刷新", "next_run": cache.get("job:last_sector_refresh")})
+    out.append({"id": "last_distribution_phase", "name": "最近派发期判定", "next_run": cache.get("job:last_distribution_phase")})
     out.append({"id": "last_quote_snapshot_refresh", "name": "最近持仓价刷新", "next_run": cache.get("job:last_quote_snapshot_refresh")})
     return out

@@ -159,6 +159,13 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
     math = _trade_math(real_time.get("price"), holding)
     # 组合联动（batch F）：读组合哨兵告警概览（多键隔离快照），供个股判断参考；无快照为空 dict 不阻断
     po = read_portfolio_overview(today)
+    # 派发期判定（batch D）：6 维参考事实（LLM 一票否决）；失败为 None 不阻断
+    dist = None
+    try:
+        from app.services.distribution_phase import compute_distribution_phase
+        dist = compute_distribution_phase(code, today)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("派发期判定失败（跳过注入）: %s", exc)
     real_time_block = {
         **real_time, **math,
         "数据状态": "实时（TTL 30s 内缓存）" if not stale else "数据暂未更新（实时源不可用，以下为最近一次有效数据）",
@@ -172,6 +179,8 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         # 组合联动（batch F）：组合告警三态色 / 集中度警示 / 板块暴露占比（缺失不注入，避免噪音）
         **({k: po[k] for k in ("portfolio_alert_level", "concentration_warning", "sector_exposure_pct")
            if k in po and po[k] is not None and po[k] != ""}),
+        # 派发期判定（batch D）：{phase_label}(置信度) + 6 维原始数据
+        "distribution_phase_context": dist,
     }
     news_context = "\n".join(
         f"{n.get('published_at')} {n.get('title')}" for n in (state.get("news_report") or [])) or "（无）"

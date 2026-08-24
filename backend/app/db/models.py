@@ -689,3 +689,25 @@ class QuoteSnapshot(Base):
     source: Mapped[str] = mapped_column(String(8), nullable=False, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class DistributionPhaseLog(Base):
+    """派发期自动判定结果（每日 15:30 收盘后落库；Monitor/Sell/Score 注入参考）
+
+    表结构：distribution_phase_log；(trade_date, symbol) 唯一，6 维快照 JSON 承载。
+    """
+    __tablename__ = "distribution_phase_log"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "symbol", name="uq_dist_date_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    phase: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    phase_label: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    confidence: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    six_dim: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    missing_data: Mapped[list] = mapped_column(SafeJSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

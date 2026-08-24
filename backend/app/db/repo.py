@@ -22,7 +22,7 @@ from app.db.models import (
     MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
     PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
     SectorSnapshot, SellDecision, StockCandidate, StockScore, TradeProfile,
-    TradeRecord, WorkerRun, _now,
+    TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -332,6 +332,24 @@ def get_quote_snapshot(within_minutes: int = 10) -> pd.DataFrame | None:
          "change_pct": r.change_pct, "source": r.source}
         for r in rows
     ])
+
+
+def upsert_distribution_phase(trade_date: str, symbol: str, phase: int, phase_label: str,
+                              confidence: str, six_dim: dict, missing_data: list) -> None:
+    """派发期判定结果幂等落库（(trade_date, symbol) 唯一键冲突时覆盖）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(DistributionPhaseLog).where(
+                DistributionPhaseLog.trade_date == trade_date,
+                DistributionPhaseLog.symbol == symbol)
+        ).scalar_one_or_none()
+        if row is None:
+            row = DistributionPhaseLog(trade_date=trade_date, symbol=symbol)
+            db.add(row)
+        row.phase, row.phase_label, row.confidence = phase, phase_label, confidence
+        row.six_dim, row.missing_data = six_dim or {}, missing_data or []
+        row.updated_at = _now()
+        db.commit()
 
 
 # ==================== 市场研判底座（market_intel，每日收盘后 1 次 + 手动入口） ====================

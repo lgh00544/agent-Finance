@@ -72,6 +72,7 @@ def init_db() -> None:
     _ensure_indexes()
     _ensure_sector_snapshot_table()
     _ensure_quote_snapshot_table()
+    _ensure_distribution_phase_table()
 
 
 def _ensure_experience_fts() -> None:
@@ -131,6 +132,12 @@ def _ensure_quote_snapshot_table() -> None:
     """幂等补建 quote_snapshot 表（持仓实时价快照；create_all 兜底 SQLite/MySQL 通吃）"""
     from app.db import models  # noqa: F401
     Base.metadata.create_all(bind=engine, tables=[models.QuoteSnapshot.__table__])
+
+
+def _ensure_distribution_phase_table() -> None:
+    """幂等补建 distribution_phase_log 表（派发期判定；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[models.DistributionPhaseLog.__table__])
 
 
 def _ensure_stock_candidate_detail(eng=None) -> None:
