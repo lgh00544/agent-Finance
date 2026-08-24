@@ -99,6 +99,8 @@ function ListPanel() {
             render: (v: string) => <Text type="secondary" style={{ fontSize: 12 }}>{String(v ?? '').slice(0, 60)}</Text>,
           },
           { title: '创建', dataIndex: 'created_at', width: 150, render: (v: string) => String(v ?? '').slice(0, 16) },
+          { title: '命中', dataIndex: 'hit_count', width: 70, render: (v: number) => <Text type="secondary">{v ?? 0}</Text> },
+          { title: '最近使用', dataIndex: 'last_used_at', width: 150, render: (v: string | null) => (v ? String(v).slice(0, 16) : '—') },
           {
             title: '操作', key: 'ops', width: 80,
             render: (_: unknown, r: { id: number }) => (

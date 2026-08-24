@@ -826,6 +826,7 @@ def list_knowledge(agent_tag: Optional[str] = None):
     """私有交易经验/战法列表（全部或按 Agent 过滤）"""
     rows = repo.list_knowledge(agent_tag)
     return [{"id": r.id, "title": r.title, "content": r.content, "agent_tag": r.agent_tag,
+             "hit_count": r.hit_count, "last_used_at": str(r.last_used_at) if r.last_used_at else None,
              "created_at": str(r.created_at)} for r in rows]
 
 

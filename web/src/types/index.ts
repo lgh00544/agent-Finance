@@ -245,6 +245,7 @@ export interface AgentSuggestion {
   target_agent?: string
   rule_name?: string
   rule_type?: string
+  target_kind?: string
   current_value?: string
   suggested_value?: string
   reason?: string
@@ -303,6 +304,8 @@ export interface KnowledgeItem {
   title: string
   content: string
   agent_tag?: string
+  hit_count?: number
+  last_used_at?: string | null
   created_at?: string
   [k: string]: unknown
 }

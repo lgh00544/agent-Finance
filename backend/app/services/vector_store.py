@@ -207,7 +207,8 @@ class VectorStore:
                     .limit(top_k)
                 )
                 rows = db.execute(stmt).scalars().all()
-                return [{"title": r.title, "content": r.content} for r in rows]
+                # 返回带 id（决策级归因：命中计量 + 对话引用编号映射依赖 id 定位）
+                return [{"id": r.id, "title": r.title, "content": r.content} for r in rows]
         except Exception as exc:  # noqa: BLE001
             logger.warning("私有知识库检索失败: %s", exc)
             return []

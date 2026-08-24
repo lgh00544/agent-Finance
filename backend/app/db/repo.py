@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 
 from app.cache import cache
 from app.core.config import settings
@@ -1465,6 +1465,23 @@ def delete_knowledge(knowledge_id: int) -> bool:
         db.delete(row)
         db.commit()
         return True
+
+
+def bump_knowledge_hits(knowledge_ids: list[int]) -> int:
+    """私有知识命中计量（决策级归因）：hit_count+1 + last_used_at=now，批量一次 UPDATE。
+    只加不自减（保留历史累计命中，不因"未用"清零）；空列表不执行；
+    调用方已降级（知识检索/对话回吐失败仅 warning，不阻塞主链路）。"""
+    ids = [int(i) for i in knowledge_ids if i]
+    if not ids:
+        return 0
+    with SessionLocal() as db:
+        res = db.execute(
+            update(PrivateKnowledge)
+            .where(PrivateKnowledge.id.in_(ids))
+            .values(hit_count=PrivateKnowledge.hit_count + 1, last_used_at=datetime.now())
+        )
+        db.commit()
+        return int(res.rowcount or 0)
 
 
 # ==================== 卖出决策（SellAgent 输出，仅供参考） ====================

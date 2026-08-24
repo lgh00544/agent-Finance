@@ -318,6 +318,9 @@ class PrivateKnowledge(Base):
     content: Mapped[str] = mapped_column(Text, default="")
     # 适用 Agent：discover/score/position/monitor/sell/review/all（all=全部 Agent 通用）
     agent_tag: Mapped[str] = mapped_column(String(32), index=True, default="all")
+    # 决策级归因·命中计量：检索注入 + 对话显式引用累计（只加不自减，便于看历史累计）；last_used_at 最近命中时间
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

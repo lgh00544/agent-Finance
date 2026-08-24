@@ -265,7 +265,7 @@ function Suggestions() {
   const act = (r: (typeof list)[number], action: 'approve' | 'adopt' | 'reject') => {
     const confirmMap: Record<string, { title: string; fn: () => Promise<unknown> }> = {
       approve: { title: `确认采纳建议：${r.rule_name}`, fn: () => approveSuggestion(r.id) },
-      adopt: { title: `应用生效：${r.rule_name}（硬规则需二次确认）`, fn: () => adoptSuggestion(r.id, true) },
+      adopt: { title: `应用生效：${r.rule_name}（硬规则需二次确认）`, fn: () => adoptSuggestion(r.id, r.rule_type === 'hard') },
       reject: { title: `驳回建议：${r.rule_name}`, fn: () => rejectSuggestion(r.id, '人工驳回') },
     }
     modal.confirm({
@@ -292,9 +292,11 @@ function Suggestions() {
           title: '操作', key: 'ops', width: 200,
           render: (_: unknown, r: (typeof list)[number]) => (
             <Space size={4}>
-              {r.status === 'pending' ? <Button size="small" onClick={() => act(r, 'approve')}>采纳</Button> : null}
+              {r.status === 'pending' ? (r.target_kind === 'profile'
+                ? <Button size="small" onClick={() => act(r, 'approve')}>采纳</Button>
+                : <Button size="small" onClick={() => act(r, 'adopt')}>应用生效</Button>
+              ) : null}
               {r.status === 'pending' ? <Button size="small" onClick={() => act(r, 'reject')}>驳回</Button> : null}
-              {r.status === 'approved' ? <Button size="small" type="primary" onClick={() => act(r, 'adopt')}>应用</Button> : null}
             </Space>
           ),
         },

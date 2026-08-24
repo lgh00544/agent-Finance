@@ -74,6 +74,7 @@ def init_db() -> None:
     _ensure_quote_snapshot_table()
     _ensure_distribution_phase_table()
     _ensure_capital_view_tables()
+    _ensure_knowledge_hit_columns()
 
 
 def _ensure_experience_fts() -> None:
@@ -186,6 +187,29 @@ def _ensure_review_result_columns(eng=None) -> None:
             for col, ddl in additions.items():
                 try:
                     conn.exec_driver_sql(f"ALTER TABLE review_result ADD COLUMN {col} {ddl}")
+                except Exception:  # noqa: BLE001 列已存在
+                    pass
+
+
+def _ensure_knowledge_hit_columns(eng=None) -> None:
+    """幂等补齐 private_knowledge.hit_count/last_used_at 列（决策级归因·命中计量；
+    仅增量加列，不重建表不丢数据；旧数据 hit_count=0、last_used_at=NULL）"""
+    eng = eng or engine
+    additions = {
+        "hit_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_used_at": "DATETIME",
+    }
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(private_knowledge)")}
+            for col, ddl in additions.items():
+                if col not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE private_knowledge ADD COLUMN {col} {ddl}")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            for col, ddl in additions.items():
+                try:
+                    conn.exec_driver_sql(f"ALTER TABLE private_knowledge ADD COLUMN {col} {ddl}")
                 except Exception:  # noqa: BLE001 列已存在
                     pass
 

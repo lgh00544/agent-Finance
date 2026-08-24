@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { App, Button, Card, Input, Space, Table, Tabs, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { hotMoneyFlows, hotMoneyProfiles, hotMoneyWinrateIterate } from '@/api/hotMoney'
+import { hotMoneyFlows, hotMoneyProfiles, hotMoneyTierApply, hotMoneyWinrateIterate } from '@/api/hotMoney'
 import { agentSuggestions, approveSuggestion, rejectSuggestion } from '@/api/suggestions'
 import { EmptyState, ErrorCard, StockLabel } from '@/components/common'
 import { moneyCn } from '@/utils/format'
@@ -108,7 +108,11 @@ function SuggestList() {
     okText: '确认', okButtonProps: action === 'reject' ? { danger: true } : { type: 'primary' as const },
     onOk: async () => {
       try {
-        if (action === 'approve') { await approveSuggestion(r.id); message.success('已采纳') }
+        if (action === 'approve') {
+          try { await approveSuggestion(r.id) } catch { message.error('审核未通过'); return }
+          try { await hotMoneyTierApply(r.id) } catch { message.error('审核已过但档位应用失败，请到游资追踪页重试'); return }
+          message.success('已采纳')
+        }
         else { await rejectSuggestion(r.id, '人工驳回'); message.info('已驳回') }
         qc.invalidateQueries({ queryKey: ['agent-sug'] })
       } catch (e) { message.error(e instanceof Error ? e.message : '操作失败') }

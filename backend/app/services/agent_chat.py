@@ -94,6 +94,10 @@ class ChatAnswer(BaseModel):
                     "{sentiment: 利好/利空/中性, reason: 一句话理由, "
                     "cross_check: 与股价/量价/资金的交叉验证说明, risk_note: 风险提示}；"
                     "未查询到公告时为 null")
+    used_knowledge: list[dict] = Field(
+        default_factory=list,
+        description="本次回答实际引用的私有知识[{id:int,title:str}]：id 为【你的私有交易经验/战法参考】"
+                    "段中的编号（1..N），未引用任何一条私有知识时留空数组")
 
 
 class RuleFeedback(BaseModel):
@@ -129,6 +133,7 @@ _CHAT_SYSTEM_PROMPT = """你是本 Agent 领域的专属对话助手。基于注
 1. 只回答本 Agent 职责范围内的问题；问题超出职责范围时在 scope_note 中明确说明「不属于本领域」，并简述可咨询哪个 Agent，不越界作答；
 2. 数据标源：关键结论必须标注依据来源（sources 字段），如「硬性规则第N条」「私有知识库《标题》」「分职能战法知识库」「公开行情数据」；
 3. 无绝对化表述：禁止「一定/必然/稳赚」等绝对化用语，不确定性用「可能/倾向/需跟踪」表达；
+3.5. 引用回吐：若实际采用了注入的【你的私有交易经验/战法参考】中的某条（按编号），必须在 used_knowledge 字段回吐其编号与标题（[{id:编号, title:标题}]）；未采用任何一条则 used_knowledge 留空数组；
 4. 标注信心度：数据充分且结论明确时 confidence 取 80-95；部分依据或主观推断取 50-75；依据不足时取 30-50 并明确说明；
 5. 风控底线不突破：任何建议不得违反人工硬性规则与风控底线（止损纪律/仓位上限/派发期一票否决等）；
 6. 涉及具体标的时：不给出确定的买卖指令，只做分析参考，交易必须人工决策并执行；
@@ -317,13 +322,26 @@ def ask_agent(agent: str, question: str) -> dict:
         user_prompt = f"{user_prompt}\n\n{ann_ctx}"
         system_prompt = f"{system_prompt}\n{_ANNOUNCEMENT_SYSTEM_PROMPT}"
     key = f"chat:{agent}:{hashlib.md5(question.strip().encode('utf-8')).hexdigest()[:10]}"
+    # 决策级归因·命中计量：预取私有知识段 → docs（编号→id 映射）；命中自增在 knowledge_section 内，
+    # agent_call 收到 knowledge_docs 后复用不再重复检索/重复计量
+    _, knowledge_docs = common.knowledge_section(agent)
     answer = common.agent_call(
         agent=agent, cache_key=key, system_prompt=system_prompt,
         user_prompt=user_prompt,
-        schema=ChatAnswer, ttl_seconds=0, model_level=ModelLevel.DEEP)
+        schema=ChatAnswer, ttl_seconds=0, model_level=ModelLevel.DEEP,
+        knowledge_docs=knowledge_docs)
+    # 引用回吐写回：LLM 报告的编号 → 知识 id → bump（失败仅 warning，不阻塞回答）
+    used = [u for u in (answer.used_knowledge or []) if isinstance(u, dict)]
+    if used and knowledge_docs:
+        try:
+            num_map = {d["number"]: d["id"] for d in knowledge_docs}
+            repo.bump_knowledge_hits([num_map.get(u.get("id", u.get("number"))) for u in used])
+        except Exception as exc:  # noqa: BLE001 写回失败不阻塞回答
+            logger.warning("对话引用知识写回失败（降级跳过）: %s", exc)
     sources_text = "；".join(s for s in answer.sources if s) or "未标注具体来源"
     payload = {"answer": answer.answer, "confidence": answer.confidence,
-               "sources": sources_text, "scope_note": answer.scope_note}
+               "sources": sources_text, "scope_note": answer.scope_note,
+               "used_knowledge": answer.used_knowledge or []}
     if announcement_data is not None:
         payload["announcement"] = announcement_data
         if answer.announcement_verdict:
@@ -333,6 +351,8 @@ def ask_agent(agent: str, question: str) -> dict:
                                                            "sources": answer.sources,
                                                            "scope_note": answer.scope_note,
                                                            "user_msg_id": user_mid,
+                                                           **({"used_knowledge": answer.used_knowledge}
+                                                              if answer.used_knowledge else {}),
                                                            **({"announcement": announcement_data}
                                                               if announcement_data else {})})
     return payload
