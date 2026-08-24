@@ -13,10 +13,12 @@ import {
   Typography,
 } from 'antd'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
-import { reviews } from '@/api/reviews'
+import { portfolioAttribution, reviews, stockCycleAttribution } from '@/api/reviews'
 import { candidateTradeable } from '@/api/candidates'
 import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion } from '@/api/suggestions'
 import { trackVerifyDates, trackVerifyList, trackVerifyStats, runTrackVerify, runTrackSuggest } from '@/api/track'
+import { ChartCard } from '@/components/charts/ChartCard'
+import type { EChartsOption } from 'echarts'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StatusBadge, StockLabel } from '@/components/common'
 import type { ReviewInfo, TrackVerifyRow } from '@/types'
 
@@ -300,11 +302,98 @@ function Suggestions() {
   )
 }
 
+/** 组合复盘（批次H）：顶部组合曲线 + 中部贡献者瀑布 + 底部周期复利表 */
+function PortfolioAttributionView() {
+  const { data: attr } = useQuery({
+    queryKey: ['portfolio-attribution'],
+    queryFn: () => portfolioAttribution(30),
+  })
+  const curve = attr?.portfolio_curve ?? []
+  const contributors = attr?.contributors ?? []
+  // 默认选中：最负贡献者（最大拖累者）优先，其次第一只
+  const [code, setCode] = useState<string | undefined>()
+  const cur = code ?? contributors.find((c) => (c.contribution_pct ?? 0) < 0)?.stock_code
+    ?? contributors[0]?.stock_code
+  const { data: cycle } = useQuery({
+    queryKey: ['stock-cycle', cur],
+    queryFn: () => stockCycleAttribution(cur ?? ''),
+    enabled: !!cur,
+  })
+
+  if (!curve.length && !contributors.length) {
+    return <EmptyState text="暂无持仓数据。录入建仓并刷新行情后即可查看组合归因。" icon="📊" />
+  }
+
+  const curveOption: EChartsOption = {
+    tooltip: { trigger: 'axis', formatter: (p: unknown) => {
+      const it = (p as Array<{ axisValue: string; data: number }>)[0]
+      return `${it.axisValue}：组合盈亏 ${it.data >= 0 ? '+' : ''}${it.data.toFixed(2)}%`
+    } },
+    grid: { left: 8, right: 16, top: 24, bottom: 8, containLabel: true },
+    xAxis: { type: 'category', data: curve.map((c) => c.date), axisLabel: { color: '#9ca3af' } },
+    yAxis: { type: 'value', axisLabel: { formatter: '{value}%', color: '#9ca3af' }, splitLine: { lineStyle: { color: 'rgba(60,80,120,0.2)' } } },
+    series: [{
+      type: 'line', data: curve.map((c) => c.total_pnl_pct), smooth: true,
+      symbol: 'circle', symbolSize: 5,
+      itemStyle: { color: '#3b82f6' },
+      areaStyle: { color: 'rgba(59,130,246,0.15)' },
+    }],
+  }
+  const waterfallOption: EChartsOption = {
+    tooltip: { trigger: 'axis', formatter: (p: unknown) => {
+      const it = (p as Array<{ name: string; value: number }>)[0]
+      return `${it.name}：贡献 ${it.value >= 0 ? '+' : ''}${it.value.toFixed(2)}%`
+    } },
+    grid: { left: 8, right: 16, top: 24, bottom: 8, containLabel: true },
+    xAxis: { type: 'category', data: contributors.map((c) => c.stock_code), axisLabel: { color: '#9ca3af', rotate: 30 } },
+    yAxis: { type: 'value', axisLabel: { formatter: '{value}%', color: '#9ca3af' }, splitLine: { lineStyle: { color: 'rgba(60,80,120,0.2)' } } },
+    series: [{
+      type: 'bar',
+      data: contributors.map((c) => ({
+        value: c.contribution_pct ?? 0,
+        itemStyle: { color: (c.contribution_pct ?? 0) >= 0 ? '#ef4444' : '#10b981', borderRadius: 2 },
+      })),
+      barWidth: 22,
+    }],
+  }
+  const cycRows = [
+    { k: '总盈亏（元）', v: cycle?.total_pnl != null ? cycle.total_pnl.toFixed(2) : '—' },
+    { k: '平均持仓天数', v: cycle?.avg_hold_days != null ? String(cycle.avg_hold_days) : '—' },
+    { k: '历史胜率', v: cycle?.win_rate != null ? `${cycle.win_rate}%` : '—' },
+    { k: '历史拖累率', v: cycle?.drag_rate != null ? `${cycle.drag_rate}%` : '—' },
+    { k: '周期数', v: `${cycle?.cycle_count ?? 0}（已了结 ${cycle?.closed_cycle_count ?? 0}）` },
+    { k: '最佳周期', v: cycle?.best_cycle ? `${cycle.best_cycle.entry_date ?? '—'} ${cycle.best_cycle.pnl != null ? cycle.best_cycle.pnl.toFixed(2) : '—'} 元` : '—' },
+    { k: '最差周期', v: cycle?.worst_cycle ? `${cycle.worst_cycle.entry_date ?? '—'} ${cycle.worst_cycle.pnl != null ? cycle.worst_cycle.pnl.toFixed(2) : '—'} 元` : '—' },
+  ]
+
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size={12}>
+      {attr?.drag_analysis ? <Alert type="warning" showIcon message={attr.drag_analysis} /> : null}
+      <ChartCard title="组合盈亏曲线（近 30 日，当前持仓视角）" option={curveOption} />
+      <ChartCard title="各持仓贡献度（正绿 / 负红，% 相对总成本）" option={waterfallOption} />
+      <Card size="small" title="周期复利（历史多次操作汇总）" style={{ background: 'var(--bg-card)' }}>
+        <Space wrap style={{ marginBottom: 8 }}>
+          <Select placeholder="选择股票" style={{ width: 200 }} value={cur} onChange={setCode}
+            options={contributors.map((c) => ({ label: `${c.stock_code} ${c.stock_name ?? ''}`.trim(), value: c.stock_code }))} />
+          {cycle && !cycle.has_history ? <Tag color="default">该股无历史操作记录</Tag> : null}
+        </Space>
+        <Table<{ k: string; v: string }> size="small" rowKey="k" pagination={false}
+          dataSource={cycRows}
+          columns={[
+            { title: '指标', dataIndex: 'k', width: 160 },
+            { title: '值', dataIndex: 'v', render: (v: string) => <Text>{v}</Text> },
+          ]} />
+      </Card>
+    </Space>
+  )
+}
+
 /** 交易复盘页（Phase 4 黑盒规范） */
 export function ReviewsPage() {
   return (
     <div>
       <Tabs items={[
+        { key: 'attr', label: '组合复盘', children: <PortfolioAttributionView /> },
         { key: 'reviews', label: '每日复盘报告', children: <ReviewsList /> },
         { key: 'track', label: '选股效果验证', children: <TrackVerify /> },
         { key: 'sug', label: '策略闭环建议', children: <Suggestions /> },

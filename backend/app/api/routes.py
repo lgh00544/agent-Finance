@@ -1163,6 +1163,24 @@ def red_line_check_single(stock_code: str):
     return result[0] if result else {"stock_code": stock_code, "red_line": None}
 
 
+# ================= 复盘反哺选股（批次H）：组合归因 / 周期复利 =================
+@router.get("/portfolio_attribution")
+def portfolio_attribution(days: int = 30):
+    """组合归因（纯计算，零 LLM）：组合盈亏曲线 + 各持仓贡献度瀑布 + 最大拖累者。
+    口径写死在 track_verify.build_portfolio_attribution（单测锁定）；days 默认 30，上限 365。"""
+    from app.services.track_verify import build_portfolio_attribution
+    days = max(1, min(days, 365))
+    return build_portfolio_attribution(days)
+
+
+@router.get("/stock_cycle_attribution/{stock_code}")
+def stock_cycle_attribution(stock_code: str):
+    """单股周期复利（纯计算，零 LLM）：历史多次操作的汇总（总盈亏/平均持仓/最佳最差周期/胜率拖累率）。
+    无持仓记录 → has_history=False；供 Score 历史胜率加分/扣分 + 复盘页周期表。"""
+    from app.services.track_verify import build_stock_cycle_attribution
+    return build_stock_cycle_attribution(stock_code)
+
+
 # ================= 游资追踪（游资档案 / 龙虎榜流水 / 留痕 / 权重迭代） =================
 @router.get("/hot-money/profiles")
 def hot_money_profiles(q: str = "", tier: str = ""):

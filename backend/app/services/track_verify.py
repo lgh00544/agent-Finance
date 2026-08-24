@@ -881,3 +881,174 @@ def run_verify_chain(backfill: bool = False, price_lookup=None, llm_call=None) -
         return {"error": str(exc)}
     finally:
         cache.release_lock("track_verify")
+
+
+# ==================== 复盘反哺选股（批次H）：组合归因 / 周期复利 ====================
+# 纯计算、零 LLM。贡献度口径写死（见各函数 docstring），供 Review/Score 注入与复盘页三段 UI。
+# 铁律：缺数据字段显式 null，不补 0、不伪造；失败降级返回空结构不阻塞调用方。
+
+def _curve_points(items: list[dict], closes: dict, dates: list[str], total_cost: float) -> list[dict]:
+    """纯函数（可单测）：组合曲线 = 每日 Σ(单票当日浮盈亏) / 当前总成本 × 100。
+    items=[{code, cost_ps, shares, entry_date}]；closes={code: {date: close}}；
+    dates 为升序交易日列表；建仓日之前的日期不计入、缺行情日该票当日不计入（不伪造 0）。"""
+    pts = []
+    for d in dates:
+        pnl_sum = 0.0
+        for it in items:
+            if it.get("entry_date") and d < it["entry_date"]:
+                continue  # 建仓前不计入
+            close = closes.get(it["code"], {}).get(d)
+            if close is None:
+                continue
+            pnl_sum += (close - it["cost_ps"]) * it["shares"]
+        pts.append({"date": d,
+                    "total_pnl_pct": round(pnl_sum / total_cost * 100, 2) if total_cost else 0.0})
+    return pts
+
+
+def _daily_closes(codes: list[str], days: int) -> dict[str, dict[str, float]]:
+    """每只近 days 日K收盘 → {code: {date: close}}；单只失败返回空 dict（该票当日不计入）"""
+    out: dict[str, dict[str, float]] = {}
+    if not codes:
+        return out
+    from app.datasource.fallback import get_datasource
+
+    end = time.strftime("%Y-%m-%d")
+    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days + 20) * 86400))  # +20 缓冲覆盖周末/停牌
+    src = get_datasource()
+    for code in codes:
+        try:
+            kl = src.fetch_daily_kline(code, start, end)
+            if kl is not None and not kl.empty:
+                out[code] = {str(r["date"])[:10]: float(r["close"]) for _, r in kl.iterrows()}
+        except Exception as exc:  # noqa: BLE001 单只失败不影响其余
+            logger.warning("组合归因·日K取数失败 %s: %s", code, exc)
+    return out
+
+
+def build_portfolio_attribution(period_days: int = 30) -> dict:
+    """组合归因（纯计算，零 LLM）：当前持仓视角的组合盈亏曲线 + 贡献者 + 最大拖累者。
+
+    口径（写死，供单测锁定）：
+    - 组合曲线：第 d 日 = Σ_持仓 [(close_d − 每股成本) × 现股数] / 当前持仓总成本 × 100；
+      以当前持仓回看 period_days（简化：持仓不变、缺行情日不计入、建仓前不计入）；
+    - 贡献度：单票当前浮盈亏金额 / 当前持仓总成本 × 100（正绿/负红）；
+    - 拖累分析：贡献度最负的持仓 → "最大拖累者 X (Y%)"；无负贡献 → None。
+    数据源：holding_view 实时行情行 + 每只日K；无持仓/读取失败返回空结构不阻塞。"""
+    from datetime import date
+    from app.services.holding_view import build_holding_view
+
+    view = build_holding_view()
+    rows = view["rows"]
+    empty = {"portfolio_curve": [], "contributors": [], "drag_analysis": None,
+             "total_cost": 0.0, "period_days": period_days}
+    if not rows:
+        return empty
+
+    total_cost = 0.0
+    items = []
+    for r in rows:
+        cost_ps = float(r.get("entry_price") or 0)
+        shares = float(r.get("shares") or 0)
+        cost_amt = float(r.get("cost") or (cost_ps * shares) or 0)
+        total_cost += cost_amt
+        pa = r.get("pnl_amount")
+        items.append({"code": r["stock_code"], "cost_ps": cost_ps, "shares": shares,
+                      "entry_date": str(r.get("entry_date") or "")[:10],
+                      "pnl_amount": float(pa) if pa is not None else None,
+                      "name": r.get("stock_name") or r["stock_code"]})
+    if total_cost <= 0:
+        return empty
+
+    closes = _daily_closes([it["code"] for it in items], period_days)
+    dates = sorted(set().union(*[set(c) for c in closes.values()]) if closes else [])
+    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - period_days * 86400))
+    curve = [p for p in _curve_points(items, closes, dates, total_cost) if p["date"] >= start]
+
+    contributors = []
+    for it in items:
+        pa = it["pnl_amount"]
+        holding_days = None
+        if it["entry_date"]:
+            try:
+                holding_days = max(0, (date.today() - date.fromisoformat(it["entry_date"])).days)
+            except ValueError:
+                holding_days = None
+        contributors.append({
+            "stock_code": it["code"], "stock_name": it["name"],
+            "contribution_pct": round(pa / total_cost * 100, 2) if pa is not None else None,
+            "pnl_amount": round(pa, 2) if pa is not None else None,
+            "holding_days": holding_days,
+        })
+    contributors.sort(key=lambda x: (x["contribution_pct"] is None, x["contribution_pct"] or 0))
+
+    drag = None
+    neg = [c for c in contributors if c["contribution_pct"] is not None and c["contribution_pct"] < 0]
+    if neg:
+        drag = f"最大拖累者 {neg[0]['stock_code']} ({neg[0]['contribution_pct']}%)"
+    return {"portfolio_curve": curve, "contributors": contributors, "drag_analysis": drag,
+            "total_cost": round(total_cost, 2), "period_days": period_days}
+
+
+def build_stock_cycle_attribution(stock_code: str) -> dict:
+    """周期复利（纯计算，零 LLM）：该股历史多次操作的汇总（供 Score 历史胜率维度回流 + Review 折叠展示）。
+
+    口径（写死，供单测锁定）：每个持仓记录 = 1 个周期；
+    - 周期盈亏 = 卖出额 − 买入额（已了结周期，即存在卖出流水）；
+    - 未了结周期（无卖出）盈亏为 null，不参与总盈亏/胜率/拖累率（标 unrealized_cycles）；
+    - win_rate = 盈利周期 / 已了结周期数；drag_rate = 亏损周期 / 已了结周期数；
+    - 平均持仓天数 = 各周期（末次卖出日 − 首次买入日；未了结用 今日 − 建仓日）均值；
+    - 最佳/最差周期 = 已了结周期中盈亏最大/最小者。
+    无任何持仓记录 → has_history=False（调用方标「无历史数据」，不加分不扣分）。"""
+    try:
+        holdings = [h for h in repo.list_holdings() if h["stock_code"] == stock_code]
+    except Exception as exc:  # noqa: BLE001 读失败按无历史处理，不阻塞打分
+        logger.warning("周期复利·持仓读取失败 %s: %s", stock_code, exc)
+        return {"stock_code": stock_code, "has_history": False, "cycle_count": 0,
+                "closed_cycle_count": 0, "total_pnl": None, "avg_hold_days": None,
+                "win_rate": None, "drag_rate": None, "best_cycle": None, "worst_cycle": None}
+
+    empty = {"stock_code": stock_code, "has_history": False, "cycle_count": 0,
+             "closed_cycle_count": 0, "total_pnl": None, "avg_hold_days": None,
+             "win_rate": None, "drag_rate": None, "best_cycle": None, "worst_cycle": None}
+    if not holdings:
+        return empty
+
+    from datetime import date
+    today = date.today()
+    cycles = []
+    for h in holdings:
+        trades = repo.get_trades(h["id"])
+        buys = [t for t in trades if t.side == "buy"]
+        sells = [t for t in trades if t.side == "sell"]
+        entry = str(h.get("entry_date") or "")[:10]
+        if sells:
+            pnl = round(sum(t.amount for t in sells) - sum(t.amount for t in buys), 2)
+            d_end = date.fromisoformat(sells[-1].trade_date)
+            d_start = date.fromisoformat(buys[0].trade_date) if buys else d_end
+            hold_days = (d_end - d_start).days
+        else:
+            pnl = None
+            hold_days = (today - date.fromisoformat(entry)).days if entry else None
+        cycles.append({"entry_date": entry, "pnl": pnl, "hold_days": hold_days})
+
+    closed = [c for c in cycles if c["pnl"] is not None]
+    n_closed = len(closed)
+    wins = sum(1 for c in closed if c["pnl"] > 0)
+    losses = sum(1 for c in closed if c["pnl"] < 0)
+    hd = [c["hold_days"] for c in cycles if c["hold_days"] is not None]
+    best = max(closed, key=lambda c: c["pnl"]) if closed else None
+    worst = min(closed, key=lambda c: c["pnl"]) if closed else None
+    return {
+        "stock_code": stock_code,
+        "has_history": True,
+        "cycle_count": len(holdings),
+        "closed_cycle_count": n_closed,
+        "unrealized_cycles": len(cycles) - n_closed,
+        "total_pnl": round(sum(c["pnl"] for c in closed), 2) if closed else None,
+        "avg_hold_days": round(sum(hd) / len(hd), 1) if hd else None,
+        "win_rate": round(wins / n_closed * 100, 1) if n_closed else None,
+        "drag_rate": round(losses / n_closed * 100, 1) if n_closed else None,
+        "best_cycle": best,
+        "worst_cycle": worst,
+    }

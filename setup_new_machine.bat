@@ -35,7 +35,14 @@ echo.
 
 echo [2/4] 安装依赖（首次约 5-10 分钟，请耐心等待）...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip -q
-".venv\Scripts\python.exe" -m pip install -r backend\requirements.txt -r streamlit\requirements.txt
+".venv\Scripts\python.exe" -m pip install -r backend\requirements.txt
+rem ---------------- React 前端（最新架构）依赖，需 Node.js ----------------
+if exist "web\package.json" (
+    echo [2/4] 安装 React 前端依赖（web\）...
+    pushd "%~dp0web"
+    call npm install
+    popd
+)
 if errorlevel 1 (
     echo [错误] 依赖安装失败（可能是网络问题），请重试或联系我.
     pause
@@ -66,11 +73,11 @@ echo    cd /d "%~dp0backend".
 echo    set PYTHONPATH=%~dp0;%~dp0backend.
 echo    "..\.venv\Scripts\python.exe" -m uvicorn app.main:app --host 127.0.0.1 --port 8000.
 echo.
-echo  终端2 - 面板：.
-echo    cd /d "%~dp0".
-echo    ".venv\Scripts\python.exe" -m streamlit run streamlit\app.py --server.port 8501.
+echo  终端2 - React 前端（最新架构）：.
+echo    cd /d "%~dp0web".
+echo    npm run dev.
 echo.
-echo  然后浏览器打开 http://localhost:8501.
+echo  然后浏览器打开 http://localhost:5173.
 echo  详细说明与常见问题见 新机器部署指南.md.
 echo ============================================================
 pause
