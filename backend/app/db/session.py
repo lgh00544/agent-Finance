@@ -73,6 +73,7 @@ def init_db() -> None:
     _ensure_sector_snapshot_table()
     _ensure_quote_snapshot_table()
     _ensure_distribution_phase_table()
+    _ensure_capital_view_tables()
 
 
 def _ensure_experience_fts() -> None:
@@ -138,6 +139,16 @@ def _ensure_distribution_phase_table() -> None:
     """幂等补建 distribution_phase_log 表（派发期判定；create_all 兜底 SQLite/MySQL 通吃）"""
     from app.db import models  # noqa: F401
     Base.metadata.create_all(bind=engine, tables=[models.DistributionPhaseLog.__table__])
+
+
+def _ensure_capital_view_tables() -> None:
+    """幂等补建资本视图 4 表（capital_actor/dragon_tiger/capital_flow/capital_stats；
+    批次E 游资真接入；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[
+        models.CapitalActor.__table__, models.DragonTiger.__table__,
+        models.CapitalFlow.__table__, models.CapitalStats.__table__,
+    ])
 
 
 def _ensure_stock_candidate_detail(eng=None) -> None:

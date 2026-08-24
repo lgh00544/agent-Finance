@@ -43,3 +43,7 @@ export const sellDecisions = (hid: number): Promise<Array<Record<string, unknown
 /** GET /api/holdings/take-profit-plan（止盈/仓位计划） */
 export const takeProfitPlan = (force = false): Promise<{ rows?: Array<Record<string, unknown>> }> =>
   get('/holdings/take-profit-plan', force ? { force: true } : undefined)
+
+/** GET /api/red_line_check（持仓红线扫描：C1/C2/C3/K139 四色徽章数据源） */
+export const redLineCheck = (): Promise<{ rows?: Array<Record<string, unknown>> }> =>
+  get('/red_line_check')

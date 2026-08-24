@@ -711,3 +711,90 @@ class DistributionPhaseLog(Base):
     missing_data: Mapped[list] = mapped_column(SafeJSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class CapitalActor(Base):
+    """游资维度：单标的单日命中游资（近30日窗口聚合；『三维表』之游资维）
+    表结构：capital_actor；(trade_date, stock_code, actor_name) 唯一。
+    数据来自 lhb_original_flow 席位命中 hot_money_profile（未知营业部不硬绑，留 LLM 研判占位）。"""
+    __tablename__ = "capital_actor"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "stock_code", "actor_name", name="uq_cap_actor_dcn"),
+        Index("ix_cap_actor_code_date", "stock_code", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    seat_code: Mapped[str] = mapped_column(String(64), default="")
+    tier: Mapped[str] = mapped_column(String(8), default="观察")
+    net_buy: Mapped[float] = mapped_column(Float, default=0.0)
+    days_active: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(16), default="sse_only")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class DragonTiger(Base):
+    """龙虎榜维度：单标的单日龙虎榜汇总（股票级净买 + 龙头席位；『三维表』之龙虎榜维）
+    表结构：dragon_tiger；(trade_date, stock_code) 唯一，rollup 自 lhb_original_flow 股票级行。"""
+    __tablename__ = "dragon_tiger"
+    __table_args__ = (UniqueConstraint("trade_date", "stock_code", name="uq_dt_date_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    lhb_type: Mapped[str] = mapped_column(String(8), default="1d")
+    net_buy: Mapped[float] = mapped_column(Float, default=0.0)
+    buy_amt: Mapped[float] = mapped_column(Float, default=0.0)
+    sell_amt: Mapped[float] = mapped_column(Float, default=0.0)
+    top_seat: Mapped[str] = mapped_column(String(64), default="")   # 净买额最大席位
+    top_seat_net: Mapped[float] = mapped_column(Float, default=0.0)
+    disclosure_reason: Mapped[str] = mapped_column(String(128), default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.8)
+    source: Mapped[str] = mapped_column(String(16), default="sse_only")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class CapitalFlow(Base):
+    """资金流维度：单标的单日主力/大中小单净额（『三维表』之资金流维）
+    表结构：capital_flow；(trade_date, stock_code) 唯一，来源 akshare 个股资金流（严格当日）。"""
+    __tablename__ = "capital_flow"
+    __table_args__ = (UniqueConstraint("trade_date", "stock_code", name="uq_cf_date_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    main_net_inflow: Mapped[float] = mapped_column(Float, default=0.0)
+    super_large_net: Mapped[float] = mapped_column(Float, default=0.0)
+    large_net: Mapped[float] = mapped_column(Float, default=0.0)
+    medium_net: Mapped[float] = mapped_column(Float, default=0.0)
+    small_net: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(16), default="sse_only")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class CapitalStats(Base):
+    """资本视图统计：单标的单日 30 日聚合快照（K189 对倒/协调/胜率/盈亏比/题材共振；徽章 + Agent 注入）
+    表结构：capital_stats；(trade_date, stock_code) 唯一。缺数据 → null + missing_data 明列（K227）。"""
+    __tablename__ = "capital_stats"
+    __table_args__ = (UniqueConstraint("trade_date", "stock_code", name="uq_cs_date_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    wash_suspect: Mapped[bool] = mapped_column(Boolean, default=False)
+    coordination: Mapped[str] = mapped_column(String(8), default="数据不足")
+    win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    payoff_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_hold_days: Mapped[float | None] = mapped_column(Float, nullable=True)
+    theme_resonance: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="sse_only")
+    missing_data: Mapped[list] = mapped_column(SafeJSON, default=list)
+    raw_json: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

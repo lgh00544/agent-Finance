@@ -33,7 +33,7 @@ _TABLE_COLS = [*_TABLE_COLS, *_WYCKOFF_COLS]
 _ENRICH_COLS = ["industry", "intraday_narrow_pct",
                 "super_large_net", "large_net", "medium_net", "small_net",
                 "main_net_3d", "main_net_5d", "main_net_10d",
-                "holder_change_pct", "inst_hold_pct"]
+                "holder_change_pct", "inst_hold_pct", "capital_view_context"]
 _MONEY_COLS = {"super_large_net", "large_net", "medium_net", "small_net",
                "main_net_3d", "main_net_5d", "main_net_10d"}
 
@@ -502,6 +502,17 @@ def _enrich_candidate_data(source: DataSource, inst_map: dict,
                     out["main_net_10d"] = round(float(vals.tail(10).sum()), 2)
     except Exception as exc:  # noqa: BLE001
         logger.warning("候选 %s 资金流增量失败: %s", code, exc)
+    # 资本视图（批次E）：capital_flow 段后注入 capital_view_context —— 游资/龙虎榜/资金流三维 +
+    # K189 对倒纯代码（不交 LLM）+ 30日胜率；无已识别游资或对倒不触发则不占列，避免噪音
+    try:
+        from app.services.capital_view import build_capital_view_line, compute_capital_view
+        cv = compute_capital_view(code, trade_date)
+        if cv and (cv.get("recent_actors") or cv.get("wash_suspect")):
+            line = build_capital_view_line(cv)
+            if line:
+                out["capital_view_context"] = line
+    except Exception as exc:  # noqa: BLE001 资本视图失败降级跳过，不阻塞候选富化
+        logger.warning("候选 %s 资本视图失败（跳过注入）: %s", code, exc)
     try:
         inst = inst_map.get(code) or {}
         if inst:

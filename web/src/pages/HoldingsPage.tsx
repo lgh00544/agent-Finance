@@ -15,6 +15,7 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -26,6 +27,7 @@ import {
   holdingQuotes,
   holdingTrades,
   holdings,
+  redLineCheck,
   sellDecisions,
   takeProfitPlan,
 } from '@/api/holdings'
@@ -524,6 +526,36 @@ function SellDecisionBtn({ hid, size = 'small' as const }: { hid: number; size?:
   )
 }
 
+/** 红线徽章（批次G）：C1/C2/C3/K139 四色——绿(无)/黄(预警)/红(触发)/灰(无数据)；悬停显示触发条件 */
+function RedLineBadges({ red, price }: { red?: Record<string, unknown>; price: number | null | undefined }) {
+  const badge = (label: string, color: string, tip: string) => (
+    <Tooltip title={tip}>
+      <Tag color={color} style={{ marginInlineEnd: 2, fontSize: 11 }}>{label}</Tag>
+    </Tooltip>
+  )
+  const c1 = red?.c1_alert as boolean | null | undefined
+  const c2 = red?.c2_alert as boolean | null | undefined
+  const c3 = red?.c3_alert as boolean | null | undefined
+  const k139 = (red?.k139_sop as Record<string, unknown>) ?? null
+  const cap = red?.c1_cap_pct as number | null | undefined
+  const draw = red?.c2_drawdown_pct as number | null | undefined
+  const sl = red?.c3_stop_loss as number | null | undefined
+  const stage = String(k139?.stage ?? '')
+  const ts = k139?.trailing_stop as number | null | undefined
+  const c3dist = (typeof price === 'number' && typeof sl === 'number' && sl > 0)
+    ? ((price - sl) / sl * 100).toFixed(1) : null
+  const colorOf = (v: boolean | null | undefined) => (v === true ? 'red' : v === false ? 'green' : 'default')
+  const k139Color = stage === '跌破C3' ? 'red' : stage.includes('减仓') ? 'orange' : stage ? 'green' : 'default'
+  return (
+    <Space size={2} wrap>
+      {badge('C1', colorOf(c1), cap != null ? `C1 单只占比 ${cap}%，上限 60%（超限触发）` : 'C1 占比无数据')}
+      {badge('C2', colorOf(c2), draw != null ? `C2 日内回撤 ${draw}%，触发线 -30%（相对成本）` : 'C2 回撤无数据')}
+      {badge('C3', colorOf(c3), sl != null ? `C3 止损 ${sl}，距 ${c3dist ?? '—'}%（成本×0.92）` : 'C3 止损无数据')}
+      {badge('K139', k139Color, k139 ? `K139 SOP：${stage}，移动止盈 ${ts ?? '—'}` : 'K139 SOP 无数据')}
+    </Space>
+  )
+}
+
 /** ============ 当前持仓表（需求 A：去重合并） ============ */
 function HoldingsTable() {
   const [drawerH, setDrawerH] = useState<Holding | null>(null)
@@ -532,6 +564,13 @@ function HoldingsTable() {
     queryFn: holdingQuotes,
     refetchInterval: 60_000,
   })
+  const { data: redData } = useQuery({
+    queryKey: ['red-line-check'],
+    queryFn: redLineCheck,
+    refetchInterval: 300_000,
+  })
+  const redMap = new Map<string, Record<string, unknown>>(
+    (redData?.rows ?? []).map((r) => [String(r.stock_code), r]))
   const shanghai = useShanghaiIndex()
   const rows = data?.rows ?? []
   if (isError) return <ErrorCard title="持仓数据加载失败" message={error?.message} onRetry={() => refetch()} />
@@ -577,6 +616,12 @@ function HoldingsTable() {
     { title: '止损', key: 'sl', width: 76, render: (_: unknown, m: MergedRow) => m.current.stop_loss ?? '—' },
     { title: '止盈', key: 'tp', width: 76, render: (_: unknown, m: MergedRow) => m.current.take_profit ?? '—' },
     { title: '目标仓位', key: 'target', width: 88, render: (_: unknown, m: MergedRow) => (m.current.target_pct ? `${m.current.target_pct}%` : '—') },
+    {
+      title: '红线', key: 'redline', width: 160,
+      render: (_: unknown, m: MergedRow) => (
+        <RedLineBadges red={redMap.get(m.code)} price={m.current.current_price ?? null} />
+      ),
+    },
     {
       title: '操作', key: 'ops', width: 190,
       render: (_: unknown, m: MergedRow) => (

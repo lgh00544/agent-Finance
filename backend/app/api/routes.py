@@ -1078,6 +1078,91 @@ def distribution_phase(stock_code: str, force: bool = False):
         raise HTTPException(status_code=502, detail=f"派发期判定失败: {exc}")
 
 
+# ================= 资本视图（游资/龙虎榜/资金流三维 + K189 对倒 + 30日统计；批次E） =================
+@router.get("/capital_view/{stock_code}")
+def capital_view(stock_code: str, force: bool = False):
+    """单只标的资本视图（最近 30 个上榜交易日）：recent_actors/coordination/wash_suspect(K189 纯代码)/
+    stats_30d/theme_resonance + dragon_tiger_rows·capital_flow_rows 三维表。
+    结果 86400s 缓存，force=true 删除缓存键后重算；30 日无数据 → coordination="数据不足"（绝不写"无动作"）；
+    单源必标 source="sse_only"（K227 诚实）。"""
+    from app.cache import cache
+    from app.services.capital_view import compute_capital_view
+    trade_date = time.strftime("%Y-%m-%d")
+    if force:
+        cache.delete(f"capital_view:{trade_date}:{stock_code}")
+    try:
+        return compute_capital_view(stock_code, trade_date)
+    except Exception as exc:  # noqa: BLE001 计算失败报 502，前端提示可稍后重试
+        logger.warning("资本视图失败 %s: %s", stock_code, exc)
+        raise HTTPException(status_code=502, detail=f"资本视图失败: {exc}")
+
+
+# ================= 持仓红线扫描（批次G）：C1/C2/C3/C4 + K139/K226/K189 事实层 =================
+def _fetch_day_lows(codes: list) -> dict:
+    """每只持仓当日最低价（日K最新一根 low）；失败/停牌 → 不收录（C2 缺数据显式 null）"""
+    lows: dict[str, float] = {}
+    if not codes:
+        return lows
+    from app.datasource.fallback import get_datasource
+    end = time.strftime("%Y-%m-%d")
+    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - 45 * 86400))
+    for code in codes:
+        try:
+            kl = get_datasource().fetch_daily_kline(code, start, end)
+            if kl is not None and not kl.empty:
+                lows[code] = float(kl.iloc[-1]["low"])
+        except Exception as exc:  # noqa: BLE001 单只失败不影响其余
+            logger.warning("红线扫描·当日 low 取数失败 %s: %s", code, exc)
+    return lows
+
+
+def _red_line_holdings() -> tuple[list, dict]:
+    """红线扫描输入：build_holding_view() 行情行（100% 与持仓监控页同源）+ 每只 high_price（repo 读取）"""
+    view = holding_view.build_holding_view()
+    holdings = []
+    for r in view["rows"]:
+        high_price = None
+        if r.get("id"):
+            try:
+                h = repo.get_holding(r["id"])
+                high_price = getattr(h, "high_price", None)
+            except Exception:  # noqa: BLE001 单只 high_price 失败不阻塞（C4 缺数据 → null）
+                high_price = None
+        holdings.append({"stock_code": r["stock_code"], "entry_price": r.get("entry_price"),
+                         "cost": r.get("cost"), "shares": r.get("shares"),
+                         "high_price": high_price})
+    return holdings, view
+
+
+@router.get("/red_line_check")
+def red_line_check():
+    """全部持仓红线扫描：C1 占比 / C2 日内回撤 / C3 止损 / C4 突破 + K139 SOP / K226 派发期 / K189 对倒。
+    纯计算 + 复用 D/E 缓存；缺数据字段显式 null；K139/K226 为参考权重（LLM 一票否决）。"""
+    from app.services.red_line_check import account_total_asset, compute_red_line
+    holdings, view = _red_line_holdings()
+    prices = {r["stock_code"]: r["current_price"] for r in view["rows"] if r.get("current_price") is not None}
+    lows = _fetch_day_lows(list(prices))
+    total_asset = account_total_asset()
+    result = compute_red_line(holdings, prices, total_asset, lows=lows)
+    return {"rows": result, "trade_date": time.strftime("%Y-%m-%d"),
+            "total_asset": total_asset, "quote_time": view.get("quote_time")}
+
+
+@router.get("/red_line_check/{stock_code}")
+def red_line_check_single(stock_code: str):
+    """单只持仓红线扫描（取数管道与全量一致）；无该持仓 → 404"""
+    from app.services.red_line_check import account_total_asset, compute_red_line
+    holdings, view = _red_line_holdings()
+    row = next((r for r in view["rows"] if r["stock_code"] == stock_code), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"无该持仓: {stock_code}")
+    h = next((x for x in holdings if x["stock_code"] == stock_code), None)
+    prices = {stock_code: row["current_price"]} if row.get("current_price") is not None else {}
+    lows = _fetch_day_lows([stock_code])
+    result = compute_red_line([h] if h else [], prices, account_total_asset(), lows=lows)
+    return result[0] if result else {"stock_code": stock_code, "red_line": None}
+
+
 # ================= 游资追踪（游资档案 / 龙虎榜流水 / 留痕 / 权重迭代） =================
 @router.get("/hot-money/profiles")
 def hot_money_profiles(q: str = "", tier: str = ""):

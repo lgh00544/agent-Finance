@@ -204,10 +204,19 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 派发期判定失败跳过注入，不阻塞打分
         logger.warning("派发期判定失败（跳过注入）: %s", exc)
 
+    # 资本视图（批次E）：游资/龙虎榜/资金流三维 + K189 对倒纯代码判定；失败 None 不阻断打分
+    capital_view_context = None
+    try:
+        from app.services.capital_view import compute_capital_view
+        capital_view_context = compute_capital_view(code, today)
+    except Exception as exc:  # noqa: BLE001 资本视图失败跳过注入，不阻塞打分
+        logger.warning("资本视图失败（跳过注入）: %s", exc)
+
     state["discover_context"] = discover_ctx
     state["market_intel_summary"] = intel_summary
     state["factor_calibration"] = factor_calibration
     state["distribution_phase_context"] = distribution_phase_context
+    state["capital_view_context"] = capital_view_context
     state["trace"] = [*state.get("trace", []),
                       f"聚合完成: K线{len(kline)}行 财务{len(fin_rows)}期 资金流{len(ff_rows)}日 新闻{len(news_rows)}条"]
     return state
@@ -235,6 +244,8 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "游资聚合": state.get("hot_money"),
         # 派发期判定（batch D）：6 维 + phase/confidence，供 LLM 单一票否决参考（缺失为 None）
         "distribution_phase_context": state.get("distribution_phase_context"),
+        # 资本视图（批次E）：游资/龙虎榜/资金流三维 + K189 对倒 + 30日胜率（缺失为 None）
+        "capital_view_context": state.get("capital_view_context"),
     }
 
     output = agent_call(
@@ -263,6 +274,16 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         if _notice not in output.risk_list:
             output.risk_list.append(_notice)
 
+    # ---- 资本视图（批次E）：加分/减分仿 D 派发期（K189 对倒纯代码判定不交 LLM，减分压上限；
+    #      多游资同买仅 +3 加分提示跟买≠必胜；30日无数据不触发）----
+    _cv = state.get("capital_view_context") or {}
+    if _cv.get("wash_suspect"):
+        output.score = min(output.score, 88)
+        _notice = ("⚠️ K189 对倒嫌疑（同营业部近5日买卖共存且单次≥1000万），评分上限压至 88")
+        if _notice not in output.risk_list:
+            output.risk_list.append(_notice)
+    elif _cv.get("coordination") == "多游资同买":
+        output.score = min(100, output.score + 3)
     # ---- v4.0 代码层推导 potential_flag（不信任 LLM 自报；factor 分值为 LLM 判断，flag 为事实换算）----
     _催化 = next((f.score for f in output.factors if f.factor == "催化"), 0)
     _动量 = next((f.score for f in output.factors if f.factor == "动量"), 0)

@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
+    CapitalActor, CapitalFlow, CapitalStats, DragonTiger,
     Experience, ExperienceConfig, Holding, HotMoneyProfile, LhbOriginalFlow,
     MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
     PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
@@ -1931,6 +1932,78 @@ def hot_money_fingerprint() -> str:
         n = db.execute(select(func.count()).select_from(LhbOriginalFlow)).scalar_one()
         last = db.execute(select(func.max(LhbOriginalFlow.created_at))).scalar_one()
     return f"{n}:{last.strftime('%Y%m%d%H%M%S') if last else '0'}"
+
+
+# ==================== 批次E 资本视图 4 表落库（游资真接入；聚合由 services/capital_view 计算） ====================
+
+def upsert_capital_view(snapshot: dict) -> int:
+    """资本视图快照落库 4 表（同 stock_code+trade_date 删后插，仿 upsert_sector_snapshot）。
+    snapshot 字段：trade_date/stock_code 必填；recent_actors/dragon_tiger_rows/capital_flow_rows/
+    stats(wash_suspect/coordination/win_rate/payoff_ratio/avg_hold_days/theme_resonance/
+    source/missing_data)/raw。返回写入行数。"""
+    trade_date = snapshot.get("trade_date", "")
+    stock_code = snapshot.get("stock_code", "")
+    if not trade_date or not stock_code:
+        return 0
+    source = snapshot.get("source", "sse_only")
+    stats = snapshot.get("stats") or {}
+    with SessionLocal() as db:
+        db.execute(text("DELETE FROM capital_actor WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        for a in snapshot.get("recent_actors") or []:
+            db.add(CapitalActor(trade_date=trade_date, stock_code=stock_code,
+                                actor_name=a.get("name", ""), seat_code=a.get("seat") or "",
+                                tier=a.get("tier") or "观察", net_buy=float(a.get("net_buy") or 0),
+                                days_active=int(a.get("days_active") or 0), source=source))
+        db.execute(text("DELETE FROM dragon_tiger WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        for r in snapshot.get("dragon_tiger_rows") or []:
+            db.add(DragonTiger(trade_date=r.get("trade_date", trade_date), stock_code=stock_code,
+                               stock_name=r.get("stock_name", ""), lhb_type=r.get("lhb_type", "1d"),
+                               net_buy=float(r.get("net_buy") or 0), buy_amt=float(r.get("buy_amt") or 0),
+                               sell_amt=float(r.get("sell_amt") or 0), top_seat=r.get("top_seat") or "",
+                               top_seat_net=float(r.get("top_seat_net") or 0),
+                               disclosure_reason=r.get("disclosure_reason") or "",
+                               confidence=float(r.get("confidence") or 0.8), source=source))
+        db.execute(text("DELETE FROM capital_flow WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        for f in snapshot.get("capital_flow_rows") or []:
+            db.add(CapitalFlow(trade_date=f.get("trade_date", trade_date), stock_code=stock_code,
+                               main_net_inflow=float(f.get("main_net_inflow") or 0),
+                               super_large_net=float(f.get("super_large_net") or 0),
+                               large_net=float(f.get("large_net") or 0),
+                               medium_net=float(f.get("medium_net") or 0),
+                               small_net=float(f.get("small_net") or 0), source=source))
+        db.execute(text("DELETE FROM capital_stats WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        db.add(CapitalStats(trade_date=trade_date, stock_code=stock_code,
+                            wash_suspect=bool(stats.get("wash_suspect")),
+                            coordination=stats.get("coordination") or "数据不足",
+                            win_rate=stats.get("win_rate"), payoff_ratio=stats.get("payoff_ratio"),
+                            avg_hold_days=stats.get("avg_hold_days"),
+                            theme_resonance=stats.get("theme_resonance"),
+                            source=source, missing_data=stats.get("missing_data") or [],
+                            raw_json=snapshot.get("raw") or {}))
+        db.commit()
+    return 1 + len(snapshot.get("recent_actors") or []) + len(snapshot.get("dragon_tiger_rows") or []) \
+        + len(snapshot.get("capital_flow_rows") or [])
+
+
+def get_capital_stats(stock_code: str, trade_date: str) -> dict | None:
+    """读资本视图统计快照（capitals × 展示用；不存在返回 None）"""
+    with SessionLocal() as db:
+        stmt = (select(CapitalStats).where(CapitalStats.stock_code == stock_code,
+                                           CapitalStats.trade_date == trade_date)
+                .order_by(CapitalStats.id.desc()).limit(1))
+        row = db.execute(stmt).scalar_one_or_none()
+    if row is None:
+        return None
+    return {"trade_date": row.trade_date, "stock_code": row.stock_code,
+            "wash_suspect": bool(row.wash_suspect), "coordination": row.coordination,
+            "win_rate": row.win_rate, "payoff_ratio": row.payoff_ratio,
+            "avg_hold_days": row.avg_hold_days, "theme_resonance": row.theme_resonance,
+            "source": row.source, "missing_data": row.missing_data or [],
+            "updated_at": str(row.updated_at)}
 
 
 # ==================== 经验沉淀闭环（pending → worker → experience → review_log → 检索注入） ====================

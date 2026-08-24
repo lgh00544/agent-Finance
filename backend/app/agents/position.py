@@ -50,6 +50,22 @@ def collect_plan_input(state: StockAgentState) -> StockAgentState:
         "max_single_pct": settings.max_single_position_pct,
         "trade_style": settings.trade_style,
     }
+    # K 红线参考（批次G）：C1/C2 软上限 + K192 吸筹末期（建仓前事实参考，非死条件）；失败 None 不阻塞
+    red_line_ref = None
+    try:
+        from app.services.capital_view import compute_capital_view
+        _cv = compute_capital_view(code, today)
+        red_line_ref = {
+            "c1_cap_threshold_pct": 60.0,
+            "c2_drawdown_threshold_pct": -30.0,
+            "c3_stop_loss_factor": 0.92,
+            "wash_suspect": (bool(_cv.get("wash_suspect"))
+                             if _cv and _cv.get("wash_suspect") is not None else None),
+            "k192_note": "建仓按 K192 试探仓：主力成本附近建仓、100 整数倍、C3=成本×0.92（吸筹末期待拉升）",
+        }
+    except Exception as exc:  # noqa: BLE001 红线参考读取失败不阻塞建仓规划
+        logger.warning("K 红线参考读取失败（跳过注入）: %s", exc)
+    state["basic_info"]["red_line_ref"] = red_line_ref
     state["trace"] = [*state.get("trace", []), "建仓数据聚合完成"]
     return state
 
@@ -72,6 +88,15 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
         f"总资金: {info.get('capital')} 元；单标的仓位上限: {info.get('max_single_pct')}%；"
         f"交易风格: {info.get('trade_style')}"
     )
+    _rl = info.get("red_line_ref") or {}
+    if _rl:
+        capital_constraints += (
+            f"\n【K 红线参考】C1 单只占比上限 {_rl.get('c1_cap_threshold_pct')}%；"
+            f"C2 日内回撤触发线 {_rl.get('c2_drawdown_threshold_pct')}%；"
+            f"C3 止损 = 成本 × {_rl.get('c3_stop_loss_factor')}（L0 红线）；"
+            f"对倒嫌疑: {_rl.get('wash_suspect') if _rl.get('wash_suspect') is not None else '无数据'}；"
+            f"K192 建仓策略: {_rl.get('k192_note')}"
+        )
     stock_data = _compact(info.get("indicators", {}))
 
     output = agent_call(

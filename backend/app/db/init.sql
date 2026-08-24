@@ -296,3 +296,76 @@ CREATE TABLE IF NOT EXISTS distribution_phase_log (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_dist_date_symbol (trade_date, symbol)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ──── 批次E 资本视图（游资真接入）；与 backend/app/db/models.py 四表一致 ────
+-- 游资维度：单标的单日命中游资（近30日窗口聚合；『三维表』之游资维）
+CREATE TABLE IF NOT EXISTS capital_actor (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    actor_name VARCHAR(32) NOT NULL,
+    seat_code VARCHAR(64) NOT NULL DEFAULT '',
+    tier VARCHAR(8) NOT NULL DEFAULT '观察',
+    net_buy DOUBLE NOT NULL DEFAULT 0,
+    days_active INT NOT NULL DEFAULT 0,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_cap_actor_dcn (trade_date, stock_code, actor_name),
+    KEY ix_cap_actor_code_date (stock_code, trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 龙虎榜维度：单标的单日龙虎榜汇总（股票级净买 + 龙头席位；『三维表』之龙虎榜维）
+CREATE TABLE IF NOT EXISTS dragon_tiger (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    lhb_type VARCHAR(8) NOT NULL DEFAULT '1d',
+    net_buy DOUBLE NOT NULL DEFAULT 0,
+    buy_amt DOUBLE NOT NULL DEFAULT 0,
+    sell_amt DOUBLE NOT NULL DEFAULT 0,
+    top_seat VARCHAR(64) NOT NULL DEFAULT '',
+    top_seat_net DOUBLE NOT NULL DEFAULT 0,
+    disclosure_reason VARCHAR(128) NOT NULL DEFAULT '',
+    confidence DOUBLE NOT NULL DEFAULT 0.8,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_dt_date_code (trade_date, stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 资金流维度：单标的单日主力/大中小单净额（『三维表』之资金流维）
+CREATE TABLE IF NOT EXISTS capital_flow (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    main_net_inflow DOUBLE NOT NULL DEFAULT 0,
+    super_large_net DOUBLE NOT NULL DEFAULT 0,
+    large_net DOUBLE NOT NULL DEFAULT 0,
+    medium_net DOUBLE NOT NULL DEFAULT 0,
+    small_net DOUBLE NOT NULL DEFAULT 0,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_cf_date_code (trade_date, stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 资本视图统计：单标的单日 30 日聚合快照（K189 对倒/协调/胜率/盈亏比/题材共振；徽章 + Agent 注入）
+CREATE TABLE IF NOT EXISTS capital_stats (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    wash_suspect TINYINT(1) NOT NULL DEFAULT 0,
+    coordination VARCHAR(8) NOT NULL DEFAULT '数据不足',
+    win_rate DOUBLE NULL,
+    payoff_ratio DOUBLE NULL,
+    avg_hold_days DOUBLE NULL,
+    theme_resonance TINYINT(1) NULL,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    missing_data JSON NULL,
+    raw_json JSON NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_cs_date_code (trade_date, stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
