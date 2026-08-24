@@ -152,8 +152,8 @@ class Settings(BaseSettings):
     datasource_read_timeout: float = 15      # 读取超时秒数
     datasource_retry_times: int = 1          # 实时热点路径失败后重试次数（间隔 1-2s，勿立即重试触发限流）
     datasource_retry_delay: float = 1.5      # 重试间隔秒数
-    datasource_breaker_threshold: int = 3    # 连续失败次数阈值，达到后进入临时降级
-    datasource_breaker_cooldown: int = 600   # 临时降级持续时间（秒），到期下次调用静默探测主源
+    datasource_breaker_threshold: int = 1    # 连续失败次数阈值，达到后进入临时降级（1 次失败即开断路器，持仓价走兜底）
+    datasource_breaker_cooldown: int = 30    # 临时降级持续时间（秒），到期下次调用静默探测主源（由 600 收紧，快速恢复主源）
     datasource_min_request_interval: float = 0.5  # 同类实时请求最小间隔（秒），高频场景自动补齐间隔
     datasource_user_agent: str = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                   "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")

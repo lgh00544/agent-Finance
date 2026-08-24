@@ -41,6 +41,13 @@ def _isolate(monkeypatch):
     breaker_reset()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _db_ready():
+    """DB 建表（quote_snapshot 测试用真实 SQLite；保持与 test_sector_snapshot 同模式）"""
+    from app.db.session import init_db
+    init_db()
+
+
 def _boom():
     raise ConnectionError("东财拒绝连接")
 
@@ -226,3 +233,84 @@ def test_stats_snapshot_structure():
     assert kinds == {"tick", "snapshot"}
     assert all(k["current_source"] in ("primary", "degraded") for k in s["kinds"])
     assert s["requests"] == sum(k["requests"] for k in s["kinds"])
+
+
+# ================= 腾讯批量行情 + 持仓价快照（持仓监控页稳定性根治） =================
+
+class _TencentResp:
+    status_code = 200
+
+    def __init__(self, text):
+        self.text = text
+
+
+def test_tencent_batch_parse_and_prefix(monkeypatch):
+    """腾讯批量：解析 price=fields[3]；6 位代码去前缀；6 开头加 sh、否则 sz（N 只 = 1 次 HTTP）"""
+    payload = ('v_sh600487="1~白云机场~600487~62.18~62.02~60.89~...";\n'
+               'v_sz002475="1~立讯精密~002475~54.65~54.00~53.00~..."')
+    captured = {}
+
+    def fake_get(url, timeout=None):
+        captured["url"] = url
+        return _TencentResp(payload)
+
+    src = AkshareSource()
+    monkeypatch.setattr(src._quotes_session, "get", fake_get)
+    out = src.fetch_tencent_batch(["600487", "002475"])
+    assert out == {"600487": 62.18, "002475": 54.65}      # price=fields[3]，去前缀
+    assert "sh600487" in captured["url"] and "sz002475" in captured["url"]
+
+
+def test_tencent_batch_codes_normalized(monkeypatch):
+    """代码左补零至 6 位；空白剔除；6 开头 sh、其余 sz"""
+    captured = {}
+
+    def fake_get(url, timeout=None):
+        captured["url"] = url
+        return _TencentResp('v_sz006005="1~x~6005~13.5~13.0~..."')
+
+    src = AkshareSource()
+    monkeypatch.setattr(src._quotes_session, "get", fake_get)
+    src.fetch_tencent_batch(["6005", " 002475 ", ""])
+    # "6005".zfill(6) = "006005"（非 6 开头）→ sz；" 002475 " → "002475" → sz
+    assert "sz006005,sz002475" in captured["url"]
+
+
+def test_tencent_batch_all_failed_returns_empty(monkeypatch):
+    """腾讯全失败（连拒/解析空）→ 返回 {}，调用方走 DB 快照兜底"""
+    def fake_get(url, timeout=None):
+        raise ConnectionError("腾讯不可达")
+
+    src = AkshareSource()
+    monkeypatch.setattr(src._quotes_session, "get", fake_get)
+    assert src.fetch_tencent_batch(["600487"]) == {}
+    # 解析无结果也算失败
+    monkeypatch.setattr(src._quotes_session, "get",
+                        lambda url, timeout=None: _TencentResp("v_sh600487=\"1~x~600487~~\""))
+    assert src.fetch_tencent_batch(["600487"]) == {}       # price 缺字段跳过
+
+
+def test_quote_snapshot_upsert_and_readback():
+    """持仓价快照：整表删后插 + 10 分钟内读回（source 保留）"""
+    from app.db import repo
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    assert repo.upsert_quote_snapshot([
+        {"stock_code": "600487", "name": "白云机场", "price": 62.18,
+         "change_pct": None, "source": "tencent", "updated_at": now},
+        {"stock_code": "000001", "name": "平安银行", "price": 11.41,
+         "change_pct": 0.2, "source": "universe", "updated_at": now},
+    ]) == 2
+    df = repo.get_quote_snapshot(within_minutes=10)
+    assert df is not None and set(df["code"]) == {"600487", "000001"}
+    assert set(df["source"]) == {"tencent", "universe"}
+
+
+def test_quote_snapshot_stale_returns_none():
+    """全部过期（updated_at 超窗口）→ get 返回 None（走下一级全市场快照）"""
+    from app.db import repo
+    repo.upsert_quote_snapshot([
+        {"stock_code": "600000", "name": "x", "price": 1.0,
+         "change_pct": None, "source": "tencent",
+         "updated_at": "2020-01-01 00:00:00"}])
+    assert repo.get_quote_snapshot(within_minutes=10) is None
+    repo.upsert_quote_snapshot([])  # 清表，避免污染后续

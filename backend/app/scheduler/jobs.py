@@ -248,6 +248,27 @@ def sector_refresh_job() -> None:
         cache.release_lock("sector_refresh")
 
 
+def quote_snapshot_refresh_job() -> None:
+    """持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁互不干扰）"""
+    if not cache.acquire_lock("quote_snapshot_refresh", ttl_seconds=240):
+        logger.info("quote_snapshot_refresh 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.quote_snapshot import refresh_quote_snapshot
+        result = refresh_quote_snapshot()
+        if result.get("success"):
+            cache.set("job:last_quote_snapshot_refresh",
+                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("持仓价快照刷新完成: %s 条 (source=%s)",
+                        result.get("rows", 0), result.get("source"))
+        else:
+            logger.warning("持仓价快照刷新失败: %s", result.get("error"))
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("持仓价快照刷新异常: %s", exc)
+    finally:
+        cache.release_lock("quote_snapshot_refresh")
+
+
 def _is_previous_trading_day(yesterday: str) -> bool:
     """昨天是否最近交易日（龙虎榜 T+1：16:30 后拉的是昨日数据）。
     日历为全量静态历（1990~年末含未来日期）：取今天之前的最后一个交易日与昨天比对"""
@@ -396,6 +417,11 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-15", minute="*/5",
                       id="sector_refresh", name="板块快照刷新",
                       replace_existing=True, misfire_grace_time=300)
+    # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
+    scheduler.add_job(quote_snapshot_refresh_job, "cron",
+                      day_of_week="mon-fri", hour="9-15", minute="*/5",
+                      id="quote_snapshot_refresh", name="持仓价快照刷新",
+                      replace_existing=True, misfire_grace_time=300)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")
 
@@ -421,4 +447,5 @@ def job_status() -> list[dict]:
     out.append({"id": "last_pre_market", "name": "最近盘前快筛", "next_run": cache.get("job:last_pre_market")})
     out.append({"id": "last_market_accuracy", "name": "最近市况回填", "next_run": cache.get("job:last_market_accuracy")})
     out.append({"id": "last_sector_refresh", "name": "最近板块刷新", "next_run": cache.get("job:last_sector_refresh")})
+    out.append({"id": "last_quote_snapshot_refresh", "name": "最近持仓价刷新", "next_run": cache.get("job:last_quote_snapshot_refresh")})
     return out

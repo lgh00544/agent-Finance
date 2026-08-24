@@ -71,6 +71,7 @@ def init_db() -> None:
     _add_factor_scores_column()
     _ensure_indexes()
     _ensure_sector_snapshot_table()
+    _ensure_quote_snapshot_table()
 
 
 def _ensure_experience_fts() -> None:
@@ -124,6 +125,12 @@ def _ensure_sector_snapshot_table() -> None:
     """幂等补建 sector_snapshot 表（首页板块快照；create_all 兜底 SQLite/MySQL 通吃）"""
     from app.db import models  # noqa: F401
     Base.metadata.create_all(bind=engine, tables=[models.SectorSnapshot.__table__])
+
+
+def _ensure_quote_snapshot_table() -> None:
+    """幂等补建 quote_snapshot 表（持仓实时价快照；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[models.QuoteSnapshot.__table__])
 
 
 def _ensure_stock_candidate_detail(eng=None) -> None:

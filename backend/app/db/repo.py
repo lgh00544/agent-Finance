@@ -6,7 +6,10 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Any, Callable
+
+import pandas as pd
 
 from sqlalchemy import delete, func, select, text
 
@@ -17,8 +20,9 @@ from app.db.models import (
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
     Experience, ExperienceConfig, Holding, HotMoneyProfile, LhbOriginalFlow,
     MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
-    PrivateKnowledge, ReviewLog, ReviewResult, RuleChange, SectorSnapshot,
-    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord, WorkerRun, _now,
+    PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
+    SectorSnapshot, SellDecision, StockCandidate, StockScore, TradeProfile,
+    TradeRecord, WorkerRun, _now,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -275,6 +279,59 @@ def get_sector_snapshot_updated_at(trade_date: str) -> str | None:
             .limit(1)
         ).scalar_one_or_none()
         return str(row) if row is not None else None
+
+
+# ==================== 持仓实时价快照（quote_snapshot，持仓监控页 DB 兜底） ====================
+
+def upsert_quote_snapshot(rows: list[dict]) -> int:
+    """整表清除后批量插入持仓价快照（行数小，删后插简单稳，仿 upsert_sector_snapshot）
+    rows 每项字段：stock_code/name/price/change_pct/source/updated_at；返回写入行数。"""
+    if not rows:
+        return 0
+    with SessionLocal() as db:
+        db.execute(text("DELETE FROM quote_snapshot"))
+        for r in rows:
+            db.add(QuoteSnapshot(
+                stock_code=r["stock_code"],
+                name=r.get("name", ""),
+                price=r.get("price", 0.0),
+                change_pct=r.get("change_pct"),
+                source=r.get("source", ""),
+                updated_at=_parse_ts(r.get("updated_at")),
+            ))
+        db.commit()
+    return len(rows)
+
+
+def _parse_ts(value) -> datetime:
+    """updated_at 容错：datetime 直通；'YYYY-MM-DD HH:MM:SS' 字符串转 datetime；异常回落 now()"""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    return datetime.now()
+
+
+def get_quote_snapshot(within_minutes: int = 10) -> pd.DataFrame | None:
+    """读 updated_at 在 N 分钟内的持仓价快照（DB 兜底二级）。
+
+    返回 DataFrame（code/name/price/change_pct/source）；表空或全部过期返回 None
+    （调用方走下一级全市场快照兜底）。首页热路径 O(rows) 秒回，无外部请求。"""
+    cutoff = datetime.now() - timedelta(minutes=within_minutes)
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(QuoteSnapshot).where(QuoteSnapshot.updated_at >= cutoff)
+        ).scalars().all()
+    if not rows:
+        return None
+    return pd.DataFrame([
+        {"code": r.stock_code, "name": r.name, "price": r.price,
+         "change_pct": r.change_pct, "source": r.source}
+        for r in rows
+    ])
 
 
 # ==================== 市场研判底座（market_intel，每日收盘后 1 次 + 手动入口） ====================

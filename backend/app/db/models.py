@@ -671,3 +671,21 @@ class SectorSnapshot(Base):
     rank_no: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class QuoteSnapshot(Base):
+    """持仓实时价快照（每 5 分钟腾讯批量落库；持仓监控页 DB 兜底，首页热路径 <50ms）
+
+    表结构：quote_snapshot；stock_code 唯一，新鲜度由 updated_at 判定（within_minutes）。
+    作用：解决东财全市场快照单点 hang 10-20s 导致前端 15s 超时（DB 快照永远秒回）
+    """
+    __tablename__ = "quote_snapshot"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(10), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    change_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

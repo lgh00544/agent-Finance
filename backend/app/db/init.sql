@@ -266,3 +266,17 @@ CREATE TABLE IF NOT EXISTS sector_snapshot (
     UNIQUE KEY uq_sector_date_name (trade_date, sector_name),
     KEY ix_sector_date_rank (trade_date, rank_no)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 持仓实时价快照（每 5 分钟腾讯批量落库；持仓监控页 DB 兜底解决东财全市场 hang 超时）
+-- 与 backend/app/db/models.py 的 QuoteSnapshot 一致；stock_code 唯一，新鲜度由 updated_at 判定
+CREATE TABLE IF NOT EXISTS quote_snapshot (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    stock_code VARCHAR(10) NOT NULL,
+    name VARCHAR(64) NOT NULL DEFAULT '',
+    price DECIMAL(10,3) NOT NULL DEFAULT 0,
+    change_pct FLOAT NULL,
+    source VARCHAR(8) NOT NULL DEFAULT '',           -- 'tencent' / 'universe'
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_quote_code (stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
