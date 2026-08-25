@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { App, Button, Card, Input, Space, Table, Tabs, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { hotMoneyFlows, hotMoneyProfiles, hotMoneyTierApply, hotMoneyWinrateIterate } from '@/api/hotMoney'
+import { capitalView, hotMoneyFlows, hotMoneyProfiles, hotMoneyTierApply, hotMoneyWinrateIterate } from '@/api/hotMoney'
 import { agentSuggestions, approveSuggestion, rejectSuggestion } from '@/api/suggestions'
 import { EmptyState, ErrorCard, StockLabel } from '@/components/common'
 import { moneyCn } from '@/utils/format'
@@ -138,6 +138,59 @@ function SuggestList() {
   )
 }
 
+/** 个股资本视图（K189 对倒 · 游资活跃 · 30日统计；读 /api/capital_view/{code}） */
+function CapitalViewPanel() {
+  const [code, setCode] = useState('')
+  const { data, isError, error, refetch } = useQuery({
+    queryKey: ['capital-view', code],
+    queryFn: () => capitalView(code),
+    enabled: code.length === 6,
+  })
+  if (isError) return <ErrorCard title="资本视图加载失败" message={error?.message} onRetry={() => refetch()} />
+  const actors = data?.recent_actors ?? []
+  const stats: Record<string, number | null> = data?.stats_30d ?? {}
+  const badge = data?.wash_suspect ? { color: 'red', text: '对倒嫌疑（K189）' }
+    : actors.length ? { color: 'gold', text: '游资关注' }
+    : { color: 'default', text: '无数据' }
+  const coordTone: Record<string, string> = { '多游资同买': 'red', '单家动作': 'orange', '无显著动作': 'default', '数据不足': 'default' }
+  const winRate = stats['胜率']
+  const rr = stats['盈亏比']
+  const holdDays = stats['平均持仓天数']
+  return (
+    <Space direction="vertical" style={{ width: '100%' }}>
+      <Input.Search placeholder="输入6位股票代码，如 600519" style={{ width: 260 }} onSearch={setCode} allowClear />
+      {!code && <EmptyState text="输入股票代码查看个股资本视图。" icon="🏛️" />}
+      {code.length === 6 && !isError && !data && <EmptyState text="资本视图加载中…" icon="⏳" />}
+      {data && (
+        <>
+          <Space wrap>
+            <Tag color={badge.color}>{badge.text}</Tag>
+            <Tag color={coordTone[data.coordination ?? ''] ?? 'default'}>{data.coordination || '—'}</Tag>
+            {data.theme_resonance ? <Tag color="blue">板块共振</Tag> : null}
+            <Text type="secondary">数据源 {data.source || '—'} · {data.trade_date || '—'}</Text>
+          </Space>
+          <Table size="small" rowKey={(r) => String(r.name ?? r.seat ?? '')} dataSource={actors} pagination={false}
+            columns={[
+              { title: '游资', dataIndex: 'name', width: 120, render: (v: string) => <Text strong>{v || '—'}</Text> },
+              { title: '席位', dataIndex: 'seat', width: 200, ellipsis: true, render: (v: string) => v || '—' },
+              { title: '梯队', dataIndex: 'tier', width: 80, render: (v: string) => <Tag color={TIER_TONE[v] ?? 'default'}>{v ?? '—'}</Tag> },
+              { title: '净买额', dataIndex: 'net_buy', align: 'right' as const, render: (v: number) => (v != null ? moneyCn(v) : '—') },
+              { title: '活跃天数', dataIndex: 'days_active', width: 80, render: (v: number) => v ?? '—' },
+            ]}
+            locale={{ emptyText: '30日无活跃游资（数据不足，不编造）。' }} />
+          <Card size="small" title="30日游资统计（stats_30d）" style={{ background: 'var(--bg-input)' }}>
+            <Space wrap>
+              <Text>胜率：{winRate != null ? `${(winRate * 100).toFixed(0)}%` : '—'}</Text>
+              <Text>盈亏比：{rr != null ? rr.toFixed(2) : '—'}</Text>
+              <Text>平均持仓天数：{holdDays != null ? `${holdDays.toFixed(1)}天` : '—'}</Text>
+            </Space>
+          </Card>
+        </>
+      )}
+    </Space>
+  )
+}
+
 /** 游资追踪页（Phase 4） */
 export function HotMoneyPage() {
   return (
@@ -146,6 +199,7 @@ export function HotMoneyPage() {
         { key: 'profile', label: '游资档案', children: <Profiles /> },
         { key: 'flow', label: '龙虎榜流水', children: <Flows /> },
         { key: 'iterate', label: '胜率迭代', children: <Iterate /> },
+        { key: 'capital', label: '个股资本视图', children: <CapitalViewPanel /> },
       ]} />
     </div>
   )

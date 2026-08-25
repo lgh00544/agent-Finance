@@ -59,7 +59,29 @@ export interface MarketConditionInfo {
   dims?: Record<string, unknown>
   summary?: string
   created_at?: string
+  strictness?: string | null
   [k: string]: unknown
+}
+
+// ===== 候选审计底稿（批次4 前端审计卡片）：A 层可建仓判定 / 拒判明细，只读展示 =====
+export interface AuditDecision {
+  key?: string
+  label?: string
+  passed?: boolean | null
+  evidence?: string
+}
+export interface MarketAudit {
+  verdict?: string
+  passed_ratio?: string
+  note?: string
+  trade_date?: string
+  market?: Record<string, unknown>
+  decisions?: AuditDecision[]
+}
+export interface BlockDetail {
+  rule?: string
+  passed?: boolean | null
+  evidence?: string
 }
 export interface MarketIntelInfo {
   trade_date?: string
@@ -337,6 +359,38 @@ export interface HotMoneyFlow {
   confidence?: number
   source?: string
   disclosure_reason?: string
+  [k: string]: unknown
+}
+
+// ===== 个股资本视图（批次E 后半段：K189 对倒 · 游资活跃 · 30日统计）=====
+export interface CapitalViewActor {
+  name?: string
+  seat?: string
+  tier?: string
+  net_buy?: number | null
+  days_active?: number | null
+  [k: string]: unknown
+}
+export interface CapitalViewRow {
+  trade_date?: string
+  seat_name?: string
+  buy_amt?: number
+  sell_amt?: number
+  net_buy?: number
+  [k: string]: unknown
+}
+export interface CapitalView {
+  stock_code?: string
+  trade_date?: string
+  recent_actors?: CapitalViewActor[]
+  coordination?: string
+  wash_suspect?: boolean
+  stats_30d?: Record<string, number | null>
+  theme_resonance?: boolean
+  source?: string
+  missing_data?: string[]
+  dragon_tiger_rows?: CapitalViewRow[]
+  capital_flow_rows?: CapitalViewRow[]
   [k: string]: unknown
 }
 

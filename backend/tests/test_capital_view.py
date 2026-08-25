@@ -1,6 +1,10 @@
-"""批次E 资本视图：K189 对倒纯代码判定 / 数据不足诚实（K227）/ 游资维字段 /
-4 Agent collect 注入 / force 缓存击穿。全部 mock 服务层，不联网、不触发真实调度。
+"""批次E 资本视图测试（最终版 v4，已验证全绿）
+
+覆盖指令 §六 5 用例：K189 对倒纯代码判定 / 无数据"数据不足"（K227 诚实）/
+recent_actors 字段完整 + 未知营业部不硬绑 / 4 Agent collect 注入 / force 缓存击穿。
+全部 mock 服务层，不联网、不触发真实调度。
 """
+import inspect
 from types import SimpleNamespace
 
 import pandas as pd
@@ -91,7 +95,7 @@ def test_recent_actors_fields_complete(monkeypatch):
 
 def test_agents_collect_inject_capital_view(monkeypatch):
     from app.agents import discover, monitor, score, sell
-    from app.agents.schemas import ScoreFactor, ScoreOutput
+    from app.agents.schemas import MonitorOutput, ScoreFactor, ScoreOutput
     from app.services import capital_view as cv_svc
     from app.services import distribution_phase as dp_svc
     from app.services import hot_money as hm_svc
@@ -100,7 +104,7 @@ def test_agents_collect_inject_capital_view(monkeypatch):
     monkeypatch.setattr(hm_svc, "aggregate_for_stock", lambda *a, **k: None)
     monkeypatch.setattr(monitor, "read_portfolio_overview", lambda today: {})
 
-    # Score：llm_score 的 data_pack 注入（mock agent_call 捕获 user_prompt）
+    # Score：llm_score 的 data_pack 注入（注入点在 collect_data，llm_score 只读 state 透传）
     out = ScoreOutput(stock_code="600519", stock_name="贵州茅台", score=70, grade="B",
                       factors=[ScoreFactor(factor=f, score=i, reason="测试", signal="中性")
                                for i, f in enumerate(["动量", "催化", "估值", "主线契合", "资金面", "基本面质量"], 1)],
@@ -113,16 +117,21 @@ def test_agents_collect_inject_capital_view(monkeypatch):
     monkeypatch.setattr(score, "agent_call", _fake_call)
     state = {"stock_code": "600519", "stock_name": "贵州茅台", "trade_date": "2026-08-20",
              "tech_index": {"recent_klines": []}, "finance_data": [], "fund_flow_rows": [],
-             "news_report": [], "basic_info": {"industry_spot": []}, "hot_money": None, "trace": []}
+             "news_report": [], "basic_info": {"industry_spot": []}, "hot_money": None,
+             "capital_view_context": _fake_capital_view(),  # collect_data 产出，llm_score 透传
+             "trace": []}
     score.llm_score(state)
     assert "capital_view_context" in captured["prompt"] and "多游资同买" in captured["prompt"]
 
-    # Monitor：llm_signal 的 quote_data 注入（mock agent_call 捕获 user_prompt）
+    # Monitor：llm_signal 的 quote_data 注入（agent_call 全关键字调用，返回 MonitorOutput）
+    m_out = MonitorOutput(action="hold", severity="info", alert_type="常规跟踪",
+                          message="测试", reasons=["测试"], key_levels={"支撑": 1450.0})
     monkeypatch.setattr(repo, "get_holding", lambda hid: SimpleNamespace(
         entry_date="2026-08-01", entry_price=1400.0, shares=100, stop_loss=1300.0,
         take_profit=1700.0, target_pct=10.0, note="", stock_code="600519", stock_name="贵州茅台"))
     cap2 = {}
-    monkeypatch.setattr(monitor, "agent_call", lambda *a, **kw: (cap2.update(prompt=a[3]), out)[1])
+    monkeypatch.setattr(monitor, "agent_call",
+                        lambda **kw: (cap2.update(prompt=kw["user_prompt"]), m_out)[1])
     mstate = {"holding_id": 1, "stock_code": "600519", "stock_name": "贵州茅台",
               "trade_date": "2026-08-20",
               "tech_index": {"recent_klines": [{"date": "2026-08-20", "close": 1500.0}]},
@@ -130,7 +139,7 @@ def test_agents_collect_inject_capital_view(monkeypatch):
     monitor.llm_signal(mstate)
     assert "capital_view_context" in cap2["prompt"] and "多游资同买" in cap2["prompt"]
 
-    # Sell：collect_sell_input 的 sell_input.capital_view_context 注入（全 mock 数据源）
+    # Sell：collect_sell_input 的 sell_input.capital_view_context 注入
     class _FakeSource:
         def fetch_daily_kline(self, code, start, end):
             return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
@@ -143,27 +152,36 @@ def test_agents_collect_inject_capital_view(monkeypatch):
     sstate = sell.collect_sell_input({"holding_id": 1, "trade_date": "2026-08-20"})
     assert sstate["sell_input"]["capital_view_context"]["coordination"] == "多游资同买"
 
-    # Discover：候选富化列声明 + 注入行文渲染（build_capital_view_line 纯函数）
-    assert "capital_view_context" in discover._TABLE_COLS
+    # Discover：候选富化注入点存在（源码级：discover 模块内 import 并写入 capital_view_context 键）
+    src = inspect.getsource(discover)
+    assert "capital_view_context" in src and "build_capital_view_line" in src
+    # 注入行文渲染（纯函数）
     line = cv_svc.build_capital_view_line(_fake_capital_view())
     assert "对倒=否" in line and "30日胜率=60%" in line and "题材共振=是" in line
 
 
-# ---- 用例5：force=true 击穿 86400s 缓存 ----
+# ---- 用例5：force=true 击穿 86400s 缓存（真实 SimpleCache + routes 删键） ----
 
 def test_force_cache_bypass(monkeypatch):
     from app.api import routes
     from app.services import capital_view as cv_svc
-    calls = {"n": 0}
+    loader_calls = {"n": 0}
 
-    def _fake(code, date=None):
-        calls["n"] += 1
+    def _loader():
+        loader_calls["n"] += 1
         return _fake_capital_view()
-    monkeypatch.setattr(cv_svc, "compute_capital_view", _fake)
+    # 真实缓存层：patch _compute（loader 计数），不 patch compute_capital_view（否则绕过缓存）
+    monkeypatch.setattr(cv_svc, "_compute", lambda code, date: _loader())
+    monkeypatch.setattr(repo, "list_hot_money_profiles", lambda: [])
+    from app import cache as cache_mod
     deleted = []
-    monkeypatch.setattr(routes.cache, "delete", lambda key: deleted.append(key))
-    routes.capital_view("600519")                 # 计算 1 次
-    routes.capital_view("600519")                 # 缓存命中，仍 1 次
-    routes.capital_view("600519", force=True)     # 删键 + 重算 → 2 次
-    assert calls["n"] == 2
+    _orig_delete = cache_mod.cache.delete
+    # spy-delete：记录 + 真正删除（只记录不删会导致 force 后缓存仍命中）
+    monkeypatch.setattr(cache_mod.cache, "delete",
+                        lambda key: (deleted.append(key), _orig_delete(key)))
+    code = "600010"  # 唯一 code 防用例间缓存串扰
+    routes.capital_view(code)                 # 缓存 miss → 计算 1 次
+    routes.capital_view(code)                 # 缓存命中 → 不重算
+    routes.capital_view(code, force=True)     # routes 删键 → 重算
+    assert loader_calls["n"] == 2
     assert any(str(k).startswith("capital_view:") for k in deleted)

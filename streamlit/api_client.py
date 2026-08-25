@@ -416,6 +416,12 @@ def hot_money_tier_apply(suggestion_id: int) -> dict:
     return _post("/api/hot-money/tier/apply", {"suggestion_id": suggestion_id})
 
 
+def capital_view(stock_code: str, force: bool = False) -> dict:
+    """个股资本视图（K189 对倒判定 + 游资活跃 + 30日统计；force 穿透当日缓存）"""
+    params = {"force": "true"} if force else None
+    return _get(f"/api/capital_view/{stock_code}", params)
+
+
 def adopt_review(rid: int) -> dict:
     return _post(f"/api/reviews/{rid}/adopt")
 
