@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Button, Card, Progress, Select, Space, Table, Tag, Typography } from 'antd'
 import { useQuery } from '@tanstack/react-query'
 import { alerts } from '@/api/alerts'
@@ -23,6 +23,37 @@ const TASK_LABEL: Record<string, string> = {
 function fmtDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`
+}
+
+// 消息列结构化：关键字分组 → 字段名（前端解析，消息模板在后端不动）
+const FIELD_GROUPS: Array<{ kw: string[]; label: string }> = [
+  { kw: ['现价', '涨', '跌'], label: '现价 / 涨跌幅' },
+  { kw: ['MA5', 'MA10', 'MA20', '均线'], label: '均线' },
+  { kw: ['MACD', 'DIF', 'DEA'], label: 'MACD' },
+  { kw: ['RSI', 'KDJ', 'BOLL'], label: '技术指标' },
+  { kw: ['支撑位', '压力位', '止损', '止盈'], label: '关键位' },
+  { kw: ['建议', '触发', '关注'], label: '建议' },
+]
+
+function classifyClause(c: string): { label: string; kw: string | null } {
+  for (const g of FIELD_GROUPS) {
+    const kw = g.kw.find((k) => c.includes(k))
+    if (kw) return { label: g.label, kw }
+  }
+  return { label: '', kw: null }
+}
+
+/** 命中关键字加粗高亮，未命中原样 */
+function highlight(text: string, kw: string): ReactNode {
+  const idx = text.indexOf(kw)
+  if (idx < 0) return text
+  return (
+    <>
+      {text.slice(0, idx)}
+      <Text strong style={{ color: 'var(--up)' }}>{kw}</Text>
+      {text.slice(idx + kw.length)}
+    </>
+  )
 }
 
 /** 告警日志页（重点分层：资金告警置顶 / 后台任务状态 / 完整日志折叠） */
@@ -62,7 +93,27 @@ export function AlertsPage() {
       render: (v: string) => <Tag color={SEV_COLOR[v] ?? 'default'}>{SEV_LABEL[v] ?? v}</Tag>,
     },
     { title: '类型', dataIndex: 'alert_type', width: 130, render: (v: string) => v ?? '—' },
-    { title: '消息', dataIndex: 'message', ellipsis: true },
+    {
+      title: '消息', dataIndex: 'message', key: 'msg',
+      render: (v: string | null) => {
+        if (v == null) return '—'
+        const lines = v.split(/[；;，,]/).map((s) => s.trim()).filter(Boolean)
+        if (!lines.length) return '—'
+        return (
+          <Space direction="vertical" size={2}>
+            {lines.map((c, i) => {
+              const cls = classifyClause(c)
+              return (
+                <div key={i} style={{ fontSize: 12 }}>
+                  {cls.label ? <Text strong type="secondary">{cls.label}：</Text> : null}
+                  {cls.kw ? highlight(c, cls.kw) : c}
+                </div>
+              )
+            })}
+          </Space>
+        )
+      },
+    },
     {
       title: '推送', dataIndex: 'pushed', width: 80,
       render: (v: boolean) => (v ? <Tag color="green">✓ 已推送</Tag> : <Tag>—</Tag>),
@@ -125,7 +176,9 @@ export function AlertsPage() {
       <Card
         title="🟢 完整告警日志"
         size="small"
-        extra={<Button size="small" type="primary" onClick={() => setLogOpen(true)}>展开完整日志</Button>}
+        extra={logOpen
+          ? <Button size="small" onClick={() => setLogOpen(false)}>收起</Button>
+          : <Button size="small" type="primary" onClick={() => setLogOpen(true)}>展开完整日志</Button>}
         style={{ marginBottom: 12 }}
       >
         {logOpen ? (
