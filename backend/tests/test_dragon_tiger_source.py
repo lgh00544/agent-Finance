@@ -216,3 +216,96 @@ def test_fetch_dragon_tiger_persists_multi_source_flag(monkeypatch):
     rows = repo.list_lhb_flows(trade_date="2026-08-13")
     verified = [r for r in rows if r.get("multi_source_verified")]
     assert verified, "双源在榜标的应持久化 multi_source_verified=True"
+
+
+# ==================== 批次3：3d 三日累计榜 ====================
+
+def _fake_3d_payload():
+    """东财 3d 口径 mock：仅 FLAG='3' 过滤请求返回三日行（股票级+席位级），其余空"""
+    def _fake_get(url, referer=None, params=None, timeout=None, **kw):
+        filt = (params or {}).get("filter") or ""
+        if "FLAG='3'" not in filt:
+            return _FakeResp({"result": {"data": []}})
+        report = (params or {}).get("reportName")
+        if report == dts._EM_STOCKS_REPORT:
+            return _FakeResp({"result": {"data": [
+                {"SECURITY_CODE": "601138", "SECURITY_NAME_ABBR": "工业富联",
+                 "TRADE_DATE": "2026-08-07 00:00:00", "EXPLANATION": "连续三个交易日累计涨幅偏离值",
+                 "FLAG": "3",
+                 "BILLBOARD_NET_AMT": 120000000, "BILLBOARD_BUY_AMT": 150000000,
+                 "BILLBOARD_SELL_AMT": 30000000},
+            ]}})
+        if report in (dts._EM_BUY_REPORT, dts._EM_SELL_REPORT):
+            return _FakeResp({"result": {"data": [
+                {"SECURITY_CODE": "601138", "OPERATEDEPT_NAME": "中信证券股份有限公司上海分公司",
+                 "BUY": 80000000, "SELL": 30000000, "NET": 50000000, "FLAG": "3"},
+            ]}})
+        return _FakeResp({"result": {"data": []}})
+    return _fake_get
+
+
+def test_fetch_lhb_stocks_3d(monkeypatch):
+    """3d 股票级：FLAG='3' 过滤生效 → 三日榜行，lhb_type='3d'（不 1d 冒充）"""
+    monkeypatch.setattr(dts, "http_get", _fake_3d_payload())
+    df = dts.DragonTigerSource().fetch_lhb_stocks("2026-08-07", lhb_type="3d")
+    assert not df.empty
+    assert df.iloc[0]["stock_code"] == "601138"
+    assert df.iloc[0]["lhb_type"] == "3d"
+    assert df.iloc[0]["net_buy"] == 120000000.0
+
+
+def test_fetch_lhb_seats_3d(monkeypatch):
+    """3d 席位级：返回三日累计席位，lhb_type='3d'"""
+    monkeypatch.setattr(dts, "http_get", _fake_3d_payload())
+    df = dts.DragonTigerSource().fetch_lhb_seats("2026-08-07", "601138", lhb_type="3d")
+    assert not df.empty
+    assert df.iloc[0]["seat_name"] == "中信证券股份有限公司上海分公司"
+    assert df.iloc[0]["lhb_type"] == "3d"
+    assert df.iloc[0]["net_buy"] == 50000000.0
+
+
+def test_fetch_lhb_3d_honest_degrades():
+    """3d 接口未按三日返回（无 FLAG='3' 行）→ 诚实降级空表，杜绝 1d 冒充 3d"""
+    # 默认 _fake_http 的 payload 无 FLAG 字段 → 3d 请求应返回空
+    assert dts.DragonTigerSource().fetch_lhb_stocks("2026-08-07", lhb_type="3d").empty
+    assert dts.DragonTigerSource().fetch_lhb_seats("2026-08-07", "601138", lhb_type="3d").empty
+
+
+def test_fetch_and_merge_3d(monkeypatch):
+    """fetch_and_merge 3d 分支：股票级+席位级均 3d 口径；sina 3d 诚实为空"""
+    monkeypatch.setattr(dts, "http_get", _fake_3d_payload())
+    monkeypatch.setattr(dts, "ak", None)  # 禁网：sina 3d 早退空，不触 akshare
+    seats, stocks = dts.DragonTigerSource().fetch_and_merge("2026-08-07", lhb_type="3d")
+    assert not stocks.empty and stocks.iloc[0]["lhb_type"] == "3d"
+    assert not seats.empty and seats.iloc[0]["lhb_type"] == "3d"
+    assert not (stocks["source"] == "sina").any()  # sina 无三日口径，不参与
+
+
+def test_fetch_dragon_tiger_lands_3d(monkeypatch):
+    """fetch_dragon_tiger 落库 3d：lhb_type='3d' 行入库，list_lhb_flows(lhb_type='3d') 可查"""
+    from app.db import repo
+    from app.db.session import init_db
+
+    monkeypatch.setattr(dts, "http_get", _fake_3d_payload())
+    monkeypatch.setattr(dts, "ak", None)
+    init_db()
+    dts.fetch_dragon_tiger("2026-08-14")
+    rows3d = repo.list_lhb_flows(trade_date="2026-08-14", lhb_type="3d")
+    assert rows3d, "3d 口径应落库可查"
+    assert all(r["lhb_type"] == "3d" for r in rows3d)
+
+
+def test_verify_net_buy_3d_single_source(monkeypatch):
+    """verify_net_buy(lhb_type='3d') 查到 3d 净买（单源 → 诚实降级 verified=False）"""
+    from app.db import repo
+    from app.db.session import init_db
+    from app.services import hot_money as hm
+
+    monkeypatch.setattr(dts, "http_get", _fake_3d_payload())
+    monkeypatch.setattr(dts, "ak", None)
+    init_db()
+    dts.fetch_dragon_tiger("2026-08-15")
+    v = hm.verify_net_buy("2026-08-15", "601138", "3d")
+    assert v is not None
+    assert v["verified"] is False  # 单源（东财 3d）→ 不采信，合理降级
+    assert "eastmoney" in v["sources"]
