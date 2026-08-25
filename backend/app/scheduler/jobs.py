@@ -349,6 +349,17 @@ def dragon_tiger_job() -> None:
         cache.release_lock("dragon_tiger")
 
 
+def hot_money_win_rate_job() -> None:
+    """游资胜率迭代（工作日 16:30，daily_discover 16:10 + market_intel 16:20 之后）：
+    归一化匹配收信号 → 统计胜率落库 + 生成降/升档建议（pending 待人工审核，不自动改档）。"""
+    try:
+        from app.services.hot_money_review import run_win_rate_iteration
+
+        run_win_rate_iteration()
+    except Exception as exc:  # noqa: BLE001 迭代失败不阻塞其他任务
+        logger.error("游资胜率迭代失败: %s", exc)
+
+
 def maintenance_job() -> None:
     """每周空间维护（低频）：超期新闻清理 + SQLite 真空收缩 + 向量库超期索引清理。
     仅清理非核心数据（新闻原文），候选/评分/持仓/复盘等关键分析数据不清理。"""
@@ -405,6 +416,11 @@ def start_scheduler() -> None:
     scheduler.add_job(market_intel_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=20,
                       id="market_intel", name="市场研判",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 工作日 16:30 游资胜率迭代（daily_discover/market_intel 之后；归一化匹配收信号）
+    scheduler.add_job(hot_money_win_rate_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=30,
+                      id="hot_money_win_rate", name="游资胜率迭代",
                       replace_existing=True, misfire_grace_time=3600)
     # 交易日 9:00-16:00 每 N 分钟触发（函数内过滤：盘中高频 + 15:00-15:30 收盘校验低频）
     monitor_minutes = max(1, int(settings.monitor_interval_minutes))

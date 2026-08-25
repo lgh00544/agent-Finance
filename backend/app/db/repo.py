@@ -1877,16 +1877,16 @@ def get_profile_by_seat(seat_name: str) -> dict | None:
             return p
     # 停用词归一化：去掉公司/营业部常见后缀词，保留主体（如 中信证券股份有限公司上海分公司
     # → 中信 上海分公司），种子与真实席位都归一化后做包含匹配
-    norm = _normalize_seat(seat)
+    norm = normalize_seat(seat)
     for p in list_hot_money_profiles():
-        p_norm = _normalize_seat(p.get("seat_code") or "")
+        p_norm = normalize_seat(p.get("seat_code") or "")
         if p_norm and (p_norm in norm or norm in p_norm):
             return p
     return None
 
 
-def _normalize_seat(seat: str) -> str:
-    """席位名停用词归一化（模糊匹配辅助，非市场判断）"""
+def normalize_seat(seat: str) -> str:
+    """席位名停用词归一化（模糊匹配辅助，非市场判断；游资信号归一化匹配复用）"""
     for word in ("股份有限公司", "有限责任公司", "证券营业部", "营业部", "证券", "分公司"):
         seat = seat.replace(word, "")
     return seat.strip()

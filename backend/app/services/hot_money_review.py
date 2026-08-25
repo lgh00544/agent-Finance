@@ -31,15 +31,15 @@ _TIER_PATTERN = ("一线", "二线", "观察")
 
 def collect_signals(profile: dict) -> list[dict]:
     """某游资的买入信号集合：主席位+协同席位在龙虎榜的净买入流水（口径 1d）。
-    同一 (标的,日期) 去重取净买最大一行；返回 [{stock_code, stock_name, trade_date, net_buy, seat_name}]。
-    无信号返回 []（不参与胜率统计）。"""
-    seats = {profile.get("seat_code") or ""}
-    seats |= set(profile.get("co_seats") or [])
+    归一化匹配（简称 seat_code vs 龙虎榜全称 seat_name）；同一 (标的,日期) 去重取净买最大。
+    返回 [{stock_code, stock_name, trade_date, net_buy, seat_name}]；无信号返回 []。"""
+    seats = {repo.normalize_seat(profile.get("seat_code") or "")}
+    seats |= {repo.normalize_seat(s) for s in (profile.get("co_seats") or [])}
     seats.discard("")
     flows = repo.list_lhb_flows(lhb_type="1d", limit=2000)
     by_key: dict[tuple, dict] = {}
     for f in flows:
-        seat = f.get("seat_name") or ""
+        seat = repo.normalize_seat(f.get("seat_name") or "")
         if seat not in seats:
             continue
         net = float(f.get("net_buy") or 0.0)
@@ -50,7 +50,7 @@ def collect_signals(profile: dict) -> list[dict]:
             by_key[key] = {"stock_code": f.get("stock_code"),
                            "stock_name": f.get("stock_name", ""),
                            "trade_date": f.get("trade_date"),
-                           "net_buy": net, "seat_name": seat}
+                           "net_buy": net, "seat_name": f.get("seat_name")}
     return sorted(by_key.values(), key=lambda s: s["trade_date"], reverse=True)
 
 
