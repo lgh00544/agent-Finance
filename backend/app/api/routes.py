@@ -343,8 +343,14 @@ def dashboard():
 
 @router.get("/market-condition")
 def market_condition():
-    """当日市况评分（v2.0 前置步骤结果：总分/档位/候选池上限/五维/综述），供首页「今日操作提示」"""
-    return repo.get_latest_market_condition()
+    """当日市况评分（v2.0 前置步骤结果：总分/档位/候选池上限/五维/综述），供首页「今日操作提示」。
+    批次4：返回值追加 strictness（当日最终严格度，含 MarketIntel 修正；row 缺失/空 → None，前端降级）。"""
+    from app.services.candidate_tradeable import _day_strictness
+    row = repo.get_latest_market_condition()
+    if not row:
+        return {"strictness": None}
+    td = row.get("trade_date")
+    return {**row, "strictness": _day_strictness(str(td)) if td else None}
 
 
 # ================= 市场概览（顶部状态栏 / 首页热门板块，只读聚合） =================
