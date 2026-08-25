@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import {
   App,
   Alert,
+  Badge,
   Button,
   Card,
   Collapse,
@@ -9,14 +10,17 @@ import {
   Input,
   Select,
   Space,
+  Statistic,
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { scores } from '@/api/scores'
-import { stockNames } from '@/api/candidates'
+import { candidates, stockNames } from '@/api/candidates'
+import { reviews } from '@/api/reviews'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard, StockLabel } from '@/components/common'
 import { ConfidenceBar } from '@/components/common'
@@ -26,6 +30,35 @@ const { Text } = Typography
 const GRADE_TONE: Record<string, string> = { A: 'red', B: 'orange', C: 'blue' }
 
 const SIGNAL_TONE: Record<string, string> = { 看多: 'red', 中性: 'default', 看空: 'green' }
+
+/** 六因子固定顺序（detail.factors 可能乱序，一律按名 find 定位，禁止 index 假设） */
+const FACTOR_NAMES = ['动量', '催化', '估值', '主线契合', '资金面', '基本面质量']
+
+function factorScore(detail: Record<string, unknown> | undefined, name: string): { score: number | null; reason: string } {
+  const factors = ((detail?.factors as Array<Record<string, unknown>> | undefined) ?? [])
+  const f = factors.find((x) => x.factor === name)
+  if (!f || f.score == null) return { score: null, reason: '' }
+  return { score: Number(f.score), reason: String(f.reason ?? '') }
+}
+
+/** 6 因子色条：≥7 绿(var--down) / 4-6 黄(var--warn) / <4 灰(var--text-mute)，悬停看 LLM 依据 */
+function FactorBar({ detail }: { detail?: Record<string, unknown> }) {
+  return (
+    <div style={{ display: 'flex', gap: 3 }}>
+      {FACTOR_NAMES.map((name) => {
+        const { score, reason } = factorScore(detail, name)
+        const bg = score == null ? 'var(--text-mute)' : score >= 7 ? 'var(--down)' : score >= 4 ? 'var(--warn)' : 'var(--text-mute)'
+        return (
+          <Tooltip key={name} title={`${name} ${score ?? '—'} · ${score == null ? '（无数据）' : reason || '（无依据）'}`}>
+            <div style={{ width: 30, height: 26, borderRadius: 4, background: bg, color: '#fff', fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              {score ?? '—'}
+            </div>
+          </Tooltip>
+        )
+      })}
+    </div>
+  )
+}
 
 /** v4.0 六因子评分卡：因子名 + 得分 + 结论 + 依据（signal 为结论，reason 为依据） */
 function FactorCards({ detail }: { detail: Record<string, unknown> }) {
@@ -183,6 +216,7 @@ export function ScoresPage() {
   const [dateF, setDateF] = useState<string>()
   const [selId, setSelId] = useState<number | null>(null)
   const [manualCode, setManualCode] = useState('')
+  const [tabKey, setTabKey] = useState('today')
 
   const { data: allRows, isError, error, refetch } = useQuery({ queryKey: ['scores'], queryFn: () => scores() })
 
@@ -203,19 +237,97 @@ export function ScoresPage() {
     return true
   }), [allRows, keyword, dateF])
 
-  if (isError) return <ErrorCard title="评分报告加载失败" message={error?.message} onRetry={() => refetch()} />
+  const today = dates[0]
+  // 已采纳股票集合：reviews() 的 suggest_status=adopted/approved（agentSuggestions 无 stock_code，无法做股票交集）
+  const { data: reviewRows } = useQuery({ queryKey: ['reviews-adopted'], queryFn: () => reviews() })
+  const { data: candRows } = useQuery({
+    queryKey: ['candidates', today],
+    queryFn: () => candidates(today),
+    enabled: !!today,
+  })
+  const adoptedSet = useMemo(() => new Set((reviewRows ?? [])
+    .filter((r) => r.suggest_status === 'approved' || r.suggest_status === 'adopted')
+    .map((r) => r.stock_code)), [reviewRows])
+  const candSet = useMemo(() => new Set((candRows ?? []).map((r) => r.stock_code)), [candRows])
+  const todayRows = (allRows ?? []).filter((r) => r.trade_date === today)
+  const hasData = !!(allRows?.length)
+  const sumA = hasData ? todayRows.filter((r) => r.grade === 'A').length : '—'
+  const sumB = hasData ? todayRows.filter((r) => r.grade === 'B').length : '—'
+  const sumAdopted = hasData ? todayRows.filter((r) => adoptedSet.has(r.stock_code)).length : '—'
 
   const manualScore = useTaskSubmit('score', () => {
     message.success('打分任务已提交后台')
     qc.invalidateQueries({ queryKey: ['scores'] })
   })
-
-  const selRow = filtered.find((r) => r.id === selId) ?? filtered[0] ?? null
-
   const genPlan = useTaskSubmit('position', () => {
     message.success('建仓方案生成任务已提交后台')
     qc.invalidateQueries({ queryKey: ['plans'] })
   })
+
+  if (isError) return <ErrorCard title="评分报告加载失败" message={error?.message} onRetry={() => refetch()} />
+
+  // Tab 拆分：今日 / 历史 A 级(≥70) / 已采纳
+  const tabs = [
+    { key: 'today', label: '今日', rows: filtered.filter((r) => r.trade_date === today) },
+    { key: 'histA', label: '历史 A 级', rows: filtered.filter((r) => Number(r.score ?? 0) >= 70) },
+    { key: 'adopted', label: '已采纳', rows: filtered.filter((r) => adoptedSet.has(r.stock_code)) },
+  ]
+  const tabRows = tabs.find((t) => t.key === tabKey)?.rows ?? []
+  const selRow = tabRows.find((r) => r.id === selId) ?? tabRows[0] ?? null
+
+  // 表格列：综合分默认降序（采纳优先二级排序）+ 6 因子色条 + 在候选池 + 风险计数
+  const cols = [
+    {
+      title: '股票', key: 'stock', width: 180,
+      render: (_: unknown, r: StockScoreInfo) => (
+        <StockLabel code={r.stock_code} name={names?.[r.stock_code] ?? r.stock_name} />
+      ),
+    },
+    { title: '日期', dataIndex: 'trade_date', width: 100 },
+    {
+      title: '综合分', dataIndex: 'score', width: 90, defaultSortOrder: 'descend' as const,
+      sorter: (a: StockScoreInfo, b: StockScoreInfo) =>
+        (Number(adoptedSet.has(b.stock_code)) - Number(adoptedSet.has(a.stock_code))) ||
+        (Number(b.score ?? 0) - Number(a.score ?? 0)),
+      render: (v: number) => <Text strong>{v ?? '—'}</Text>,
+    },
+    {
+      title: '评级', dataIndex: 'grade', width: 90,
+      render: (v: string) => (v ? <Tag color={GRADE_TONE[v] ?? 'default'}>{v} 级</Tag> : '—'),
+    },
+    {
+      title: '6 因子', key: 'factors', width: 220,
+      render: (_: unknown, r: StockScoreInfo) => <FactorBar detail={(r.detail ?? {}) as Record<string, unknown>} />,
+    },
+    {
+      title: '在候选池', key: 'inCand', width: 80,
+      render: (_: unknown, r: StockScoreInfo) => (candSet.has(r.stock_code) ? <Tag color="blue">在池</Tag> : '—'),
+    },
+    {
+      title: '风险', key: 'risk', width: 80,
+      render: (_: unknown, r: StockScoreInfo) => {
+        const risks = r.risk_list ?? []
+        const n = risks.length
+        return (
+          <Tooltip title={n ? risks.join('；') : '（无风险提示）'}>
+            <Badge count={n} showZero color={n >= 3 ? 'red' : n >= 1 ? 'orange' : '#bfbfbf'} />
+          </Tooltip>
+        )
+      },
+    },
+    {
+      title: '操作', key: 'ops', width: 150,
+      render: (_: unknown, r: StockScoreInfo) => (
+        <Button size="small" loading={genPlan.submit.isPending}
+          onClick={(e) => {
+            e.stopPropagation()
+            genPlan.submit.mutate({ stock_code: r.stock_code, stock_name: r.stock_name ?? '' })
+          }}>
+          生成建仓方案
+        </Button>
+      ),
+    },
+  ]
 
   return (
     <div>
@@ -227,47 +339,34 @@ export function ScoresPage() {
         <Button onClick={() => refetch()}>刷新</Button>
       </Space>
 
+      {/* 3 摘要卡：今日 A/B 级 + 已被采纳（无数据显 —） */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 8, marginBottom: 10 }}>
+        <Card size="small"><Statistic title="今日 A 级" value={sumA} valueStyle={{ color: 'var(--up)' }} /></Card>
+        <Card size="small"><Statistic title="今日 B 级" value={sumB} valueStyle={{ color: 'var(--warn)' }} /></Card>
+        <Card size="small"><Statistic title="已被采纳" value={sumAdopted} valueStyle={{ color: 'var(--down)' }} /></Card>
+      </div>
+
       {!filtered.length ? (
         <EmptyState text="暂无匹配的评分数据。" icon="🔍" />
       ) : (
-        <>
-          <Table<StockScoreInfo>
-            rowKey="id" size="small" dataSource={filtered}
-            pagination={{ pageSize: 20 }}
-            rowClassName={(r) => (r.id === selRow?.id ? 'ant-table-row-selected' : '')}
-            onRow={(r) => ({ onClick: () => r.id != null && setSelId(r.id) })}
-            columns={[
-              {
-                title: '股票', key: 'stock', width: 180,
-                render: (_: unknown, r: StockScoreInfo) => (
-                  <StockLabel code={r.stock_code} name={names?.[r.stock_code] ?? r.stock_name} />
-                ),
-              },
-              { title: '日期', dataIndex: 'trade_date', width: 100 },
-              {
-                title: '综合分', dataIndex: 'score', width: 90,
-                render: (v: number) => <Text strong>{v ?? '—'}</Text>,
-              },
-              {
-                title: '评级', dataIndex: 'grade', width: 90,
-                render: (v: string) => (v ? <Tag color={GRADE_TONE[v] ?? 'default'}>{v} 级</Tag> : '—'),
-              },
-              {
-                title: '操作', key: 'ops', width: 150,
-                render: (_: unknown, r: StockScoreInfo) => (
-                  <Button size="small" loading={genPlan.submit.isPending}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      genPlan.submit.mutate({ stock_code: r.stock_code, stock_name: r.stock_name ?? '' })
-                    }}>
-                    生成建仓方案
-                  </Button>
-                ),
-              },
-            ]}
-          />
-          {selRow ? <ScoreDetail r={selRow} /> : null}
-        </>
+        <Tabs activeKey={tabKey} onChange={setTabKey} items={tabs.map((t) => ({
+          key: t.key,
+          label: `${t.label}（${t.rows.length}）`,
+          children: t.rows.length ? (
+            <>
+              <Table<StockScoreInfo>
+                rowKey="id" size="small" dataSource={t.rows}
+                pagination={{ pageSize: 20 }}
+                rowClassName={(r) => (r.id === selRow?.id ? 'ant-table-row-selected' : '')}
+                onRow={(r) => ({ onClick: () => r.id != null && setSelId(r.id) })}
+                columns={cols}
+              />
+              {selRow ? <ScoreDetail r={selRow} /> : null}
+            </>
+          ) : (
+            <EmptyState text={`「${t.label}」暂无数据`} icon="—" />
+          ),
+        }))} />
       )}
 
       <Card size="small" title="手动打分" style={{ marginTop: 16, background: 'var(--bg-input)' }}>
