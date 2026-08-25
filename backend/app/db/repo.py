@@ -1174,15 +1174,21 @@ def list_untracked_candidates() -> list[dict]:
                 for c, _ in db.execute(stmt).all()]
 
 
-def list_track_verify(select_date: str = "", rating: str = "",
-                      is_finished: int | None = None, limit: int = 200) -> list[dict]:
-    """追踪验证行列表（按选中日+排序；60s 缓存，写后失效）"""
+def list_track_verify(select_date: str = "", start_date: str = "", end_date: str = "",
+                      rating: str = "", is_finished: int | None = None,
+                      limit: int = 200) -> list[dict]:
+    """追踪验证行列表（select_date 兼容旧单参；start_date/end_date 时间范围；60s 缓存，写后失效）"""
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(CandidateTrackVerify).order_by(
                 CandidateTrackVerify.select_date.desc(), CandidateTrackVerify.id)
             if select_date:
                 stmt = stmt.where(CandidateTrackVerify.select_date == select_date)
+            elif start_date or end_date:
+                if start_date:
+                    stmt = stmt.where(CandidateTrackVerify.select_date >= start_date)
+                if end_date:
+                    stmt = stmt.where(CandidateTrackVerify.select_date <= end_date)
             if rating:
                 stmt = stmt.where(CandidateTrackVerify.select_rating == rating)
             if is_finished is not None:
@@ -1198,8 +1204,26 @@ def list_track_verify(select_date: str = "", rating: str = "",
                      "created_at": str(r.created_at)} for r in rows]
 
     return _dbq("track_verify",
-                {"date": select_date, "rating": rating,
-                 "finished": is_finished, "limit": limit}, _load)
+                {"date": select_date, "start": start_date, "end": end_date,
+                 "rating": rating, "finished": is_finished, "limit": limit}, _load)
+
+
+def fetch_daily_kline(code: str, start_date: str, end_date: str) -> list[dict]:
+    """单股日K（透传 datasource；供 kline 接口/多日盈亏曲线渲染；纯数据无判断）。
+    失败返回空列表（不抛，单标的行情缺失不阻塞）。"""
+    try:
+        from app.datasource.fallback import get_datasource
+        df = get_datasource().fetch_daily_kline(code, start_date, end_date)
+        if df is None or df.empty:
+            return []
+        out = []
+        for _, r in df.iterrows():
+            out.append({"date": str(r.get("date") or "")[:10], "open": r.get("open"),
+                        "high": r.get("high"), "low": r.get("low"), "close": r.get("close"),
+                        "volume": r.get("volume")})
+        return out
+    except Exception:  # noqa: BLE001 单股行情失败降级空列表
+        return []
 
 
 def list_track_verify_dates(limit: int = 30) -> list[str]:

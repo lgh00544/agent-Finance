@@ -1188,6 +1188,21 @@ def stock_cycle_attribution(stock_code: str):
     return build_stock_cycle_attribution(stock_code)
 
 
+@router.get("/portfolio/daily-summary")
+def portfolio_daily_summary(days: int = 30):
+    """每日组合总结（纯计算聚合，零 LLM）：组合当日盈亏 + N 日曲线 + top gainers/losers + 总结文案"""
+    from app.services.portfolio_summary import build_daily_summary
+    return build_daily_summary(days)
+
+
+@router.get("/kline/{stock_code}")
+def kline(stock_code: str, start: str = "", end: str = ""):
+    """单股日K（透传 datasource fetch_daily_kline；多日盈亏曲线渲染用）。start/end 缺省返回空 klines"""
+    if not start or not end:
+        return {"code": stock_code, "klines": []}
+    return {"code": stock_code, "klines": repo.fetch_daily_kline(stock_code, start, end)}
+
+
 # ================= 游资追踪（游资档案 / 龙虎榜流水 / 留痕 / 权重迭代） =================
 @router.get("/hot-money/profiles")
 def hot_money_profiles(q: str = "", tier: str = ""):
@@ -1245,15 +1260,16 @@ def hot_money_tier_apply(body: TierApplyBody):
 
 # ================= 候选池 T+N 验证（选股效果闭环） =================
 @router.get("/track/verify/list")
-def track_verify_list(select_date: str = "", rating: str = "", status: str = "",
-                      limit: int = 200):
-    """追踪验证行列表（默认全部；status: all/tracking/finished；纯读）"""
+def track_verify_list(select_date: str = "", start_date: str = "", end_date: str = "",
+                      rating: str = "", status: str = "", limit: int = 200):
+    """追踪验证行列表（select_date 兼容旧单参；start_date/end_date 时间范围；纯读）"""
     finished = None
     if status == "tracking":
         finished = 0
     elif status == "finished":
         finished = 1
-    return repo.list_track_verify(select_date=select_date, rating=rating,
+    return repo.list_track_verify(select_date=select_date, start_date=start_date,
+                                  end_date=end_date, rating=rating,
                                   is_finished=finished, limit=limit)
 
 
