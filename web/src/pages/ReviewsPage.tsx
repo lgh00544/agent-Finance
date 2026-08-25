@@ -5,11 +5,13 @@ import {
   Button,
   Card,
   Drawer,
+  Input,
   Select,
   Space,
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -20,13 +22,19 @@ import { trackVerifyDates, trackVerifyList, trackVerifyStats, runTrackVerify, ru
 import { ChartCard } from '@/components/charts/ChartCard'
 import type { EChartsOption } from 'echarts'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StatusBadge, StockLabel } from '@/components/common'
-import type { ReviewInfo, TrackVerifyRow } from '@/types'
+import type { AgentSuggestion, ReviewInfo, TrackVerifyRow } from '@/types'
 
 const { Text } = Typography
 const SUG_STATUS: Record<string, { label: string; color: string }> = {
   pending: { label: '待审核', color: 'orange' },
   approved: { label: '已采纳', color: 'green' },
+  adopted: { label: '已采纳', color: 'green' },
   rejected: { label: '已驳回', color: 'default' },
+}
+// AI 自动决策记录：模块（target_agent）→ 中文
+const MODULE_LABEL: Record<string, string> = {
+  discover: '选股发现', score: '评分分析', position: '建仓方案',
+  monitor: '持仓监控', sell: '卖出决策', review: '复盘迭代',
 }
 
 /** 复盘详情抽屉（黑盒：结论 + 交易记录 + 卖出决策 + 留痕） */
@@ -43,6 +51,14 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
     onOk: async () => {
       try { await adoptSuggestion(r.id); message.success('已采纳'); qc.invalidateQueries({ queryKey: ['reviews'] }) }
       catch (e) { message.error(e instanceof Error ? e.message : '采纳失败') }
+    },
+  })
+  const reject = () => modal.confirm({
+    title: '驳回该建议', okText: '确认驳回', okButtonProps: { danger: true },
+    content: '驳回后该建议标记为「已驳回」，不写入偏好档案；可在策略闭环建议列表重新处理。',
+    onOk: async () => {
+      try { await rejectSuggestion(r.id, '人工驳回'); message.success('已驳回'); qc.invalidateQueries({ queryKey: ['reviews'] }) }
+      catch (e) { message.error(e instanceof Error ? e.message : '驳回失败') }
     },
   })
 
@@ -63,9 +79,13 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
             <div><Text type="secondary">{String(suggestion.reason ?? '')}</Text></div>
             {r.suggest_status === 'pending' ? (
               <div style={{ marginTop: 8 }}>
-                <Button type="primary" onClick={adopt}>采纳建议并更新偏好档案</Button>
+                <Space>
+                  <Button type="primary" onClick={adopt}>采纳建议并更新偏好档案</Button>
+                  <Button type="default" danger onClick={reject}>驳回</Button>
+                </Space>
               </div>
-            ) : r.suggest_status === 'adopted' ? <Text type="success">已采纳并生效</Text> : null}
+            ) : r.suggest_status === 'adopted' ? <Text type="success">已采纳并生效</Text>
+              : r.suggest_status === 'rejected' ? <Text type="secondary">已驳回</Text> : null}
           </Card>
         ) : null}
       </Space>
@@ -75,11 +95,38 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
 
 /** 复盘列表 + 黑盒详情（点击行展开） */
 function ReviewsList() {
+  const { message, modal } = App.useApp()
+  const qc = useQueryClient()
   const [drawerR, setDrawerR] = useState<ReviewInfo | null>(null)
+  const [autoOpen, setAutoOpen] = useState(false)
+  const [detailSug, setDetailSug] = useState<AgentSuggestion | null>(null)
   const { data: rows, isError, error, refetch } = useQuery({ queryKey: ['reviews'], queryFn: () => reviews() })
+  // AI 自动决策记录（agent_suggestions 已有数据，仅可见性 + 提意见；回滚接口未上线 → disabled）
+  const { data: sugs } = useQuery({ queryKey: ['agent-sug'], queryFn: () => agentSuggestions() })
   if (isError) return <ErrorCard title="复盘加载失败" message={error?.message} onRetry={() => refetch()} />
   const list = rows ?? []
   if (!list.length) return <EmptyState text="暂无复盘记录。在「持仓监控」页录入人工卖出后自动触发复盘。" icon="🔁" />
+
+  const sugList = sugs ?? []
+  const passed = sugList.filter((s) => s.status === 'approved').length
+  const rejected = sugList.filter((s) => s.status === 'rejected').length
+  const pending = sugList.filter((s) => s.status === 'pending').length
+
+  const openFeedback = (s: AgentSuggestion) => {
+    let reason = ''
+    modal.confirm({
+      title: '对这条 AI 自动决策提意见（以「驳回 + 理由」记录）',
+      content: <Input.TextArea rows={3} placeholder="说明不同意的理由…" onChange={(e) => { reason = e.target.value }} />,
+      okText: '提交', cancelText: '取消', okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await rejectSuggestion(s.id, reason.trim() || '人工驳回')
+          message.success('已记录驳回意见')
+          qc.invalidateQueries({ queryKey: ['agent-sug'] })
+        } catch (e) { message.error(e instanceof Error ? e.message : '提交失败') }
+      },
+    })
+  }
 
   const cols = [
     {
@@ -98,9 +145,51 @@ function ReviewsList() {
 
   return (
     <>
+      {/* AI 自动决策 banner（reviews 为空时早退已隐藏；sugList 为空不显示统计 0 的横幅） */}
+      {sugList.length ? (
+        <Alert type="info" showIcon style={{ marginBottom: 10, cursor: 'pointer' }} onClick={() => setAutoOpen(true)}
+          message={`🤖 AI 自动决策：近 ${sugList.length} 条 · 通过 ${passed} · 驳回 ${rejected} · 待审 ${pending}（点击查看）`} />
+      ) : null}
       <Table<ReviewInfo> rowKey="id" size="small" dataSource={list} columns={cols} pagination={{ pageSize: 20 }}
         onRow={(r) => ({ onClick: () => setDrawerR(r) })} />
       <ReviewDrawer r={drawerR!} open={!!drawerR} onClose={() => setDrawerR(null)} />
+
+      {/* AI 自动决策记录列表 */}
+      <Drawer title="🤖 AI 自动决策记录" open={autoOpen} onClose={() => setAutoOpen(false)} width={640}>
+        <Table size="small" rowKey="id" dataSource={sugList} pagination={{ pageSize: 10 }}
+          columns={[
+            { title: '时间', dataIndex: 'created_at', width: 130, render: (v: string) => String(v ?? '').slice(0, 16) },
+            { title: '模块', dataIndex: 'target_agent', width: 90, render: (v: string) => <Tag>{MODULE_LABEL[String(v)] ?? v}</Tag> },
+            { title: '操作', dataIndex: 'rule_name', ellipsis: true },
+            { title: '状态', dataIndex: 'status', width: 76, render: (v: string) => <Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? v}</Tag> },
+            {
+              title: '操作', key: 'ops', width: 200,
+              render: (_: unknown, s: AgentSuggestion) => (
+                <Space size={4}>
+                  <Button size="small" onClick={() => setDetailSug(s)}>查看详情</Button>
+                  <Button size="small" onClick={() => openFeedback(s)}>提意见</Button>
+                  <Tooltip title="回滚功能开发中"><Button size="small" disabled>回滚</Button></Tooltip>
+                </Space>
+              ),
+            },
+          ]} />
+      </Drawer>
+
+      {/* 单条 AI 自动决策详情（查看详情） */}
+      <Drawer title="🤖 AI 自动决策详情" open={!!detailSug} onClose={() => setDetailSug(null)} width={520}>
+        {detailSug ? (
+          <Space direction="vertical" style={{ width: '100%' }} size={10}>
+            <div><Text strong>规则：</Text>{String(detailSug.rule_name ?? '')}</div>
+            <div><Text strong>当前 → 建议：</Text>{String(detailSug.current_value ?? '—')} → {String(detailSug.suggested_value ?? '—')}</div>
+            {detailSug.reason ? <div><Text strong>理由：</Text>{String(detailSug.reason)}</div> : null}
+            {detailSug.rule_text ? (
+              <Card size="small" title="规则全文" style={{ background: 'var(--bg-input)' }}>
+                <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: 0 }}>{String(detailSug.rule_text)}</pre>
+              </Card>
+            ) : null}
+          </Space>
+        ) : null}
+      </Drawer>
     </>
   )
 }
