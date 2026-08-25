@@ -667,9 +667,14 @@ function HoldingsTable() {
 /** ============ 告警记录 ============ */
 function AlertsTab() {
   const { data, isError, error, refetch } = useQuery({ queryKey: ['alerts'], queryFn: () => alerts(50) })
+  const [filter, setFilter] = useState<string>('all')
   if (isError) return <ErrorCard title="告警加载失败" message={error?.message} onRetry={() => refetch()} />
   const rows = data ?? []
   if (!rows.length) return <EmptyState text="暂无告警记录。" icon="🛡️" />
+  const sentinel = rows.filter((r) => String(r.source ?? '') === 'portfolio_sentinel')
+  const filtered = filter === 'sentinel' ? sentinel
+    : filter === 'monitor' ? rows.filter((r) => String(r.source ?? '') !== 'portfolio_sentinel')
+    : rows
   const cols = [
     {
       title: '股票', key: 'stock', width: 150,
@@ -680,10 +685,38 @@ function AlertsTab() {
       render: (v: string) => <Tag color={v === 'critical' ? 'red' : v === 'warning' ? 'orange' : 'blue'}>{v}</Tag>,
     },
     { title: '类型', dataIndex: 'alert_type', width: 110 },
+    { title: '来源', dataIndex: 'source', width: 100, render: (v: string) => v === 'portfolio_sentinel' ? <Tag color="red">组合哨兵</Tag> : v === 'monitor' ? '持仓监控' : (v ?? '—') },
     { title: '消息', dataIndex: 'message', ellipsis: true },
     { title: '时间', dataIndex: 'created_at', width: 150, render: (v: string) => String(v).slice(0, 16) },
   ]
-  return <Table size="small" rowKey="id" columns={cols} dataSource={rows} pagination={{ pageSize: 20 }} />
+  return (
+    <>
+      <Card size="small" title="🛡️ 组合哨兵告警（组合级风控）" style={{ marginBottom: 12, background: 'var(--bg-input)' }}>
+        {sentinel.length ? (
+          <Space direction="vertical" style={{ width: '100%' }} size={8}>
+            {sentinel.map((r) => (
+              <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                <Space wrap>
+                  <Tag color="red">组合级风控</Tag>
+                  <Tag>{String(r.alert_type ?? '—')}</Tag>
+                  <Text style={{ fontSize: 13 }}>{String(r.message ?? '')}</Text>
+                </Space>
+                <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{String(r.created_at ?? '').slice(0, 16)}</Text>
+              </div>
+            ))}
+          </Space>
+        ) : <EmptyState text="暂无组合哨兵告警。" icon="🛡️" />}
+      </Card>
+      <Space style={{ marginBottom: 8 }} wrap>
+        <Text type="secondary">筛选：</Text>
+        <Button size="small" type={filter === 'all' ? 'primary' : 'default'} onClick={() => setFilter('all')}>全部</Button>
+        <Button size="small" type={filter === 'sentinel' ? 'primary' : 'default'} onClick={() => setFilter('sentinel')}>组合哨兵</Button>
+        <Button size="small" type={filter === 'monitor' ? 'primary' : 'default'} onClick={() => setFilter('monitor')}>持仓监控</Button>
+        <Text type="secondary" style={{ fontSize: 12 }}>共 {filtered.length} 条</Text>
+      </Space>
+      <Table size="small" rowKey="id" columns={cols} dataSource={filtered} pagination={{ pageSize: 20 }} />
+    </>
+  )
 }
 
 /** ============ 历史持仓 ============ */
