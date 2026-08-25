@@ -147,3 +147,72 @@ def test_fetch_dragon_tiger_lands_db(monkeypatch):
     assert len(rows) - before == 4
     seat_rows = [r for r in rows if r["seat_name"]]
     assert len(seat_rows) == 3
+
+
+def test_second_source_status_dynamic():
+    """第二源状态动态（K227 零网络）：sina_fetched=True → available=True 双源标注；False → 旧标注"""
+    ss_t = dts.second_source_status(sina_fetched=True)
+    assert ss_t["available"] is True
+    assert "双源" in ss_t["annotation"] and "东财金额" in ss_t["annotation"]
+    ss_f = dts.second_source_status(sina_fetched=False)
+    assert ss_f["available"] is False
+    assert "仅东财可用" in ss_f["annotation"] and "采信待第二源" in ss_f["annotation"]
+    # 无参默认向后兼容（jobs.py/hot_money.py 不传参 → 旧标注）
+    assert dts.second_source_status()["available"] is False
+    assert dts.second_source_status()["annotation"] == ss_f["annotation"]
+
+
+def test_fetch_and_merge_dual_listed_verified(monkeypatch):
+    """双源在榜：东财金额行 confidence 升级 0.9 + multi_source_verified=True；金额以东财为准"""
+    class _FakeAk:
+        def stock_lhb_detail_daily_sina(self, date=None):
+            return pd.DataFrame([
+                {"股票代码": "601138", "股票名称": "工业富联", "指标": "日涨幅偏离值达7%"},
+            ])
+    monkeypatch.setattr(dts, "ak", _FakeAk())
+    _, stocks = dts.DragonTigerSource().fetch_and_merge("2026-08-07")
+    em_row = stocks[stocks["source"] == "eastmoney"].iloc[0]
+    assert em_row["stock_code"] == "601138"
+    assert em_row["confidence"] == 0.9
+    assert bool(em_row["multi_source_verified"]) is True  # pandas bool 列回 np.bool_，用 bool() 归一
+    assert em_row["net_buy"] == 40000000.0  # 金额以东财为准，不被新浪覆盖
+    sina_row = stocks[stocks["source"] == "sina"].iloc[0]
+    assert "net_buy" not in sina_row or pd.isna(sina_row.get("net_buy"))  # 新浪无金额列
+
+
+def test_fetch_and_merge_sina_only_degrades(monkeypatch):
+    """仅新浪在榜（无金额，仅上榜确认）：confidence 0.55、multi_source_verified 不置"""
+    class _FakeAk:
+        def stock_lhb_detail_daily_sina(self, date=None):
+            return pd.DataFrame([
+                {"股票代码": "000001", "股票名称": "平安银行", "指标": "日涨幅偏离值达7%"},
+            ])
+    monkeypatch.setattr(dts, "ak", _FakeAk())
+    _, stocks = dts.DragonTigerSource().fetch_and_merge("2026-08-07")
+    sina_row = stocks[stocks["source"] == "sina"].iloc[0]
+    assert sina_row["stock_code"] == "000001"
+    assert sina_row["confidence"] == 0.55
+    assert bool(sina_row["multi_source_verified"]) is False
+    assert "net_buy" not in sina_row or pd.isna(sina_row.get("net_buy"))
+    # 东财独享行不受影响（保持 0.8，不置核验标志）
+    em_row = stocks[stocks["source"] == "eastmoney"].iloc[0]
+    assert em_row["confidence"] == 0.8
+    assert bool(em_row["multi_source_verified"]) is False
+
+
+def test_fetch_dragon_tiger_persists_multi_source_flag(monkeypatch):
+    """落库：双源在榜标的 multi_source_verified=True 写入 lhb_flows 并随查询返回"""
+    from app.db import repo
+    from app.db.session import init_db
+
+    class _FakeAk:
+        def stock_lhb_detail_daily_sina(self, date=None):
+            return pd.DataFrame([
+                {"股票代码": "601138", "股票名称": "工业富联", "指标": "日涨幅偏离值达7%"},
+            ])
+    monkeypatch.setattr(dts, "ak", _FakeAk())
+    init_db()
+    dts.fetch_dragon_tiger("2026-08-13")
+    rows = repo.list_lhb_flows(trade_date="2026-08-13")
+    verified = [r for r in rows if r.get("multi_source_verified")]
+    assert verified, "双源在榜标的应持久化 multi_source_verified=True"

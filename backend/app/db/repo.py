@@ -1920,7 +1920,8 @@ def normalize_seat(seat: str) -> str:
 
 def insert_lhb_flows(rows: list[dict]) -> int:
     """批量插入龙虎榜流水（rows: trade_date/stock_code/stock_name/lhb_type/
-    disclosure_reason/seat_name/buy_amt/sell_amt/net_buy/confidence/source）"""
+    disclosure_reason/seat_name/buy_amt/sell_amt/net_buy/confidence/source/
+    multi_source_verified）"""
     if not rows:
         return 0
     with SessionLocal() as db:
@@ -1933,7 +1934,8 @@ def insert_lhb_flows(rows: list[dict]) -> int:
                 buy_amt=float(r.get("buy_amt") or 0.0), sell_amt=float(r.get("sell_amt") or 0.0),
                 net_buy=float(r.get("net_buy") or 0.0),
                 confidence=float(r.get("confidence") or 1.0),
-                source=r.get("source", "eastmoney")))
+                source=r.get("source", "eastmoney"),
+                multi_source_verified=bool(r.get("multi_source_verified") or False)))
         db.commit()
         _invalidate("lhb")
     return len(rows)
@@ -1960,6 +1962,7 @@ def list_lhb_flows(trade_date: str | None = None, stock_code: str | None = None,
                  "disclosure_reason": r.disclosure_reason, "seat_name": r.seat_name,
                  "buy_amt": r.buy_amt, "sell_amt": r.sell_amt, "net_buy": r.net_buy,
                  "confidence": r.confidence, "source": r.source,
+                 "multi_source_verified": bool(r.multi_source_verified),
                  "created_at": str(r.created_at)} for r in rows]
 
     return _dbq("lhb", {"trade_date": trade_date, "stock_code": stock_code,

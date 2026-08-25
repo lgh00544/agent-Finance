@@ -67,6 +67,7 @@ def init_db() -> None:
     _ensure_hot_money_profile_columns()
     _ensure_holding_high_price()
     _ensure_alert_log_source()
+    _ensure_lhb_multi_source_verified()
     _ensure_market_condition_next_day()
     _add_factor_scores_column()
     _ensure_indexes()
@@ -356,6 +357,25 @@ def _ensure_alert_log_source(eng=None) -> None:
             # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
             try:
                 conn.exec_driver_sql("ALTER TABLE alert_log ADD COLUMN source VARCHAR(16) DEFAULT 'monitor'")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _ensure_lhb_multi_source_verified(eng=None) -> None:
+    """幂等补齐 lhb_original_flow.multi_source_verified 列（第二源上榜确认采信标记；
+    仅增量加列，不重建表不丢数据；旧数据默认 False）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(lhb_original_flow)")}
+            if "multi_source_verified" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE lhb_original_flow ADD COLUMN multi_source_verified BOOLEAN DEFAULT 0")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql(
+                    "ALTER TABLE lhb_original_flow ADD COLUMN multi_source_verified BOOLEAN DEFAULT 0")
             except Exception:  # noqa: BLE001 列已存在
                 pass
 

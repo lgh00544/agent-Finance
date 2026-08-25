@@ -565,6 +565,7 @@ class LhbOriginalFlow(Base):
     net_buy: Mapped[float] = mapped_column(Float, default=0.0)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)     # 官方=1.0/第三方=0.8/社区=0.5
     source: Mapped[str] = mapped_column(String(16), default="eastmoney")  # sse/szse/eastmoney
+    multi_source_verified: Mapped[bool] = mapped_column(Boolean, default=False)  # 第二源上榜确认采信
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

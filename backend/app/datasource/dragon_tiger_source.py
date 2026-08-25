@@ -10,10 +10,12 @@
   用于游资-席位映射（seat_name → hot_money_profile）。
 
 第二源现状（K227 诚实标注，不伪造第二源数据）：
-- 新浪 stock_lhb_detail_daily_sina 仅返回"上榜原因列表"，无金额明细（已实测确认）；
+- 新浪 stock_lhb_detail_daily_sina 仅返回"上榜原因列表"，无金额明细（已实测确认）→
+  本批接入为"上榜确认第二源"：双源在榜采信升级（金额以东财为准），available 动态反映；
 - 同花顺 data.10jqka.com.cn 直连需 JS 生成的 hexin-v token，本环境不可用（已实测确认）；
-- 当前仅东财可用 → 单源数据标"数据置信度不足"仅参考（second_source_status() 如实标注，
-  第二源接入后 verify_net_buy 自动升级为 0.9 采信，无需改动校验逻辑）。
+- 金额主源东财；新浪无净额列 → 仅作上榜确认标签，绝不合并进净买额。second_source_status()
+  动态如实标注 available：双源在榜 confidence 升级 max(0.8,0.9)=0.9 采信，仅新浪在榜降 0.55
+  仅参考（verify_net_buy 自身多源校验逻辑无需改动）。
 
 实现对齐 MairuiSource 独立类模式：不继承 DataSource 协议，方法返回约定对齐
 （失败 → 空表），低频 T+1 任务不接断路器（避免动 datasource_stats._KINDS 测试断言）。
@@ -27,19 +29,28 @@ from app.datasource.base import DataSourceError
 
 logger = logging.getLogger(__name__)
 
-# 第二源可用性诚实标注（K227：无第二源不得假装采信）
+# 第二源可用性诚实标注（K227：无第二源不得假装采信；新浪上榜确认接入后动态反映）
 _SECOND_SOURCE_ANNOTATION = "当前仅东财可用、采信待第二源"
 _SECOND_SOURCE_CANDIDATES = {
+    "eastmoney": "东财 datacenter 每日龙虎榜详情（股票级净买额，金额主源）",
     "ths": "同花顺 data.10jqka.com.cn 直连需 JS 生成的 hexin-v token（本环境不可用）",
-    "sina": "新浪每日明细接口无金额明细（仅上榜确认，不参与金额采信）",
+    "sina": "新浪每日明细接口无金额明细（仅上榜确认，本批作上榜确认第二源参与采信）",
 }
 
 
-def second_source_status() -> dict:
+def second_source_status(sina_fetched: bool = False) -> dict:
     """第二龙虎榜数据源可用性（K227 诚实标注，零网络调用）：
     返回 {"available": bool, "main_source": str, "annotation": str, "candidates": {...}}。
-    当前可用金额源仅东财 → available=False，注入层与调度如实标注"采信待第二源"，
-    单源数据保持"置信度不足仅参考"降级；第二源接入后校验逻辑无需改动自动升级。"""
+    sina_fetched: 本批是否拉到新浪上榜确认数据（由抓取/调度端传入布尔，本函数不发请求）。
+    True → available=True，双源采信（金额以东财为准）；False → 仅东财、采信待第二源。
+    无参调用默认 False → 旧标注（向后兼容，jobs.py/hot_money.py 不传参仍按旧行为）。"""
+    if sina_fetched:
+        return {
+            "available": True,
+            "main_source": "eastmoney",
+            "annotation": "双源：东财金额+新浪上榜确认（金额以主源为准）",
+            "candidates": dict(_SECOND_SOURCE_CANDIDATES),
+        }
     return {
         "available": False,
         "main_source": "eastmoney",
@@ -68,6 +79,8 @@ _LHB_SEAT_COLS = {
 # 官方源置信度 1.0 / 第三方（东财/新浪）0.8 / 社区 0.5
 _CONF_OFFICIAL = 1.0
 _CONF_THIRD = 0.8
+_CONF_VERIFIED = 0.9      # 双源在榜采信（东财金额 + 新浪上榜确认，金额以东财为准）
+_CONF_SINA_ONLY = 0.55    # 仅新浪上榜确认（无金额，置信度不足档，不参与金额采信）
 
 try:
     import akshare as ak  # noqa: PLC0415 数据源层按需导入，缺失时整体降级
@@ -196,6 +209,31 @@ def _num(v) -> float:
         return 0.0
 
 
+def _apply_second_source_credit(rows: pd.DataFrame, em: pd.DataFrame, sina: pd.DataFrame) -> None:
+    """第二源上榜确认采信（K227：金额单源不伪造，in-place 打标/调置信度）。
+    同(日期,标的)双源在榜 → 东财金额行 confidence 升级 max(0.8,0.9)=0.9 + multi_source_verified=True；
+    仅新浪在榜（无金额，仅上榜确认）→ confidence=0.55，不置多源核验标志。
+    金额列一律以东财为准，新浪无净额列绝不合并/覆盖进净买额。"""
+    rows["multi_source_verified"] = False
+    if em.empty:
+        if not sina.empty:
+            rows.loc[rows["source"] == "sina", "confidence"] = _CONF_SINA_ONLY
+        return
+    if sina.empty:
+        return
+    em_codes = set(em["stock_code"].astype(str))
+    sina_codes = set(sina["stock_code"].astype(str))
+    code_col = rows["stock_code"].astype(str)
+    dual = em_codes & sina_codes
+    if dual:
+        dual_mask = (rows["source"] == "eastmoney") & code_col.isin(dual)
+        rows.loc[dual_mask, "confidence"] = max(_CONF_THIRD, _CONF_VERIFIED)
+        rows.loc[dual_mask, "multi_source_verified"] = True
+    sina_only = (rows["source"] == "sina") & ~code_col.isin(em_codes)
+    if sina_only.any():
+        rows.loc[sina_only, "confidence"] = _CONF_SINA_ONLY
+
+
 class DragonTigerSource:
     """龙虎榜数据源（东财主源 + 新浪备源；低频 T+1，失败降级不阻塞主链路）"""
 
@@ -272,13 +310,14 @@ class DragonTigerSource:
     def fetch_and_merge(self, trade_date: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         """抓取并合并：返回 (席位级流水, 股票级净买汇总)。
         席位级 = 当日全量买卖前五席位明细（东财一次拉取）；股票级 = 东财净买 + 新浪上榜确认。
-        第二源按 DRAGON_TIGER_SECOND_SOURCE 开关聚合（当前仅新浪可作上榜确认；
-        无金额第二源 → 多源校验保持降级，second_source_status() 如实标注，不伪造）。
+        第二源按 DRAGON_TIGER_SECOND_SOURCE 开关聚合：新浪作上榜确认第二源，双源在榜
+        采信升级（confidence 0.9 + multi_source_verified），金额以东财为准；仅新浪在榜
+        降 0.55（无金额，仅上榜确认），second_source_status() 动态如实标注。
         全部失败返回两个空表。"""
         if not settings.dragon_tiger_enable:
             return pd.DataFrame(), pd.DataFrame()
 
-        # 1) 股票级：东财（含净买额）+ 第二源（按开关；新浪当前仅上榜原因确认）
+        # 1) 股票级：东财（含净买额）+ 第二源（按开关；新浪作上榜确认第二源）
         em = self.fetch_lhb_stocks(trade_date, source="eastmoney")
         second = (settings.dragon_tiger_second_source or "auto").lower()
         sina = pd.DataFrame()
@@ -286,6 +325,8 @@ class DragonTigerSource:
             sina = self.fetch_lhb_stocks(trade_date, source="sina")
         stock_rows = pd.concat([em, sina], ignore_index=True) if not (em.empty and sina.empty) \
             else pd.DataFrame()
+        if not stock_rows.empty:
+            _apply_second_source_credit(stock_rows, em, sina)
 
         # 2) 席位级：东财当日全量买卖前五席位明细（一次请求，当日缓存）
         seat_df = self.fetch_lhb_seats(trade_date, "ALL", lhb_type="1d") if not em.empty \
@@ -342,12 +383,13 @@ def fetch_dragon_tiger(trade_date: str) -> pd.DataFrame:
                 "net_buy": _num(r.get("net_buy")),
                 "confidence": _num(r.get("confidence")) or _CONF_THIRD,
                 "source": str(r.get("source") or "eastmoney"),
+                "multi_source_verified": bool(r.get("multi_source_verified") or False),
             })
     n2 = repo.insert_lhb_flows(stock_rows) if stock_rows else 0
     logger.info("龙虎榜落库 %s: 席位级 %s 条 / 股票级 %s 条", trade_date, n, n2)
-    # 第二源现状如实标注（K227 诚实：无金额第二源时单源数据保持"置信度不足仅参考"）
-    ss = second_source_status()
-    if not ss.get("available"):
-        logger.info("龙虎榜第二源现状: %s（%s）", ss.get("annotation"),
-                    "；".join(ss.get("candidates") or {}))
+    # 第二源上榜确认采信状态如实标注（K227 诚实：sina 拉到上榜确认 → available=True 动态反映，
+    # 金额仍以东财为准；未拉到则如实标"采信待第二源"）
+    sina_fetched = bool(not stocks.empty and (stocks["source"] == "sina").any())
+    ss = second_source_status(sina_fetched=sina_fetched)
+    logger.info("龙虎榜第二源状态: available=%s（%s）", ss.get("available"), ss.get("annotation"))
     return seats
