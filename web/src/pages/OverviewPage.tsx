@@ -2,11 +2,11 @@ import { App, Button, Card, Col, Row, Space, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { dashboard, jobStatus, llmStats as fetchLlm, datasourceStats as fetchDs } from '@/api/system'
 import { recentTasks, retryTask } from '@/api/tasks'
-import { hotSectors } from '@/api/market'
-import { holdingQuotes, takeProfitPlan } from '@/api/holdings'
+import { hotSectors, marketCondition, marketIndices } from '@/api/market'
+import { holdingQuotes, redLineCheck, takeProfitPlan } from '@/api/holdings'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { ChartCard, hotSectorBarOption } from '@/components/charts/ChartCard'
-import { ErrorCard, StatCard, StatCardGrid, StockLabel } from '@/components/common'
+import { EmptyState, ErrorCard, StatCard, StatCardGrid, StockLabel } from '@/components/common'
 import type { HotSector } from '@/types'
 
 const { Text } = Typography
@@ -14,6 +14,24 @@ const { Text } = Typography
 type DashboardData = {
   checked_at?: string
   modules?: Record<string, unknown>
+}
+
+/** 市况 band → Tag 色（A股：强=红涨 / 弱=绿跌） */
+function bandColor(b: string): string {
+  return b.includes('强') ? 'red' : b.includes('弱') ? 'green' : 'orange'
+}
+
+/** 严格度档位 → Tag 色（宽松绿/标准蓝/严格橙/极严红） */
+function strictColor(s: string): string {
+  return s.includes('宽松') ? 'green' : s.includes('标准') ? 'blue' : s.includes('严格') ? 'orange' : s.includes('极严') ? 'red' : 'default'
+}
+
+/** detail.factors 最高分因子 → "因子 分/10"（缺 → —） */
+function strongestFactor(detail: unknown): string {
+  const factors = ((detail as Record<string, unknown> | undefined)?.factors as Array<Record<string, unknown>> | undefined) ?? []
+  if (!factors.length) return '—'
+  const best = factors.reduce((a, b) => (Number(b.score) > Number(a.score) ? b : a), factors[0])
+  return `${String(best.factor ?? '')} ${Number(best.score ?? 0)}/10`
 }
 
 /** 任务状态区（对齐 render.task_status_area）：recentTasks 列表 + 失败重试 */
@@ -98,6 +116,15 @@ export function OverviewPage() {
     queryFn: () => holdingQuotes(),
     refetchInterval: 60_000,  // 与 HoldingsPage 保持一致
   })
+  // 市况速览：三大指数 + 严格度（dashboard 的 market_condition 无 strictness，复用 /market-condition 已有 api）
+  const { data: idx } = useQuery({ queryKey: ['market-indices'], queryFn: marketIndices })
+  const { data: mcStrict } = useQuery({ queryKey: ['market-cond-strict'], queryFn: marketCondition })
+  // 持仓红线预警（复用已有 /red_line_check，5 分钟轮询平衡开销）
+  const { data: redRes } = useQuery({
+    queryKey: ['red-line-check'],
+    queryFn: redLineCheck,
+    refetchInterval: 5 * 60_000,
+  })
 
   const dig = useTaskSubmit('daily_pipeline', () => {
     message.success('每日挖掘任务已提交后台')
@@ -106,12 +133,42 @@ export function OverviewPage() {
 
   const mods = dash?.modules ?? {}
   const holdings = (mods.holdings as Array<Record<string, unknown>>) ?? []
-  const tradeable = (mods.candidate_tradeable as { date?: string; count?: number; total?: number }) ?? {}
-  const alerts = (mods.alerts as Array<Record<string, unknown>>) ?? []
+  const tradeable = (mods.candidate_tradeable as { date?: string; count?: number; total?: number; items?: Array<Record<string, unknown>> }) ?? {}
   const marketCond = (mods.market_condition as Record<string, unknown>) ?? {}
   const scores = (mods.scores as Array<Record<string, unknown>>) ?? []
 
   const ops = (tpPlans?.rows ?? []) as Array<Record<string, unknown>>
+
+  // ② 今日可建仓标的（is_tradeable 判定行；grade/score/因子从 dashboard.scores 同名代码取，缺则诚实降级）
+  const tradeableList = ((tradeable.items ?? []) as Array<Record<string, unknown>>).filter((i) => i.is_tradeable)
+  // ③ 持仓分类：止盈/止损 = quotes 现价 vs 参考位；红线 = red_line_check 命中；质量低 holdings 无该字段，诚实置空
+  const quoteRows = (quotes?.rows ?? []) as Array<Record<string, unknown>>
+  const strictness = String(marketCond.strictness ?? mcStrict?.strictness ?? '')
+  const redByCode = new Map((redRes?.rows ?? []).map((r) => [String((r as Record<string, unknown>).stock_code ?? ''), r as Record<string, unknown>]))
+  const takeProfitHits = quoteRows.filter((q) => q.current_price != null && q.take_profit != null && Number(q.current_price) >= Number(q.take_profit))
+  const stopLossHits = quoteRows.filter((q) => q.current_price != null && q.stop_loss != null && Number(q.current_price) <= Number(q.stop_loss))
+  const redLineHits = quoteRows.filter((q) => {
+    const r = redByCode.get(String(q.stock_code))
+    return !!r && !!(r.c1_alert || r.c2_alert || r.c3_alert || r.c4_high_break || Number(r.k226_alert_level) >= 2 || r.k189_wash_suspect)
+  })
+  const triggered = new Set([...takeProfitHits, ...stopLossHits, ...redLineHits].map((q) => String(q.stock_code)))
+  const normalHits = quoteRows.filter((q) => !triggered.has(String(q.stock_code)))
+  const redReason = (q: Record<string, unknown>): string => {
+    const r = redByCode.get(String(q.stock_code))
+    if (!r) return '红线'
+    if (r.c1_alert) return 'C1 集中度'
+    if (r.c2_alert) return 'C2 回撤'
+    if (r.c3_alert) return 'C3 止损'
+    if (r.c4_high_break) return 'C4 突破'
+    if (Number(r.k226_alert_level) >= 2) return 'K226 派发'
+    return 'K189 对倒'
+  }
+  const holdCats: Array<{ key: string; label: string; color: string; rows: Array<Record<string, unknown>>; reason: (q: Record<string, unknown>) => string }> = [
+    { key: 'tp', label: '止盈触发', color: 'green', rows: takeProfitHits, reason: () => '现价≥止盈' },
+    { key: 'sl', label: '止损触发', color: 'red', rows: stopLossHits, reason: () => '现价≤止损' },
+    { key: 'rl', label: '红线预警', color: 'orange', rows: redLineHits, reason: redReason },
+    { key: 'ql', label: '正常', color: 'default', rows: normalHits, reason: () => '无触发' },
+  ]
 
   return (
     <div>
@@ -123,19 +180,68 @@ export function OverviewPage() {
         <Button onClick={() => qc.invalidateQueries({ queryKey: ['dashboard'] })}>刷新看板</Button>
       </Space>
 
-      <StatCardGrid>
-        <StatCard
-          label="今日可建仓"
-          value={tradeable.count ?? 0}
+      {/* ① 市况速览（替换原 4 StatCard 位置；数据缺失全 "—" 降级） */}
+      <Card size="small" title="市况速览" style={{ background: 'var(--bg-card)', marginBottom: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12 }}>市况 band</Text>
+            <div style={{ marginTop: 2 }}><Tag color={bandColor(String(marketCond.band ?? ''))}>{String(marketCond.band ?? '—')}</Tag></div>
+          </div>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12 }}>市况综合分</Text>
+            <div style={{ marginTop: 2 }}><Text strong>{marketCond.total_score != null ? `${marketCond.total_score}/100` : '—'}</Text></div>
+          </div>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12 }}>当日严格度</Text>
+            <div style={{ marginTop: 2 }}><Tag color={strictColor(strictness)}>{strictness || '—'}</Tag></div>
+          </div>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12 }}>三大指数</Text>
+            <div style={{ marginTop: 2 }}>
+              <Space size={4} wrap>
+                {(idx?.indices ?? []).map((i) => {
+                  const pct = i.change_pct
+                  return (
+                    <Tag key={String(i.code ?? i.name)} color={pct == null ? 'default' : pct >= 0 ? 'red' : 'green'}>
+                      {String(i.name ?? '')} {pct == null ? '—' : `${pct >= 0 ? '+' : ''}${pct}%`}
+                    </Tag>
+                  )
+                })}
+              </Space>
+            </div>
+          </div>
+        </div>
+        <div style={{ marginTop: 8, fontSize: 13 }}><Text type="secondary">{String(marketCond.summary ?? '—')}</Text></div>
+      </Card>
+
+      {/* ② 今日可建仓（可建仓判定 top3；0 只 EmptyState） */}
+      <Card size="small" title="今日可建仓" style={{ background: 'var(--bg-card)', marginBottom: 12 }}>
+        <StatCard label="今日可建仓"
+          value={tradeable.count != null ? `${tradeable.count} / ${tradeable.total ?? 0} 只` : '—'}
           tone={(tradeable.count ?? 0) > 0 ? 'ok' : 'warn'}
-          sub={`${tradeable.date ?? '今日'} · 候选池 ${tradeable.total ?? 0} 只`} />
-        <StatCard label="当前持仓" value={holdings.length} tone="info" sub="有效持仓标的" />
-        <StatCard label="告警记录" value={alerts.length} tone="warn" sub="全部信号记录" />
-        <StatCard label="市况评分"
-          value={marketCond.total_score != null ? `${marketCond.total_score} 分` : '—'}
-          tone={String(marketCond.band ?? '').includes('强') ? 'up' : String(marketCond.band ?? '').includes('弱') ? 'down' : 'warn'}
-          sub={`${marketCond.band ?? '—'} · 候选池上限 ${marketCond.cap ?? '—'} 只`} />
-      </StatCardGrid>
+          sub={`${tradeable.date ?? '今日'} · 候选池`} />
+        {tradeableList.length ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {tradeableList.slice(0, 3).map((it) => {
+              const code = String(it.stock_code ?? '')
+              const sc = scores.find((s) => String(s.stock_code ?? '') === code)
+              const grade = String(sc?.grade ?? it.label ?? '')
+              return (
+                <div key={code} style={{ padding: 6, borderRadius: 6, background: 'var(--bg-input)' }}>
+                  <Space wrap>
+                    <StockLabel code={code} name={String(it.stock_name ?? '')} />
+                    <Tag color={grade === 'A' ? 'red' : grade === 'B' ? 'orange' : 'blue'}>{grade || '—'}</Tag>
+                    {sc?.score != null ? <Text strong>{String(sc.score)}</Text> : <Text type="secondary">—</Text>}
+                    <Text type="secondary" style={{ fontSize: 12 }}>最强因子 {strongestFactor(sc?.detail)}</Text>
+                  </Space>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <EmptyState text="今日无可建仓标的" icon="—" />
+        )}
+      </Card>
 
       <Row gutter={12}>
         <Col xs={24} lg={14}>
@@ -157,49 +263,34 @@ export function OverviewPage() {
               )
             }) : <Text type="secondary">（暂无在途止盈计划）</Text>}
           </Card>
-          {quotes?.rows?.length ? (
-            <Card size="small" title="当前持仓概览（每日定时 / 手动触发后刷新）" style={{ background: 'var(--bg-card)', marginBottom: 12 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 8 }}>
-                {quotes.rows.slice(0, 12).map((q) => {
-                  const h = q as Record<string, unknown>
-                  const code = String(h.stock_code ?? '—')
-                  const name = String(h.stock_name ?? '')
-                  const shares = Number(h.shares ?? 0)
-                  const cost = Number(h.entry_price ?? 0)
-                  const price = h.current_price != null ? Number(h.current_price) : null
-                  const mv = h.market_value != null ? Number(h.market_value) : (price != null ? price * shares : 0)
-                  const pnl = (price != null && cost > 0) ? (price - cost) * shares : null
-                  const pnlPct = (price != null && cost > 0) ? (price - cost) / cost * 100 : null
-                  const sl = h.stop_loss ?? '—'
-                  const tp = h.take_profit ?? '—'
-                  const pnlColor = pnl == null ? 'var(--text)' : pnl > 0 ? 'var(--up)' : pnl < 0 ? 'var(--down)' : 'var(--text)'
-                  return (
-                    <div key={code} style={{ padding: 8, borderRadius: 6, background: 'var(--bg-input)' }}>
-                      <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-                        <Text strong>{code} {name}</Text>
-                        <Tag color={pnl != null && pnl >= 0 ? 'red' : 'green'}>{pnl != null ? `${pnl >= 0 ? '+' : ''}${(pnlPct ?? 0).toFixed(2)}%` : '—'}</Tag>
-                      </Space>
-                      <div style={{ fontSize: 12, marginTop: 4, color: 'var(--text-mute)' }}>
-                        持股 <Text strong style={{ color: 'var(--text)' }}>{shares.toLocaleString()}</Text> 股
-                        · 成本 <Text strong style={{ color: 'var(--text)' }}>{cost.toFixed(2)}</Text>
-                        · 现价 <Text strong style={{ color: 'var(--text)' }}>{price?.toFixed(2) ?? '—'}</Text>
-                        · 市值 <Text strong style={{ color: 'var(--text)' }}>{mv.toLocaleString()}</Text>
+          {/* ③ 持仓关注（替换原「当前持仓概览」Card：4 分类，每类 0/1-3 只） */}
+          <Card size="small" title="持仓关注" style={{ background: 'var(--bg-card)', marginBottom: 12 }}>
+            <StatCard label="持仓总数" value={holdings.length} tone="info" sub="有效持仓标的" />
+            {holdCats.map((c) => (
+              <div key={c.key} style={{ marginBottom: 10 }}>
+                <Space style={{ marginBottom: 4 }}>
+                  <Text strong style={{ fontSize: 13 }}>{c.label}</Text>
+                  <Tag color={c.rows.length ? c.color : 'default'}>{c.rows.length || '无'}</Tag>
+                </Space>
+                {c.rows.length ? (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {c.rows.slice(0, 3).map((q) => (
+                      <div key={String(q.stock_code)} style={{ padding: '4px 8px', borderRadius: 6, background: 'var(--bg-input)' }}>
+                        <StockLabel code={String(q.stock_code)} name={String(q.stock_name ?? '')} />
+                        <Tag color={c.color} style={{ marginLeft: 4 }}>{c.reason(q)}</Tag>
                       </div>
-                      <div style={{ fontSize: 12, marginTop: 2, color: pnlColor }}>
-                        浮盈 {pnl != null ? `${pnl >= 0 ? '+' : ''}${pnl.toFixed(0)}` : '—'} 元
-                        · 止损 <Text type="danger">{String(sl)}</Text>
-                        · 止盈 <Text type="success">{String(tp)}</Text>
-                      </div>
-                    </div>
-                  )
-                })}
+                    ))}
+                  </div>
+                ) : (
+                  <Text type="secondary" style={{ fontSize: 12 }}>无</Text>
+                )}
               </div>
-              <Text type="secondary" style={{ fontSize: 12, marginTop: 8, display: 'block' }}>
-                行情最后更新：{quotes?.quote_time ?? '—'}（约 60s 缓存）
-                · 监控定时 5 分钟轮询 / 手动「立即刷新监控」后自动更新
-              </Text>
-            </Card>
-          ) : null}
+            ))}
+            <Text type="secondary" style={{ fontSize: 12, marginTop: 6, display: 'block' }}>
+              行情最后更新：{quotes?.quote_time ?? '—'}（约 60s 缓存）
+              · 监控定时 5 分钟轮询 / 手动「立即刷新监控」后自动更新
+            </Text>
+          </Card>
         </Col>
         <Col xs={24} lg={10}>
           <StatsCards />
