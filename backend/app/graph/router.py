@@ -233,6 +233,24 @@ def run_portfolio_sentinel(trade_date: str | None = None) -> StockAgentState:
     return graph.invoke(state)
 
 
+def run_sector_rotation(trade_date: str | None = None) -> dict:
+    """板块轮动分析（批次B 状态机 + 批次C 归因子 Agent，非主图）：状态判定落
+    sector_daily_rank_log，top10 板块各一次 LIGHT 归因落 sector_launch_reason（删后插幂等）。"""
+    from app.services.sector_launch_reason import run_launch_reason
+    from app.services.sector_rotation import judge_rotation_state
+
+    state = judge_rotation_state(trade_date)
+    launch = run_launch_reason(trade_date)
+    return {
+        "trade_date": launch.get("trade_date") or state.get("trade_date"),
+        "rotation_state": state.get("rotation_state"),
+        "churn_rate": state.get("churn_rate"),
+        "launch": {"rows": launch.get("count", 0), "success": launch.get("success"),
+                   "error": launch.get("error")},
+        "error": state.get("error") or launch.get("error"),
+    }
+
+
 def run_daily_pipeline(trade_date: str | None = None) -> dict:
     """每日主链路：discover → 对全部候选打分（供面板查看评分）
 

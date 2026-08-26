@@ -62,6 +62,7 @@ def _task_experience_worker(params: dict) -> dict:
 _TASK_KINDS: dict[str, tuple[str, object]] = {
     "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
     "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
+    "sector_rotation": ("板块轮动分析", lambda p: _task_sector_rotation()),
     "score": ("单股评分",
               lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
     "position": ("分批建仓方案",
@@ -98,6 +99,16 @@ def _task_market_intel() -> dict:
             "phase": mi.get("phase"),
             "risk_appetite": mi.get("risk_appetite"),
             "summary": mi.get("summary"),
+            "error": result.get("error")}
+
+
+def _task_sector_rotation() -> dict:
+    """板块轮动分析（手动入口）：状态机判定 + 归因子 Agent → 落库"""
+    result = graph_router.run_sector_rotation()
+    launch = result.get("launch") or {}
+    return {"trade_date": result.get("trade_date"),
+            "rotation_state": result.get("rotation_state"),
+            "rows": launch.get("rows", 0),
             "error": result.get("error")}
 
 
@@ -300,6 +311,14 @@ def market_intel_dates(limit: int = 30):
     """已生成市场研判的日期列表（最新在前，页面选日期）。
     返回裸数组（原包裹 {"dates": [...]} 与前端期望 string[] 不一致，致 React SPA 黑屏）"""
     return repo.list_market_intel_dates(limit)
+
+
+# ================= 板块轮动（sector_rotation：状态机 + 归因子 Agent + 手动触发） =================
+
+@router.post("/market/sector-rotation/run")
+def run_sector_rotation_job():
+    """手动触发板块轮动分析（异步提交：状态机判定 + 归因子 Agent → 落库）"""
+    return _submit_task("sector_rotation", {})
 
 
 @router.get("/jobs/status")
