@@ -68,6 +68,7 @@ def init_db() -> None:
     _ensure_holding_high_price()
     _ensure_alert_log_source()
     _ensure_lhb_multi_source_verified()
+    _ensure_forward_view_history()
     _ensure_market_condition_next_day()
     _add_factor_scores_column()
     _ensure_indexes()
@@ -378,6 +379,15 @@ def _ensure_lhb_multi_source_verified(eng=None) -> None:
                     "ALTER TABLE lhb_original_flow ADD COLUMN multi_source_verified BOOLEAN DEFAULT 0")
             except Exception:  # noqa: BLE001 列已存在
                 pass
+
+
+def _ensure_forward_view_history(eng=None) -> None:
+    """幂等建 forward_view_history 表（预测性选股 2.5 前瞻回填闭环；
+    复用模型元数据 create(checkfirst=True)，无手写 DDL；已存在则跳过）"""
+    from app.db.models import ForwardViewHistory
+
+    eng = eng or engine
+    ForwardViewHistory.__table__.create(bind=eng, checkfirst=True)
 
 
 def _ensure_market_condition_next_day(eng=None) -> None:

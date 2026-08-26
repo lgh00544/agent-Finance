@@ -147,11 +147,29 @@ def build_user_prompt(data_pack: str, preference: str,
 【因子校准相关性参考】
 {factor_calibration}
 """
+    fwd_calib_section = _forward_calibration_section()
     return f"""{pref_section}
 {ctx_section}
 {intel_section}
 {calib_section}
+{fwd_calib_section}
 【标的原始数据包】（全部为原始数据与纯数学指标，供你研判）
 {data_pack}
 
 请对标的进行六因子透明评分并输出结构化结果。"""
+
+
+def _forward_calibration_section() -> str:
+    """前瞻先验校准（近 30 日）文本段（预测性选股 2.5 §3.5 注入模板）。
+    纯统计零 LLM；缺样本显「样本不足」不编造；读取失败返回空段不阻塞评分。"""
+    try:
+        from app.services.forward_view_history import get_forward_calibration_text
+        body = get_forward_calibration_text(lookback_days=30)
+    except Exception:  # noqa: BLE001 读取失败不注入
+        return ""
+    if not body:
+        return ""
+    return f"""
+【前瞻先验校准（近 30 日）】
+{body}
+"""

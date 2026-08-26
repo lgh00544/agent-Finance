@@ -881,7 +881,7 @@ function PortfolioAttributionView() {
   })
   const curve = attr?.portfolio_curve ?? []
   const contributors = attr?.contributors ?? []
-  const totalCost = (attr as Record<string, unknown>).total_cost as number | undefined
+  const totalCost = (attr as Record<string, unknown> | undefined)?.total_cost as number | undefined
   // 默认选中：最负贡献者（最大拖累者）优先，其次第一只
   const [code, setCode] = useState<string | undefined>()
   const cur = code ?? contributors.find((c) => (c.contribution_pct ?? 0) < 0)?.stock_code

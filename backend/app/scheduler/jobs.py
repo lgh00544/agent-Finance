@@ -397,6 +397,26 @@ def experience_worker_job(force: bool = False) -> None:
         logger.error("经验沉淀 Worker 异常: %s", exc)
 
 
+def fill_forward_view_job() -> None:
+    """预测性选股 2.5：每日 16:00 回填前瞻 T+5 实际涨跌（纯统计，复用 track_verify.t5_pct 不新算）"""
+    try:
+        from app.services.forward_view_history import fill_forward_view_actual
+        result = fill_forward_view_actual()
+        if result["filled"] > 0:
+            logger.info("前瞻T+5回填完成: %s", result)
+    except Exception as exc:  # noqa: BLE001 回填失败不阻塞调度
+        logger.error("前瞻T+5回填异常: %s", exc)
+
+
+def calibrate_forward_view_job() -> None:
+    """预测性选股 2.5：每周日 04:00 校准前瞻先验（回算近 30 日准确率写日志，不入库）"""
+    try:
+        from app.services.forward_view_history import calibrate_forward_view_prior
+        calibrate_forward_view_prior(lookback_days=30)
+    except Exception as exc:  # noqa: BLE001 校准失败不阻塞调度
+        logger.error("前瞻先验校准异常: %s", exc)
+
+
 def start_scheduler() -> None:
     global scheduler
     if scheduler is not None:
@@ -406,6 +426,16 @@ def start_scheduler() -> None:
     scheduler.add_job(track_verify_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=0,
                       id="track_verify", name="候选池T+N验证",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 预测性选股 2.5：每日 16:00 前瞻 T+5 回填（纯统计，复用 track_verify.t5_pct 不新算）
+    scheduler.add_job(fill_forward_view_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=0,
+                      id="forward_view_fill", name="前瞻T+5回填",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 每周日 04:00 前瞻先验校准（回算近 30 日准确率写日志）
+    scheduler.add_job(calibrate_forward_view_job, "cron",
+                      day_of_week="sun", hour=4, minute=0,
+                      id="forward_view_calibrate", name="前瞻先验校准",
                       replace_existing=True, misfire_grace_time=3600)
     # 工作日 16:10 每日挖掘
     scheduler.add_job(daily_discover_job, "cron",

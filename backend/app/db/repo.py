@@ -19,9 +19,9 @@ from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
     CapitalActor, CapitalFlow, CapitalStats, DragonTiger,
-    Experience, ExperienceConfig, Holding, HotMoneyProfile, LhbOriginalFlow,
-    MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
-    PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
+    Experience, ExperienceConfig, ForwardViewHistory, Holding, HotMoneyProfile,
+    LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
+    PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
     SectorSnapshot, SellDecision, StockCandidate, StockScore, TradeProfile,
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
@@ -1155,6 +1155,97 @@ def update_track_verify(row_id: int, *, t3_pct=None, t5_pct=None, t10_pct=None,
         _invalidate("track_verify")
 
 
+# ==================== 前瞻回填闭环（预测性选股 2.5） ====================
+
+def upsert_forward_view(stock_code: str, trade_date: str, forward_view: str,
+                        forward_signals: dict) -> int:
+    """落库前瞻快照（幂等：同 code+date 已存在则更新 forward_view/signals，不重复插）。
+    返回行 id；missing_data 跳过判定在服务层完成，本函数只做存取。"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(ForwardViewHistory).where(
+                ForwardViewHistory.stock_code == stock_code,
+                ForwardViewHistory.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = ForwardViewHistory(stock_code=stock_code, trade_date=trade_date,
+                                     forward_view=forward_view,
+                                     forward_signals=forward_signals or {})
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        else:
+            row.forward_view = forward_view
+            row.forward_signals = forward_signals or {}
+            db.commit()
+        _invalidate("forward_view")
+        return row.id
+
+
+def list_unfilled_forward_view(cutoff_date: str, limit: int = 500) -> list[dict]:
+    """待回填前瞻快照：选入日 ≤ cutoff 且 t5_pct_actual IS NULL（每日 16:00 回填 cron 用）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = (select(ForwardViewHistory)
+                    .where(ForwardViewHistory.trade_date <= cutoff_date,
+                           ForwardViewHistory.t5_pct_actual.is_(None))
+                    .order_by(ForwardViewHistory.trade_date)
+                    .limit(limit))
+            return [{"id": r.id, "stock_code": r.stock_code, "trade_date": r.trade_date,
+                     "forward_view": r.forward_view, "forward_signals": r.forward_signals or {}}
+                    for r in db.execute(stmt).scalars().all()]
+    return _dbq("forward_view", {"cutoff": cutoff_date}, _load)
+
+
+def get_track_verify_t5_pct(stock_code: str, select_date: str) -> float | None:
+    """追踪行 T+5 实际涨跌幅（回填 t5_pct_actual 用；无行/无值返回 None，不补 0）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(CandidateTrackVerify).where(
+                CandidateTrackVerify.stock_code == stock_code,
+                CandidateTrackVerify.select_date == select_date)
+        ).scalar_one_or_none()
+        return row.t5_pct if row is not None else None
+
+
+def update_forward_view_actual(row_id: int, actual: float, bucket: str) -> None:
+    """回填 t5_pct_actual + 校准 bucket（correct/wrong/neutral；幂等覆盖）"""
+    with SessionLocal() as db:
+        row = db.get(ForwardViewHistory, row_id)
+        if row is None:
+            return
+        row.t5_pct_actual = float(actual)
+        row.t5_filled_at = datetime.now()
+        row.accuracy_bucket = bucket
+        db.commit()
+        _invalidate("forward_view")
+
+
+def compute_forward_view_accuracy(lookback_days: int = 30) -> dict:
+    """近 lookback_days 日前瞻准确率（校准先验用）：按 forward_view 分桶统计。
+    准确率 = correct / (correct + wrong)，neutral 不计入分母；无样本返回 0（诚实标注）。"""
+    cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(ForwardViewHistory)
+            .where(ForwardViewHistory.trade_date >= cutoff,
+                   ForwardViewHistory.accuracy_bucket.isnot(None))
+        ).scalars().all()
+    strong_c = sum(1 for r in rows if r.forward_view == "强" and r.accuracy_bucket == "correct")
+    strong_d = sum(1 for r in rows if r.forward_view == "强" and r.accuracy_bucket != "neutral")
+    weak_c = sum(1 for r in rows if r.forward_view == "弱" and r.accuracy_bucket == "correct")
+    weak_d = sum(1 for r in rows if r.forward_view == "弱" and r.accuracy_bucket != "neutral")
+    return {
+        "strong": round(strong_c / strong_d, 4) if strong_d else 0.0,
+        "strong_n": strong_d,
+        "weak": round(weak_c / weak_d, 4) if weak_d else 0.0,
+        "weak_n": weak_d,
+        "neutral_n": sum(1 for r in rows if r.accuracy_bucket == "neutral"),
+        "total": len(rows),
+        "lookback_days": lookback_days,
+    }
+
+
 def list_untracked_candidates() -> list[dict]:
     """候选池中尚未进入追踪表的全部标的（自愈初始化数据源：无日期过滤，
     任何一天漏跑下次运行自动补齐）；每日仅调用一次，不走 _dbq"""
@@ -2052,11 +2143,71 @@ def get_capital_stats(stock_code: str, trade_date: str) -> dict | None:
 
 # ==================== 经验沉淀闭环（pending → worker → experience → review_log → 检索注入） ====================
 
+def _parse_monitor_summary(summary):
+    """summary "000725 监控信号 hold" → (000725, hold)；其他形态（候选 N 只/评分/建仓/复盘）→ (None, None)"""
+    if not summary:
+        return None, None
+    parts = str(summary).split(" 监控信号 ")
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        return None, None
+    return parts[0].strip(), parts[1].strip()
+
+
+def _artifacts_meta(ref, code, sig, original_ref) -> dict:
+    """artifacts_ref 读兼容：新 JSON 直接解；旧 int/其他 → 从零构造（旧数据读不报错）"""
+    if ref:
+        try:
+            meta = json.loads(ref)
+            if isinstance(meta, dict):
+                meta.setdefault("count", 1)
+                meta.setdefault("first_at", datetime.now().isoformat(timespec="seconds"))
+                meta.setdefault("last_at", datetime.now().isoformat(timespec="seconds"))
+                meta.setdefault("stock_code", code)
+                meta.setdefault("signal_type", sig)
+                meta.setdefault("original_ref", original_ref)
+                return meta
+        except (TypeError, ValueError):
+            pass
+    now = datetime.now().isoformat(timespec="seconds")
+    return {"count": 1, "first_at": now, "last_at": now, "stock_code": code,
+            "signal_type": sig, "original_ref": original_ref}
+
+
+def merge_pending_duplicate(task_id, stage, summary, artifacts_ref) -> int | None:
+    """同 hour 桶 (stock_code, signal_type) 已 pending → 合并 count++ 返回行 id；否则 None 不合并"""
+    code, sig = _parse_monitor_summary(summary)
+    if not code:
+        return None
+    hour_start = datetime.now().replace(minute=0, second=0, microsecond=0)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(
+            PendingExperience.status == "pending",
+            PendingExperience.created_at >= hour_start,
+        ).order_by(PendingExperience.id.desc())
+        for r in db.execute(stmt).scalars().all():
+            r_code, r_sig = _parse_monitor_summary(r.summary)
+            if r_code == code and r_sig == sig:
+                meta = _artifacts_meta(r.artifacts_ref, code, sig, str(artifacts_ref or ""))
+                meta["count"] = int(meta.get("count") or 1) + 1
+                meta["last_at"] = datetime.now().isoformat(timespec="seconds")
+                r.artifacts_ref = json.dumps(meta, ensure_ascii=False)
+                db.commit()
+                _invalidate("pending_experience")
+                return r.id
+    return None
+
+
 def add_pending_experience(task_id, stage, summary, artifacts_ref) -> int:
-    """热路径经验沉淀写入：单行 INSERT，零分析。失败由调用方静默降级（不阻塞主任务）。"""
+    """热路径经验沉淀写入：同 hour (stock_code, signal_type) 已 pending → 合并 count++；
+    否则单行 INSERT（artifacts_ref 落 JSON 元数据，旧 int 数据读兼容）。失败由调用方静默降级。"""
+    merged = merge_pending_duplicate(task_id, stage, summary, artifacts_ref)
+    if merged:
+        return merged
+    code, sig = _parse_monitor_summary(summary)
+    meta = _artifacts_meta(artifacts_ref, code, sig, str(artifacts_ref or ""))
     with SessionLocal() as db:
         row = PendingExperience(task_id=task_id, stage=stage, summary=summary,
-                                artifacts_ref=artifacts_ref, status="pending")
+                                artifacts_ref=json.dumps(meta, ensure_ascii=False), status="pending")
         db.add(row)
         db.commit()
         _invalidate("pending_experience")

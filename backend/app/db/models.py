@@ -86,6 +86,29 @@ class CandidateTrackVerify(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class ForwardViewHistory(Base):
+    """前瞻判断快照（预测性选股 2.5：discover 前瞻三态落库 → T+5 回填校准闭环）。
+    forward_view: 强/中性/弱（由 horizon_bias 映射：延续→强/回归→中性/回吐→弱）；
+    forward_signals: 触发前瞻结论的对照事实（position/money/peer/history 摘要）；
+    accuracy_bucket: 回填后判定 correct/wrong/neutral（§3.5 口径）。"""
+    __tablename__ = "forward_view_history"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "stock_code", name="uq_fwd_date_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    forward_view: Mapped[str] = mapped_column(String(16))  # 强/中性/弱
+    forward_signals: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    # 回填字段
+    t5_pct_actual: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t5_filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 校准字段
+    accuracy_bucket: Mapped[str | None] = mapped_column(String(16), nullable=True)  # correct/wrong/neutral
+
+
 class MarketCondition(Base):
     """每日市况评分（v2.0 Discover 前置步骤）：LLM 五维打分 + 代码档位映射候选池上限"""
     __tablename__ = "market_condition"

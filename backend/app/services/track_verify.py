@@ -256,12 +256,15 @@ def _fmt_float(v, suffix="%"):
     return f"{f:.1f}{suffix}"
 
 
-def build_horizon_context(shortlist: list[dict], data_enrichment: dict) -> str:
+def build_horizon_context(shortlist: list[dict], data_enrichment: dict,
+                          trade_date: str | None = None) -> str:
     """逐 shortlist 候选组装【前瞻对照事实】文本段（供 Discover 终选注入）。
     shortlist: LLM 初选输出（含威科夫列 pos_52w/pct_change_5d/dist_52w_high_pct/
-               ma20_pos_pct/ma60_pos_pct/vol_5_20 与 confidence_tier）；
-    data_enrichment: {code: enrich}，enrich 含 main_net_3d/5d/10d（有则给，无则标注不可用）。
-    返回多行文本；任何一只数据不足只影响该只，整段异常返回空串（调用方省略，终选退回今日行为）。"""
+               ma20_pos_pct/ma60_pos_pct/vol_5_20 与 confidence_tier/horizon_bias/horizon_clarity）；
+    data_enrichment: {code: enrich}，enrich 含 main_net_3d/5d/10d（有则给，无则标注不可用）；
+    trade_date: 选入日（缺省取当日；仅用于前瞻快照落库，discover 顺带调用不传则用 today）。
+    返回多行文本；任何一只数据不足只影响该只，整段异常返回空串（调用方省略，终选退回今日行为）。
+    副作用：逐候选同步落库前瞻三态快照（预测性选股 2.5 衔接点，save_forward_view 内部 skip missing）。"""
     if not shortlist:
         return ""
     try:
@@ -332,6 +335,24 @@ def build_horizon_context(shortlist: list[dict], data_enrichment: dict) -> str:
             hist_line = "自身历史入选：无"
 
         blocks.append(f"【前瞻对照】{code} {name}\n{pos_line}\n{money_line}\n{peer_line}\n{hist_line}")
+
+        # 预测性选股 2.5 衔接点：同步落库前瞻三态快照（discover 计算时顺带存；
+        # horizon_clarity=低 → missing_data 跳过；trade_date+stock_code 唯一，重复更新）
+        if code:
+            try:
+                from datetime import date
+                from app.services.forward_view_history import save_forward_view
+                save_forward_view(
+                    stock_code=code,
+                    trade_date=trade_date or date.today().isoformat(),
+                    horizon_bias=cand.get("horizon_bias") or "",
+                    horizon_clarity=cand.get("horizon_clarity") or "",
+                    signals={"position": pos_line, "money": money_line,
+                             "peer": peer_line, "history": hist_line,
+                             "note": cand.get("horizon_note") or ""},
+                )
+            except Exception as exc:  # noqa: BLE001 快照落库失败不影响前瞻段
+                logger.warning("前瞻快照落库失败（不影响前瞻段）: %s", exc)
 
     return "\n\n".join(blocks)
 
