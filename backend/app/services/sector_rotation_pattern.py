@@ -131,3 +131,24 @@ def get_rotation_daily(trade_date: str | None = None) -> dict:
             "mainline_sector": log.get("mainline_sector"),
             "top10": top10,
             "launch": repo.list_sector_launch_by_date(d)}
+
+
+def build_rotation_context(trade_date: str | None = None) -> str:
+    """Discover 终选宏观注入段：轮动状态 + churn + 主线 + top5 启动归因；无数据返回空串"""
+    try:
+        daily = get_rotation_daily(trade_date)
+    except Exception:  # noqa: BLE001 读取失败降级空串
+        return ""
+    if not daily.get("rotation_state") and not daily.get("top10"):
+        return ""
+    lines = [f"【板块轮动状态】{daily.get('rotation_state') or '（数据缺失）'}，"
+             f"churn={daily.get('churn_rate')}，主线={daily.get('mainline_sector') or '无'}"]
+    lmap = {r["sector_name"]: r for r in (daily.get("launch") or [])}
+    top5 = (daily.get("top10") or [])[:5]
+    if top5:
+        lines.append("今日 top5 板块启动归因：")
+        for r in top5:
+            lr = lmap.get(r["sector_name"]) or {}
+            lines.append(f"- {r['sector_name']}({r.get('change_pct')}%)："
+                         f"tags={lr.get('reason_tags') or '（数据缺失）'}；{lr.get('reason_text') or '（数据缺失）'}")
+    return "\n".join(lines)

@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { type CSSProperties, useState } from 'react'
 import { App, Alert, Button, Card, Descriptions, Select, Space, Tabs, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { marketIntel, marketIntelDates } from '@/api/market'
+import { marketIntel, marketIntelDates, sectorPatterns, sectorRotation } from '@/api/market'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard } from '@/components/common'
 import type { MarketIntelInfo } from '@/types'
@@ -67,6 +67,100 @@ function DeepModules({ mi }: { mi: MarketIntelInfo }) {
           })}
         </Card>
       ) : null}
+    </Space>
+  )
+}
+
+const thStyle: CSSProperties = { textAlign: 'left', padding: '4px 8px', borderBottom: '1px solid var(--border)', fontWeight: 600 }
+const tdStyle: CSSProperties = { padding: '4px 8px', borderBottom: '1px solid var(--border)' }
+
+/** 板块轮动 Tab：状态徽章 + top10 表 + 归因卡片（可展开 reason_chain）+ 规律表 */
+function SectorRotationTab() {
+  const { data: rot } = useQuery({ queryKey: ['sector-rotation'], queryFn: () => sectorRotation() })
+  const { data: pats } = useQuery({ queryKey: ['sector-patterns'], queryFn: () => sectorPatterns() })
+
+  const stateColor: Record<string, string> = {
+    mainline: 'var(--up)', rotation: 'var(--warn)', chaos: 'var(--err)',
+  }
+  const launchList = rot?.launch?.length ? rot.launch : (rot?.launch_reasons ?? [])
+
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size={12}>
+      <Alert
+        type="info" showIcon
+        message={
+          <span>
+            轮动状态 ·{' '}
+            <Text style={{ color: stateColor[rot?.rotation_state ?? ''] }}>{rot?.rotation_state ?? '（数据缺失）'}</Text>
+            {rot?.rotation_state ? <> · churn {rot?.churn_rate ?? '—'} · 主线 {rot?.mainline_sector ?? '无'}</> : null}
+          </span>
+        }
+      />
+
+      {rot?.top10?.length ? (
+        <Card size="small" title="今日 top10 板块" style={{ background: 'var(--bg-input)' }}>
+          <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr><th style={thStyle}>排名</th><th style={thStyle}>板块</th><th style={thStyle}>涨幅%</th><th style={thStyle}>量比</th></tr>
+            </thead>
+            <tbody>
+              {rot.top10.map((r, i) => (
+                <tr key={i}>
+                  <td style={tdStyle}>{r.rank_no ?? i + 1}</td>
+                  <td style={tdStyle}>{r.sector_name ?? '—'}</td>
+                  <td style={{ ...tdStyle, color: (r.change_pct ?? 0) >= 0 ? 'var(--up)' : 'var(--down)' }}>{r.change_pct ?? '—'}</td>
+                  <td style={tdStyle}>{r.volume_ratio ?? '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      ) : <Text type="secondary">（当日无 top10 快照，可手动触发板块轮动分析）</Text>}
+
+      {launchList.length ? (
+        <Card size="small" title="启动归因（可展开 reason_chain 证据链）" style={{ background: 'var(--bg-input)' }}>
+          {launchList.map((lr, i) => (
+            <Card key={i} size="small" style={{ marginBottom: 6, background: 'var(--bg-input)' }}>
+              <Text strong>{lr.sector_name ?? '—'}</Text> · {lr.reason_tags || '（数据缺失）'}
+              <div style={{ fontSize: 13 }}>{lr.reason_text || '（数据缺失）'}</div>
+              {lr.reason_chain ? (
+                <details style={{ marginTop: 4 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 12 }}>reason_chain 证据链</summary>
+                  <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: '4px 0 0' }}>
+                    {typeof lr.reason_chain === 'string' ? lr.reason_chain : JSON.stringify(lr.reason_chain, null, 2)}
+                  </pre>
+                </details>
+              ) : null}
+            </Card>
+          ))}
+        </Card>
+      ) : <Text type="secondary">（当日无启动归因）</Text>}
+
+      <Card size="small" title="多窗口规律（3/10/20/60 日）" style={{ background: 'var(--bg-input)' }}>
+        <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              <th style={thStyle}>窗口</th><th style={thStyle}>轮动周期(天)</th><th style={thStyle}>生命周期(天)</th>
+              <th style={thStyle}>高切频次</th><th style={thStyle}>放量延续率(量比≥1.5)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {['3d', '10d', '20d', '60d'].map((w) => {
+              const p = pats?.patterns?.[w]
+              return (
+                <tr key={w}>
+                  <td style={tdStyle}>{w}</td>
+                  <td style={tdStyle}>{p?.rotation_cycle_days ?? '—'}</td>
+                  <td style={tdStyle}>{p?.lifecycle_avg_streak ?? '—'}</td>
+                  <td style={tdStyle}>{p?.switch_frequency ?? '—'}</td>
+                  <td style={tdStyle}>{p?.volume_breakout_continuation ?? '—'}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+        <Text type="secondary" style={{ fontSize: 12 }}>放量延续率 = 量比≥1.5 且居前板块次日收涨占比（非箱位口径）</Text>
+      </Card>
     </Space>
   )
 }
@@ -160,6 +254,10 @@ export function MarketIntelPage() {
                   if (!Object.keys(nw).length) return <Text type="secondary">（该轮未输出次日盯盘点）</Text>
                   return <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{flatten(nw)}</pre>
                 })(),
+              },
+              {
+                key: 'rotation', label: '板块轮动',
+                children: <SectorRotationTab />,
               },
             ]}
           />

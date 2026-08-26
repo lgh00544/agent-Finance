@@ -103,6 +103,39 @@ export interface HotSector {
   leading_stock?: string
   [k: string]: unknown
 }
+export interface SectorLaunchItem {
+  sector_name?: string
+  rank_no?: number
+  reason_tags?: string
+  reason_text?: string
+  reason_chain?: Array<{ evidence_key?: string; inference?: string }> | string | null
+  evidence?: Record<string, unknown>
+  confidence?: number | null
+  [k: string]: unknown
+}
+export interface SectorRotationInfo {
+  trade_date?: string | null
+  rotation_state?: string | null
+  churn_rate?: number | null
+  mainline_sector?: string | null
+  top10?: Array<{ sector_name?: string; change_pct?: number | null; rank_no?: number; volume_ratio?: number | null }>
+  launch?: SectorLaunchItem[]
+  launch_reasons?: SectorLaunchItem[]
+  count?: number
+  [k: string]: unknown
+}
+export interface SectorPattern {
+  success?: boolean
+  days?: number
+  rotation_cycle_days?: number | null
+  lifecycle_avg_streak?: number | null
+  switch_frequency?: number | null
+  volume_breakout_continuation?: number | null
+  cumulative_strength_top10?: Array<{ sector_name?: string; cum_strength?: number }>
+  mainline_candidates?: string[]
+  top_slopes?: Array<{ sector_name?: string; slope?: number | null }>
+  [k: string]: unknown
+}
 
 // ===== 账户 =====
 export interface AccountSummary {
