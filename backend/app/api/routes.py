@@ -321,6 +321,20 @@ def run_sector_rotation_job():
     return _submit_task("sector_rotation", {})
 
 
+@router.get("/market/sector-patterns")
+def get_sector_patterns():
+    """多窗口规律（3/10/20/60 日）：轮动周期/生命周期/高切低/启动延续率，读真实落库"""
+    from app.services.sector_rotation_pattern import analyze_patterns
+    return {"patterns": {f"{w}d": analyze_patterns(w) for w in (3, 10, 20, 60)}}
+
+
+@router.get("/market/sector-rotation")
+def get_sector_rotation(date: str | None = None):
+    """当日板块轮动：状态 + top10 + 归因（默认最新一日；无数据返回空结构）"""
+    from app.services.sector_rotation_pattern import get_rotation_daily
+    return get_rotation_daily(date)
+
+
 @router.get("/jobs/status")
 def job_status():
     return {"jobs": scheduler_jobs.job_status()}

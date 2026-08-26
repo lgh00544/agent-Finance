@@ -412,6 +412,31 @@ def get_sector_rank_log(trade_date: str) -> dict | None:
                 "mainline_sector": r.mainline_sector, "notes": r.notes}
 
 
+def list_sector_launch_by_date(trade_date: str) -> list[dict]:
+    """按交易日取启动归因（rank_no 升序）；reason_chain JSON 串解析为 list 返回"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorLaunchReason)
+            .where(SectorLaunchReason.trade_date == trade_date)
+            .order_by(SectorLaunchReason.rank_no.asc())
+        ).scalars().all()
+        out = []
+        for r in result:
+            chain = None
+            if r.reason_chain:
+                try:
+                    chain = json.loads(r.reason_chain)
+                except (TypeError, ValueError):
+                    chain = None
+            out.append({
+                "trade_date": r.trade_date, "sector_name": r.sector_name,
+                "rank_no": r.rank_no, "reason_tags": r.reason_tags,
+                "reason_text": r.reason_text, "reason_chain": chain,
+                "evidence": r.evidence or {}, "confidence": r.confidence,
+            })
+        return out
+
+
 # ==================== 持仓实时价快照（quote_snapshot，持仓监控页 DB 兜底） ====================
 
 def upsert_quote_snapshot(rows: list[dict]) -> int:

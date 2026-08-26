@@ -14,7 +14,7 @@ import pytest
 from app.datasource.akshare_source import AkshareSource
 from app.db import repo
 from app.db.session import init_db
-from app.services import sector_daily
+from app.services import market_view, sector_daily
 
 TODAY = time.strftime("%Y-%m-%d")
 
@@ -58,7 +58,9 @@ def _daily_row(rank_no, name="半导体", pct=3.5):
 def test_refresh_full_board_no_top5_cut():
     """8 个板块全存（不截取 top5），rank_no 按涨幅降序 1~8"""
     with mock.patch.object(AkshareSource, "fetch_industry_spot",
-                           return_value=_board_df(8)):
+                           return_value=_board_df(8)), \
+         mock.patch.object(market_view, "_spot_name_map", return_value={}), \
+         mock.patch.object(market_view, "_leading_from_cons", return_value=""):
         result = sector_daily.refresh_sector_daily_snapshot()
     assert result["success"] is True
     assert result["rows"] == 8
@@ -89,7 +91,9 @@ def test_missing_fields_none_not_fabricated():
     """df 缺 volume_ratio/turnover_rate/down_count 且 up_count 为 NaN/None → 落库为 NULL"""
     df = _board_df(3, detail=False)
     df["up_count"] = [float("nan"), 10, None]  # 板块01→NaN / 板块02→10 / 板块03→None
-    with mock.patch.object(AkshareSource, "fetch_industry_spot", return_value=df):
+    with mock.patch.object(AkshareSource, "fetch_industry_spot", return_value=df), \
+         mock.patch.object(market_view, "_spot_name_map", return_value={}), \
+         mock.patch.object(market_view, "_leading_from_cons", return_value=""):
         result = sector_daily.refresh_sector_daily_snapshot()
     assert result["success"] is True
     rows = repo.list_sector_daily_by_date(TODAY)
@@ -100,3 +104,20 @@ def test_missing_fields_none_not_fabricated():
     assert rows[0]["down_count"] is None
     assert rows[0]["leading_stock_code"] == ""  # 无代码来源 → 默认空串
     assert rows[1]["up_count"] == 10            # 有效值正常落库
+
+
+# ============ 4: 领涨股代码解析（批D 补丁：名称→代码映射命中非空） ============
+
+def test_leading_stock_code_resolved_from_name_map():
+    """领涨股名称命中全市场映射 → leading_stock_code 非空（修复前恒空串，批C 证据维度假死）"""
+    with mock.patch.object(AkshareSource, "fetch_industry_spot",
+                           return_value=_board_df(2)), \
+         mock.patch.object(market_view, "_spot_name_map", return_value={"龙头2": "600002"}), \
+         mock.patch.object(market_view, "_leading_from_cons", return_value=""):
+        result = sector_daily.refresh_sector_daily_snapshot()
+    assert result["success"] is True
+    rows = repo.list_sector_daily_by_date(TODAY)
+    by_name = {r["sector_name"]: r for r in rows}
+    assert by_name["板块02"]["leading_stock_name"] == "龙头2"
+    assert by_name["板块02"]["leading_stock_code"] == "600002"   # 映射命中非空
+    assert by_name["板块01"]["leading_stock_code"] == ""          # 无映射+cons 降级空 → 空串
