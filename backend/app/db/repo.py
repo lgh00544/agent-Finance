@@ -22,7 +22,8 @@ from app.db.models import (
     Experience, ExperienceConfig, ForwardViewHistory, Holding, HotMoneyProfile,
     LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
     PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
-    SectorSnapshot, SellDecision, StockCandidate, StockScore, TradeProfile,
+    SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
+    SellDecision, StockCandidate, StockScore, TradeProfile,
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
 from app.db.session import SessionLocal
@@ -280,6 +281,123 @@ def get_sector_snapshot_updated_at(trade_date: str) -> str | None:
             .limit(1)
         ).scalar_one_or_none()
         return str(row) if row is not None else None
+
+
+# ==================== 板块轮动·全板块日快照（sector_daily_snapshot） ====================
+
+def upsert_sector_daily_snapshot(rows: list[dict]) -> int:
+    """全板块日快照删后插（trade_date 全删当日覆盖，简单稳，不做 ORM merge）。
+    rows 每项字段：trade_date/sector_name/change_pct/rank_no/up_count/down_count/
+                   volume_ratio/turnover_rate/leading_stock_name/leading_stock_code/
+                   leading_chg/source；返回写入行数。"""
+    if not rows:
+        return 0
+    trade_date = rows[0].get("trade_date", "")
+    if not trade_date:
+        return 0
+    with SessionLocal() as db:
+        db.execute(
+            text("DELETE FROM sector_daily_snapshot WHERE trade_date = :d"),
+            {"d": trade_date},
+        )
+        for r in rows:
+            db.add(SectorDailySnapshot(
+                trade_date=r["trade_date"],
+                sector_name=r["sector_name"],
+                change_pct=r["change_pct"],
+                rank_no=r["rank_no"],
+                up_count=r.get("up_count"),
+                down_count=r.get("down_count"),
+                volume_ratio=r.get("volume_ratio"),
+                turnover_rate=r.get("turnover_rate"),
+                leading_stock_name=r.get("leading_stock_name", ""),
+                leading_stock_code=r.get("leading_stock_code", ""),
+                leading_chg=r.get("leading_chg"),
+                source=r.get("source", "em"),
+            ))
+        db.commit()
+    return len(rows)
+
+
+def list_sector_daily_by_date(trade_date: str) -> list[dict]:
+    """按交易日取全板块日快照（rank_no 升序），批次 B 轮动判定输入"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorDailySnapshot)
+            .where(SectorDailySnapshot.trade_date == trade_date)
+            .order_by(SectorDailySnapshot.rank_no.asc())
+        ).scalars().all()
+        return [
+            {
+                "trade_date": r.trade_date,
+                "sector_name": r.sector_name,
+                "change_pct": r.change_pct,
+                "rank_no": r.rank_no,
+                "up_count": r.up_count,
+                "down_count": r.down_count,
+                "volume_ratio": r.volume_ratio,
+                "turnover_rate": r.turnover_rate,
+                "leading_stock_name": r.leading_stock_name,
+                "leading_stock_code": r.leading_stock_code,
+                "leading_chg": r.leading_chg,
+                "source": r.source,
+            }
+            for r in result
+        ]
+
+
+def list_sector_daily_history(sector_name: str, days: int) -> list[dict]:
+    """按板块名取近 N 日快照（trade_date 升序），批次 B streak 连续居前判定"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorDailySnapshot)
+            .where(SectorDailySnapshot.sector_name == sector_name)
+            .order_by(SectorDailySnapshot.trade_date.desc())
+            .limit(days)
+        ).scalars().all()
+        return [
+            {"trade_date": r.trade_date, "rank_no": r.rank_no,
+             "change_pct": r.change_pct, "sector_name": r.sector_name}
+            for r in reversed(result)
+        ]
+
+
+# ==================== 板块轮动·轮动指标快照（sector_daily_rank_log） ====================
+
+def upsert_sector_rank_log(row: dict) -> int:
+    """轮动指标快照删后插（trade_date 唯一，当日最后一次覆盖）。
+    row 字段：trade_date/rotation_state/churn_rate/top5_overlap/mainline_sector/notes"""
+    if not row or not row.get("trade_date"):
+        return 0
+    with SessionLocal() as db:
+        db.execute(
+            text("DELETE FROM sector_daily_rank_log WHERE trade_date = :d"),
+            {"d": row["trade_date"]},
+        )
+        db.add(SectorDailyRankLog(
+            trade_date=row["trade_date"],
+            rotation_state=row.get("rotation_state", ""),
+            churn_rate=row.get("churn_rate"),
+            top5_overlap=row.get("top5_overlap"),
+            mainline_sector=row.get("mainline_sector"),
+            notes=row.get("notes", ""),
+        ))
+        db.commit()
+    return 1
+
+
+def get_sector_rank_log(trade_date: str) -> dict | None:
+    """按交易日取轮动指标快照（无 → None）"""
+    with SessionLocal() as db:
+        r = db.execute(
+            select(SectorDailyRankLog)
+            .where(SectorDailyRankLog.trade_date == trade_date)
+        ).scalars().first()
+        if r is None:
+            return None
+        return {"trade_date": r.trade_date, "rotation_state": r.rotation_state,
+                "churn_rate": r.churn_rate, "top5_overlap": r.top5_overlap,
+                "mainline_sector": r.mainline_sector, "notes": r.notes}
 
 
 # ==================== 持仓实时价快照（quote_snapshot，持仓监控页 DB 兜底） ====================

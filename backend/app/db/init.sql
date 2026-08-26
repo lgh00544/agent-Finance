@@ -369,3 +369,54 @@ CREATE TABLE IF NOT EXISTS capital_stats (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_cs_date_code (trade_date, stock_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 板块轮动分析·全板块每日快照（收盘 15:35 落库；与 sector_snapshot 并存不替代）
+-- 与 backend/app/db/models.py 的 SectorDailySnapshot 一致；东财缺失字段如实 NULL（K227）
+CREATE TABLE IF NOT EXISTS sector_daily_snapshot (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    sector_name VARCHAR(64) NOT NULL,
+    change_pct FLOAT NOT NULL,
+    rank_no INT NOT NULL,
+    up_count INT NULL,
+    down_count INT NULL,
+    volume_ratio FLOAT NULL,
+    turnover_rate FLOAT NULL,
+    leading_stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    leading_stock_code VARCHAR(16) NOT NULL DEFAULT '',
+    leading_chg FLOAT NULL,
+    source VARCHAR(8) NOT NULL DEFAULT 'em',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_sd_date_name (trade_date, sector_name),
+    KEY ix_sd_date_rank (trade_date, rank_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 板块轮动·轮动指标快照（批次 B 状态机结果，trade_date 唯一）
+-- 与 backend/app/db/models.py 的 SectorDailyRankLog 一致
+CREATE TABLE IF NOT EXISTS sector_daily_rank_log (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    rotation_state VARCHAR(16) NOT NULL,
+    churn_rate FLOAT NULL,
+    top5_overlap INT NULL,
+    mainline_sector VARCHAR(64) NULL,
+    notes VARCHAR(255) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_rd_date (trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 板块轮动·启动归因（批次 C 子 Agent 输出；reason_chain 证据链 K227）
+-- 与 backend/app/db/models.py 的 SectorLaunchReason 一致
+CREATE TABLE IF NOT EXISTS sector_launch_reason (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    sector_name VARCHAR(64) NOT NULL,
+    rank_no INT NOT NULL,
+    reason_tags VARCHAR(128) NOT NULL DEFAULT '',
+    reason_text TEXT NULL,
+    reason_chain TEXT NULL,
+    evidence JSON NULL,
+    confidence FLOAT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_lr_date_name (trade_date, sector_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

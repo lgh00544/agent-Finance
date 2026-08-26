@@ -700,6 +700,69 @@ class SectorSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class SectorDailySnapshot(Base):
+    """全板块每日快照（收盘 15:35 落库；批次 B 轮动判定底座，与 sector_snapshot 并存不替代）
+    """
+    __tablename__ = "sector_daily_snapshot"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "sector_name", name="uq_sd_date_name"),
+        Index("ix_sd_date_rank", "trade_date", "rank_no"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    sector_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    change_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    rank_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    up_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    down_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    volume_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    turnover_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    leading_stock_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    leading_stock_code: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    leading_chg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String(8), nullable=False, default="em")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SectorDailyRankLog(Base):
+    """轮动指标快照（批次 B 状态机结果，trade_date 唯一；notes 存批次 D 规律文本）
+    """
+    __tablename__ = "sector_daily_rank_log"
+    __table_args__ = (
+        UniqueConstraint("trade_date", name="uq_rd_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    rotation_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    churn_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    top5_overlap: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mainline_sector: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    notes: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SectorLaunchReason(Base):
+    """板块启动归因（批次 C 子 Agent 输出；reason_chain 为 LLM 推导证据链，K227 证据须真实）
+    """
+    __tablename__ = "sector_launch_reason"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "sector_name", name="uq_lr_date_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    sector_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    rank_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason_tags: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    reason_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason_chain: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class QuoteSnapshot(Base):
     """持仓实时价快照（每 5 分钟腾讯批量落库；持仓监控页 DB 兜底，首页热路径 <50ms）
 
