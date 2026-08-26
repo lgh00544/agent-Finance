@@ -14,6 +14,8 @@
 import logging
 import re
 
+from app.core.config import (STRICTNESS_FREEZE_NOTE, apply_market_intel_correction,
+                             market_band_info, strictness_policy)
 from app.db import repo
 
 logger = logging.getLogger(__name__)
@@ -67,36 +69,54 @@ def _current_price(cand: dict, snapshot: dict | None, plan: dict | None) -> floa
 
 
 def judge_tradeable(cand: dict, tier_effective: str, plan: dict | None,
-                    snapshot: dict | None = None) -> dict:
-    """单标的可建仓判定（纯函数）：返回 {is_tradeable, label, block_reason, cond_*, plan_exists, price_zone, current_price}"""
-    cond_grade = 1 if tier_effective in ("A", "B") else 0
+                    snapshot: dict | None = None,
+                    strictness: str = "标准",
+                    win_rate_5d: float | None = None) -> dict:
+    """单标的可建仓判定（纯函数）：返回 {is_tradeable, label, block_reason, block_details, cond_*, ...}。
+    block_details 每项 {rule, passed, evidence}，失败项 evidence 拼接进 block_reason（兼容旧读取方）"""
+    policy = strictness_policy.get(strictness, strictness_policy["标准"])
+    cond_grade = 1 if tier_effective in policy["tier_allowed"] else 0
     cond_risk = 0 if _has_major_negative(cand) else 1
     plan_exists = 1 if plan else 0
     current_price = _current_price(cand, snapshot, plan)
     cond_price = 0
     price_zone = ""
     reasons = []
+    block_details = []
+
+    def _block(rule, passed, evidence, fail_txt=None):
+        block_details.append({"rule": rule, "passed": bool(passed), "evidence": evidence})
+        if not passed:
+            reasons.append(fail_txt or evidence)
+
     if plan:
         batches = plan.get("batches") or []
         price_zone = str((batches[0] or {}).get("price_zone") or "")
         bounds = _zone_bounds(price_zone)
         if bounds is None:
-            reasons.append("建仓方案首仓区间无法解析")
+            _block("建仓方案", False, "首仓区间无法解析", "建仓方案首仓区间无法解析")
         elif current_price is None:
-            reasons.append("现价缺失，无法判定买点")
+            _block("建仓方案", False, "现价缺失，无法判定买点")
         elif bounds[0] <= current_price <= bounds[1]:
             cond_price = 1
+            _block("建仓方案", True, f"现价 {current_price:.2f} ∈ 首仓区间（{price_zone}）")
         else:
-            reasons.append(f"现价 {current_price:.2f} 偏离首仓区间（{price_zone}），买点未到")
+            _block("建仓方案", False, f"现价 {current_price:.2f} 偏离首仓区间（{price_zone}），买点未到")
     else:
-        reasons.append("暂无建仓方案，买点未验证")
+        _block("建仓方案", False, "暂无建仓方案，买点未验证")
     if not cond_grade:
-        reasons.append("未评级/无权威评分（仅观察，不可建仓）" if tier_effective is None
-                       else "评级未达 B（C 级仅观察）")
+        _block("评级档位", False,
+               "未评级/无权威评分（仅观察，不可建仓）" if tier_effective is None
+               else f"评级未达门槛（{strictness}市况仅 {'/'.join(policy['tier_allowed'])} 可建仓）")
+    else:
+        _block("评级档位", True, f"评级 {tier_effective} 达标")
     if not cond_risk:
-        reasons.append("候选风险含重大利空类表述")
+        _block("重大利空排查", False, "候选风险含重大利空类表述")
+    else:
+        _block("重大利空排查", True, "无重大利空类表述")
+    cond_win, cond_inflow = _strictness_extra_checks(cand, strictness, win_rate_5d, reasons, block_details)
 
-    is_tradeable = 1 if (cond_grade and cond_price and cond_risk) else 0
+    is_tradeable = 1 if (cond_grade and cond_price and cond_risk and cond_win and cond_inflow) else 0
     if is_tradeable:
         label = "可建仓"
     elif tier_effective in ("A", "B"):
@@ -105,8 +125,50 @@ def judge_tradeable(cand: dict, tier_effective: str, plan: dict | None,
         label = "观察"
     return {"is_tradeable": is_tradeable, "label": label,
             "block_reason": "；".join(reasons) or "",
+            "block_details": block_details,
             "cond_grade": cond_grade, "cond_price": cond_price, "cond_risk": cond_risk,
             "plan_exists": plan_exists, "price_zone": price_zone, "current_price": current_price}
+
+
+def _strictness_extra_checks(cand: dict, strictness: str, win_rate_5d: float | None,
+                             reasons: list, block_details: list) -> tuple[int, int]:
+    """严格度额外硬校验（extra_checks）：返回 (cond_win, cond_inflow)；逐项构造 block_details"""
+    policy = strictness_policy.get(strictness, strictness_policy["标准"])
+    cond_win, cond_inflow = 1, 1
+    win_thr = None
+    inflow_thr = None
+    for chk in policy["extra_checks"]:
+        if chk.startswith("win_rate_5d>="):
+            win_thr = max(win_thr or 0.0, float(chk.split(">=")[1]))
+        elif chk.startswith("main_net_5d>="):
+            inflow_thr = float(chk.split(">=")[1])
+    if win_thr is None and inflow_thr is None:
+        block_details.append({"rule": "严格度门槛", "passed": True,
+                              "evidence": f"{strictness}市况无额外硬校验"})
+        return cond_win, cond_inflow
+    if win_thr is not None:
+        if win_rate_5d is not None and win_rate_5d >= win_thr:
+            block_details.append({"rule": "严格度门槛", "passed": True,
+                                  "evidence": f"历史 T+5 胜率 {win_rate_5d:.0f}% ≥ {win_thr:.0f}%（{strictness}市况）"})
+        else:
+            cond_win = 0
+            msg = f"历史 T+5 胜率不足 {win_thr:.0f}%（{strictness}市况）"
+            reasons.append(msg)
+            block_details.append({"rule": "严格度门槛", "passed": False, "evidence": msg})
+    if inflow_thr is not None:
+        try:
+            main5 = float((cand.get("detail") or {}).get("main_net_5d") or 0)
+        except (TypeError, ValueError):
+            main5 = 0
+        if main5 >= inflow_thr:
+            block_details.append({"rule": "严格度门槛", "passed": True,
+                                  "evidence": f"主力净流入 {main5 / 1e8:.2f} 亿 ≥ {inflow_thr / 1e8:.0f} 亿（{strictness}市况）"})
+        else:
+            cond_inflow = 0
+            msg = f"主力净流入不足 {inflow_thr / 1e8:.0f} 亿（{strictness}市况）"
+            reasons.append(msg)
+            block_details.append({"rule": "严格度门槛", "passed": False, "evidence": msg})
+    return cond_win, cond_inflow
 
 
 def _effective_tier(cand: dict, adjusts: dict, trade_date: str) -> str | None:
@@ -131,6 +193,40 @@ def _latest_plan_for(code: str) -> dict | None:
     return None
 
 
+_STRICTNESS_FREEZE_LOGGED = False
+
+
+def _day_strictness(trade_date: str) -> str:
+    """当日最终严格度：市况基底（market_cap_bands 4 元组末位）+ MarketIntel 修正；数据缺失退化基底标准"""
+    base = "标准"
+    mc = repo.get_latest_market_condition()
+    if mc:
+        base = market_band_info(mc["total_score"])[3]
+    return apply_market_intel_correction(base, repo.get_market_intel(trade_date))
+
+
+def _history_win_rate(stock_code: str) -> float | None:
+    """单股历史 T+5 胜率（%）：全部已追踪行中 t5_pct>0 占比；无有效样本返回 None"""
+    rows = repo.list_track_verify(limit=1000)
+    rows = [r for r in rows if r.get("stock_code") == stock_code and r.get("t5_pct") is not None]
+    if not rows:
+        return None
+    return sum(1 for r in rows if (r.get("t5_pct") or 0) > 0) / len(rows) * 100
+
+
+def _log_strictness_freeze(trade_date: str, strictness: str) -> None:
+    """严格度 mapping 冻结留痕写 review_log（进程内一次；失败不阻塞判定）"""
+    global _STRICTNESS_FREEZE_LOGGED
+    if _STRICTNESS_FREEZE_LOGGED:
+        return
+    try:
+        repo.write_review_log(None, "strictness_freeze", "system",
+                              note=f"{STRICTNESS_FREEZE_NOTE}；当日 {trade_date} 严格度={strictness}")
+        _STRICTNESS_FREEZE_LOGGED = True
+    except Exception:  # noqa: BLE001 留痕失败不影响主链路
+        logger.warning("严格度冻结留痕写入失败")
+
+
 def ensure_tradeable(trade_date: str) -> int:
     """当日全部候选逐股判定并落库（幂等覆盖，code+date 唯一）；返回判定条数"""
     try:
@@ -138,6 +234,8 @@ def ensure_tradeable(trade_date: str) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("可建仓判定：候选读取失败 %s", exc)
         return 0
+    strictness = _day_strictness(trade_date)
+    _log_strictness_freeze(trade_date, strictness)
     adjusts = {a["stock_code"]: a for a in repo.list_candidate_adjusts(trade_date)}
     judged = 0
     for cand in rows:
@@ -148,11 +246,12 @@ def ensure_tradeable(trade_date: str) -> int:
             snapshot = repo.get_candidate_snapshot(code, trade_date)
             plan = _latest_plan_for(code)
             tier = _effective_tier(cand, adjusts, trade_date)
-            res = judge_tradeable(cand, tier, plan, snapshot)
+            res = judge_tradeable(cand, tier, plan, snapshot, strictness, _history_win_rate(code))
         except Exception as exc:  # noqa: BLE001 单标的异常不阻塞整体
             logger.warning("可建仓判定 %s@%s 失败: %s", code, trade_date, exc)
             res = {"is_tradeable": 0, "label": "建议关注",
                    "block_reason": f"判定异常（{type(exc).__name__}）",
+                   "block_details": [],
                    "cond_grade": 0, "cond_price": 0, "cond_risk": 0,
                    "plan_exists": 0, "price_zone": "", "current_price": None}
         repo.upsert_candidate_tradeable(
@@ -162,7 +261,8 @@ def ensure_tradeable(trade_date: str) -> int:
             res["cond_grade"], res["cond_price"], res["cond_risk"],
             res["block_reason"], {"effective_tier": tier,
                                   "confidence_tier": (cand.get("detail") or {}).get("confidence_tier"),
-                                  "plan_date": _plan_date(plan)})
+                                  "plan_date": _plan_date(plan),
+                                  "block_details": res["block_details"]})
         judged += 1
     return judged
 

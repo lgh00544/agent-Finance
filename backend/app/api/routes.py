@@ -343,8 +343,14 @@ def dashboard():
 
 @router.get("/market-condition")
 def market_condition():
-    """当日市况评分（v2.0 前置步骤结果：总分/档位/候选池上限/五维/综述），供首页「今日操作提示」"""
-    return repo.get_latest_market_condition()
+    """当日市况评分（v2.0 前置步骤结果：总分/档位/候选池上限/五维/综述），供首页「今日操作提示」。
+    批次4：返回值追加 strictness（当日最终严格度，含 MarketIntel 修正；row 缺失/空 → None，前端降级）。"""
+    from app.services.candidate_tradeable import _day_strictness
+    row = repo.get_latest_market_condition()
+    if not row:
+        return {"strictness": None}
+    td = row.get("trade_date")
+    return {**row, "strictness": _day_strictness(str(td)) if td else None}
 
 
 # ================= 市场概览（顶部状态栏 / 首页热门板块，只读聚合） =================
@@ -826,6 +832,7 @@ def list_knowledge(agent_tag: Optional[str] = None):
     """私有交易经验/战法列表（全部或按 Agent 过滤）"""
     rows = repo.list_knowledge(agent_tag)
     return [{"id": r.id, "title": r.title, "content": r.content, "agent_tag": r.agent_tag,
+             "hit_count": r.hit_count, "last_used_at": str(r.last_used_at) if r.last_used_at else None,
              "created_at": str(r.created_at)} for r in rows]
 
 
@@ -1060,6 +1067,142 @@ def take_profit_plan(force: bool = False):
     return build_plans(force=force)
 
 
+# ================= 派发期判定（6 维自动判定；每日 15:30 落库，此端点实时查 / force 击穿） =================
+@router.get("/distribution_phase/{stock_code}")
+def distribution_phase(stock_code: str, force: bool = False):
+    """单只标的派发期自动判定：完整 6 维 + phase + confidence + missing_data（纯计算零 LLM）。
+    结果按 代码+日期 缓存 86400s，force=true 删除缓存键后重算（手动击穿）；
+    缺维返回 null + missing_data 标注，不补零不补均值。"""
+    from app.cache import cache
+    from app.services.distribution_phase import compute_distribution_phase
+    trade_date = time.strftime("%Y-%m-%d")
+    if force:
+        cache.delete(f"distribution_phase:{trade_date}:{stock_code}")
+    try:
+        return compute_distribution_phase(stock_code, trade_date)
+    except Exception as exc:  # noqa: BLE001 判定失败报 502，前端提示可稍后重试
+        logger.warning("派发期判定失败 %s: %s", stock_code, exc)
+        raise HTTPException(status_code=502, detail=f"派发期判定失败: {exc}")
+
+
+# ================= 资本视图（游资/龙虎榜/资金流三维 + K189 对倒 + 30日统计；批次E） =================
+@router.get("/capital_view/{stock_code}")
+def capital_view(stock_code: str, force: bool = False):
+    """单只标的资本视图（最近 30 个上榜交易日）：recent_actors/coordination/wash_suspect(K189 纯代码)/
+    stats_30d/theme_resonance + dragon_tiger_rows·capital_flow_rows 三维表。
+    结果 86400s 缓存，force=true 删除缓存键后重算；30 日无数据 → coordination="数据不足"（绝不写"无动作"）；
+    单源必标 source="sse_only"（K227 诚实）。"""
+    from app.cache import cache
+    from app.services.capital_view import compute_capital_view
+    trade_date = time.strftime("%Y-%m-%d")
+    if force:
+        cache.delete(f"capital_view:{trade_date}:{stock_code}")
+    try:
+        return compute_capital_view(stock_code, trade_date)
+    except Exception as exc:  # noqa: BLE001 计算失败报 502，前端提示可稍后重试
+        logger.warning("资本视图失败 %s: %s", stock_code, exc)
+        raise HTTPException(status_code=502, detail=f"资本视图失败: {exc}")
+
+
+# ================= 持仓红线扫描（批次G）：C1/C2/C3/C4 + K139/K226/K189 事实层 =================
+def _fetch_day_lows(codes: list) -> dict:
+    """每只持仓当日最低价（日K最新一根 low）；失败/停牌 → 不收录（C2 缺数据显式 null）"""
+    lows: dict[str, float] = {}
+    if not codes:
+        return lows
+    from app.datasource.fallback import get_datasource
+    end = time.strftime("%Y-%m-%d")
+    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - 45 * 86400))
+    for code in codes:
+        try:
+            kl = get_datasource().fetch_daily_kline(code, start, end)
+            if kl is not None and not kl.empty:
+                lows[code] = float(kl.iloc[-1]["low"])
+        except Exception as exc:  # noqa: BLE001 单只失败不影响其余
+            logger.warning("红线扫描·当日 low 取数失败 %s: %s", code, exc)
+    return lows
+
+
+def _red_line_holdings() -> tuple[list, dict]:
+    """红线扫描输入：build_holding_view() 行情行（100% 与持仓监控页同源）+ 每只 high_price（repo 读取）"""
+    view = holding_view.build_holding_view()
+    holdings = []
+    for r in view["rows"]:
+        high_price = None
+        if r.get("id"):
+            try:
+                h = repo.get_holding(r["id"])
+                high_price = getattr(h, "high_price", None)
+            except Exception:  # noqa: BLE001 单只 high_price 失败不阻塞（C4 缺数据 → null）
+                high_price = None
+        holdings.append({"stock_code": r["stock_code"], "entry_price": r.get("entry_price"),
+                         "cost": r.get("cost"), "shares": r.get("shares"),
+                         "high_price": high_price})
+    return holdings, view
+
+
+@router.get("/red_line_check")
+def red_line_check():
+    """全部持仓红线扫描：C1 占比 / C2 日内回撤 / C3 止损 / C4 突破 + K139 SOP / K226 派发期 / K189 对倒。
+    纯计算 + 复用 D/E 缓存；缺数据字段显式 null；K139/K226 为参考权重（LLM 一票否决）。"""
+    from app.services.red_line_check import account_total_asset, compute_red_line
+    holdings, view = _red_line_holdings()
+    prices = {r["stock_code"]: r["current_price"] for r in view["rows"] if r.get("current_price") is not None}
+    lows = _fetch_day_lows(list(prices))
+    total_asset = account_total_asset()
+    result = compute_red_line(holdings, prices, total_asset, lows=lows)
+    return {"rows": result, "trade_date": time.strftime("%Y-%m-%d"),
+            "total_asset": total_asset, "quote_time": view.get("quote_time")}
+
+
+@router.get("/red_line_check/{stock_code}")
+def red_line_check_single(stock_code: str):
+    """单只持仓红线扫描（取数管道与全量一致）；无该持仓 → 404"""
+    from app.services.red_line_check import account_total_asset, compute_red_line
+    holdings, view = _red_line_holdings()
+    row = next((r for r in view["rows"] if r["stock_code"] == stock_code), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"无该持仓: {stock_code}")
+    h = next((x for x in holdings if x["stock_code"] == stock_code), None)
+    prices = {stock_code: row["current_price"]} if row.get("current_price") is not None else {}
+    lows = _fetch_day_lows([stock_code])
+    result = compute_red_line([h] if h else [], prices, account_total_asset(), lows=lows)
+    return result[0] if result else {"stock_code": stock_code, "red_line": None}
+
+
+# ================= 复盘反哺选股（批次H）：组合归因 / 周期复利 =================
+@router.get("/portfolio_attribution")
+def portfolio_attribution(days: int = 30):
+    """组合归因（纯计算，零 LLM）：组合盈亏曲线 + 各持仓贡献度瀑布 + 最大拖累者。
+    口径写死在 track_verify.build_portfolio_attribution（单测锁定）；days 默认 30，上限 365。"""
+    from app.services.track_verify import build_portfolio_attribution
+    days = max(1, min(days, 365))
+    return build_portfolio_attribution(days)
+
+
+@router.get("/stock_cycle_attribution/{stock_code}")
+def stock_cycle_attribution(stock_code: str):
+    """单股周期复利（纯计算，零 LLM）：历史多次操作的汇总（总盈亏/平均持仓/最佳最差周期/胜率拖累率）。
+    无持仓记录 → has_history=False；供 Score 历史胜率加分/扣分 + 复盘页周期表。"""
+    from app.services.track_verify import build_stock_cycle_attribution
+    return build_stock_cycle_attribution(stock_code)
+
+
+@router.get("/portfolio/daily-summary")
+def portfolio_daily_summary(days: int = 30):
+    """每日组合总结（纯计算聚合，零 LLM）：组合当日盈亏 + N 日曲线 + top gainers/losers + 总结文案"""
+    from app.services.portfolio_summary import build_daily_summary
+    return build_daily_summary(days)
+
+
+@router.get("/kline/{stock_code}")
+def kline(stock_code: str, start: str = "", end: str = ""):
+    """单股日K（透传 datasource fetch_daily_kline；多日盈亏曲线渲染用）。start/end 缺省返回空 klines"""
+    if not start or not end:
+        return {"code": stock_code, "klines": []}
+    return {"code": stock_code, "klines": repo.fetch_daily_kline(stock_code, start, end)}
+
+
 # ================= 游资追踪（游资档案 / 龙虎榜流水 / 留痕 / 权重迭代） =================
 @router.get("/hot-money/profiles")
 def hot_money_profiles(q: str = "", tier: str = ""):
@@ -1117,15 +1260,16 @@ def hot_money_tier_apply(body: TierApplyBody):
 
 # ================= 候选池 T+N 验证（选股效果闭环） =================
 @router.get("/track/verify/list")
-def track_verify_list(select_date: str = "", rating: str = "", status: str = "",
-                      limit: int = 200):
-    """追踪验证行列表（默认全部；status: all/tracking/finished；纯读）"""
+def track_verify_list(select_date: str = "", start_date: str = "", end_date: str = "",
+                      rating: str = "", status: str = "", limit: int = 200):
+    """追踪验证行列表（select_date 兼容旧单参；start_date/end_date 时间范围；纯读）"""
     finished = None
     if status == "tracking":
         finished = 0
     elif status == "finished":
         finished = 1
-    return repo.list_track_verify(select_date=select_date, rating=rating,
+    return repo.list_track_verify(select_date=select_date, start_date=start_date,
+                                  end_date=end_date, rating=rating,
                                   is_finished=finished, limit=limit)
 
 

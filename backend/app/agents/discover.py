@@ -11,7 +11,7 @@ import pandas as pd
 from app.agents.common import ModelLevel, agent_call
 from agent_prompts import discover_prompt, market_prompt
 from app.agents.schemas import DiscoverCandidate, DiscoverOutput, MarketConditionOutput
-from app.core.config import market_band_info, settings
+from app.core.config import market_band_info, settings, strictness_policy
 from app.datasource.base import DataSource
 from app.datasource.fallback import get_datasource
 from app.db import repo
@@ -33,7 +33,7 @@ _TABLE_COLS = [*_TABLE_COLS, *_WYCKOFF_COLS]
 _ENRICH_COLS = ["industry", "intraday_narrow_pct",
                 "super_large_net", "large_net", "medium_net", "small_net",
                 "main_net_3d", "main_net_5d", "main_net_10d",
-                "holder_change_pct", "inst_hold_pct"]
+                "holder_change_pct", "inst_hold_pct", "capital_view_context"]
 _MONEY_COLS = {"super_large_net", "large_net", "medium_net", "small_net",
                "main_net_3d", "main_net_5d", "main_net_10d"}
 
@@ -171,12 +171,13 @@ def market_condition(state: StockAgentState) -> StockAgentState:
         )
         total = output.dim_index + output.dim_sector + output.dim_money \
             + output.dim_sentiment + output.dim_risk
-        cap, band = market_band_info(total)
+        cap, band, grade, strictness = market_band_info(total)
         dims = {"index": output.dim_index, "sector": output.dim_sector,
                 "money": output.dim_money, "sentiment": output.dim_sentiment,
                 "risk": output.dim_risk}
         state["market_condition"] = {
             "trade_date": date_key, "total_score": total, "band": band, "cap": cap,
+            "grade": grade, "strictness": strictness,
             "dims": dims, "summary": output.summary,
         }
         state["market_cap"] = cap
@@ -184,7 +185,7 @@ def market_condition(state: StockAgentState) -> StockAgentState:
         logger.info("市况评分 %s 分（%s），候选池上限 %s 只", total, band, cap)
     except Exception as exc:  # noqa: BLE001 市况失败不阻塞主链路，按默认上限继续
         logger.warning("市况评分失败，按默认档位继续: %s", exc)
-        cap, band = market_band_info(999)
+        cap, band, *_ = market_band_info(999)
         state["market_condition"] = None
         state["market_cap"] = cap
     score_txt = f"{total}分" if total is not None else "失败"
@@ -194,12 +195,16 @@ def market_condition(state: StockAgentState) -> StockAgentState:
 
 
 def _market_note(state: StockAgentState) -> str:
-    """市况摘要文本（注入 LLM 提示，告知当日候选池规模约束）"""
+    """市况摘要文本（注入 LLM 提示，告知当日候选池规模约束与严格度措辞）"""
     mc = state.get("market_condition")
     if not mc:
         return f"今日市况评分暂不可用，候选池按默认上限 {state.get('market_cap') or 20} 只执行。"
-    return (f"今日市况评分 {mc['total_score']} 分（{mc['band']}），"
-            f"当日候选池上限 {mc['cap']} 只，市况综述：{mc['summary']}")
+    grade = mc.get("grade") or "中"
+    strictness = mc.get("strictness") or "标准"
+    phrase = strictness_policy[strictness]["prompt_phrase"]
+    return (f"今日市况评分 {mc['total_score']} 分（{mc['band']}，{grade}），"
+            f"当日候选池上限 {mc['cap']} 只。市况定级【{grade}】→ 选股策略应【{phrase}】。"
+            f"市况综述：{mc['summary']}")
 
 
 def _market_context(source: DataSource) -> str:
@@ -502,6 +507,17 @@ def _enrich_candidate_data(source: DataSource, inst_map: dict,
                     out["main_net_10d"] = round(float(vals.tail(10).sum()), 2)
     except Exception as exc:  # noqa: BLE001
         logger.warning("候选 %s 资金流增量失败: %s", code, exc)
+    # 资本视图（批次E）：capital_flow 段后注入 capital_view_context —— 游资/龙虎榜/资金流三维 +
+    # K189 对倒纯代码（不交 LLM）+ 30日胜率；无已识别游资或对倒不触发则不占列，避免噪音
+    try:
+        from app.services.capital_view import build_capital_view_line, compute_capital_view
+        cv = compute_capital_view(code, trade_date)
+        if cv and (cv.get("recent_actors") or cv.get("wash_suspect")):
+            line = build_capital_view_line(cv)
+            if line:
+                out["capital_view_context"] = line
+    except Exception as exc:  # noqa: BLE001 资本视图失败降级跳过，不阻塞候选富化
+        logger.warning("候选 %s 资本视图失败（跳过注入）: %s", code, exc)
     try:
         inst = inst_map.get(code) or {}
         if inst:
@@ -515,6 +531,54 @@ def _enrich_candidate_data(source: DataSource, inst_map: dict,
     except Exception as exc:  # noqa: BLE001
         logger.warning("候选 %s 股东户数失败: %s", code, exc)
     return out
+
+
+_NEG_RISK_TERMS = ("派发", "跌停", "退市", "ST", "爆雷", "利空", "减持", "解禁", "破产")
+_TIER_ORDER = {"强烈推荐": 2, "建议关注": 1, "谨慎观察": 0}
+
+
+def _build_candidate_audit(cand: DiscoverCandidate, market: dict | None,
+                           trade_date: str) -> dict:
+    """构造候选审计底稿（A 层，展示性判定：只读已字段/已有判定，不二次重算）。
+    6 项 passed/evidence 供前端逐条复核；verdict 默认 = confidence_tier，
+    极严市况且未全项通过（<5/6）→ 降一档并记 note。"""
+    mc = market or {}
+    decisions = [
+        {"key": "market_gate", "label": "市况门槛",
+         "passed": bool(mc and (mc.get("cap") or 0) > 0),
+         "evidence": f"市况 {mc.get('band', '—')} {mc.get('grade', '?')}，候选上限 {mc.get('cap', 0)}"},
+        {"key": "tier_gate", "label": "评级档位",
+         "passed": cand.confidence_tier != "谨慎观察",
+         "evidence": f"K202 档位 {cand.confidence_tier}（{cand.confidence_pct:.0f}%）"},
+        {"key": "stop_loss", "label": "止损约束",
+         "passed": bool(cand.price_levels) or "止损" in (cand.position_hint or ""),
+         "evidence": cand.price_levels or (cand.position_hint or "未给出止损位")},
+        {"key": "profit_risk_ratio", "label": "盈亏比≥2:1",
+         "passed": bool(cand.price_levels and cand.position_hint),
+         "evidence": f"价位 {cand.price_levels or '空'} | 建议 {cand.position_hint or '空'}"},
+        {"key": "major_negative", "label": "重大利空排查",
+         "passed": not any(t in (r or "") for r in cand.risks for t in _NEG_RISK_TERMS),
+         "evidence": "；".join(cand.risks[:2]) or "无"},
+        {"key": "pool_position", "label": "位置(距52高)",
+         "passed": not any(t in cand.stock_type for t in ("派发", "下跌", "拉升中段")),
+         "evidence": f"威科夫定位 {cand.stock_type}"},
+    ]
+    passed_ratio = sum(1 for d in decisions if d["passed"])
+    verdict = cand.confidence_tier
+    note = ""
+    if mc.get("strictness") == "极严" and passed_ratio < 5:
+        cur = _TIER_ORDER.get(verdict, 0)
+        if cur > 0:
+            verdict = next(k for k, v in _TIER_ORDER.items() if v == cur - 1)
+            note = "降档原因：严市况未全项通过"
+    return {
+        "trade_date": trade_date,
+        "market": {"score": mc.get("total_score"), "band": mc.get("band"),
+                   "grade": mc.get("grade"), "strictness": mc.get("strictness"),
+                   "cap": mc.get("cap")},
+        "decisions": decisions,
+        "verdict": verdict, "passed_ratio": f"{passed_ratio}/6", "note": note,
+    }
 
 
 def _final_table_text(shortlist: list[dict], data_enrichment: dict) -> str:
@@ -606,6 +670,15 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         logger.warning("游资聚合失败（降级跳过）: %s", exc)
     hm_text = hot_money_svc.build_hot_money_context(hm_aggs, date_key) if hm_aggs else ""
 
+    # 前瞻兑现对照事实注入（第 5 子 Agent 输入切片）：逐候选离组 延续/回归/回吐 判据的客观事实。
+    # 纯统计零 LLM（track_verify.build_horizon_context）；空串整段省略（终选退回今日行为，不阻塞）。
+    try:
+        from app.services.track_verify import build_horizon_context
+        horizon_text = build_horizon_context(shortlist, data_enrichment)
+    except Exception as exc:  # noqa: BLE001 组装失败降级省略前瞻段，不阻塞终选
+        logger.warning("前瞻对照事实组装失败（省略前瞻段）: %s", exc)
+        horizon_text = ""
+
     cap = state.get("market_cap")
     output = agent_call(
         agent="discover_final",
@@ -613,7 +686,7 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         system_prompt=discover_prompt.SYSTEM_PROMPT,
         user_prompt=discover_prompt.build_final_prompt(
             table, news_text, cap=cap, market_note=_market_note(state),
-            hot_money_context=hm_text),
+            hot_money_context=hm_text, horizon_context=horizon_text),
         schema=DiscoverOutput,
         ttl_seconds=86400,
         model_level=ModelLevel.DEEP,
@@ -626,12 +699,22 @@ def llm_final(state: StockAgentState) -> StockAgentState:
 
     trade_date = state.get("trade_date", _today())
     candidates = []
+    market = state.get("market_condition")
     for rank, cand in enumerate(final_list, start=1):
+        # 前瞻硬兜底（pydantic schema 无字段间约束，prompt 软约束不够，必须代码硬兜底防 LLM 自作主张）：
+        # 回吐 + 清晰度高/中 → 不得「强烈推荐」，强制降档建议关注 + 关注类型观察
+        clarity = (cand.horizon_clarity or "").strip()
+        if cand.horizon_bias == "回吐" and clarity in ("高", "中") \
+                and cand.confidence_tier == "强烈推荐":
+            cand.confidence_tier = "建议关注"
+            cand.focus_type = "观察"
+            logger.warning("[前瞻兜底] %s 回吐+清晰度%s → 强烈推荐降档建议关注",
+                           cand.stock_code, clarity)
         item = cand.model_dump()
         candidates.append(item)
         snapshot = next((u for u in state.get("universe") or []
                          if u.get("code") == cand.stock_code), {})
-        detail = {
+        new_detail = {
             "confidence_tier": cand.confidence_tier, "confidence_pct": cand.confidence_pct,
             "stock_type": cand.stock_type,
             # v3.0 白盒维度归因（主结论）：dimensions 数组 + final_advice 综合评估
@@ -643,8 +726,18 @@ def llm_final(state: StockAgentState) -> StockAgentState:
             "tech_view": cand.tech_view, "price_levels": cand.price_levels,
             "position_hint": cand.position_hint,
             "rule_refs": cand.rule_refs,
+            # 审计底稿（A 层，展示性判定：市况/档位/止损/盈亏/利空/位置 6 项 + 证据）
+            "audit": _build_candidate_audit(cand, market, trade_date),
+            # 前瞻兑现三态（第 5 子 Agent 收口；缺则用 schema 默认，禁止静默丢键）
+            "horizon_bias": cand.horizon_bias,
+            "horizon_clarity": cand.horizon_clarity,
+            "horizon_note": cand.horizon_note,
             "enriched": data_enrichment.get(cand.stock_code) or {},
         }
+        # 防丢键：防御式 merge，保留既有 detail 中的旧字段（本批次只新增字段，不整 dict 覆盖）。
+        # 仅在本函数内封装；不改 repo.upsert_candidate 内部（被 Score/Monitor/ExperienceWorker 共用）。
+        existing = repo.get_candidate_detail(cand.stock_code, trade_date) or {}
+        detail = {**existing, **new_detail}
         repo.upsert_candidate(cand.stock_code, cand.stock_name, trade_date,
                               rank, [cand.reason], [cand.risk_notice], snapshot, detail)
     # 当日快照替换：删除当日不在本次执行结果中的残留候选，保证当日只保留最新一次执行产物。

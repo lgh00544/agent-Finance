@@ -248,6 +248,84 @@ def sector_refresh_job() -> None:
         cache.release_lock("sector_refresh")
 
 
+def sector_daily_job() -> None:
+    """全板块日快照：工作日 15:35 收盘后刷新（删后插当日覆盖；独立锁防并发）"""
+    if not cache.acquire_lock("sector_daily", ttl_seconds=600):
+        logger.info("sector_daily 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.sector_daily import refresh_sector_daily_snapshot
+        result = refresh_sector_daily_snapshot()
+        if result.get("success"):
+            cache.set("job:last_sector_daily",
+                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("全板块日快照完成: %s 条", result.get("rows", 0))
+        else:
+            logger.warning("全板块日快照失败: %s", result.get("error"))
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("全板块日快照异常: %s", exc)
+    finally:
+        cache.release_lock("sector_daily")
+
+
+def distribution_phase_job() -> None:
+    """派发期判定：每日 15:30 收盘后，遍历「今日候选 + 当前持仓」逐只判定落库
+
+    结果幂等落 distribution_phase_log（(trade_date, symbol) 唯一键覆盖）；
+    单只失败不阻断其余；锁防并发。
+    """
+    if not cache.acquire_lock("distribution_phase_auto", ttl_seconds=1800):
+        logger.info("distribution_phase_auto 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.distribution_phase import compute_distribution_phase
+        trade_date = time.strftime("%Y-%m-%d")
+        codes = {c.get("stock_code") for c in repo.list_candidates(trade_date, limit=200)
+                 if c.get("stock_code")}
+        codes |= {h.get("stock_code") for h in repo.list_holdings() if h.get("stock_code")}
+        codes = sorted(codes)
+        done, failed = 0, 0
+        for code in codes:
+            try:
+                r = compute_distribution_phase(code, trade_date)
+                repo.upsert_distribution_phase(
+                    trade_date, code, r.get("phase") or 0,
+                    r.get("phase_label") or "", r.get("confidence") or "",
+                    r.get("six_dim") or {}, r.get("missing_data") or [])
+                done += 1
+            except Exception as exc:  # noqa: BLE001 单只失败不阻断其余
+                logger.warning("派发期判定失败 %s: %s", code, exc)
+                failed += 1
+        cache.set("job:last_distribution_phase",
+                  time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        logger.info("派发期判定完成: 共%d只 成功%d 失败%d", len(codes), done, failed)
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("派发期判定异常: %s", exc)
+    finally:
+        cache.release_lock("distribution_phase_auto")
+
+
+def quote_snapshot_refresh_job() -> None:
+    """持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁互不干扰）"""
+    if not cache.acquire_lock("quote_snapshot_refresh", ttl_seconds=240):
+        logger.info("quote_snapshot_refresh 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.quote_snapshot import refresh_quote_snapshot
+        result = refresh_quote_snapshot()
+        if result.get("success"):
+            cache.set("job:last_quote_snapshot_refresh",
+                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("持仓价快照刷新完成: %s 条 (source=%s)",
+                        result.get("rows", 0), result.get("source"))
+        else:
+            logger.warning("持仓价快照刷新失败: %s", result.get("error"))
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("持仓价快照刷新异常: %s", exc)
+    finally:
+        cache.release_lock("quote_snapshot_refresh")
+
+
 def _is_previous_trading_day(yesterday: str) -> bool:
     """昨天是否最近交易日（龙虎榜 T+1：16:30 后拉的是昨日数据）。
     日历为全量静态历（1990~年末含未来日期）：取今天之前的最后一个交易日与昨天比对"""
@@ -291,6 +369,17 @@ def dragon_tiger_job() -> None:
         cache.release_lock("dragon_tiger")
 
 
+def hot_money_win_rate_job() -> None:
+    """游资胜率迭代（工作日 16:30，daily_discover 16:10 + market_intel 16:20 之后）：
+    归一化匹配收信号 → 统计胜率落库 + 生成降/升档建议（pending 待人工审核，不自动改档）。"""
+    try:
+        from app.services.hot_money_review import run_win_rate_iteration
+
+        run_win_rate_iteration()
+    except Exception as exc:  # noqa: BLE001 迭代失败不阻塞其他任务
+        logger.error("游资胜率迭代失败: %s", exc)
+
+
 def maintenance_job() -> None:
     """每周空间维护（低频）：超期新闻清理 + SQLite 真空收缩 + 向量库超期索引清理。
     仅清理非核心数据（新闻原文），候选/评分/持仓/复盘等关键分析数据不清理。"""
@@ -328,6 +417,26 @@ def experience_worker_job(force: bool = False) -> None:
         logger.error("经验沉淀 Worker 异常: %s", exc)
 
 
+def fill_forward_view_job() -> None:
+    """预测性选股 2.5：每日 16:00 回填前瞻 T+5 实际涨跌（纯统计，复用 track_verify.t5_pct 不新算）"""
+    try:
+        from app.services.forward_view_history import fill_forward_view_actual
+        result = fill_forward_view_actual()
+        if result["filled"] > 0:
+            logger.info("前瞻T+5回填完成: %s", result)
+    except Exception as exc:  # noqa: BLE001 回填失败不阻塞调度
+        logger.error("前瞻T+5回填异常: %s", exc)
+
+
+def calibrate_forward_view_job() -> None:
+    """预测性选股 2.5：每周日 04:00 校准前瞻先验（回算近 30 日准确率写日志，不入库）"""
+    try:
+        from app.services.forward_view_history import calibrate_forward_view_prior
+        calibrate_forward_view_prior(lookback_days=30)
+    except Exception as exc:  # noqa: BLE001 校准失败不阻塞调度
+        logger.error("前瞻先验校准异常: %s", exc)
+
+
 def start_scheduler() -> None:
     global scheduler
     if scheduler is not None:
@@ -338,6 +447,16 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=16, minute=0,
                       id="track_verify", name="候选池T+N验证",
                       replace_existing=True, misfire_grace_time=3600)
+    # 预测性选股 2.5：每日 16:00 前瞻 T+5 回填（纯统计，复用 track_verify.t5_pct 不新算）
+    scheduler.add_job(fill_forward_view_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=0,
+                      id="forward_view_fill", name="前瞻T+5回填",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 每周日 04:00 前瞻先验校准（回算近 30 日准确率写日志）
+    scheduler.add_job(calibrate_forward_view_job, "cron",
+                      day_of_week="sun", hour=4, minute=0,
+                      id="forward_view_calibrate", name="前瞻先验校准",
+                      replace_existing=True, misfire_grace_time=3600)
     # 工作日 16:10 每日挖掘
     scheduler.add_job(daily_discover_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=10,
@@ -347,6 +466,11 @@ def start_scheduler() -> None:
     scheduler.add_job(market_intel_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=20,
                       id="market_intel", name="市场研判",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 工作日 16:30 游资胜率迭代（daily_discover/market_intel 之后；归一化匹配收信号）
+    scheduler.add_job(hot_money_win_rate_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=30,
+                      id="hot_money_win_rate", name="游资胜率迭代",
                       replace_existing=True, misfire_grace_time=3600)
     # 交易日 9:00-16:00 每 N 分钟触发（函数内过滤：盘中高频 + 15:00-15:30 收盘校验低频）
     monitor_minutes = max(1, int(settings.monitor_interval_minutes))
@@ -396,6 +520,21 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-15", minute="*/5",
                       id="sector_refresh", name="板块快照刷新",
                       replace_existing=True, misfire_grace_time=300)
+    # 派发期判定：每日 15:30 收盘后逐只落库（6 维自动判定，供 Monitor/Sell/Score 参考）
+    scheduler.add_job(distribution_phase_job, "cron",
+                      day_of_week="mon-fri", hour=15, minute=30,
+                      id="distribution_phase", name="派发期判定",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 板块轮动数据底座：全板块日快照（收盘后 15:35，删后插当日覆盖）
+    scheduler.add_job(sector_daily_job, "cron",
+                      day_of_week="mon-fri", hour=15, minute=35,
+                      id="sector_daily", name="板块轮动日快照",
+                      replace_existing=True, misfire_grace_time=3600)
+    # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
+    scheduler.add_job(quote_snapshot_refresh_job, "cron",
+                      day_of_week="mon-fri", hour="9-15", minute="*/5",
+                      id="quote_snapshot_refresh", name="持仓价快照刷新",
+                      replace_existing=True, misfire_grace_time=300)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")
 
@@ -421,4 +560,7 @@ def job_status() -> list[dict]:
     out.append({"id": "last_pre_market", "name": "最近盘前快筛", "next_run": cache.get("job:last_pre_market")})
     out.append({"id": "last_market_accuracy", "name": "最近市况回填", "next_run": cache.get("job:last_market_accuracy")})
     out.append({"id": "last_sector_refresh", "name": "最近板块刷新", "next_run": cache.get("job:last_sector_refresh")})
+    out.append({"id": "last_distribution_phase", "name": "最近派发期判定", "next_run": cache.get("job:last_distribution_phase")})
+    out.append({"id": "last_quote_snapshot_refresh", "name": "最近持仓价刷新", "next_run": cache.get("job:last_quote_snapshot_refresh")})
+    out.append({"id": "last_sector_daily", "name": "最近板块轮动日快照", "next_run": cache.get("job:last_sector_daily")})
     return out

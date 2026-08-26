@@ -232,6 +232,131 @@ def get_selection_performance_summary(period: str = "t5") -> str:
     return text
 
 
+# ==================== 前瞻兑现对照事实（Discover 第 5 子 Agent 输入切片） ====================
+# 纯统计、零 LLM。为 shortlist 每只拼一段【前瞻对照事实】，供 Discover 终选做 延续/回归/回吐 判断。
+# 数据来源仅：初选威科夫列 + enrich 资金列 + candidate_track_verify（复用现有统计）。
+# 铁律：缺列/失败写「数据不足」，禁止编造、禁止 LLM 算这些数、禁止「延续概率 70%」这类模型分。
+#
+# 【D1 决策】同类 T+5 分组维度 = select_rating（A/B/C 信心档），非 pos_52w 位置桶。
+#   实测历史 candidate_track_verify 57 条仅 8 条 snapshot 含 pos_52w（其余早于威科夫列加入，
+#   stock_type 历史也从未落库）。按位置桶近期必然样本不足；select_rating 100% 落库且直接对应
+#   同类信念强度，故同类桶退回 confidence-tier 档。单测须锁死此边界。
+_HORIZON_MIN_SAMPLE = 5      # 同类桶样本下限（写入注入事实的阈值；以下写「样本不足」）
+_HORIZON_SELF_MAX = 2        # 自身历史入选最多展示次数
+
+
+def _fmt_float(v, suffix="%"):
+    """数值格式化：None/非数值 → '数据不足'；否则保留 1 位小数 + 后缀"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "数据不足"
+    if f != f:  # NaN
+        return "数据不足"
+    return f"{f:.1f}{suffix}"
+
+
+def build_horizon_context(shortlist: list[dict], data_enrichment: dict,
+                          trade_date: str | None = None) -> str:
+    """逐 shortlist 候选组装【前瞻对照事实】文本段（供 Discover 终选注入）。
+    shortlist: LLM 初选输出（含威科夫列 pos_52w/pct_change_5d/dist_52w_high_pct/
+               ma20_pos_pct/ma60_pos_pct/vol_5_20 与 confidence_tier/horizon_bias/horizon_clarity）；
+    data_enrichment: {code: enrich}，enrich 含 main_net_3d/5d/10d（有则给，无则标注不可用）；
+    trade_date: 选入日（缺省取当日；仅用于前瞻快照落库，discover 顺带调用不传则用 today）。
+    返回多行文本；任何一只数据不足只影响该只，整段异常返回空串（调用方省略，终选退回今日行为）。
+    副作用：逐候选同步落库前瞻三态快照（预测性选股 2.5 衔接点，save_forward_view 内部 skip missing）。"""
+    if not shortlist:
+        return ""
+    try:
+        track_rows = repo.list_track_verify(limit=500)
+    except Exception as exc:  # noqa: BLE001 读失败整段省略，不阻塞终选
+        logger.warning("前瞻对照统计读取失败（省略前瞻段）: %s", exc)
+        return ""
+
+    # 同类 T+5 分组：按 select_rating（A/B/C 信心档）→ _group_stats（样本含 t5_pct 才计入）
+    t5_by_rating: dict[str, list[dict]] = {}
+    self_history: dict[str, list[dict]] = {}
+    for r in track_rows:
+        code, date = r.get("stock_code"), r.get("select_date")
+        if r.get("t5_pct") is not None:
+            rating = (r.get("select_rating") or "").strip() or "未知"
+            t5_by_rating.setdefault(rating, []).append({"pct": r.get("t5_pct")})
+        if code and date:
+            self_history.setdefault(code, []).append(
+                {"select_date": date, "t3": r.get("t3_pct"), "t5": r.get("t5_pct")})
+    rating_stats = {k: _group_stats(v) for k, v in t5_by_rating.items()}
+    # 自身历史按 select_date 降序（list_track_verify 已按 select_date DESC）
+    for code in self_history:
+        self_history[code] = self_history[code][:_HORIZON_SELF_MAX]
+
+    blocks = []
+    for cand in shortlist:
+        code = cand.get("stock_code") or cand.get("code") or ""
+        name = cand.get("stock_name") or cand.get("name") or ""
+        enrich = data_enrichment.get(code) or {}
+
+        # —— 位置/量能行 ——
+        pos_line = (f"位置：5日斜率 {_fmt_float(cand.get('pct_change_5d'))}；"
+                    f"距52周高点 {_fmt_float(cand.get('dist_52w_high_pct'))}；"
+                    f"区间位置 {_fmt_float(cand.get('pos_52w'))}；"
+                    f"MA20 {_fmt_float(cand.get('ma20_pos_pct'))} / MA60 {_fmt_float(cand.get('ma60_pos_pct'))}；"
+                    f"量能5/20 {_fmt_float(cand.get('vol_5_20'))}")
+
+        # —— 资金行（3/5/10 日主力净额，enrich 无则标注不可用）——
+        m3, m5, m10 = (enrich.get("main_net_3d"), enrich.get("main_net_5d"),
+                       enrich.get("main_net_10d"))
+        money_val = lambda v: f"{float(v) / 100000000:.2f}亿" if v not in (None, "") else "无"  # noqa: E731
+        money_line = (f"资金：3/5/10日主力 {money_val(m3)}/{money_val(m5)}/{money_val(m10)}"
+                      + ("（当日主力资金可用）" if any(v not in (None, "") for v in (m3, m5, m10))
+                         else "（当日资金不可用）"))
+
+        # —— 同类 T+5（confidence-tier 桶）——
+        cand_rating = (cand.get("confidence_tier") or "").strip()
+        g = rating_stats.get(cand_rating) if cand_rating else None
+        if cand_rating and g and g.get("n", 0) >= _HORIZON_MIN_SAMPLE:
+            wr = f"{g['win_rate']:.1f}%" if g["win_rate"] is not None else "数据不足"
+            avg = f"{g['avg_pct']:+.2f}%" if g["avg_pct"] is not None else "数据不足"
+            peer_line = (f"同类T+5：桶={cand_rating} 档 样本={g['n']} 胜率={wr} 均收益={avg}"
+                         f"（{_HORIZON_MIN_SAMPLE} 个以上可用样本，可作为对照）")
+        else:
+            n_txt = f"（现有 {g['n']} 个）" if g and g.get("n") else ""
+            peer_line = f"同类T+5：桶={cand_rating or '未知'} 档 样本不足{n_txt}，禁止当作结论（需≥{_HORIZON_MIN_SAMPLE}）"
+
+        # —— 自身历史入选 ——
+        hist = self_history.get(code) or []
+        if hist:
+            parts = []
+            for h in hist:
+                t3 = f"{h['t3']:+.2f}%" if h.get("t3") is not None else "—"
+                t5 = f"{h['t5']:+.2f}%" if h.get("t5") is not None else "—"
+                parts.append(f"{h['select_date']} T3={t3} T5={t5}")
+            hist_line = "自身历史入选：" + "；".join(parts)
+        else:
+            hist_line = "自身历史入选：无"
+
+        blocks.append(f"【前瞻对照】{code} {name}\n{pos_line}\n{money_line}\n{peer_line}\n{hist_line}")
+
+        # 预测性选股 2.5 衔接点：同步落库前瞻三态快照（discover 计算时顺带存；
+        # horizon_clarity=低 → missing_data 跳过；trade_date+stock_code 唯一，重复更新）
+        if code:
+            try:
+                from datetime import date
+                from app.services.forward_view_history import save_forward_view
+                save_forward_view(
+                    stock_code=code,
+                    trade_date=trade_date or date.today().isoformat(),
+                    horizon_bias=cand.get("horizon_bias") or "",
+                    horizon_clarity=cand.get("horizon_clarity") or "",
+                    signals={"position": pos_line, "money": money_line,
+                             "peer": peer_line, "history": hist_line,
+                             "note": cand.get("horizon_note") or ""},
+                )
+            except Exception as exc:  # noqa: BLE001 快照落库失败不影响前瞻段
+                logger.warning("前瞻快照落库失败（不影响前瞻段）: %s", exc)
+
+    return "\n\n".join(blocks)
+
+
 def _format_perf_summary(stats: dict, anomalies: list[dict], period_label: str = "T+5") -> str:
     """统计 + 异常 → 紧凑文本（客观事实；win_rate/avg_pct/pl_ratio 为 None 时降级不报错；
     分评级仅展示样本≥3 的档位；异常只列事实 desc+data，不给结论）。"""
@@ -777,3 +902,174 @@ def run_verify_chain(backfill: bool = False, price_lookup=None, llm_call=None) -
         return {"error": str(exc)}
     finally:
         cache.release_lock("track_verify")
+
+
+# ==================== 复盘反哺选股（批次H）：组合归因 / 周期复利 ====================
+# 纯计算、零 LLM。贡献度口径写死（见各函数 docstring），供 Review/Score 注入与复盘页三段 UI。
+# 铁律：缺数据字段显式 null，不补 0、不伪造；失败降级返回空结构不阻塞调用方。
+
+def _curve_points(items: list[dict], closes: dict, dates: list[str], total_cost: float) -> list[dict]:
+    """纯函数（可单测）：组合曲线 = 每日 Σ(单票当日浮盈亏) / 当前总成本 × 100。
+    items=[{code, cost_ps, shares, entry_date}]；closes={code: {date: close}}；
+    dates 为升序交易日列表；建仓日之前的日期不计入、缺行情日该票当日不计入（不伪造 0）。"""
+    pts = []
+    for d in dates:
+        pnl_sum = 0.0
+        for it in items:
+            if it.get("entry_date") and d < it["entry_date"]:
+                continue  # 建仓前不计入
+            close = closes.get(it["code"], {}).get(d)
+            if close is None:
+                continue
+            pnl_sum += (close - it["cost_ps"]) * it["shares"]
+        pts.append({"date": d,
+                    "total_pnl_pct": round(pnl_sum / total_cost * 100, 2) if total_cost else 0.0})
+    return pts
+
+
+def _daily_closes(codes: list[str], days: int) -> dict[str, dict[str, float]]:
+    """每只近 days 日K收盘 → {code: {date: close}}；单只失败返回空 dict（该票当日不计入）"""
+    out: dict[str, dict[str, float]] = {}
+    if not codes:
+        return out
+    from app.datasource.fallback import get_datasource
+
+    end = time.strftime("%Y-%m-%d")
+    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days + 20) * 86400))  # +20 缓冲覆盖周末/停牌
+    src = get_datasource()
+    for code in codes:
+        try:
+            kl = src.fetch_daily_kline(code, start, end)
+            if kl is not None and not kl.empty:
+                out[code] = {str(r["date"])[:10]: float(r["close"]) for _, r in kl.iterrows()}
+        except Exception as exc:  # noqa: BLE001 单只失败不影响其余
+            logger.warning("组合归因·日K取数失败 %s: %s", code, exc)
+    return out
+
+
+def build_portfolio_attribution(period_days: int = 30) -> dict:
+    """组合归因（纯计算，零 LLM）：当前持仓视角的组合盈亏曲线 + 贡献者 + 最大拖累者。
+
+    口径（写死，供单测锁定）：
+    - 组合曲线：第 d 日 = Σ_持仓 [(close_d − 每股成本) × 现股数] / 当前持仓总成本 × 100；
+      以当前持仓回看 period_days（简化：持仓不变、缺行情日不计入、建仓前不计入）；
+    - 贡献度：单票当前浮盈亏金额 / 当前持仓总成本 × 100（正绿/负红）；
+    - 拖累分析：贡献度最负的持仓 → "最大拖累者 X (Y%)"；无负贡献 → None。
+    数据源：holding_view 实时行情行 + 每只日K；无持仓/读取失败返回空结构不阻塞。"""
+    from datetime import date
+    from app.services.holding_view import build_holding_view
+
+    view = build_holding_view()
+    rows = view["rows"]
+    empty = {"portfolio_curve": [], "contributors": [], "drag_analysis": None,
+             "total_cost": 0.0, "period_days": period_days}
+    if not rows:
+        return empty
+
+    total_cost = 0.0
+    items = []
+    for r in rows:
+        cost_ps = float(r.get("entry_price") or 0)
+        shares = float(r.get("shares") or 0)
+        cost_amt = float(r.get("cost") or (cost_ps * shares) or 0)
+        total_cost += cost_amt
+        pa = r.get("pnl_amount")
+        items.append({"code": r["stock_code"], "cost_ps": cost_ps, "shares": shares,
+                      "entry_date": str(r.get("entry_date") or "")[:10],
+                      "pnl_amount": float(pa) if pa is not None else None,
+                      "name": r.get("stock_name") or r["stock_code"]})
+    if total_cost <= 0:
+        return empty
+
+    closes = _daily_closes([it["code"] for it in items], period_days)
+    dates = sorted(set().union(*[set(c) for c in closes.values()]) if closes else [])
+    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - period_days * 86400))
+    curve = [p for p in _curve_points(items, closes, dates, total_cost) if p["date"] >= start]
+
+    contributors = []
+    for it in items:
+        pa = it["pnl_amount"]
+        holding_days = None
+        if it["entry_date"]:
+            try:
+                holding_days = max(0, (date.today() - date.fromisoformat(it["entry_date"])).days)
+            except ValueError:
+                holding_days = None
+        contributors.append({
+            "stock_code": it["code"], "stock_name": it["name"],
+            "contribution_pct": round(pa / total_cost * 100, 2) if pa is not None else None,
+            "pnl_amount": round(pa, 2) if pa is not None else None,
+            "holding_days": holding_days,
+        })
+    contributors.sort(key=lambda x: (x["contribution_pct"] is None, x["contribution_pct"] or 0))
+
+    drag = None
+    neg = [c for c in contributors if c["contribution_pct"] is not None and c["contribution_pct"] < 0]
+    if neg:
+        drag = f"最大拖累者 {neg[0]['stock_code']} ({neg[0]['contribution_pct']}%)"
+    return {"portfolio_curve": curve, "contributors": contributors, "drag_analysis": drag,
+            "total_cost": round(total_cost, 2), "period_days": period_days}
+
+
+def build_stock_cycle_attribution(stock_code: str) -> dict:
+    """周期复利（纯计算，零 LLM）：该股历史多次操作的汇总（供 Score 历史胜率维度回流 + Review 折叠展示）。
+
+    口径（写死，供单测锁定）：每个持仓记录 = 1 个周期；
+    - 周期盈亏 = 卖出额 − 买入额（已了结周期，即存在卖出流水）；
+    - 未了结周期（无卖出）盈亏为 null，不参与总盈亏/胜率/拖累率（标 unrealized_cycles）；
+    - win_rate = 盈利周期 / 已了结周期数；drag_rate = 亏损周期 / 已了结周期数；
+    - 平均持仓天数 = 各周期（末次卖出日 − 首次买入日；未了结用 今日 − 建仓日）均值；
+    - 最佳/最差周期 = 已了结周期中盈亏最大/最小者。
+    无任何持仓记录 → has_history=False（调用方标「无历史数据」，不加分不扣分）。"""
+    try:
+        holdings = [h for h in repo.list_holdings() if h["stock_code"] == stock_code]
+    except Exception as exc:  # noqa: BLE001 读失败按无历史处理，不阻塞打分
+        logger.warning("周期复利·持仓读取失败 %s: %s", stock_code, exc)
+        return {"stock_code": stock_code, "has_history": False, "cycle_count": 0,
+                "closed_cycle_count": 0, "total_pnl": None, "avg_hold_days": None,
+                "win_rate": None, "drag_rate": None, "best_cycle": None, "worst_cycle": None}
+
+    empty = {"stock_code": stock_code, "has_history": False, "cycle_count": 0,
+             "closed_cycle_count": 0, "total_pnl": None, "avg_hold_days": None,
+             "win_rate": None, "drag_rate": None, "best_cycle": None, "worst_cycle": None}
+    if not holdings:
+        return empty
+
+    from datetime import date
+    today = date.today()
+    cycles = []
+    for h in holdings:
+        trades = repo.get_trades(h["id"])
+        buys = [t for t in trades if t.side == "buy"]
+        sells = [t for t in trades if t.side == "sell"]
+        entry = str(h.get("entry_date") or "")[:10]
+        if sells:
+            pnl = round(sum(t.amount for t in sells) - sum(t.amount for t in buys), 2)
+            d_end = date.fromisoformat(sells[-1].trade_date)
+            d_start = date.fromisoformat(buys[0].trade_date) if buys else d_end
+            hold_days = (d_end - d_start).days
+        else:
+            pnl = None
+            hold_days = (today - date.fromisoformat(entry)).days if entry else None
+        cycles.append({"entry_date": entry, "pnl": pnl, "hold_days": hold_days})
+
+    closed = [c for c in cycles if c["pnl"] is not None]
+    n_closed = len(closed)
+    wins = sum(1 for c in closed if c["pnl"] > 0)
+    losses = sum(1 for c in closed if c["pnl"] < 0)
+    hd = [c["hold_days"] for c in cycles if c["hold_days"] is not None]
+    best = max(closed, key=lambda c: c["pnl"]) if closed else None
+    worst = min(closed, key=lambda c: c["pnl"]) if closed else None
+    return {
+        "stock_code": stock_code,
+        "has_history": True,
+        "cycle_count": len(holdings),
+        "closed_cycle_count": n_closed,
+        "unrealized_cycles": len(cycles) - n_closed,
+        "total_pnl": round(sum(c["pnl"] for c in closed), 2) if closed else None,
+        "avg_hold_days": round(sum(hd) / len(hd), 1) if hd else None,
+        "win_rate": round(wins / n_closed * 100, 1) if n_closed else None,
+        "drag_rate": round(losses / n_closed * 100, 1) if n_closed else None,
+        "best_cycle": best,
+        "worst_cycle": worst,
+    }

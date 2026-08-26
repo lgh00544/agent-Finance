@@ -11,8 +11,8 @@ import pytest
 from sqlalchemy import delete
 
 from app.db import repo
-from app.db.models import (CandidateAdjust, CandidateTradeable, PositionPlan,
-                           StockCandidate, StockScore)
+from app.db.models import (CandidateAdjust, CandidateTradeable, MarketCondition,
+                           PositionPlan, StockCandidate, StockScore)
 from app.db.session import SessionLocal, init_db
 from app.services.candidate_tradeable import (_effective_tier, _zone_bounds,
                                               ensure_if_missing, ensure_tradeable,
@@ -35,6 +35,8 @@ def _clean():
         db.execute(delete(PositionPlan))
         db.execute(delete(StockCandidate))
         db.execute(delete(StockScore))
+        # 严格度门槛依赖当日市况，清空保证 ensure_tradeable 在确定环境（无市况→退化标准）判定
+        db.execute(delete(MarketCondition))
         db.commit()
     repo._invalidate("tradeable")
     repo._invalidate("candidate")
@@ -110,6 +112,68 @@ def test_judge_tradeable_unparseable_zone():
     res = judge_tradeable(_cand(), "A", _plan(zone="区间待定"), {"price": "23.8"})
     assert res["is_tradeable"] == 0
     assert "无法解析" in res["block_reason"]
+
+
+def test_judge_tradeable_strictness_tiers():
+    """严格度门槛矩阵：宽松/标准 A/B 可建仓、C 观察；严格仅 A+胜率40；极严 A+胜率50+净流入1亿"""
+    plan, snap = _plan(), {"price": "23.8"}
+    for s in ("宽松", "标准"):
+        assert judge_tradeable(_cand(), "A", plan, snap, strictness=s)["is_tradeable"] == 1
+        assert judge_tradeable(_cand(), "B", plan, snap, strictness=s)["is_tradeable"] == 1
+        assert judge_tradeable(_cand(), "C", plan, snap, strictness=s)["is_tradeable"] == 0
+    assert judge_tradeable(_cand(), "A", plan, snap, strictness="严格", win_rate_5d=50.0)["is_tradeable"] == 1
+    assert judge_tradeable(_cand(), "B", plan, snap, strictness="严格")["is_tradeable"] == 0
+    assert "严格市况" in judge_tradeable(_cand(), "A", plan, snap, strictness="严格", win_rate_5d=30.0)["block_reason"]
+    rich = {"stock_code": "600000", "stock_name": "测试股",
+            "detail": {"confidence_tier": "强烈推荐", "risks": ["无"], "main_net_5d": 2e8}}
+    poor = {"stock_code": "600000", "stock_name": "测试股",
+            "detail": {"confidence_tier": "强烈推荐", "risks": ["无"], "main_net_5d": 5e7}}
+    assert judge_tradeable(rich, "A", plan, snap, strictness="极严", win_rate_5d=60.0)["is_tradeable"] == 1
+    assert judge_tradeable(rich, "A", plan, snap, strictness="极严", win_rate_5d=40.0)["is_tradeable"] == 0
+    assert judge_tradeable(poor, "A", plan, snap, strictness="极严", win_rate_5d=60.0)["is_tradeable"] == 0
+
+
+def test_judge_tradeable_block_details_shape():
+    """block_details 结构化数组：每项 {rule, passed, evidence}；全过时 block_reason 为空"""
+    res = judge_tradeable(_cand(), "A", _plan(), {"price": "23.8"})
+    assert res["is_tradeable"] == 1
+    assert res["block_reason"] == ""
+    assert res["block_details"]
+    for item in res["block_details"]:
+        assert set(item) == {"rule", "passed", "evidence"}
+        assert isinstance(item["passed"], bool)
+    assert any(d["rule"] == "严格度门槛" and d["passed"] for d in res["block_details"])
+
+
+def test_judge_tradeable_block_reason_compat():
+    """block_reason 兼容旧读取：失败项 evidence 拼接；C 级/无方案/利空 文案保留"""
+    res = judge_tradeable(_cand(tier="谨慎观察"), "C", _plan(), {"price": "23.8"})
+    assert res["is_tradeable"] == 0
+    assert any(not d["passed"] for d in res["block_details"])
+    assert "评级" in res["block_reason"]
+    res2 = judge_tradeable(_cand(), "A", None, {"price": "23.8"})
+    assert "暂无建仓方案" in res2["block_reason"]
+    assert any(d["rule"] == "建仓方案" and not d["passed"] for d in res2["block_details"])
+    res3 = judge_tradeable(_cand(risks=["收到立案通知书"]), "A", _plan(), {"price": "23.8"})
+    assert "重大利空" in res3["block_reason"]
+    assert any(d["rule"] == "重大利空排查" and not d["passed"] for d in res3["block_details"])
+
+
+def test_judge_tradeable_block_details_strictness_item():
+    """严格度门槛项：极严市况胜率不足项失败；宽松无额外校验项通过"""
+    plan, snap = _plan(), {"price": "23.8"}
+    rich = {"stock_code": "600000", "stock_name": "测试股",
+            "detail": {"confidence_tier": "强烈推荐", "risks": ["无"], "main_net_5d": 2e8}}
+    res = judge_tradeable(rich, "A", plan, snap, strictness="极严", win_rate_5d=60.0)
+    assert res["is_tradeable"] == 1
+    assert all(d["passed"] for d in res["block_details"] if d["rule"] == "严格度门槛")
+    res2 = judge_tradeable(rich, "A", plan, snap, strictness="极严", win_rate_5d=30.0)
+    assert res2["is_tradeable"] == 0
+    assert any(d["rule"] == "严格度门槛" and not d["passed"] and "胜率" in d["evidence"]
+               for d in res2["block_details"])
+    res3 = judge_tradeable(_cand(), "A", plan, snap, strictness="宽松")
+    assert res3["is_tradeable"] == 1
+    assert any(d["rule"] == "严格度门槛" and d["passed"] for d in res3["block_details"])
 
 
 def test_tier_of_mapping():

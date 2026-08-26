@@ -4,16 +4,19 @@
 失败一律降级返回空表/空 dict，不抛异常打断主链路；中文日志记录原因。
 
 数据分层（口径硬隔离，K227 防误读）：
-- 股票级：当日上榜股票 + 龙虎榜净买额（东财 stock_lhb_detail_em / 新浪 stock_lhb_detail_daily_sina），
-  用于多源校验（同(日期,标的,口径) ≥2 源且差值<10% 才采信）；
+- 股票级：上榜股票 + 龙虎榜净买额（东财 stock_lhb_detail_em / 新浪 stock_lhb_detail_daily_sina），
+  用于多源校验（同(日期,标的,口径) ≥2 源且差值<10% 才采信）；3d 三日累计榜由东财
+  FLAG='3' 过滤拉取，接口未按三日口径返回时诚实降级空表（不拿 1d 冒充 3d）；
 - 席位级：单股席位买卖明细（东财 stock_lhb_stock_detail_em，flag='1' 当日 / '3' 三日累计），
   用于游资-席位映射（seat_name → hot_money_profile）。
 
 第二源现状（K227 诚实标注，不伪造第二源数据）：
-- 新浪 stock_lhb_detail_daily_sina 仅返回"上榜原因列表"，无金额明细（已实测确认）；
+- 新浪 stock_lhb_detail_daily_sina 仅返回"上榜原因列表"，无金额明细（已实测确认）→
+  本批接入为"上榜确认第二源"：双源在榜采信升级（金额以东财为准），available 动态反映；
 - 同花顺 data.10jqka.com.cn 直连需 JS 生成的 hexin-v token，本环境不可用（已实测确认）；
-- 当前仅东财可用 → 单源数据标"数据置信度不足"仅参考（second_source_status() 如实标注，
-  第二源接入后 verify_net_buy 自动升级为 0.9 采信，无需改动校验逻辑）。
+- 金额主源东财；新浪无净额列 → 仅作上榜确认标签，绝不合并进净买额。second_source_status()
+  动态如实标注 available：双源在榜 confidence 升级 max(0.8,0.9)=0.9 采信，仅新浪在榜降 0.55
+  仅参考（verify_net_buy 自身多源校验逻辑无需改动）。
 
 实现对齐 MairuiSource 独立类模式：不继承 DataSource 协议，方法返回约定对齐
 （失败 → 空表），低频 T+1 任务不接断路器（避免动 datasource_stats._KINDS 测试断言）。
@@ -27,19 +30,28 @@ from app.datasource.base import DataSourceError
 
 logger = logging.getLogger(__name__)
 
-# 第二源可用性诚实标注（K227：无第二源不得假装采信）
+# 第二源可用性诚实标注（K227：无第二源不得假装采信；新浪上榜确认接入后动态反映）
 _SECOND_SOURCE_ANNOTATION = "当前仅东财可用、采信待第二源"
 _SECOND_SOURCE_CANDIDATES = {
+    "eastmoney": "东财 datacenter 每日龙虎榜详情（股票级净买额，金额主源）",
     "ths": "同花顺 data.10jqka.com.cn 直连需 JS 生成的 hexin-v token（本环境不可用）",
-    "sina": "新浪每日明细接口无金额明细（仅上榜确认，不参与金额采信）",
+    "sina": "新浪每日明细接口无金额明细（仅上榜确认，本批作上榜确认第二源参与采信）",
 }
 
 
-def second_source_status() -> dict:
+def second_source_status(sina_fetched: bool = False) -> dict:
     """第二龙虎榜数据源可用性（K227 诚实标注，零网络调用）：
     返回 {"available": bool, "main_source": str, "annotation": str, "candidates": {...}}。
-    当前可用金额源仅东财 → available=False，注入层与调度如实标注"采信待第二源"，
-    单源数据保持"置信度不足仅参考"降级；第二源接入后校验逻辑无需改动自动升级。"""
+    sina_fetched: 本批是否拉到新浪上榜确认数据（由抓取/调度端传入布尔，本函数不发请求）。
+    True → available=True，双源采信（金额以东财为准）；False → 仅东财、采信待第二源。
+    无参调用默认 False → 旧标注（向后兼容，jobs.py/hot_money.py 不传参仍按旧行为）。"""
+    if sina_fetched:
+        return {
+            "available": True,
+            "main_source": "eastmoney",
+            "annotation": "双源：东财金额+新浪上榜确认（金额以主源为准）",
+            "candidates": dict(_SECOND_SOURCE_CANDIDATES),
+        }
     return {
         "available": False,
         "main_source": "eastmoney",
@@ -68,6 +80,8 @@ _LHB_SEAT_COLS = {
 # 官方源置信度 1.0 / 第三方（东财/新浪）0.8 / 社区 0.5
 _CONF_OFFICIAL = 1.0
 _CONF_THIRD = 0.8
+_CONF_VERIFIED = 0.9      # 双源在榜采信（东财金额 + 新浪上榜确认，金额以东财为准）
+_CONF_SINA_ONLY = 0.55    # 仅新浪上榜确认（无金额，置信度不足档，不参与金额采信）
 
 try:
     import akshare as ak  # noqa: PLC0415 数据源层按需导入，缺失时整体降级
@@ -103,11 +117,18 @@ def _em_json(report_name: str, params: dict) -> list:
     return rows if isinstance(rows, list) else []
 
 
-def _fetch_em_stocks(trade_date: str) -> pd.DataFrame:
-    """东财每日龙虎榜详情（股票级，vendored 直连）"""
-    rows = _em_json(_EM_STOCKS_REPORT,
-                    {"filter": f"TRADE_DATE='{trade_date}'", "page_size": 500})
+def _fetch_em_stocks(trade_date: str, lhb_type: str = "1d") -> pd.DataFrame:
+    """东财每日龙虎榜详情（股票级，vendored 直连）。
+    lhb_type: '1d' 当日榜 / '3d' 三日累计榜（filter 追加 FLAG='3'；接口未按三日口径
+    返回时诚实降级空表，杜绝 1d 冒充 3d）。"""
+    _filter = f"TRADE_DATE='{trade_date}'" if lhb_type == "1d" \
+        else f"TRADE_DATE='{trade_date}')(FLAG='3'"
+    rows = _em_json(_EM_STOCKS_REPORT, {"filter": _filter, "page_size": 500})
     if not rows:
+        return pd.DataFrame()
+    # 三日口径防线：FLAG='3' 过滤若被接口忽略（无三日行）→ 视为不可靠，诚实降级空表
+    if lhb_type == "3d" and not any(str(r.get("FLAG") or "") == "3" for r in rows):
+        logger.warning("东财三日榜 FLAG='3' 过滤未生效（返回非三日行），诚实降级空表: %s", trade_date)
         return pd.DataFrame()
     out = pd.DataFrame(rows)
     keep = {"SECURITY_CODE": "stock_code", "SECURITY_NAME_ABBR": "stock_name",
@@ -120,7 +141,7 @@ def _fetch_em_stocks(trade_date: str) -> pd.DataFrame:
     for col in ("net_buy", "buy_amt", "sell_amt"):
         _to_float(out, col)
     out["trade_date"] = str(trade_date)
-    out["lhb_type"] = "1d"
+    out["lhb_type"] = lhb_type
     out["source"] = "eastmoney"
     out["confidence"] = _CONF_THIRD
     return out
@@ -129,12 +150,13 @@ def _fetch_em_stocks(trade_date: str) -> pd.DataFrame:
 _SEATS_CACHE_TTL = 86400  # 当日席位明细缓存（T+1 数据当日不变）
 
 
-def _fetch_em_seats(trade_date: str) -> pd.DataFrame:
-    """东财当日全部席位明细（买入前五 + 卖出前五，vendored 直连；单位：元）。
+def _fetch_em_seats(trade_date: str, lhb_type: str = "1d") -> pd.DataFrame:
+    """东财全部席位明细（买入前五 + 卖出前五，vendored 直连；单位：元）。
+    lhb_type: '1d' 当日 / '3d' 三日累计（filter 追加 FLAG='3'，缓存按口径隔离）。
     当日全量一次拉取（~600 行），按 SECURITY_CODE 过滤个股，避免逐股请求。"""
     from app.cache import cache
 
-    cache_key = f"lhb:seats:{trade_date}"
+    cache_key = f"lhb:seats:{trade_date}:{lhb_type}"
     cached = cache.get(cache_key)
     if cached:
         try:
@@ -142,14 +164,17 @@ def _fetch_em_seats(trade_date: str) -> pd.DataFrame:
             return pd.DataFrame(_json.loads(cached))
         except Exception:  # noqa: BLE001 缓存损坏忽略重新拉
             pass
+    _filter = f"TRADE_DATE='{trade_date}'" if lhb_type == "1d" \
+        else f"TRADE_DATE='{trade_date}')(FLAG='3'"
     frames = []
     for report in (_EM_BUY_REPORT, _EM_SELL_REPORT):
         try:
-            rows = _em_json(report, {"filter": f"TRADE_DATE='{trade_date}'", "page_size": 500})
-            if rows:
+            rows = _em_json(report, {"filter": _filter, "page_size": 500})
+            # 3d 防线：接口未按三日口径返回（无 FLAG='3' 行）→ 该报表跳过，杜绝 1d 冒充 3d
+            if rows and (lhb_type != "3d" or any(str(r.get("FLAG") or "") == "3" for r in rows)):
                 frames.append(pd.DataFrame(rows))
         except Exception as exc:  # noqa: BLE001 单报告失败降级
-            logger.warning("东财席位明细 %s 拉取失败: %s", report, exc)
+            logger.warning("东财席位明细 %s/%s 拉取失败: %s", report, lhb_type, exc)
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
@@ -163,7 +188,7 @@ def _fetch_em_seats(trade_date: str) -> pd.DataFrame:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
     out["trade_date"] = str(trade_date)
-    out["lhb_type"] = "1d"
+    out["lhb_type"] = lhb_type
     out["source"] = "eastmoney"
     out["confidence"] = _CONF_THIRD
     if not out.empty:
@@ -196,6 +221,31 @@ def _num(v) -> float:
         return 0.0
 
 
+def _apply_second_source_credit(rows: pd.DataFrame, em: pd.DataFrame, sina: pd.DataFrame) -> None:
+    """第二源上榜确认采信（K227：金额单源不伪造，in-place 打标/调置信度）。
+    同(日期,标的)双源在榜 → 东财金额行 confidence 升级 max(0.8,0.9)=0.9 + multi_source_verified=True；
+    仅新浪在榜（无金额，仅上榜确认）→ confidence=0.55，不置多源核验标志。
+    金额列一律以东财为准，新浪无净额列绝不合并/覆盖进净买额。"""
+    rows["multi_source_verified"] = False
+    if em.empty:
+        if not sina.empty:
+            rows.loc[rows["source"] == "sina", "confidence"] = _CONF_SINA_ONLY
+        return
+    if sina.empty:
+        return
+    em_codes = set(em["stock_code"].astype(str))
+    sina_codes = set(sina["stock_code"].astype(str))
+    code_col = rows["stock_code"].astype(str)
+    dual = em_codes & sina_codes
+    if dual:
+        dual_mask = (rows["source"] == "eastmoney") & code_col.isin(dual)
+        rows.loc[dual_mask, "confidence"] = max(_CONF_THIRD, _CONF_VERIFIED)
+        rows.loc[dual_mask, "multi_source_verified"] = True
+    sina_only = (rows["source"] == "sina") & ~code_col.isin(em_codes)
+    if sina_only.any():
+        rows.loc[sina_only, "confidence"] = _CONF_SINA_ONLY
+
+
 class DragonTigerSource:
     """龙虎榜数据源（东财主源 + 新浪备源；低频 T+1，失败降级不阻塞主链路）"""
 
@@ -203,13 +253,18 @@ class DragonTigerSource:
         if not settings.dragon_tiger_enable:
             logger.info("龙虎榜数据源未启用（DRAGON_TIGER_ENABLE=false），抓取方法返回空")
 
-    def fetch_lhb_stocks(self, trade_date: str, source: str = "eastmoney") -> pd.DataFrame:
-        """当日上榜股票列表（股票级，含龙虎榜净买额；多源校验用）。
-        source: eastmoney（vendored 东财 datacenter 直连，akshare 兜底）/ sina（上榜原因列表，无金额）"""
+    def fetch_lhb_stocks(self, trade_date: str, source: str = "eastmoney",
+                         lhb_type: str = "1d") -> pd.DataFrame:
+        """上榜股票列表（股票级，含龙虎榜净买额；多源校验用）。
+        source: eastmoney（vendored 东财 datacenter 直连，akshare 兜底）/ sina（上榜原因列表，无金额）。
+        lhb_type: '1d' 当日榜 / '3d' 三日累计榜（仅东财支持；sina 无三日口径 → 3d 诚实返回空）。"""
         if not settings.dragon_tiger_enable:
             return pd.DataFrame()
         try:
             if source == "sina":
+                if lhb_type != "1d":
+                    logger.warning("龙虎榜 sina 无 %s 口径（仅当日上榜确认），返回空: %s", lhb_type, trade_date)
+                    return pd.DataFrame()
                 if ak is None:
                     return pd.DataFrame()
                 df = ak.stock_lhb_detail_daily_sina(date=trade_date.replace("-", ""))
@@ -226,14 +281,17 @@ class DragonTigerSource:
                 out["confidence"] = _CONF_THIRD
                 out["lhb_type"] = "1d"
                 return out
-            # eastmoney：vendored 东财直连为主源（akshare 1.18.81 该接口真实环境报错）
+            # eastmoney：vendored 东财直连为主源（akshare 1.18.81 该接口真实环境报错）；
+            # 3d 仅东财直连（akshare 无三日榜，不兜底以免 1d 冒充 3d）
             try:
-                out = _fetch_em_stocks(trade_date)
+                out = _fetch_em_stocks(trade_date, lhb_type)
                 if not out.empty:
                     return out
-                logger.warning("龙虎榜 eastmoney 直连无数据: %s", trade_date)
+                logger.warning("龙虎榜 eastmoney 直连无数据 %s/%s", trade_date, lhb_type)
             except Exception as exc:  # noqa: BLE001 直连失败降级 akshare
                 logger.warning("龙虎榜 eastmoney 直连失败，回退 akshare: %s", exc)
+            if lhb_type != "1d":
+                return pd.DataFrame()
             if ak is None:
                 return pd.DataFrame()
             df = ak.stock_lhb_detail_em(start_date=trade_date, end_date=trade_date)
@@ -254,11 +312,11 @@ class DragonTigerSource:
     def fetch_lhb_seats(self, trade_date: str, stock_code: str,
                         lhb_type: str = "1d") -> pd.DataFrame:
         """单股席位买卖明细（席位级，游资-席位映射用）。
-        东财当日全量明细（买入前五+卖出前五，当日缓存）按股过滤；3d 暂不支持返回空。"""
-        if not settings.dragon_tiger_enable or lhb_type != "1d":
+        东财全量明细（买入前五+卖出前五，缓存）按股过滤；1d/3d 同源分别拉取（flag='1'/'3'）。"""
+        if not settings.dragon_tiger_enable:
             return pd.DataFrame()
         try:
-            all_seats = _fetch_em_seats(trade_date)
+            all_seats = _fetch_em_seats(trade_date, lhb_type)
             if all_seats.empty:
                 return pd.DataFrame()
             if str(stock_code) == "ALL":
@@ -269,26 +327,30 @@ class DragonTigerSource:
             logger.warning("龙虎榜席位明细抓取失败 %s/%s(%s): %s", trade_date, stock_code, lhb_type, exc)
             return pd.DataFrame()
 
-    def fetch_and_merge(self, trade_date: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def fetch_and_merge(self, trade_date: str, lhb_type: str = "1d") -> tuple[pd.DataFrame, pd.DataFrame]:
         """抓取并合并：返回 (席位级流水, 股票级净买汇总)。
-        席位级 = 当日全量买卖前五席位明细（东财一次拉取）；股票级 = 东财净买 + 新浪上榜确认。
-        第二源按 DRAGON_TIGER_SECOND_SOURCE 开关聚合（当前仅新浪可作上榜确认；
-        无金额第二源 → 多源校验保持降级，second_source_status() 如实标注，不伪造）。
+        席位级 = 全量买卖前五席位明细（东财一次拉取）；股票级 = 东财净买 + 新浪上榜确认。
+        lhb_type: '1d' 当日榜 / '3d' 三日累计榜（同源不同口径；新浪仅当日，3d 无第二源）。
+        第二源按 DRAGON_TIGER_SECOND_SOURCE 开关聚合：新浪作上榜确认第二源，双源在榜
+        采信升级（confidence 0.9 + multi_source_verified），金额以东财为准；仅新浪在榜
+        降 0.55（无金额，仅上榜确认），second_source_status() 动态如实标注。
         全部失败返回两个空表。"""
         if not settings.dragon_tiger_enable:
             return pd.DataFrame(), pd.DataFrame()
 
-        # 1) 股票级：东财（含净买额）+ 第二源（按开关；新浪当前仅上榜原因确认）
-        em = self.fetch_lhb_stocks(trade_date, source="eastmoney")
+        # 1) 股票级：东财（含净买额）+ 第二源（按开关；新浪作上榜确认第二源）
+        em = self.fetch_lhb_stocks(trade_date, source="eastmoney", lhb_type=lhb_type)
         second = (settings.dragon_tiger_second_source or "auto").lower()
         sina = pd.DataFrame()
         if second != "none":
-            sina = self.fetch_lhb_stocks(trade_date, source="sina")
+            sina = self.fetch_lhb_stocks(trade_date, source="sina", lhb_type=lhb_type)
         stock_rows = pd.concat([em, sina], ignore_index=True) if not (em.empty and sina.empty) \
             else pd.DataFrame()
+        if not stock_rows.empty:
+            _apply_second_source_credit(stock_rows, em, sina)
 
-        # 2) 席位级：东财当日全量买卖前五席位明细（一次请求，当日缓存）
-        seat_df = self.fetch_lhb_seats(trade_date, "ALL", lhb_type="1d") if not em.empty \
+        # 2) 席位级：东财全量买卖前五席位明细（一次请求，缓存）
+        seat_df = self.fetch_lhb_seats(trade_date, "ALL", lhb_type=lhb_type) if not em.empty \
             else pd.DataFrame()
         if not seat_df.empty and not em.empty:
             name_map = dict(zip(em["stock_code"], em["stock_name"]))
@@ -303,51 +365,55 @@ class DragonTigerSource:
 
 
 def fetch_dragon_tiger(trade_date: str) -> pd.DataFrame:
-    """模块级便捷入口（调度/脚本用）：拉取并落库一次龙虎榜"""
+    """模块级便捷入口（调度/脚本用）：拉取并落库一次龙虎榜（当日榜 + 三日累计榜）"""
     from app.db import repo
 
     src = DragonTigerSource()
-    seats, stocks = src.fetch_and_merge(trade_date)
-    # 席位级流水落库（游资-席位映射数据）
-    rows = []
-    if not seats.empty:
-        for _, r in seats.iterrows():
-            rows.append({
-                "trade_date": r.get("trade_date") or trade_date,
-                "stock_code": str(r.get("stock_code") or ""),
-                "stock_name": str(r.get("stock_name") or ""),
-                "lhb_type": str(r.get("lhb_type") or "1d"),
-                "disclosure_reason": str(r.get("disclosure_reason") or ""),
-                "seat_name": str(r.get("seat_name") or ""),
-                "buy_amt": _num(r.get("buy_amt")),
-                "sell_amt": _num(r.get("sell_amt")),
-                "net_buy": _num(r.get("net_buy")),
-                "confidence": _num(r.get("confidence")) or _CONF_THIRD,
-                "source": str(r.get("source") or "eastmoney"),
-            })
-    n = repo.insert_lhb_flows(rows) if rows else 0
-    # 股票级净买（东财/新浪）也落库：多源校验与"无席位但上榜"标的覆盖
-    stock_rows = []
-    if not stocks.empty:
-        for _, r in stocks.iterrows():
-            stock_rows.append({
-                "trade_date": r.get("trade_date") or trade_date,
-                "stock_code": str(r.get("stock_code") or ""),
-                "stock_name": str(r.get("stock_name") or ""),
-                "lhb_type": str(r.get("lhb_type") or "1d"),
-                "disclosure_reason": str(r.get("disclosure_reason") or ""),
-                "seat_name": "",  # 股票级行：席位为空，净买为股票级龙虎榜净买额
-                "buy_amt": _num(r.get("buy_amt")),
-                "sell_amt": _num(r.get("sell_amt")),
-                "net_buy": _num(r.get("net_buy")),
-                "confidence": _num(r.get("confidence")) or _CONF_THIRD,
-                "source": str(r.get("source") or "eastmoney"),
-            })
-    n2 = repo.insert_lhb_flows(stock_rows) if stock_rows else 0
-    logger.info("龙虎榜落库 %s: 席位级 %s 条 / 股票级 %s 条", trade_date, n, n2)
-    # 第二源现状如实标注（K227 诚实：无金额第二源时单源数据保持"置信度不足仅参考"）
-    ss = second_source_status()
-    if not ss.get("available"):
-        logger.info("龙虎榜第二源现状: %s（%s）", ss.get("annotation"),
-                    "；".join(ss.get("candidates") or {}))
-    return seats
+    rows_all, stock_all, seat_frames = [], [], []
+    sina_fetched = False
+    for lhb_type in ("1d", "3d"):
+        seats, stocks = src.fetch_and_merge(trade_date, lhb_type=lhb_type)
+        # 席位级流水落库（游资-席位映射数据）
+        if not seats.empty:
+            seat_frames.append(seats)
+            for _, r in seats.iterrows():
+                rows_all.append({
+                    "trade_date": r.get("trade_date") or trade_date,
+                    "stock_code": str(r.get("stock_code") or ""),
+                    "stock_name": str(r.get("stock_name") or ""),
+                    "lhb_type": str(r.get("lhb_type") or lhb_type),
+                    "disclosure_reason": str(r.get("disclosure_reason") or ""),
+                    "seat_name": str(r.get("seat_name") or ""),
+                    "buy_amt": _num(r.get("buy_amt")),
+                    "sell_amt": _num(r.get("sell_amt")),
+                    "net_buy": _num(r.get("net_buy")),
+                    "confidence": _num(r.get("confidence")) or _CONF_THIRD,
+                    "source": str(r.get("source") or "eastmoney"),
+                })
+        # 股票级净买（东财/新浪）也落库：多源校验与"无席位但上榜"标的覆盖
+        if not stocks.empty:
+            if lhb_type == "1d":
+                sina_fetched = bool((stocks["source"] == "sina").any())
+            for _, r in stocks.iterrows():
+                stock_all.append({
+                    "trade_date": r.get("trade_date") or trade_date,
+                    "stock_code": str(r.get("stock_code") or ""),
+                    "stock_name": str(r.get("stock_name") or ""),
+                    "lhb_type": str(r.get("lhb_type") or lhb_type),
+                    "disclosure_reason": str(r.get("disclosure_reason") or ""),
+                    "seat_name": "",  # 股票级行：席位为空，净买为股票级龙虎榜净买额
+                    "buy_amt": _num(r.get("buy_amt")),
+                    "sell_amt": _num(r.get("sell_amt")),
+                    "net_buy": _num(r.get("net_buy")),
+                    "confidence": _num(r.get("confidence")) or _CONF_THIRD,
+                    "source": str(r.get("source") or "eastmoney"),
+                    "multi_source_verified": bool(r.get("multi_source_verified") or False),
+                })
+    n = repo.insert_lhb_flows(rows_all) if rows_all else 0
+    n2 = repo.insert_lhb_flows(stock_all) if stock_all else 0
+    logger.info("龙虎榜落库 %s: 席位级 %s 条 / 股票级 %s 条（含 3d）", trade_date, n, n2)
+    # 第二源上榜确认采信状态如实标注（K227 诚实：sina 拉到上榜确认 → available=True 动态反映，
+    # 金额仍以东财为准；未拉到则如实标"采信待第二源"；sina 仅当日口径，3d 无第二源）
+    ss = second_source_status(sina_fetched=sina_fetched)
+    logger.info("龙虎榜第二源状态: available=%s（%s）", ss.get("available"), ss.get("annotation"))
+    return pd.concat(seat_frames, ignore_index=True) if seat_frames else pd.DataFrame()

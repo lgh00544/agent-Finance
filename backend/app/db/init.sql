@@ -266,3 +266,157 @@ CREATE TABLE IF NOT EXISTS sector_snapshot (
     UNIQUE KEY uq_sector_date_name (trade_date, sector_name),
     KEY ix_sector_date_rank (trade_date, rank_no)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 持仓实时价快照（每 5 分钟腾讯批量落库；持仓监控页 DB 兜底解决东财全市场 hang 超时）
+-- 与 backend/app/db/models.py 的 QuoteSnapshot 一致；stock_code 唯一，新鲜度由 updated_at 判定
+CREATE TABLE IF NOT EXISTS quote_snapshot (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    stock_code VARCHAR(10) NOT NULL,
+    name VARCHAR(64) NOT NULL DEFAULT '',
+    price DECIMAL(10,3) NOT NULL DEFAULT 0,
+    change_pct FLOAT NULL,
+    source VARCHAR(8) NOT NULL DEFAULT '',           -- 'tencent' / 'universe'
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_quote_code (stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 派发期自动判定结果（每日 15:30 落库；Monitor/Sell/Score 注入参考；6 维快照 JSON）
+-- 与 backend/app/db/models.py 的 DistributionPhaseLog 一致
+CREATE TABLE IF NOT EXISTS distribution_phase_log (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    phase INT NOT NULL DEFAULT 0,
+    phase_label VARCHAR(16) NOT NULL DEFAULT '',
+    confidence VARCHAR(8) NOT NULL DEFAULT '',
+    six_dim JSON NULL,
+    missing_data JSON NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_dist_date_symbol (trade_date, symbol)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ──── 批次E 资本视图（游资真接入）；与 backend/app/db/models.py 四表一致 ────
+-- 游资维度：单标的单日命中游资（近30日窗口聚合；『三维表』之游资维）
+CREATE TABLE IF NOT EXISTS capital_actor (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    actor_name VARCHAR(32) NOT NULL,
+    seat_code VARCHAR(64) NOT NULL DEFAULT '',
+    tier VARCHAR(8) NOT NULL DEFAULT '观察',
+    net_buy DOUBLE NOT NULL DEFAULT 0,
+    days_active INT NOT NULL DEFAULT 0,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_cap_actor_dcn (trade_date, stock_code, actor_name),
+    KEY ix_cap_actor_code_date (stock_code, trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 龙虎榜维度：单标的单日龙虎榜汇总（股票级净买 + 龙头席位；『三维表』之龙虎榜维）
+CREATE TABLE IF NOT EXISTS dragon_tiger (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    lhb_type VARCHAR(8) NOT NULL DEFAULT '1d',
+    net_buy DOUBLE NOT NULL DEFAULT 0,
+    buy_amt DOUBLE NOT NULL DEFAULT 0,
+    sell_amt DOUBLE NOT NULL DEFAULT 0,
+    top_seat VARCHAR(64) NOT NULL DEFAULT '',
+    top_seat_net DOUBLE NOT NULL DEFAULT 0,
+    disclosure_reason VARCHAR(128) NOT NULL DEFAULT '',
+    confidence DOUBLE NOT NULL DEFAULT 0.8,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_dt_date_code (trade_date, stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 资金流维度：单标的单日主力/大中小单净额（『三维表』之资金流维）
+CREATE TABLE IF NOT EXISTS capital_flow (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    main_net_inflow DOUBLE NOT NULL DEFAULT 0,
+    super_large_net DOUBLE NOT NULL DEFAULT 0,
+    large_net DOUBLE NOT NULL DEFAULT 0,
+    medium_net DOUBLE NOT NULL DEFAULT 0,
+    small_net DOUBLE NOT NULL DEFAULT 0,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_cf_date_code (trade_date, stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 资本视图统计：单标的单日 30 日聚合快照（K189 对倒/协调/胜率/盈亏比/题材共振；徽章 + Agent 注入）
+CREATE TABLE IF NOT EXISTS capital_stats (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    wash_suspect TINYINT(1) NOT NULL DEFAULT 0,
+    coordination VARCHAR(8) NOT NULL DEFAULT '数据不足',
+    win_rate DOUBLE NULL,
+    payoff_ratio DOUBLE NULL,
+    avg_hold_days DOUBLE NULL,
+    theme_resonance TINYINT(1) NULL,
+    source VARCHAR(16) NOT NULL DEFAULT 'sse_only',
+    missing_data JSON NULL,
+    raw_json JSON NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_cs_date_code (trade_date, stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 板块轮动分析·全板块每日快照（收盘 15:35 落库；与 sector_snapshot 并存不替代）
+-- 与 backend/app/db/models.py 的 SectorDailySnapshot 一致；东财缺失字段如实 NULL（K227）
+CREATE TABLE IF NOT EXISTS sector_daily_snapshot (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    sector_name VARCHAR(64) NOT NULL,
+    change_pct FLOAT NOT NULL,
+    rank_no INT NOT NULL,
+    up_count INT NULL,
+    down_count INT NULL,
+    volume_ratio FLOAT NULL,
+    turnover_rate FLOAT NULL,
+    leading_stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    leading_stock_code VARCHAR(16) NOT NULL DEFAULT '',
+    leading_chg FLOAT NULL,
+    source VARCHAR(8) NOT NULL DEFAULT 'em',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_sd_date_name (trade_date, sector_name),
+    KEY ix_sd_date_rank (trade_date, rank_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 板块轮动·轮动指标快照（批次 B 状态机结果，trade_date 唯一）
+-- 与 backend/app/db/models.py 的 SectorDailyRankLog 一致
+CREATE TABLE IF NOT EXISTS sector_daily_rank_log (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    rotation_state VARCHAR(16) NOT NULL,
+    churn_rate FLOAT NULL,
+    top5_overlap INT NULL,
+    mainline_sector VARCHAR(64) NULL,
+    notes VARCHAR(255) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_rd_date (trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 板块轮动·启动归因（批次 C 子 Agent 输出；reason_chain 证据链 K227）
+-- 与 backend/app/db/models.py 的 SectorLaunchReason 一致
+CREATE TABLE IF NOT EXISTS sector_launch_reason (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    sector_name VARCHAR(64) NOT NULL,
+    rank_no INT NOT NULL,
+    reason_tags VARCHAR(128) NOT NULL DEFAULT '',
+    reason_text TEXT NULL,
+    reason_chain TEXT NULL,
+    evidence JSON NULL,
+    confidence FLOAT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_lr_date_name (trade_date, sector_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

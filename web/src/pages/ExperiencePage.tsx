@@ -380,6 +380,7 @@ function ExpLibraryPanel() {
                     {r.auto_merged === 1 ? <Tag color="purple">🤖 自动</Tag> : <Tag>👤 人工</Tag>}
                     <StatusBadge text={({ active: '已生效', rolled_back: '已回滚', rejected: '已驳回', pending_review: '待审核' } as Record<string, string>)[r.status ?? ''] ?? r.status ?? ''}
                       tone={({ active: 'ok', rolled_back: 'rolled_back' } as Record<string, string>)[r.status ?? ''] ?? 'mute'} />
+                    {IMPACT_BADGE[r.impact ?? 'low']}
                   </Space>
                   <Text type="secondary" style={{ fontSize: 12 }}>{r.body.slice(0, 60)}{r.body.length > 60 ? '…' : ''}</Text>
                 </Space>
@@ -397,6 +398,7 @@ function ExpLibraryPanel() {
             expandedRowRender: (r) => (
               <Space direction="vertical" size={4}>
                 <div><b>正文：</b>{r.body}</div>
+                <Text type="secondary">来源：{r.source_summary ?? '（无来源摘要）'} · 任务 {r.source_task_id ?? '—'}</Text>
                 <Text type="secondary">影响 {r.impact} · 创建 {String(r.created_at ?? '').slice(0, 16)} · 最后审核 {r.last_reviewed_at ?? '—'}</Text>
                 {(r.status === 'active' && r.auto_merged === 1) ? (
                   <Button size="small" danger onClick={() => confirmRollback(r)}>回滚该经验（不再注入 Agent）</Button>

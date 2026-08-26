@@ -18,17 +18,21 @@ import {
 } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { candidateConcentration, candidateDates, candidateTradeable, candidates, stockNames } from '@/api/candidates'
+import { marketCondition } from '@/api/market'
 import { trackVerifyStats } from '@/api/track'
 import { traces, traceDetail } from '@/api/traces'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, StatCard, StatCardGrid, StockLabel } from '@/components/common'
 import { applyBatchAdjust, batchMetaByAssistantId, chatHistory } from '@/api/chat'
-import type { BatchAskResult, Candidate } from '@/types'
+import type { AuditDecision, BatchAskResult, BlockDetail, Candidate, MarketAudit } from '@/types'
 
 const { Text } = Typography
 
 const TIER_MAP: Record<string, string> = { 强烈推荐: 'A', 建议关注: 'B', 谨慎观察: 'C' }
 const TIER_DOT: Record<string, string> = { A: 'red', B: 'orange', C: 'blue' }
+// 前瞻兑现三态徽章（与 confidence_tier 的 red/orange/blue 独立、不抢色；
+// 不用 var(--up)/var(--down) 红绿，避免与强烈推荐=红撞色、且延续/回吐语境用红绿会误导）
+const HORIZON_MAP: Record<string, string> = { 延续: 'success', 回归: 'default', 回吐: 'warning' }
 const LABEL_COLORS: Record<string, string> = {
   '可建仓': 'green',
   '建议关注': 'blue',
@@ -74,6 +78,12 @@ function CandidateExpand({ c }: { c: Candidate }) {
   })
 
   const tier = TIER_MAP[String(detail.confidence_tier ?? '')] ?? ''
+
+  // 前瞻兑现三态（有默认值即视为可展示；clarity=低 时徽章仍显示、note 为「数据不足」，不隐藏）
+  const horizonBias = String(detail.horizon_bias ?? '')
+  const horizonClarity = String(detail.horizon_clarity ?? '')
+  const horizonColor = HORIZON_MAP[horizonBias] ?? 'default'
+  const horizonNote = String(detail.horizon_note ?? '前瞻数据不足')
 
   // 各 Tab 内容块
   const dimsTab = (
@@ -146,6 +156,34 @@ function CandidateExpand({ c }: { c: Candidate }) {
     </div>
   )
 
+  // 审计底稿（批次4）：detail.audit 的 6 项判定 + verdict/ratio/note；存量候选无 audit → EmptyState
+  const audit = (detail.audit as MarketAudit) ?? null
+  const auditDecisions = (audit?.decisions ?? []) as AuditDecision[]
+  const auditTab = audit && auditDecisions.length ? (
+    <div>
+      <Space style={{ marginBottom: 8 }} wrap>
+        {audit.verdict ? <Tag color="blue">有效档：{String(audit.verdict)}</Tag> : null}
+        {audit.passed_ratio ? <Tag>通过 {String(audit.passed_ratio)}</Tag> : null}
+      </Space>
+      {audit.note ? <Alert type="warning" showIcon style={{ marginBottom: 8 }} message={String(audit.note)} /> : null}
+      {auditDecisions.map((d, i) => (
+        <div key={String(d.key ?? i)} style={{ marginBottom: 6 }}>
+          <Space>
+            <Text style={{ width: 130, fontWeight: 600 }}>{String(d.label ?? d.key ?? '—')}</Text>
+            <Tag color={d.passed === true ? 'green' : d.passed === false ? 'red' : 'default'}>
+              {d.passed === true ? '通过' : d.passed === false ? '未过' : '—'}
+            </Tag>
+          </Space>
+          {d.evidence ? (
+            <div style={{ marginLeft: 138 }}><Text type="secondary" style={{ fontSize: 12 }}>{String(d.evidence)}</Text></div>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  ) : (
+    <EmptyState text="暂无审计底稿（存量候选未记录 audit）。" icon="🧾" />
+  )
+
   const items = [
     { key: 'dims', label: '维度归因', children: dimsTab },
     { key: 'reasons', label: '候选理由', children: reasonsTab },
@@ -167,12 +205,14 @@ function CandidateExpand({ c }: { c: Candidate }) {
     { key: 'risks', label: '风险点', children: riskTab },
     { key: 'ops', label: '操作建议', children: opTab },
     { key: 'verify', label: '三维验证', children: verifyTab },
+    { key: 'audit', label: '审计', children: auditTab },
   ]
 
   return (
     <div>
       <Space style={{ marginBottom: 10 }}>
         {tier ? <Tag color={TIER_DOT[tier]}>{tier} 级</Tag> : null}
+        {horizonBias ? <Tag color={horizonColor} title={`清晰度：${horizonClarity || '低'}`}>前瞻·{horizonBias}</Tag> : null}
         <Tag>{String(detail.stock_type ?? '未评级')}</Tag>
         <Button
           size="small"
@@ -183,6 +223,11 @@ function CandidateExpand({ c }: { c: Candidate }) {
           生成建仓方案
         </Button>
       </Space>
+      {horizonNote && horizonNote !== '前瞻数据不足' ? (
+        <Alert type="warning" showIcon style={{ marginBottom: 10 }} message={`前瞻：${horizonBias}（${horizonClarity || '低'}）—— ${horizonNote}`} />
+      ) : (
+        <Alert type="info" showIcon style={{ marginBottom: 10 }} message="前瞻：暂无足够数据（历史同类样本不足）" />
+      )}
       <Tabs defaultActiveKey="dims" size="small" items={items} />
     </div>
   )
@@ -510,6 +555,17 @@ export function CandidatesPage() {
     queryFn: () => candidateConcentration(date),
     enabled: !!date || !!dates?.length,
   })
+  // 批次4：上游严格度横幅（market-condition 追加 strictness；缺 → 后备 band，再缺 → 不显示）
+  const { data: marketInfo } = useQuery({ queryKey: ['market-condition'], queryFn: marketCondition })
+  const mk = (marketInfo ?? {}) as Record<string, unknown>
+  const strictBanner = (() => {
+    const strict = mk.strictness ? String(mk.strictness) : null
+    const band = mk.band ? String(mk.band) : null
+    const grade = mk.grade ? String(mk.grade) : null
+    if (strict) return `今日严格度：${strict}｜市况 ${band ?? '—'}${grade ? ` ${grade}` : ''}`
+    if (band) return `市况 ${band}${grade ? ` ${grade}` : ''}`
+    return null
+  })()
 
   const dig = useTaskSubmit('daily_pipeline', (result) => {
     const count = (result as { count?: number } | null)?.count ?? 0
@@ -574,6 +630,8 @@ export function CandidatesPage() {
         </Button>
       </Space>
 
+      {strictBanner ? <Alert type="info" showIcon style={{ marginBottom: 10 }} message={strictBanner} /> : null}
+
       <StatCardGrid>
         <StatCard label="今日可建仓标的" value={Number(tradeable?.count ?? 0)}
           tone={Number(tradeable?.count ?? 0) > 0 ? 'ok' : 'mute'}
@@ -625,15 +683,23 @@ export function CandidatesPage() {
                 const tv = (tradeableMap[r.stock_code] ?? {}) as Record<string, unknown>
                 const label = String(tv.label ?? '')
                 const block = String(tv.block_reason ?? '')
+                // 批次4：拒判明细 = block_reason + block_details 逐项 {rule,passed,evidence}；旧记录无 block_details → 回落单行
+                const tvDetail = (tv.detail ?? {}) as Record<string, unknown>
+                const details = (tvDetail.block_details as BlockDetail[]) ?? []
+                const tooltipContent = details.length ? (
+                  <div>
+                    <div>{block}</div>
+                    {details.map((d, i) => (
+                      <div key={i}>{String(d.rule ?? '')}：{d.passed ? '通过' : '未过'}——{String(d.evidence ?? '')}</div>
+                    ))}
+                  </div>
+                ) : (block || '评级 / 现价 / 风险三条件均满足，建议进入建仓阶段')
                 return (
                   <Space size={6} wrap>
                     <Text type="secondary">#{r.rank ?? '—'}</Text>
                     <StockLabel code={r.stock_code} name={nameOf(r)} />
                     {label ? (
-                      <Tooltip
-                        title={block || '评级 / 现价 / 风险三条件均满足，建议进入建仓阶段'}
-                        placement="top"
-                      >
+                      <Tooltip title={tooltipContent} placement="top">
                         <Tag color={LABEL_COLORS[label] ?? 'default'} style={{ marginInlineEnd: 0 }}>
                           {label}
                         </Tag>

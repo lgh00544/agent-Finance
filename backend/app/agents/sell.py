@@ -83,6 +83,49 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 组合快照读取失败降级标注不可用，不阻塞卖出决策
         logger.warning("组合风险上下文读取失败（降级标注不可用）: %s", exc)
 
+    # 派发期判定（batch D）：6 维自动判定事实（LLM 一票否决）；失败为 None 不阻断
+    distribution_phase_context = None
+    try:
+        from app.services.distribution_phase import compute_distribution_phase
+        _dist = compute_distribution_phase(code, today)
+        if _dist:
+            distribution_phase_context = {
+                "phase": _dist.get("phase"),
+                "phase_label": _dist.get("phase_label"),
+                "confidence": _dist.get("confidence"),
+                "six_dim": _dist.get("six_dim"),
+                "missing_data": _dist.get("missing_data") or [],
+            }
+    except Exception as exc:  # noqa: BLE001 派发期判定失败跳过注入，不阻塞卖出决策
+        logger.warning("派发期判定失败（跳过注入）: %s", exc)
+
+    # 资本视图（批次E）：游资三维 + K189 对倒纯代码判定（portfolio_risk_context 后 D 后注入）；失败 None 不阻断
+    capital_view_context = None
+    try:
+        from app.services.capital_view import compute_capital_view
+        capital_view_context = compute_capital_view(code, today)
+    except Exception as exc:  # noqa: BLE001 资本视图失败跳过注入，不阻塞卖出决策
+        logger.warning("资本视图失败（跳过注入）: %s", exc)
+
+    # K139 SOP 触发判定（批次G）：持盈不持亏事实层（参考权重，LLM 一票否决）；失败 None 不阻断
+    k139_sop = None
+    try:
+        from app.services.red_line_check import account_total_asset, compute_red_line
+        _kl = indicators.get("recent_klines") or []
+        _low = float(_kl[-1].get("low")) if _kl and _kl[-1].get("low") is not None else None
+        _red = compute_red_line(
+            [{"stock_code": code,
+              "entry_price": holding.entry_price,
+              "cost": getattr(holding, "cost", None),
+              "shares": holding.shares,
+              "high_price": getattr(holding, "high_price", None)}],
+            {code: last_close},
+            account_total_asset(), trade_date=today, lows={code: _low})
+        if _red:
+            k139_sop = _red[0].get("k139_sop")
+    except Exception as exc:  # noqa: BLE001 K139 SOP 失败跳过注入，不阻塞卖出决策
+        logger.warning("K139 SOP 触发判定失败（跳过注入）: %s", exc)
+
     state["sell_input"] = {
         "holding": {"entry_date": holding.entry_date, "entry_price": holding.entry_price,
                     "shares": holding.shares, "stop_loss": holding.stop_loss,
@@ -96,6 +139,10 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
         "news_titles": news_titles,
         "hot_money": hm_agg,
         "portfolio_risk_context": portfolio_risk_context,
+        "distribution_phase_context": distribution_phase_context,
+        "capital_view_context": capital_view_context,
+        # K139 SOP 触发判定（批次G）：{trailing_stop, stage, next_action}，参考权重非死条件
+        "k139_sop": k139_sop,
     }
     state["tech_index"] = indicators
     state["trace"] = [*state.get("trace", []),
@@ -133,6 +180,8 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
         "最新新闻标题": data["news_titles"],
         # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
         "游资聚合": data.get("hot_money"),
+        # K139 SOP 触发判定（批次G）：持盈不持亏事实层（缺失为 None 不注入噪音）
+        "【K139 SOP 触发判定】": data.get("k139_sop"),
     }
 
     # 组合风险上下文 → 文本（只读参考；缺失标注不可用，不影响个股独立研判）

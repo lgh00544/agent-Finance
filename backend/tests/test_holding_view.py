@@ -24,7 +24,7 @@ def _spot(*items):
     return pd.DataFrame([{"code": c, "name": n, "price": p} for c, n, p in items])
 
 
-def _mock_sources(monkeypatch, holdings, plans=None, spot=None, exc=None):
+def _mock_sources(monkeypatch, holdings, plans=None, spot=None, exc=None, snapshot=None):
     monkeypatch.setattr(holding_view.repo, "list_holdings", lambda status=None: holdings)
 
     def _plans(code=None, limit=50):
@@ -34,8 +34,14 @@ def _mock_sources(monkeypatch, holdings, plans=None, spot=None, exc=None):
         return rows
 
     monkeypatch.setattr(holding_view.repo, "list_plans", _plans)
+    # 三级取数链降级依赖：腾讯批量默认空 → DB 快照（可注入）→ 全市场快照（原逻辑）
+    monkeypatch.setattr(holding_view.repo, "get_quote_snapshot",
+                        lambda within_minutes=10: snapshot)
 
     class _Source:
+        def fetch_tencent_batch(self, codes, timeout=8):
+            return {}
+
         def fetch_spot_universe(self):
             if exc is not None:
                 raise exc
@@ -149,3 +155,13 @@ def test_no_quote_symbol_keeps_none(monkeypatch):
     r = holding_view.build_holding_view()["rows"][0]
     assert r["current_price"] is None
     assert r["target_pct"] is None
+
+
+def test_db_snapshot_tier_used_when_tencent_empty(monkeypatch):
+    """腾讯批量空 → DB 快照兜底（source='snapshot'）"""
+    _mock_sources(monkeypatch,
+                  holdings=[_holding(1, "600519", "贵州茅台", "2026-07-20", 100.0, 100)],
+                  snapshot=_spot(("600519", "贵州茅台", 108.0)))
+    view = holding_view.build_holding_view()
+    assert view["source"] == "snapshot"
+    assert view["rows"][0]["current_price"] == 108.0

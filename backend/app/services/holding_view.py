@@ -29,6 +29,34 @@ def _quote_map(spot_df) -> dict[str, float]:
     return result
 
 
+def _fetch_holding_quotes(codes: list[str]) -> tuple[dict[str, float], str, str | None]:
+    """持仓价三级取数（任一成功即返回）：①腾讯批量 → ②DB快照 → ③全市场快照。
+
+    返回 (quotes, source, error)；source ∈ 'tencent'/'snapshot'/'universe'；
+    全失败 return ({}, "universe", error)。只取数 + 降级，不做任何研判。"""
+    # ① 腾讯批量（首选：N 只 = 1 次 HTTP，实测 0.56s，不占东财反爬额度）
+    try:
+        quotes = get_datasource().fetch_tencent_batch(codes)
+        if quotes:
+            return quotes, "tencent", None
+    except Exception as exc:  # noqa: BLE001 降级不阻塞
+        logger.warning("持仓行情·腾讯批量失败: %s", exc)
+    # ② DB 快照兜底（10 分钟内，秒回；跨进程共享定时快照）
+    try:
+        snapshot = repo.get_quote_snapshot(within_minutes=10)
+        if snapshot is not None and not snapshot.empty:
+            return _quote_map(snapshot), "snapshot", None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("持仓行情·DB快照读取失败: %s", exc)
+    # ③ 全市场快照（原逻辑；akshare 挂返回空但不阻塞）
+    try:
+        quotes = _quote_map(get_datasource().fetch_spot_universe())
+        return quotes, "universe", None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("持仓行情·全市场快照失败: %s", exc)
+        return {}, "universe", f"行情获取失败：{exc}"
+
+
 def _round2(value: float) -> float:
     return round(value, 2)
 
@@ -47,12 +75,10 @@ def build_holding_view() -> dict:
                 "total_capital": settings.total_capital}
 
     quote_error = None
+    source = ""
     quotes: dict[str, float] = {}
-    try:
-        quotes = _quote_map(get_datasource().fetch_spot_universe())
-    except Exception as exc:  # noqa: BLE001 行情失败不阻塞列表展示
-        logger.warning("持仓行情刷新失败: %s", exc)
-        quote_error = f"行情获取失败：{exc}"
+    # 三级取数：腾讯批量 → DB 快照 → 全市场快照（任一成功即返回，全失败不阻塞列表）
+    quotes, source, quote_error = _fetch_holding_quotes([r["stock_code"] for r in rows])
 
     plan_rows = repo.list_plans(limit=500)
     plans = {p["id"]: p for p in plan_rows}
@@ -90,7 +116,7 @@ def build_holding_view() -> dict:
                     "take_profit": take_profit, "take_profit_source": tp_src,
                     "target_pct": target_pct})
     return {"rows": out, "quote_time": now_min, "quote_error": quote_error,
-            "total_capital": settings.total_capital}
+            "source": source, "total_capital": settings.total_capital}
 
 
 def build_account_summary() -> dict:

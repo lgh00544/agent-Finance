@@ -120,6 +120,9 @@ def collect_review(state: StockAgentState) -> StockAgentState:
         "price_stats": price_stats,
         "portfolio_attribution": _portfolio_attribution(
             code, pnl_pct, state.get("trade_date") or time.strftime("%Y-%m-%d")),
+        # 周期复利 + 组合归因（批次H）：历史多次操作汇总 + 组合曲线/贡献者/最大拖累者（复盘顶部事实）
+        "cycle_attribution": _cycle_attribution(code),
+        "portfolio_curve": _portfolio_curve_summary(),
     }
     state["trace"] = [*state.get("trace", []),
                       f"复盘数据聚合: 持有{hold_days}天 盈亏{pnl_pct}% 信号{len(signal_rows)}条 "
@@ -149,6 +152,26 @@ def _portfolio_attribution(code: str, pnl_pct: float | None, trade_date: str) ->
         "drawdown_contrib": round(pnl_pct, 2) if (pnl_pct is not None and pnl_pct < 0) else 0.0,
         "missing_data": missing,
     }
+
+
+def _cycle_attribution(code: str) -> dict | None:
+    """批次H：该股历史多次操作的周期复利汇总（参考权重；失败返回 None 不阻塞复盘）"""
+    try:
+        from app.services.track_verify import build_stock_cycle_attribution
+        return build_stock_cycle_attribution(code)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("周期复利读取失败（跳过注入）: %s", exc)
+        return None
+
+
+def _portfolio_curve_summary() -> dict:
+    """批次H：组合归因摘要（曲线 + 贡献者 + 最大拖累者；失败返回空结构不阻塞复盘）"""
+    try:
+        from app.services.track_verify import build_portfolio_attribution
+        return build_portfolio_attribution(30)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("组合归因读取失败（跳过注入）: %s", exc)
+        return {"portfolio_curve": [], "contributors": [], "drag_analysis": None}
 
 
 def llm_review(state: StockAgentState) -> StockAgentState:

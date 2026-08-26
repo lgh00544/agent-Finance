@@ -2,16 +2,17 @@
 rem ============================================================
 rem  run_dev.bat  -  本地启动：先同步云端到本地，再起服务
 rem  用法：双击本文件，或命令行运行 run_dev.bat
-rem  效果：启动 backend + streamlit，启动前自动 sync_manager backup
+rem  效果：启动 backend + React 前端（web/，Vite dev 5173），启动前自动 sync_manager backup
 rem         （云端 TiDB 最新数据拉到本地 data/dev.db，含自动快照备份）
 rem  说明：同步失败不阻塞启动（本地有旧快照可读，会提示但继续）
 rem  开关：.env 里 SYNC_ON_START=false 时跳过同步直接启动
+rem  注意：Streamlit（8501）已退役，旧启动入口已注释，不再执行
 rem ============================================================
 setlocal
 cd /d "%~dp0"
 
 set PY=D:\space\self\self\.venv\Scripts\python.exe
-set ST=D:\space\self\self\.venv\Scripts\streamlit.exe
+rem set ST=D:\space\self\self\.venv\Scripts\streamlit.exe   (Streamlit 已退役，不再启动)
 
 if not exist "%PY%" (
     echo [ERROR] venv python not found: %PY%
@@ -54,13 +55,13 @@ start "stock-backend" cmd /c ""%PY%" backend\scripts\dev_run.py"
 
 echo.
 echo ============================================================
-echo  [3/3] 启动 Streamlit 面板 (http://127.0.0.1:8501)
+echo  [3/3] 启动 React 前端 (http://localhost:5173)
 echo ============================================================
-rem streamlit.exe 启动器在本机 Python 3.14 下会静默退出（exit 1 无输出），
-rem 改走 python -m streamlit 稳定启动
-"%PY%" -m streamlit run streamlit\app.py
+rem ---- Streamlit（8501）已退役，以下旧入口不再执行 ----
+rem start "stock-streamlit" cmd /c ""%ST%" run streamlit\app.py"
+start "stock-web" cmd /c "cd /d "%~dp0web" && npm run dev"
 
 echo.
-echo Streamlit 已退出，如需停止 backend 请关闭 "stock-backend" 窗口。
+echo React 前端已退出，如需停止 backend 请关闭 "stock-backend" 窗口。
 pause
 endlocal

@@ -1,5 +1,5 @@
 import { get, post } from './client'
-import type { HotMoneyFlow, HotMoneyProfile } from '@/types'
+import type { CapitalView, HotMoneyFlow, HotMoneyProfile } from '@/types'
 
 /** GET /api/hot-money/profiles（q=模糊搜索、tier=档位过滤） */
 export const hotMoneyProfiles = (q = '', tier = ''): Promise<HotMoneyProfile[]> =>
@@ -36,3 +36,7 @@ export const hotMoneyWinrateIterate = (): Promise<Record<string, unknown>> =>
 /** POST /api/hot-money/tier/apply（仅 approved 建议可应用） */
 export const hotMoneyTierApply = (suggestionId: number): Promise<Record<string, unknown>> =>
   post('/hot-money/tier/apply', { suggestion_id: suggestionId })
+
+/** GET /api/capital_view/{code}（K189 对倒 + 游资活跃 + 30日统计；force 穿透当日缓存） */
+export const capitalView = (code: string, force = false): Promise<CapitalView> =>
+  get(`/capital_view/${code}`, force ? { force: true } : {})

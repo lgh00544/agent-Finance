@@ -6,19 +6,25 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from sqlalchemy import delete, func, select, text
+import pandas as pd
+
+from sqlalchemy import delete, func, select, text, update
 
 from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
-    Experience, ExperienceConfig, Holding, HotMoneyProfile, LhbOriginalFlow,
-    MarketCondition, MarketIntel, NewsArticle, PendingExperience, PositionPlan,
-    PrivateKnowledge, ReviewLog, ReviewResult, RuleChange, SectorSnapshot,
-    SellDecision, StockCandidate, StockScore, TradeProfile, TradeRecord, WorkerRun, _now,
+    CapitalActor, CapitalFlow, CapitalStats, DragonTiger,
+    Experience, ExperienceConfig, ForwardViewHistory, Holding, HotMoneyProfile,
+    LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
+    PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
+    SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
+    SellDecision, StockCandidate, StockScore, TradeProfile,
+    TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace
@@ -81,6 +87,18 @@ def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: in
         # 推理留痕（异步批量写，零阻塞）：discover 结论=候选理由+风险初判+detail 结构字段
         reasoning_trace.trace_candidate(stock_code, stock_name, trade_date, reasons,
                                         risk_notice, snapshot, detail or {}, row.created_at)
+
+
+def get_candidate_detail(stock_code: str, trade_date: str) -> dict:
+    """读候选 detail（只读，幂等）。供 discover 终选构造 detail 时做防御式 merge：
+    在 {**existing, **new_detail} 中保留旧字段（confidence_tier/final_advice/dimensions/enriched 等），
+    防止整 dict 覆盖丢键。无记录返回 {}。"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(StockCandidate.detail).where(
+                StockCandidate.stock_code == stock_code, StockCandidate.trade_date == trade_date)
+        ).scalar_one_or_none()
+        return (row or {}) or {}
 
 
 def replace_day_candidates(codes: set[str], trade_date: str) -> int:
@@ -174,7 +192,7 @@ def get_latest_market_condition() -> dict | None:
         ).scalar_one_or_none()
         if row is None:
             return None
-        cap, band = market_band_info(row.total_score)
+        cap, band, *_ = market_band_info(row.total_score)
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
@@ -192,7 +210,7 @@ def get_prev_market_condition() -> dict | None:
         if len(rows) < 2:
             return None
         row = rows[1]
-        cap, band = market_band_info(row.total_score)
+        cap, band, *_ = market_band_info(row.total_score)
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
@@ -263,6 +281,206 @@ def get_sector_snapshot_updated_at(trade_date: str) -> str | None:
             .limit(1)
         ).scalar_one_or_none()
         return str(row) if row is not None else None
+
+
+# ==================== 板块轮动·全板块日快照（sector_daily_snapshot） ====================
+
+def upsert_sector_daily_snapshot(rows: list[dict]) -> int:
+    """全板块日快照删后插（trade_date 全删当日覆盖，简单稳，不做 ORM merge）。
+    rows 每项字段：trade_date/sector_name/change_pct/rank_no/up_count/down_count/
+                   volume_ratio/turnover_rate/leading_stock_name/leading_stock_code/
+                   leading_chg/source；返回写入行数。"""
+    if not rows:
+        return 0
+    trade_date = rows[0].get("trade_date", "")
+    if not trade_date:
+        return 0
+    with SessionLocal() as db:
+        db.execute(
+            text("DELETE FROM sector_daily_snapshot WHERE trade_date = :d"),
+            {"d": trade_date},
+        )
+        for r in rows:
+            db.add(SectorDailySnapshot(
+                trade_date=r["trade_date"],
+                sector_name=r["sector_name"],
+                change_pct=r["change_pct"],
+                rank_no=r["rank_no"],
+                up_count=r.get("up_count"),
+                down_count=r.get("down_count"),
+                volume_ratio=r.get("volume_ratio"),
+                turnover_rate=r.get("turnover_rate"),
+                leading_stock_name=r.get("leading_stock_name", ""),
+                leading_stock_code=r.get("leading_stock_code", ""),
+                leading_chg=r.get("leading_chg"),
+                source=r.get("source", "em"),
+            ))
+        db.commit()
+    return len(rows)
+
+
+def list_sector_daily_by_date(trade_date: str) -> list[dict]:
+    """按交易日取全板块日快照（rank_no 升序），批次 B 轮动判定输入"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorDailySnapshot)
+            .where(SectorDailySnapshot.trade_date == trade_date)
+            .order_by(SectorDailySnapshot.rank_no.asc())
+        ).scalars().all()
+        return [
+            {
+                "trade_date": r.trade_date,
+                "sector_name": r.sector_name,
+                "change_pct": r.change_pct,
+                "rank_no": r.rank_no,
+                "up_count": r.up_count,
+                "down_count": r.down_count,
+                "volume_ratio": r.volume_ratio,
+                "turnover_rate": r.turnover_rate,
+                "leading_stock_name": r.leading_stock_name,
+                "leading_stock_code": r.leading_stock_code,
+                "leading_chg": r.leading_chg,
+                "source": r.source,
+            }
+            for r in result
+        ]
+
+
+def list_sector_daily_history(sector_name: str, days: int) -> list[dict]:
+    """按板块名取近 N 日快照（trade_date 升序），批次 B streak 连续居前判定"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorDailySnapshot)
+            .where(SectorDailySnapshot.sector_name == sector_name)
+            .order_by(SectorDailySnapshot.trade_date.desc())
+            .limit(days)
+        ).scalars().all()
+        return [
+            {"trade_date": r.trade_date, "rank_no": r.rank_no,
+             "change_pct": r.change_pct, "sector_name": r.sector_name}
+            for r in reversed(result)
+        ]
+
+
+def list_sector_daily_dates(limit: int = 60) -> list[str]:
+    """取有全板块快照的交易日（trade_date 降序），批次 B 取「昨日 top5」必要管道"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorDailySnapshot.trade_date)
+            .distinct()
+            .order_by(SectorDailySnapshot.trade_date.desc())
+            .limit(limit)
+        ).scalars().all()
+        return list(result)
+
+
+# ==================== 板块轮动·轮动指标快照（sector_daily_rank_log） ====================
+
+def upsert_sector_rank_log(row: dict) -> int:
+    """轮动指标快照删后插（trade_date 唯一，当日最后一次覆盖）。
+    row 字段：trade_date/rotation_state/churn_rate/top5_overlap/mainline_sector/notes"""
+    if not row or not row.get("trade_date"):
+        return 0
+    with SessionLocal() as db:
+        db.execute(
+            text("DELETE FROM sector_daily_rank_log WHERE trade_date = :d"),
+            {"d": row["trade_date"]},
+        )
+        db.add(SectorDailyRankLog(
+            trade_date=row["trade_date"],
+            rotation_state=row.get("rotation_state", ""),
+            churn_rate=row.get("churn_rate"),
+            top5_overlap=row.get("top5_overlap"),
+            mainline_sector=row.get("mainline_sector"),
+            notes=row.get("notes", ""),
+        ))
+        db.commit()
+    return 1
+
+
+def get_sector_rank_log(trade_date: str) -> dict | None:
+    """按交易日取轮动指标快照（无 → None）"""
+    with SessionLocal() as db:
+        r = db.execute(
+            select(SectorDailyRankLog)
+            .where(SectorDailyRankLog.trade_date == trade_date)
+        ).scalars().first()
+        if r is None:
+            return None
+        return {"trade_date": r.trade_date, "rotation_state": r.rotation_state,
+                "churn_rate": r.churn_rate, "top5_overlap": r.top5_overlap,
+                "mainline_sector": r.mainline_sector, "notes": r.notes}
+
+
+# ==================== 持仓实时价快照（quote_snapshot，持仓监控页 DB 兜底） ====================
+
+def upsert_quote_snapshot(rows: list[dict]) -> int:
+    """整表清除后批量插入持仓价快照（行数小，删后插简单稳，仿 upsert_sector_snapshot）
+    rows 每项字段：stock_code/name/price/change_pct/source/updated_at；返回写入行数。"""
+    if not rows:
+        return 0
+    with SessionLocal() as db:
+        db.execute(text("DELETE FROM quote_snapshot"))
+        for r in rows:
+            db.add(QuoteSnapshot(
+                stock_code=r["stock_code"],
+                name=r.get("name", ""),
+                price=r.get("price", 0.0),
+                change_pct=r.get("change_pct"),
+                source=r.get("source", ""),
+                updated_at=_parse_ts(r.get("updated_at")),
+            ))
+        db.commit()
+    return len(rows)
+
+
+def _parse_ts(value) -> datetime:
+    """updated_at 容错：datetime 直通；'YYYY-MM-DD HH:MM:SS' 字符串转 datetime；异常回落 now()"""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    return datetime.now()
+
+
+def get_quote_snapshot(within_minutes: int = 10) -> pd.DataFrame | None:
+    """读 updated_at 在 N 分钟内的持仓价快照（DB 兜底二级）。
+
+    返回 DataFrame（code/name/price/change_pct/source）；表空或全部过期返回 None
+    （调用方走下一级全市场快照兜底）。首页热路径 O(rows) 秒回，无外部请求。"""
+    cutoff = datetime.now() - timedelta(minutes=within_minutes)
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(QuoteSnapshot).where(QuoteSnapshot.updated_at >= cutoff)
+        ).scalars().all()
+    if not rows:
+        return None
+    return pd.DataFrame([
+        {"code": r.stock_code, "name": r.name, "price": r.price,
+         "change_pct": r.change_pct, "source": r.source}
+        for r in rows
+    ])
+
+
+def upsert_distribution_phase(trade_date: str, symbol: str, phase: int, phase_label: str,
+                              confidence: str, six_dim: dict, missing_data: list) -> None:
+    """派发期判定结果幂等落库（(trade_date, symbol) 唯一键冲突时覆盖）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(DistributionPhaseLog).where(
+                DistributionPhaseLog.trade_date == trade_date,
+                DistributionPhaseLog.symbol == symbol)
+        ).scalar_one_or_none()
+        if row is None:
+            row = DistributionPhaseLog(trade_date=trade_date, symbol=symbol)
+            db.add(row)
+        row.phase, row.phase_label, row.confidence = phase, phase_label, confidence
+        row.six_dim, row.missing_data = six_dim or {}, missing_data or []
+        row.updated_at = _now()
+        db.commit()
 
 
 # ==================== 市场研判底座（market_intel，每日收盘后 1 次 + 手动入口） ====================
@@ -1067,6 +1285,97 @@ def update_track_verify(row_id: int, *, t3_pct=None, t5_pct=None, t10_pct=None,
         _invalidate("track_verify")
 
 
+# ==================== 前瞻回填闭环（预测性选股 2.5） ====================
+
+def upsert_forward_view(stock_code: str, trade_date: str, forward_view: str,
+                        forward_signals: dict) -> int:
+    """落库前瞻快照（幂等：同 code+date 已存在则更新 forward_view/signals，不重复插）。
+    返回行 id；missing_data 跳过判定在服务层完成，本函数只做存取。"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(ForwardViewHistory).where(
+                ForwardViewHistory.stock_code == stock_code,
+                ForwardViewHistory.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = ForwardViewHistory(stock_code=stock_code, trade_date=trade_date,
+                                     forward_view=forward_view,
+                                     forward_signals=forward_signals or {})
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        else:
+            row.forward_view = forward_view
+            row.forward_signals = forward_signals or {}
+            db.commit()
+        _invalidate("forward_view")
+        return row.id
+
+
+def list_unfilled_forward_view(cutoff_date: str, limit: int = 500) -> list[dict]:
+    """待回填前瞻快照：选入日 ≤ cutoff 且 t5_pct_actual IS NULL（每日 16:00 回填 cron 用）"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = (select(ForwardViewHistory)
+                    .where(ForwardViewHistory.trade_date <= cutoff_date,
+                           ForwardViewHistory.t5_pct_actual.is_(None))
+                    .order_by(ForwardViewHistory.trade_date)
+                    .limit(limit))
+            return [{"id": r.id, "stock_code": r.stock_code, "trade_date": r.trade_date,
+                     "forward_view": r.forward_view, "forward_signals": r.forward_signals or {}}
+                    for r in db.execute(stmt).scalars().all()]
+    return _dbq("forward_view", {"cutoff": cutoff_date}, _load)
+
+
+def get_track_verify_t5_pct(stock_code: str, select_date: str) -> float | None:
+    """追踪行 T+5 实际涨跌幅（回填 t5_pct_actual 用；无行/无值返回 None，不补 0）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(CandidateTrackVerify).where(
+                CandidateTrackVerify.stock_code == stock_code,
+                CandidateTrackVerify.select_date == select_date)
+        ).scalar_one_or_none()
+        return row.t5_pct if row is not None else None
+
+
+def update_forward_view_actual(row_id: int, actual: float, bucket: str) -> None:
+    """回填 t5_pct_actual + 校准 bucket（correct/wrong/neutral；幂等覆盖）"""
+    with SessionLocal() as db:
+        row = db.get(ForwardViewHistory, row_id)
+        if row is None:
+            return
+        row.t5_pct_actual = float(actual)
+        row.t5_filled_at = datetime.now()
+        row.accuracy_bucket = bucket
+        db.commit()
+        _invalidate("forward_view")
+
+
+def compute_forward_view_accuracy(lookback_days: int = 30) -> dict:
+    """近 lookback_days 日前瞻准确率（校准先验用）：按 forward_view 分桶统计。
+    准确率 = correct / (correct + wrong)，neutral 不计入分母；无样本返回 0（诚实标注）。"""
+    cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(ForwardViewHistory)
+            .where(ForwardViewHistory.trade_date >= cutoff,
+                   ForwardViewHistory.accuracy_bucket.isnot(None))
+        ).scalars().all()
+    strong_c = sum(1 for r in rows if r.forward_view == "强" and r.accuracy_bucket == "correct")
+    strong_d = sum(1 for r in rows if r.forward_view == "强" and r.accuracy_bucket != "neutral")
+    weak_c = sum(1 for r in rows if r.forward_view == "弱" and r.accuracy_bucket == "correct")
+    weak_d = sum(1 for r in rows if r.forward_view == "弱" and r.accuracy_bucket != "neutral")
+    return {
+        "strong": round(strong_c / strong_d, 4) if strong_d else 0.0,
+        "strong_n": strong_d,
+        "weak": round(weak_c / weak_d, 4) if weak_d else 0.0,
+        "weak_n": weak_d,
+        "neutral_n": sum(1 for r in rows if r.accuracy_bucket == "neutral"),
+        "total": len(rows),
+        "lookback_days": lookback_days,
+    }
+
+
 def list_untracked_candidates() -> list[dict]:
     """候选池中尚未进入追踪表的全部标的（自愈初始化数据源：无日期过滤，
     任何一天漏跑下次运行自动补齐）；每日仅调用一次，不走 _dbq"""
@@ -1086,15 +1395,21 @@ def list_untracked_candidates() -> list[dict]:
                 for c, _ in db.execute(stmt).all()]
 
 
-def list_track_verify(select_date: str = "", rating: str = "",
-                      is_finished: int | None = None, limit: int = 200) -> list[dict]:
-    """追踪验证行列表（按选中日+排序；60s 缓存，写后失效）"""
+def list_track_verify(select_date: str = "", start_date: str = "", end_date: str = "",
+                      rating: str = "", is_finished: int | None = None,
+                      limit: int = 200) -> list[dict]:
+    """追踪验证行列表（select_date 兼容旧单参；start_date/end_date 时间范围；60s 缓存，写后失效）"""
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(CandidateTrackVerify).order_by(
                 CandidateTrackVerify.select_date.desc(), CandidateTrackVerify.id)
             if select_date:
                 stmt = stmt.where(CandidateTrackVerify.select_date == select_date)
+            elif start_date or end_date:
+                if start_date:
+                    stmt = stmt.where(CandidateTrackVerify.select_date >= start_date)
+                if end_date:
+                    stmt = stmt.where(CandidateTrackVerify.select_date <= end_date)
             if rating:
                 stmt = stmt.where(CandidateTrackVerify.select_rating == rating)
             if is_finished is not None:
@@ -1110,8 +1425,26 @@ def list_track_verify(select_date: str = "", rating: str = "",
                      "created_at": str(r.created_at)} for r in rows]
 
     return _dbq("track_verify",
-                {"date": select_date, "rating": rating,
-                 "finished": is_finished, "limit": limit}, _load)
+                {"date": select_date, "start": start_date, "end": end_date,
+                 "rating": rating, "finished": is_finished, "limit": limit}, _load)
+
+
+def fetch_daily_kline(code: str, start_date: str, end_date: str) -> list[dict]:
+    """单股日K（透传 datasource；供 kline 接口/多日盈亏曲线渲染；纯数据无判断）。
+    失败返回空列表（不抛，单标的行情缺失不阻塞）。"""
+    try:
+        from app.datasource.fallback import get_datasource
+        df = get_datasource().fetch_daily_kline(code, start_date, end_date)
+        if df is None or df.empty:
+            return []
+        out = []
+        for _, r in df.iterrows():
+            out.append({"date": str(r.get("date") or "")[:10], "open": r.get("open"),
+                        "high": r.get("high"), "low": r.get("low"), "close": r.get("close"),
+                        "volume": r.get("volume")})
+        return out
+    except Exception:  # noqa: BLE001 单股行情失败降级空列表
+        return []
 
 
 def list_track_verify_dates(limit: int = 30) -> list[str]:
@@ -1377,6 +1710,23 @@ def delete_knowledge(knowledge_id: int) -> bool:
         db.delete(row)
         db.commit()
         return True
+
+
+def bump_knowledge_hits(knowledge_ids: list[int]) -> int:
+    """私有知识命中计量（决策级归因）：hit_count+1 + last_used_at=now，批量一次 UPDATE。
+    只加不自减（保留历史累计命中，不因"未用"清零）；空列表不执行；
+    调用方已降级（知识检索/对话回吐失败仅 warning，不阻塞主链路）。"""
+    ids = [int(i) for i in knowledge_ids if i]
+    if not ids:
+        return 0
+    with SessionLocal() as db:
+        res = db.execute(
+            update(PrivateKnowledge)
+            .where(PrivateKnowledge.id.in_(ids))
+            .values(hit_count=PrivateKnowledge.hit_count + 1, last_used_at=datetime.now())
+        )
+        db.commit()
+        return int(res.rowcount or 0)
 
 
 # ==================== 卖出决策（SellAgent 输出，仅供参考） ====================
@@ -1772,16 +2122,16 @@ def get_profile_by_seat(seat_name: str) -> dict | None:
             return p
     # 停用词归一化：去掉公司/营业部常见后缀词，保留主体（如 中信证券股份有限公司上海分公司
     # → 中信 上海分公司），种子与真实席位都归一化后做包含匹配
-    norm = _normalize_seat(seat)
+    norm = normalize_seat(seat)
     for p in list_hot_money_profiles():
-        p_norm = _normalize_seat(p.get("seat_code") or "")
+        p_norm = normalize_seat(p.get("seat_code") or "")
         if p_norm and (p_norm in norm or norm in p_norm):
             return p
     return None
 
 
-def _normalize_seat(seat: str) -> str:
-    """席位名停用词归一化（模糊匹配辅助，非市场判断）"""
+def normalize_seat(seat: str) -> str:
+    """席位名停用词归一化（模糊匹配辅助，非市场判断；游资信号归一化匹配复用）"""
     for word in ("股份有限公司", "有限责任公司", "证券营业部", "营业部", "证券", "分公司"):
         seat = seat.replace(word, "")
     return seat.strip()
@@ -1791,7 +2141,8 @@ def _normalize_seat(seat: str) -> str:
 
 def insert_lhb_flows(rows: list[dict]) -> int:
     """批量插入龙虎榜流水（rows: trade_date/stock_code/stock_name/lhb_type/
-    disclosure_reason/seat_name/buy_amt/sell_amt/net_buy/confidence/source）"""
+    disclosure_reason/seat_name/buy_amt/sell_amt/net_buy/confidence/source/
+    multi_source_verified）"""
     if not rows:
         return 0
     with SessionLocal() as db:
@@ -1804,7 +2155,8 @@ def insert_lhb_flows(rows: list[dict]) -> int:
                 buy_amt=float(r.get("buy_amt") or 0.0), sell_amt=float(r.get("sell_amt") or 0.0),
                 net_buy=float(r.get("net_buy") or 0.0),
                 confidence=float(r.get("confidence") or 1.0),
-                source=r.get("source", "eastmoney")))
+                source=r.get("source", "eastmoney"),
+                multi_source_verified=bool(r.get("multi_source_verified") or False)))
         db.commit()
         _invalidate("lhb")
     return len(rows)
@@ -1831,6 +2183,7 @@ def list_lhb_flows(trade_date: str | None = None, stock_code: str | None = None,
                  "disclosure_reason": r.disclosure_reason, "seat_name": r.seat_name,
                  "buy_amt": r.buy_amt, "sell_amt": r.sell_amt, "net_buy": r.net_buy,
                  "confidence": r.confidence, "source": r.source,
+                 "multi_source_verified": bool(r.multi_source_verified),
                  "created_at": str(r.created_at)} for r in rows]
 
     return _dbq("lhb", {"trade_date": trade_date, "stock_code": stock_code,
@@ -1846,13 +2199,145 @@ def hot_money_fingerprint() -> str:
     return f"{n}:{last.strftime('%Y%m%d%H%M%S') if last else '0'}"
 
 
+# ==================== 批次E 资本视图 4 表落库（游资真接入；聚合由 services/capital_view 计算） ====================
+
+def upsert_capital_view(snapshot: dict) -> int:
+    """资本视图快照落库 4 表（同 stock_code+trade_date 删后插，仿 upsert_sector_snapshot）。
+    snapshot 字段：trade_date/stock_code 必填；recent_actors/dragon_tiger_rows/capital_flow_rows/
+    stats(wash_suspect/coordination/win_rate/payoff_ratio/avg_hold_days/theme_resonance/
+    source/missing_data)/raw。返回写入行数。"""
+    trade_date = snapshot.get("trade_date", "")
+    stock_code = snapshot.get("stock_code", "")
+    if not trade_date or not stock_code:
+        return 0
+    source = snapshot.get("source", "sse_only")
+    stats = snapshot.get("stats") or {}
+    with SessionLocal() as db:
+        db.execute(text("DELETE FROM capital_actor WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        for a in snapshot.get("recent_actors") or []:
+            db.add(CapitalActor(trade_date=trade_date, stock_code=stock_code,
+                                actor_name=a.get("name", ""), seat_code=a.get("seat") or "",
+                                tier=a.get("tier") or "观察", net_buy=float(a.get("net_buy") or 0),
+                                days_active=int(a.get("days_active") or 0), source=source))
+        db.execute(text("DELETE FROM dragon_tiger WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        for r in snapshot.get("dragon_tiger_rows") or []:
+            db.add(DragonTiger(trade_date=r.get("trade_date", trade_date), stock_code=stock_code,
+                               stock_name=r.get("stock_name", ""), lhb_type=r.get("lhb_type", "1d"),
+                               net_buy=float(r.get("net_buy") or 0), buy_amt=float(r.get("buy_amt") or 0),
+                               sell_amt=float(r.get("sell_amt") or 0), top_seat=r.get("top_seat") or "",
+                               top_seat_net=float(r.get("top_seat_net") or 0),
+                               disclosure_reason=r.get("disclosure_reason") or "",
+                               confidence=float(r.get("confidence") or 0.8), source=source))
+        db.execute(text("DELETE FROM capital_flow WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        for f in snapshot.get("capital_flow_rows") or []:
+            db.add(CapitalFlow(trade_date=f.get("trade_date", trade_date), stock_code=stock_code,
+                               main_net_inflow=float(f.get("main_net_inflow") or 0),
+                               super_large_net=float(f.get("super_large_net") or 0),
+                               large_net=float(f.get("large_net") or 0),
+                               medium_net=float(f.get("medium_net") or 0),
+                               small_net=float(f.get("small_net") or 0), source=source))
+        db.execute(text("DELETE FROM capital_stats WHERE trade_date = :d AND stock_code = :c"),
+                   {"d": trade_date, "c": stock_code})
+        db.add(CapitalStats(trade_date=trade_date, stock_code=stock_code,
+                            wash_suspect=bool(stats.get("wash_suspect")),
+                            coordination=stats.get("coordination") or "数据不足",
+                            win_rate=stats.get("win_rate"), payoff_ratio=stats.get("payoff_ratio"),
+                            avg_hold_days=stats.get("avg_hold_days"),
+                            theme_resonance=stats.get("theme_resonance"),
+                            source=source, missing_data=stats.get("missing_data") or [],
+                            raw_json=snapshot.get("raw") or {}))
+        db.commit()
+    return 1 + len(snapshot.get("recent_actors") or []) + len(snapshot.get("dragon_tiger_rows") or []) \
+        + len(snapshot.get("capital_flow_rows") or [])
+
+
+def get_capital_stats(stock_code: str, trade_date: str) -> dict | None:
+    """读资本视图统计快照（capitals × 展示用；不存在返回 None）"""
+    with SessionLocal() as db:
+        stmt = (select(CapitalStats).where(CapitalStats.stock_code == stock_code,
+                                           CapitalStats.trade_date == trade_date)
+                .order_by(CapitalStats.id.desc()).limit(1))
+        row = db.execute(stmt).scalar_one_or_none()
+    if row is None:
+        return None
+    return {"trade_date": row.trade_date, "stock_code": row.stock_code,
+            "wash_suspect": bool(row.wash_suspect), "coordination": row.coordination,
+            "win_rate": row.win_rate, "payoff_ratio": row.payoff_ratio,
+            "avg_hold_days": row.avg_hold_days, "theme_resonance": row.theme_resonance,
+            "source": row.source, "missing_data": row.missing_data or [],
+            "updated_at": str(row.updated_at)}
+
+
 # ==================== 经验沉淀闭环（pending → worker → experience → review_log → 检索注入） ====================
 
+def _parse_monitor_summary(summary):
+    """summary "000725 监控信号 hold" → (000725, hold)；其他形态（候选 N 只/评分/建仓/复盘）→ (None, None)"""
+    if not summary:
+        return None, None
+    parts = str(summary).split(" 监控信号 ")
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        return None, None
+    return parts[0].strip(), parts[1].strip()
+
+
+def _artifacts_meta(ref, code, sig, original_ref) -> dict:
+    """artifacts_ref 读兼容：新 JSON 直接解；旧 int/其他 → 从零构造（旧数据读不报错）"""
+    if ref:
+        try:
+            meta = json.loads(ref)
+            if isinstance(meta, dict):
+                meta.setdefault("count", 1)
+                meta.setdefault("first_at", datetime.now().isoformat(timespec="seconds"))
+                meta.setdefault("last_at", datetime.now().isoformat(timespec="seconds"))
+                meta.setdefault("stock_code", code)
+                meta.setdefault("signal_type", sig)
+                meta.setdefault("original_ref", original_ref)
+                return meta
+        except (TypeError, ValueError):
+            pass
+    now = datetime.now().isoformat(timespec="seconds")
+    return {"count": 1, "first_at": now, "last_at": now, "stock_code": code,
+            "signal_type": sig, "original_ref": original_ref}
+
+
+def merge_pending_duplicate(task_id, stage, summary, artifacts_ref) -> int | None:
+    """同 hour 桶 (stock_code, signal_type) 已 pending → 合并 count++ 返回行 id；否则 None 不合并"""
+    code, sig = _parse_monitor_summary(summary)
+    if not code:
+        return None
+    hour_start = datetime.now().replace(minute=0, second=0, microsecond=0)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(
+            PendingExperience.status == "pending",
+            PendingExperience.created_at >= hour_start,
+        ).order_by(PendingExperience.id.desc())
+        for r in db.execute(stmt).scalars().all():
+            r_code, r_sig = _parse_monitor_summary(r.summary)
+            if r_code == code and r_sig == sig:
+                meta = _artifacts_meta(r.artifacts_ref, code, sig, str(artifacts_ref or ""))
+                meta["count"] = int(meta.get("count") or 1) + 1
+                meta["last_at"] = datetime.now().isoformat(timespec="seconds")
+                r.artifacts_ref = json.dumps(meta, ensure_ascii=False)
+                db.commit()
+                _invalidate("pending_experience")
+                return r.id
+    return None
+
+
 def add_pending_experience(task_id, stage, summary, artifacts_ref) -> int:
-    """热路径经验沉淀写入：单行 INSERT，零分析。失败由调用方静默降级（不阻塞主任务）。"""
+    """热路径经验沉淀写入：同 hour (stock_code, signal_type) 已 pending → 合并 count++；
+    否则单行 INSERT（artifacts_ref 落 JSON 元数据，旧 int 数据读兼容）。失败由调用方静默降级。"""
+    merged = merge_pending_duplicate(task_id, stage, summary, artifacts_ref)
+    if merged:
+        return merged
+    code, sig = _parse_monitor_summary(summary)
+    meta = _artifacts_meta(artifacts_ref, code, sig, str(artifacts_ref or ""))
     with SessionLocal() as db:
         row = PendingExperience(task_id=task_id, stage=stage, summary=summary,
-                                artifacts_ref=artifacts_ref, status="pending")
+                                artifacts_ref=json.dumps(meta, ensure_ascii=False), status="pending")
         db.add(row)
         db.commit()
         _invalidate("pending_experience")

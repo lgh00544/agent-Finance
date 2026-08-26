@@ -16,12 +16,16 @@ Akshare 数据源实现（东财为主，新浪降级）
 import hashlib
 import json
 import logging
+import random
+import re
 import time
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Callable
 
 import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
 
 from app.cache import cache
 from app.core.config import settings
@@ -295,6 +299,56 @@ class AkshareSource(DataSource):
     def __init__(self) -> None:
         if ak is None:
             raise DataSourceError("akshare 未安装")
+        # 腾讯批量行情专用 Session（连接池 + keep-alive + 浏览器 headers）：
+        # 持仓监控页首选源，N 只 = 1 次 HTTP；连接池避免每次新建 TCP 连接（防 Connection aborted）
+        self._quotes_session = requests.Session()
+        self._quotes_session.headers.update({
+            "User-Agent": settings.datasource_user_agent,
+            "Accept": "*/*",
+            "Referer": "https://gu.qq.com/",
+        })
+        _quotes_adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+        self._quotes_session.mount("http://", _quotes_adapter)
+        self._quotes_session.mount("https://", _quotes_adapter)
+
+    # ---------------- 腾讯批量实时价（持仓监控首选源，N 只 = 1 次 HTTP） ----------------
+    def fetch_tencent_batch(self, codes: list[str], timeout: float = 8) -> dict[str, float]:
+        """腾讯批量最新价：http://qt.gtimg.cn/q=sh600487,sz002475,...（6 开头加 sh，否则 sz）。
+        解析每行 v_(字母数字)="[^"]*" 以 ~ 分割，price=fields[3]（原始价，不做任何派生推断）。
+        3 次指数退避（1s/2s/4s+抖动），全失败返回 {}（调用方走下一级 DB 快照兜底）。
+        返回 {6 位 code: price}，停牌/解析失败不收录。"""
+        codes = [str(c).strip().zfill(6) for c in codes if str(c).strip()]
+        if not codes:
+            return {}
+        q = ",".join(("sh" if c.startswith("6") else "sz") + c for c in codes)
+        url = f"http://qt.gtimg.cn/q={q}"
+        for attempt in range(3):
+            try:
+                resp = self._quotes_session.get(url, timeout=timeout)
+                if resp.status_code != 200:
+                    raise DataSourceError(f"腾讯行情 HTTP {resp.status_code}")
+                result: dict[str, float] = {}
+                for m in re.finditer(r'v_\w+="([^"]*)"', resp.text):
+                    fields = m.group(1).split("~")
+                    if len(fields) < 4:
+                        continue
+                    try:
+                        price = float(fields[3])
+                    except (TypeError, ValueError):
+                        continue
+                    if price > 0:
+                        # fields[2] 为 6 位代码；兼容前缀键剥离（sh600487 → 600487）
+                        code = re.sub(r"^(sh|sz|bj)", "", fields[2])
+                        result[code] = price
+                if result:
+                    return result
+            except requests.RequestException as exc:
+                logger.warning("腾讯批量行情第 %s 次失败: %s", attempt + 1, exc)
+            except Exception as exc:  # noqa: BLE001 解析异常也纳入退避
+                logger.warning("腾讯批量行情解析第 %s 次失败: %s", attempt + 1, exc)
+            if attempt < 2:
+                time.sleep((1 << attempt) + random.uniform(0, 1))  # 1s/2s/4s + 抖动
+        return {}
 
     # ---------------- 统一 fetch 封装 ----------------
     def _fetch(self, scope: str, func_name: str, call: Callable, ttl_seconds: int,

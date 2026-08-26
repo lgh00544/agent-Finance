@@ -46,6 +46,15 @@ class DiscoverCandidate(BaseModel):
     position_hint: str = Field(default="", description="操作建议（低吸/突破/观望 + 参考仓位建议）")
     rule_refs: list[str] = Field(default_factory=list,
         description="引用的规则/战法清单（K 编号、战法名、人工硬性规则），留痕可溯源")
+    # ============ 前瞻兑现（第 5 子 Agent 收口三态） ============
+    # 默认值保证旧缓存/旧输出可 parse、新逻辑缺字段不炸（同 MarketIntel v3 理由）。
+    # LLM 只允许输出这三字之一，不得报涨跌幅/目标价/概率百分数（common.py 纪律）。
+    horizon_bias: str = Field(default="回归", pattern="^(延续|回归|回吐)$",
+        description="前瞻兑现三态：延续/回归/回吐（未来 5 日更可能延续、方向不明、还是吐回去；只看注入的【前瞻对照事实】定性，禁止输出涨跌幅数字）")
+    horizon_clarity: str = Field(default="低", pattern="^(高|中|低)$",
+        description="前瞻清晰度：高/中/低（关键列缺失或同类样本不足 → 低）")
+    horizon_note: str = Field(default="前瞻数据不足",
+        description="前瞻依据一句话（40-80 字，必须引用注入事实中的具体数字/桶，不得空话）")
 
 
 class DiscoverOutput(BaseModel):

@@ -159,6 +159,37 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
     math = _trade_math(real_time.get("price"), holding)
     # 组合联动（batch F）：读组合哨兵告警概览（多键隔离快照），供个股判断参考；无快照为空 dict 不阻断
     po = read_portfolio_overview(today)
+    # 派发期判定（batch D）：6 维参考事实（LLM 一票否决）；失败为 None 不阻断
+    dist = None
+    try:
+        from app.services.distribution_phase import compute_distribution_phase
+        dist = compute_distribution_phase(code, today)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("派发期判定失败（跳过注入）: %s", exc)
+    # 资本视图（批次E）：游资三维 + K189 对倒纯代码判定（D 派发期后追加）；失败为 None 不阻断
+    cap_view = None
+    try:
+        from app.services.capital_view import compute_capital_view
+        cap_view = compute_capital_view(code, today)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("资本视图失败（跳过注入）: %s", exc)
+    # 红线扫描（批次G）：C1/C2/C3/C4 + K139/K226/K189 事实层（参考权重，LLM 一票否决）；失败 None 不阻断
+    red_line = None
+    try:
+        from app.services.red_line_check import account_total_asset, compute_red_line
+        _kl = indicators.get("recent_klines") or []
+        _low = float(_kl[-1].get("low")) if _kl and _kl[-1].get("low") is not None else None
+        _red = compute_red_line(
+            [{"stock_code": code,
+              "entry_price": holding.entry_price,
+              "cost": getattr(holding, "cost", None),
+              "shares": holding.shares,
+              "high_price": getattr(holding, "high_price", None)}],
+            {code: real_time.get("price")},
+            account_total_asset(), trade_date=today, lows={code: _low})
+        red_line = _red[0] if _red else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("红线扫描失败（跳过注入）: %s", exc)
     real_time_block = {
         **real_time, **math,
         "数据状态": "实时（TTL 30s 内缓存）" if not stale else "数据暂未更新（实时源不可用，以下为最近一次有效数据）",
@@ -172,6 +203,12 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         # 组合联动（batch F）：组合告警三态色 / 集中度警示 / 板块暴露占比（缺失不注入，避免噪音）
         **({k: po[k] for k in ("portfolio_alert_level", "concentration_warning", "sector_exposure_pct")
            if k in po and po[k] is not None and po[k] != ""}),
+        # 派发期判定（batch D）：{phase_label}(置信度) + 6 维原始数据
+        "distribution_phase_context": dist,
+        # 资本视图（批次E）：游资三维 + K189 对倒（D 派发期后追加注入；缺失为 None 不注入噪音）
+        "capital_view_context": cap_view,
+        # 红线扫描（批次G）：C1 占比 / C2 回撤 / C3 止损 / C4 突破 + K139/K226/K189（缺失字段为 null）
+        "【红线扫描】": red_line,
     }
     news_context = "\n".join(
         f"{n.get('published_at')} {n.get('title')}" for n in (state.get("news_report") or [])) or "（无）"

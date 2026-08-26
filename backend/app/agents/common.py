@@ -140,20 +140,39 @@ def profile_section() -> str:
     return "\n".join(lines) if lines else ""
 
 
-def knowledge_section(agent: str) -> str:
-    """私有交易经验/战法知识库 → prompt 注入文本（统一运行机制：任务启动自动检索）"""
+def knowledge_section(agent: str, docs: list | None = None) -> tuple[str, list]:
+    """私有交易经验/战法知识库 → prompt 注入文本（统一运行机制：任务启动自动检索）。
+
+    返回 (注入文本, docs)；docs=[{id, number, title}]（number=注入段中的 1..N，
+    供 agent_chat 做"编号→知识id"映射回吐）。
+    命中计量：检索到 docs 时批量 bump hit_count（只加不自减；失败仅 warning 不阻塞主链路）。
+    docs 由调用方预取传入时（agent_chat）直接拼文本，不再检索、不重复计量。"""
     from app.services.vector_store import get_vector_store
 
-    try:
-        docs = get_vector_store().search_knowledge(agent, top_k=5)
-    except Exception as exc:  # noqa: BLE001 知识检索失败不阻塞主链路
-        logger.warning("私有知识检索失败 %s: %s", agent, exc)
-        return ""
-    if not docs:
-        return ""
-    lines = [f"- 【{d['title']}】{d['content']}" for d in docs]
-    return ("【你的私有交易经验/战法参考】（来自个人知识库，请结合这些经验进行研判，"
-            "若与硬性规则冲突以硬性规则为准）\n" + "\n".join(lines))
+    if docs is None:
+        try:
+            docs = get_vector_store().search_knowledge(agent, top_k=5)
+        except Exception as exc:  # noqa: BLE001 知识检索失败不阻塞主链路
+            logger.warning("私有知识检索失败 %s: %s", agent, exc)
+            return "", []
+        if not docs:
+            return "", []
+        # 命中计量：批量一次 UPDATE（失败仅 warning，不阻塞主链路）
+        try:
+            repo.bump_knowledge_hits([d["id"] for d in docs])
+        except Exception as exc:  # noqa: BLE001 计量失败不阻塞主链路
+            logger.warning("私有知识命中计量失败（降级跳过）: %s", exc)
+    elif not docs:
+        return "", []
+
+    numbered: list[dict] = []
+    lines: list[str] = []
+    for i, d in enumerate(docs, start=1):
+        numbered.append({"id": int(d["id"]), "number": i, "title": str(d.get("title") or "")})
+        lines.append(f"{i}.【{d['title']}】{d['content']}")
+    text = ("【你的私有交易经验/战法参考】(编号与本段一致，若在研判/回答中采用了某条，"
+            "必须在\"引用的知识\"里回吐其编号；与硬性规则冲突以硬性规则为准)\n" + "\n".join(lines))
+    return text, numbered
 
 
 def _knowledge_version() -> str:
@@ -230,7 +249,8 @@ def _agent_knowledge_version(agent: str) -> str:
 def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
                schema: Type[T], ttl_seconds: int = 86400,
                with_profile: bool = True, with_knowledge: bool = True,
-               model_level: ModelLevel = ModelLevel.DEEP) -> T:
+               model_level: ModelLevel = ModelLevel.DEEP,
+               knowledge_docs: list | None = None) -> T:
     """统一 LLM 调用：固定段序拼接 + 版本指纹入缓存键。
 
     system prompt 段序（永久固定，利于服务端前缀缓存命中）：
@@ -260,9 +280,9 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
                 "【用户个人交易偏好档案】（你的研判必须尊重用户这些偏好，"
                 "如有冲突需在输出中说明）\n" + section
             )
-    # 拼接位3 · 私有知识库检索结果注入
+    # 拼接位3 · 私有知识库检索结果注入（knowledge_docs 由调用方预取时使用，避免重复检索/重复计量）
     if with_knowledge:
-        section = knowledge_section(agent)
+        section, _docs = knowledge_section(agent, docs=knowledge_docs)
         if section:
             sections.append(section)
     # 拼接位3.1 · 自动沉淀经验参考（仅 active 限量注入；与私有知识库共存不冲突）

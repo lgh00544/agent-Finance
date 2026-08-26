@@ -67,10 +67,16 @@ def init_db() -> None:
     _ensure_hot_money_profile_columns()
     _ensure_holding_high_price()
     _ensure_alert_log_source()
+    _ensure_lhb_multi_source_verified()
+    _ensure_forward_view_history()
     _ensure_market_condition_next_day()
     _add_factor_scores_column()
     _ensure_indexes()
     _ensure_sector_snapshot_table()
+    _ensure_quote_snapshot_table()
+    _ensure_distribution_phase_table()
+    _ensure_capital_view_tables()
+    _ensure_knowledge_hit_columns()
 
 
 def _ensure_experience_fts() -> None:
@@ -126,6 +132,28 @@ def _ensure_sector_snapshot_table() -> None:
     Base.metadata.create_all(bind=engine, tables=[models.SectorSnapshot.__table__])
 
 
+def _ensure_quote_snapshot_table() -> None:
+    """幂等补建 quote_snapshot 表（持仓实时价快照；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[models.QuoteSnapshot.__table__])
+
+
+def _ensure_distribution_phase_table() -> None:
+    """幂等补建 distribution_phase_log 表（派发期判定；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[models.DistributionPhaseLog.__table__])
+
+
+def _ensure_capital_view_tables() -> None:
+    """幂等补建资本视图 4 表（capital_actor/dragon_tiger/capital_flow/capital_stats；
+    批次E 游资真接入；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[
+        models.CapitalActor.__table__, models.DragonTiger.__table__,
+        models.CapitalFlow.__table__, models.CapitalStats.__table__,
+    ])
+
+
 def _ensure_stock_candidate_detail(eng=None) -> None:
     """幂等补齐 stock_candidate.detail 列（v2.0 输出详情；仅增量加列，不重建表不丢数据）"""
     eng = eng or engine
@@ -161,6 +189,29 @@ def _ensure_review_result_columns(eng=None) -> None:
             for col, ddl in additions.items():
                 try:
                     conn.exec_driver_sql(f"ALTER TABLE review_result ADD COLUMN {col} {ddl}")
+                except Exception:  # noqa: BLE001 列已存在
+                    pass
+
+
+def _ensure_knowledge_hit_columns(eng=None) -> None:
+    """幂等补齐 private_knowledge.hit_count/last_used_at 列（决策级归因·命中计量；
+    仅增量加列，不重建表不丢数据；旧数据 hit_count=0、last_used_at=NULL）"""
+    eng = eng or engine
+    additions = {
+        "hit_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_used_at": "DATETIME",
+    }
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(private_knowledge)")}
+            for col, ddl in additions.items():
+                if col not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE private_knowledge ADD COLUMN {col} {ddl}")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            for col, ddl in additions.items():
+                try:
+                    conn.exec_driver_sql(f"ALTER TABLE private_knowledge ADD COLUMN {col} {ddl}")
                 except Exception:  # noqa: BLE001 列已存在
                     pass
 
@@ -309,6 +360,34 @@ def _ensure_alert_log_source(eng=None) -> None:
                 conn.exec_driver_sql("ALTER TABLE alert_log ADD COLUMN source VARCHAR(16) DEFAULT 'monitor'")
             except Exception:  # noqa: BLE001 列已存在
                 pass
+
+
+def _ensure_lhb_multi_source_verified(eng=None) -> None:
+    """幂等补齐 lhb_original_flow.multi_source_verified 列（第二源上榜确认采信标记；
+    仅增量加列，不重建表不丢数据；旧数据默认 False）"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(lhb_original_flow)")}
+            if "multi_source_verified" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE lhb_original_flow ADD COLUMN multi_source_verified BOOLEAN DEFAULT 0")
+        else:
+            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
+            try:
+                conn.exec_driver_sql(
+                    "ALTER TABLE lhb_original_flow ADD COLUMN multi_source_verified BOOLEAN DEFAULT 0")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _ensure_forward_view_history(eng=None) -> None:
+    """幂等建 forward_view_history 表（预测性选股 2.5 前瞻回填闭环；
+    复用模型元数据 create(checkfirst=True)，无手写 DDL；已存在则跳过）"""
+    from app.db.models import ForwardViewHistory
+
+    eng = eng or engine
+    ForwardViewHistory.__table__.create(bind=eng, checkfirst=True)
 
 
 def _ensure_market_condition_next_day(eng=None) -> None:

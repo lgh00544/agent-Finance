@@ -392,3 +392,51 @@ with render.fold_module("hm_trace", "游资研判留痕（ai_reasoning_trace · 
                                             f"{render.stock_label(c.get('stock_code'), c.get('stock_name'))} · "
                                             f"{str(c.get('create_time') or '')[:16]}")
                     render.raw_json_expander(t, key=f"raw_hmt_{t['trace_id']}")
+
+# ===== 批次E 后半段：6. 个股资本视图（K189 对倒 · 游资活跃 · 30日统计）=====
+with render.fold_module("hm_cap", "个股资本视图（K189 对倒判定 · 游资活跃 · 30日统计）",
+                        meta="source=sse_only · 徽章：游资关注=黄 / 对倒嫌疑=红 / 无数据=灰（K227 不编造）",
+                        default_open=False):
+    cap_code = st.text_input("输入 6 位股票代码查看资本视图", key="hm_cap_code",
+                             placeholder="如 600519", max_chars=6)
+    if cap_code and cap_code.isdigit() and len(cap_code) == 6:
+        try:
+            cv = api.capital_view(cap_code)
+        except Exception:  # noqa: BLE001 后端未起降级空态
+            cv = None
+        if not cv:
+            render.empty_state("资本视图不可用（后端未启动或数据不足）。",
+                               action_label="重试", action_key="retry_hm_cap")
+        else:
+            actors = cv.get("recent_actors") or []
+            stats = cv.get("stats_30d") or {}
+            if bool(cv.get("wash_suspect")):
+                render.stat_cards([{"label": "K189 对倒嫌疑", "value": "是", "tone": "err"}])
+            elif actors:
+                render.stat_cards([{"label": "游资关注", "value": f"{len(actors)} 家", "tone": "warn"},
+                                   {"label": "协同动作", "value": cv.get("coordination") or "—"}])
+            else:
+                render.stat_cards([{"label": "游资动态", "value": "无数据", "tone": "mute"}])
+            if cv.get("theme_resonance"):
+                st.markdown("**板块共振**：主题共振已检测到。")
+            st.caption(f"数据源 {cv.get('source') or '—'} · 交易日 {cv.get('trade_date') or '—'}"
+                       + (f" · 缺失：{'、'.join(cv.get('missing_data') or [])}" if cv.get("missing_data") else ""))
+            if actors:
+                render.section_title("近 5 日活跃游资（recent_actors）")
+                st.table([{
+                    "游资": a.get("name") or "—",
+                    "席位": a.get("seat") or "—",
+                    "梯队": a.get("tier") or "—",
+                    "净买额": _money(a.get("net_buy")),
+                    "活跃天数": a.get("days_active") if a.get("days_active") is not None else "—",
+                } for a in actors])
+            else:
+                st.caption("30 日无活跃游资（recent_actors 为空 → 数据不足，不编造）。")
+            render.section_title("30 日游资统计（stats_30d）")
+            st.table([{"指标": "胜率",
+                       "值": f"{stats.get('胜率', 0) * 100:.0f}%" if stats.get('胜率') is not None else "—"},
+                      {"指标": "盈亏比",
+                       "值": f"{stats['盈亏比']:.2f}" if stats.get('盈亏比') is not None else "—"},
+                      {"指标": "平均持仓天数",
+                       "值": f"{stats['平均持仓天数']:.1f} 天" if stats.get('平均持仓天数') is not None else "—"}])
+            render.raw_json_expander(cv, key=f"raw_hm_cap_{cap_code}")

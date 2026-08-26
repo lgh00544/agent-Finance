@@ -15,6 +15,7 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -26,6 +27,7 @@ import {
   holdingQuotes,
   holdingTrades,
   holdings,
+  redLineCheck,
   sellDecisions,
   takeProfitPlan,
 } from '@/api/holdings'
@@ -524,6 +526,36 @@ function SellDecisionBtn({ hid, size = 'small' as const }: { hid: number; size?:
   )
 }
 
+/** 红线徽章（批次G）：C1/C2/C3/K139 四色——绿(无)/黄(预警)/红(触发)/灰(无数据)；悬停显示触发条件 */
+function RedLineBadges({ red, price }: { red?: Record<string, unknown>; price: number | null | undefined }) {
+  const badge = (label: string, color: string, tip: string) => (
+    <Tooltip title={tip}>
+      <Tag color={color} style={{ marginInlineEnd: 2, fontSize: 11 }}>{label}</Tag>
+    </Tooltip>
+  )
+  const c1 = red?.c1_alert as boolean | null | undefined
+  const c2 = red?.c2_alert as boolean | null | undefined
+  const c3 = red?.c3_alert as boolean | null | undefined
+  const k139 = (red?.k139_sop as Record<string, unknown>) ?? null
+  const cap = red?.c1_cap_pct as number | null | undefined
+  const draw = red?.c2_drawdown_pct as number | null | undefined
+  const sl = red?.c3_stop_loss as number | null | undefined
+  const stage = String(k139?.stage ?? '')
+  const ts = k139?.trailing_stop as number | null | undefined
+  const c3dist = (typeof price === 'number' && typeof sl === 'number' && sl > 0)
+    ? ((price - sl) / sl * 100).toFixed(1) : null
+  const colorOf = (v: boolean | null | undefined) => (v === true ? 'red' : v === false ? 'green' : 'default')
+  const k139Color = stage === '跌破C3' ? 'red' : stage.includes('减仓') ? 'orange' : stage ? 'green' : 'default'
+  return (
+    <Space size={2} wrap>
+      {badge('C1', colorOf(c1), cap != null ? `C1 单只占比 ${cap}%，上限 60%（超限触发）` : 'C1 占比无数据')}
+      {badge('C2', colorOf(c2), draw != null ? `C2 日内回撤 ${draw}%，触发线 -30%（相对成本）` : 'C2 回撤无数据')}
+      {badge('C3', colorOf(c3), sl != null ? `C3 止损 ${sl}，距 ${c3dist ?? '—'}%（成本×0.92）` : 'C3 止损无数据')}
+      {badge('K139', k139Color, k139 ? `K139 SOP：${stage}，移动止盈 ${ts ?? '—'}` : 'K139 SOP 无数据')}
+    </Space>
+  )
+}
+
 /** ============ 当前持仓表（需求 A：去重合并） ============ */
 function HoldingsTable() {
   const [drawerH, setDrawerH] = useState<Holding | null>(null)
@@ -532,6 +564,13 @@ function HoldingsTable() {
     queryFn: holdingQuotes,
     refetchInterval: 60_000,
   })
+  const { data: redData } = useQuery({
+    queryKey: ['red-line-check'],
+    queryFn: redLineCheck,
+    refetchInterval: 300_000,
+  })
+  const redMap = new Map<string, Record<string, unknown>>(
+    (redData?.rows ?? []).map((r) => [String(r.stock_code), r]))
   const shanghai = useShanghaiIndex()
   const rows = data?.rows ?? []
   if (isError) return <ErrorCard title="持仓数据加载失败" message={error?.message} onRetry={() => refetch()} />
@@ -578,6 +617,12 @@ function HoldingsTable() {
     { title: '止盈', key: 'tp', width: 76, render: (_: unknown, m: MergedRow) => m.current.take_profit ?? '—' },
     { title: '目标仓位', key: 'target', width: 88, render: (_: unknown, m: MergedRow) => (m.current.target_pct ? `${m.current.target_pct}%` : '—') },
     {
+      title: '红线', key: 'redline', width: 160,
+      render: (_: unknown, m: MergedRow) => (
+        <RedLineBadges red={redMap.get(m.code)} price={m.current.current_price ?? null} />
+      ),
+    },
+    {
       title: '操作', key: 'ops', width: 190,
       render: (_: unknown, m: MergedRow) => (
         <Space size={4}>
@@ -622,9 +667,14 @@ function HoldingsTable() {
 /** ============ 告警记录 ============ */
 function AlertsTab() {
   const { data, isError, error, refetch } = useQuery({ queryKey: ['alerts'], queryFn: () => alerts(50) })
+  const [filter, setFilter] = useState<string>('all')
   if (isError) return <ErrorCard title="告警加载失败" message={error?.message} onRetry={() => refetch()} />
   const rows = data ?? []
   if (!rows.length) return <EmptyState text="暂无告警记录。" icon="🛡️" />
+  const sentinel = rows.filter((r) => String(r.source ?? '') === 'portfolio_sentinel')
+  const filtered = filter === 'sentinel' ? sentinel
+    : filter === 'monitor' ? rows.filter((r) => String(r.source ?? '') !== 'portfolio_sentinel')
+    : rows
   const cols = [
     {
       title: '股票', key: 'stock', width: 150,
@@ -635,10 +685,38 @@ function AlertsTab() {
       render: (v: string) => <Tag color={v === 'critical' ? 'red' : v === 'warning' ? 'orange' : 'blue'}>{v}</Tag>,
     },
     { title: '类型', dataIndex: 'alert_type', width: 110 },
+    { title: '来源', dataIndex: 'source', width: 100, render: (v: string) => v === 'portfolio_sentinel' ? <Tag color="red">组合哨兵</Tag> : v === 'monitor' ? '持仓监控' : (v ?? '—') },
     { title: '消息', dataIndex: 'message', ellipsis: true },
     { title: '时间', dataIndex: 'created_at', width: 150, render: (v: string) => String(v).slice(0, 16) },
   ]
-  return <Table size="small" rowKey="id" columns={cols} dataSource={rows} pagination={{ pageSize: 20 }} />
+  return (
+    <>
+      <Card size="small" title="🛡️ 组合哨兵告警（组合级风控）" style={{ marginBottom: 12, background: 'var(--bg-input)' }}>
+        {sentinel.length ? (
+          <Space direction="vertical" style={{ width: '100%' }} size={8}>
+            {sentinel.map((r) => (
+              <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                <Space wrap>
+                  <Tag color="red">组合级风控</Tag>
+                  <Tag>{String(r.alert_type ?? '—')}</Tag>
+                  <Text style={{ fontSize: 13 }}>{String(r.message ?? '')}</Text>
+                </Space>
+                <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{String(r.created_at ?? '').slice(0, 16)}</Text>
+              </div>
+            ))}
+          </Space>
+        ) : <EmptyState text="暂无组合哨兵告警。" icon="🛡️" />}
+      </Card>
+      <Space style={{ marginBottom: 8 }} wrap>
+        <Text type="secondary">筛选：</Text>
+        <Button size="small" type={filter === 'all' ? 'primary' : 'default'} onClick={() => setFilter('all')}>全部</Button>
+        <Button size="small" type={filter === 'sentinel' ? 'primary' : 'default'} onClick={() => setFilter('sentinel')}>组合哨兵</Button>
+        <Button size="small" type={filter === 'monitor' ? 'primary' : 'default'} onClick={() => setFilter('monitor')}>持仓监控</Button>
+        <Text type="secondary" style={{ fontSize: 12 }}>共 {filtered.length} 条</Text>
+      </Space>
+      <Table size="small" rowKey="id" columns={cols} dataSource={filtered} pagination={{ pageSize: 20 }} />
+    </>
+  )
 }
 
 /** ============ 历史持仓 ============ */

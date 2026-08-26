@@ -41,7 +41,9 @@ SCHEMA_DESC = """{
       "tech_view": "技术面研判（标注至少两套体系及支撑依据，补充说明）",
       "price_levels": "关键价位（支撑/压力/建议关注区间）",
       "position_hint": "操作建议（低吸/突破/观望 + 参考仓位）",
-      "rule_refs": ["K8 量价硬检查", "K16 失效核对", "威科夫阶段定位"]
+      "rule_refs": ["K8 量价硬检查", "K16 失效核对", "威科夫阶段定位"],
+      "horizon_bias": "回吐", "horizon_clarity": "中",
+      "horizon_note": "高位+放量滞涨，同类C档T+5样本20胜率35%均-0.12%，这波倾向回吐"
     }
   ]
 }"""
@@ -77,15 +79,22 @@ SYSTEM_PROMPT = f"""{ROLE_BASE}
    板块整体偏弱或纯个股独立脉冲行情须谨慎，不得把纯个股独立行情当作候选逻辑。
 
 【子 Agent 协作分工（思维团队模式）】
-在最终输出前，按以下 4 个子 Agent 视角分步完成分析，主 Agent（你）统筹综合与最终校验：
+在最终输出前，按以下 5 个子 Agent 视角分步完成分析，主 Agent（你）统筹综合与最终校验：
 1. 市况与板块子 Agent：市况多维综合（指数位置/趋势/政策环境/板块资金/量能）→ 板块过滤
    （主力资金流入方向、政策催化级别、板块联动强度 ≥3 只同步）；
 2. 量价与形态子 Agent：K8 6 项硬检查 → K16 11 项失效核对 → 威科夫阶段定位 →
    量价 7 句框架交叉解读（至少两套体系验证，单一信号不构成依据）；
 3. 风控与信号校验子 Agent：派发期识别（最高优先级风险原则，默认排除）→
    K168 三维交叉验证（3 维矛盾 = 警惕）→ 主力骗局 7 大场景核对 → 止损位/盈亏比测算；
-4. 决策输出（主 Agent 收口）：综合各子 Agent 结论 → 标的类型 6 类定位 →
-   候选/观察/排除决策 → 完整字段输出。
+4. 前瞻兑现子 Agent：只依据代码注入的【前瞻对照事实】（当前位置/量能/资金/同类 T+5 历史分布/自身历史入选），
+   判断这只未来 5 日更可能 延续 / 回归 / 回吐，给三态 + 一句依据；
+   **不得预测具体涨跌幅/目标价/概率百分数**，胜率数字只允许引用注入事实里已出现的历史统计；
+   同类样本不足或关键列缺失时标注清晰度低、按回归处理，绝不臆造；
+5. 决策输出（主 Agent 收口）：综合各子 Agent 结论 → 标的类型 6 类定位 →
+   候选/观察/排除决策 → 完整字段输出；
+   **收口硬约束**：前瞻=回吐 且 清晰度为高或中 → 禁止「强烈推荐」，关注类型倾向「观察」，
+   并在最终理由/风险中如实写明回吐风险；前瞻与当下强势冲突时以回吐/低清晰度降权，
+   不得用当下强势覆盖回吐风险。
 各子 Agent 结论冲突时按元规则裁决（实时走势 > 主力资金 > 政策消息 > 技术形态 > 历史对比），
 并在理由与风险中体现冲突处理与依据。
 
@@ -138,15 +147,18 @@ def build_user_prompt(stock_table: str, market_context: str, market_note: str = 
 
 
 def build_final_prompt(stock_table: str, news_context: str, cap: int | None = None,
-                       market_note: str = "", hot_money_context: str = "") -> str:
+                       market_note: str = "", hot_money_context: str = "",
+                       horizon_context: str = "") -> str:
     """news_context: 候选股新闻/公告检索结果；cap: 当日候选池上限（v2.0 市况档位）；
-    hot_money_context: 候选游资聚合数据段（services/hot_money 组装，空串整段省略）"""
+    hot_money_context: 候选游资聚合数据段（services/hot_money 组装，空串整段省略）；
+    horizon_context: 前瞻兑现对照事实段（services/track_verify 组装，空串整段省略）"""
     cap_section = ""
     if cap is not None:
         cap_section = f"\n【当日候选池规模上限】今日候选池不得超过 {cap} 只，按优先级排序，宁缺毋滥。"
     note_section = f"\n{market_note}" if market_note else ""
     hm_section = f"\n\n{hot_money_context}" if hot_money_context else ""
-    return f"""{stock_table}{cap_section}{note_section}{hm_section}
+    hz_section = f"\n\n{horizon_context}" if horizon_context else ""
+    return f"""{stock_table}{cap_section}{note_section}{hm_section}{hz_section}
 
 【候选股新闻/公告检索结果】（向量检索相关资讯，用于核实基本面与风险）
 {news_context}
@@ -154,6 +166,12 @@ def build_final_prompt(stock_table: str, news_context: str, cap: int | None = No
 请基于新闻资讯与增量数据对初步候选做最后确认：剔除存在明确利空（立案/减持/质押/业绩暴雷等）、
 与基本面严重矛盾、或触发硬性规则（人工硬性锁定规则）的标的，输出最终候选列表。
 每只标的必须完整输出 v2.0 强制字段（信心度档位/三维分析/量能判定/技术面研判含体系标注/
-关键价位/操作建议/核心风险≥2项/关注类型）。
+关键价位/操作建议/核心风险≥2项/关注类型）与前瞻三态字段（horizon_bias/horizon_clarity/horizon_note，
+由第 4 个「前瞻兑现」子 Agent 判定并写入）。
 若有【候选游资聚合数据】：按口径后缀字段（lhb_1d_net_buy/lhb_3d_net_buy）如实纳入
-「资金/游资」维度研判；游资为平行维度只做补充加权，不压倒其他四维；置信度不足的数据仅参考并标注。"""
+「资金/游资」维度研判；游资为平行维度只做补充加权，不压倒其他四维；置信度不足的数据仅参考并标注。
+候选表「capital_view_context」列（游资/龙虎榜/资金流三维）按代码注入的事实判读：协调=多游资同买
+仅提示跟买风险（游资跟买≠必胜）；「对倒=是」为 K189 纯代码判定（同营业部近5日买卖共存且单次≥1000万）
+→ 必须纳入风险项；30日无数据时协调=数据不足，不得按"无动作"处理。
+若有【前瞻对照事实】段：逐只据此做前瞻兑现（延续/回归/回吐）+ 一句依据；
+前瞻=回吐 且 清晰度非低 → 不得「强烈推荐」、关注类型倾向「观察」；样本不足/缺列 → 清晰度标低、按回归。"""

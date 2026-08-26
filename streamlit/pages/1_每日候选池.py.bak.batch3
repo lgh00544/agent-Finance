@@ -1,0 +1,498 @@
+"""每日候选池：DiscoverAgent 输出（候选理由/技术面研判/量价与资金/关键价位/风险点/操作建议）
+
+企业级列表行范式：左=评级色圆点+代码名称(加粗)+标的类型与核心理由(副标题)，
+右=生成时间+「查看详情」；详情分区卡片化展示，原始 JSON 永久折叠在最底部。
+纯展示层：评级映射/排序/颜色仅为字段映射与展示，不含任何二次判断逻辑。
+
+错误处理：接口失败按类型分类提示（后端服务/超时/数据库/解析），重试按钮在卡片右侧；
+有离线缓存时降级展示最近一次成功数据（标注缓存时间，灰色弱化），避免完全不可用。
+"""
+import html
+import streamlit as st
+
+import api_client as api
+import frontend_cache as fc
+import render
+
+render.apply_global_theme()
+
+# 全局顶部常驻信息栏（北京时间/账户资产/三大指数，固定显示不随滚动消失）
+render.top_status_bar()
+
+# ===== 批次2：页面头部收敛为 page_header 单行范式（标题+说明+合规+操作按钮组）=====
+_hdr = render.page_header(
+    "每日候选池（DiscoverAgent）",
+    caption="筛选标准由 LLM 综合量能/趋势/行业热度/基本面研判，每日 16:10 自动生成，也可手动触发。",
+    primary_actions=[{"label": "⛏ 手动触发每日挖掘", "key": "hdr_trigger"},
+                     {"label": "💬 批量验证对话", "key": "hdr_batch"}],
+)
+if _hdr["primary"] == 0:
+    render.submit_task("daily_pipeline", label="每日挖掘")
+if _hdr["primary"] == 1:
+    st.session_state["_batch_open"] = True
+    st.rerun()
+
+# 统一后台任务状态区（运行中提示/失败重试，任务全部结束自动消失）
+render.task_status_area()
+
+# 评级映射（LLM 信心度档位 → 展示评级；纯展示层转换，不含任何研判）
+TIER_MAP = {"强烈推荐": "A", "建议关注": "B", "谨慎观察": "C"}
+TIER_LABEL = {"A": "A 强烈推荐", "B": "B 建议关注", "C": "C 谨慎观察"}
+TIER_DOT = {"A": "tier-a", "B": "tier-b", "C": "tier-c"}
+_SORT = {"A": 0, "B": 1, "C": 2}
+_TRACE_MODULE = {"discover": "选股研判", "score": "五维评分", "position": "建仓方案",
+                 "alert": "监控预警", "review": "交易复盘", "sell": "卖出决策"}
+
+CACHE_KEY = "candidates"
+_cached = fc.load(CACHE_KEY)  # 离线兜底缓存（接口失败时降级展示）
+_stale = False  # 当前是否处于离线缓存降级模式
+
+# ===== 日期列表：接口失败 → 缓存降级或分类报错（不阻塞顶部状态栏等其余模块） =====
+try:
+    dates = api.candidate_dates()
+except Exception as exc:  # noqa: BLE001 接口异常全链路捕获，绝不出现无反馈空白
+    if _cached and _cached["data"].get("date"):
+        dates = [_cached["data"]["date"]]
+        _stale = True
+    else:
+        title, hint, tech = render.classify_api_error(exc)
+        render.error_card(title, hint, detail=tech, retry_key="retry_candidates")
+        st.stop()
+if not dates:
+    render.empty_state("当日暂无生成结果。可点击下方按钮手动触发每日挖掘，或等待每日定时任务（工作日 16:10）。",
+                       icon="🔍", action_label="手动触发每日挖掘",
+                       action_key="empty_trigger_discover")
+    if st.session_state.get("empty_trigger_discover"):
+        render.submit_task("daily_pipeline", label="每日挖掘")
+        st.session_state["empty_trigger_discover"] = False
+    st.stop()
+
+# 顶部筛选行：左=日期选择 + 评级筛选（Tab 样式），操作按钮已上移 page_header
+f1, f2 = st.columns([1, 3])
+with f1:
+    date = st.selectbox("选择日期", dates, index=0)
+with f2:
+    filter_opt = st.segmented_control("评级筛选", ["全部候选", "可建仓 A+B", "观察 C"],
+                                      default="全部候选")
+st.caption("评级：A 强烈推荐 / B 建议关注 / C 谨慎观察（LLM 信心度档位映射，纯展示）")
+
+# ===== 可建仓统计卡（顶部；0 只也明确显示，接口失败降级 caption 不阻塞页面） =====
+tradeable_view = None
+trade_map: dict[str, dict] = {}
+try:
+    tradeable_view = api.candidate_tradeable(date=date, limit=200)
+    for _it in (tradeable_view.get("items") or []):
+        trade_map[_it["stock_code"]] = _it
+except Exception as exc:  # noqa: BLE001 统计卡失败仅降级提示，不阻塞候选浏览
+    st.caption("可建仓判定暂不可用（不影响候选浏览与筛选），可稍后刷新重试。")
+if tradeable_view:
+    t_count = int(tradeable_view.get("count") or 0)
+    p_count = int(tradeable_view.get("plan_candidate_count") or 0)
+    render.stat_cards([
+        {"label": "今日可建仓标的", "value": t_count,
+         "sub": "评级≥B 且现价在首仓区间且无重大利空", "tone": "ok" if t_count > 0 else "mute"},
+        {"label": "可自动生成建仓计划的标的", "value": p_count,
+         "sub": "评级 A/B 且暂无建仓方案", "tone": "info"},
+    ])
+    if t_count == 0:
+        render.msg_card("warn", "今日可建仓标的 0 只", "今日无符合买入条件的标的，建议观望。")
+
+# ===== 当日候选：接口失败 → 缓存降级（灰色弱化）或分类报错卡片 =====
+try:
+    rows = api.candidates(date=date, limit=300)
+    fc.save(CACHE_KEY, {"date": date, "rows": rows})  # 成功即刷新离线缓存
+except Exception as exc:  # noqa: BLE001
+    if _cached and _cached["data"].get("rows"):
+        rows = _cached["data"]["rows"]
+        _stale = True
+    else:
+        title, hint, tech = render.classify_api_error(exc)
+        render.error_card(title, hint, detail=tech, retry_key="retry_candidates")
+        st.stop()
+
+if _stale:
+    # 离线缓存模式：明确标注缓存时间与数据日期，非最新
+    render.msg_card("warn", "离线缓存模式（数据非最新）",
+                    f"接口暂不可用，以下展示最近一次成功缓存：{_cached['saved_at']}"
+                    f"（{_cached['data']['date']} 数据），恢复后自动更新。")
+    st.markdown('<style>[class*="st-key-cached_rows"]{opacity:.62;filter:saturate(.75)}</style>',
+                unsafe_allow_html=True)
+    rows_area = st.container(key="cached_rows")
+else:
+    rows_area = st.container()
+
+with rows_area:
+    # 同日同股按最新版本覆盖（created_at 最大），历史版本不参与渲染
+    latest: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["stock_code"], r["trade_date"])
+        if key not in latest or (r.get("created_at") or "") > (latest[key].get("created_at") or ""):
+            latest[key] = r
+    day_rows = list(latest.values())
+
+    def _tier(r: dict) -> str:
+        t = ((r.get("detail") or {}).get("confidence_tier") or "")
+        return TIER_MAP.get(t, "")
+
+    if filter_opt == "可建仓 A+B":
+        day_rows = [r for r in day_rows
+                    if (trade_map.get(r["stock_code"]) or {}).get("is_tradeable") == 1]
+    elif filter_opt == "观察 C":
+        day_rows = [r for r in day_rows if _tier(r) == "C"]
+
+    # ===== 板块行业筛选（来自首页「今日热门板块」点击跳转，query param 传递） =====
+    sector = st.query_params.get("sector", "")
+    if isinstance(sector, list):
+        sector = sector[0] if sector else ""
+    sector = str(sector or "").strip()
+    if sector:
+        st.info(f"行业筛选：**{sector}**（按候选详情行业字段子串匹配）")
+        if st.button("清除行业筛选"):
+            st.query_params.pop("sector", None)
+            st.rerun()
+        matched = []
+        for r in day_rows:
+            industry = str(((r.get("detail") or {}).get("enriched") or {}).get("industry") or "")
+            if sector in industry or (industry and industry in sector):
+                matched.append(r)
+        if not matched:
+            render.msg_card("warn", f"当日候选池中没有行业包含「{sector}」的候选股",
+                            "候选行业字段来自个股基本信息，可能与板块名称不完全一致，可清除筛选后浏览全部候选。")
+        day_rows = matched
+
+    # 可建仓置顶：A→B→C，组内按 rank 升序
+    day_rows.sort(key=lambda r: (_SORT.get(_tier(r), 3), int(r.get("rank") or 999)))
+
+    def _cand_detail(r: dict, _i: int) -> None:
+        label = render.stock_label(r["stock_code"], r["stock_name"])
+        detail = r.get("detail") or {}
+        tier = _tier(r)
+        tier_label = TIER_LABEL.get(tier, "未评级")
+        dot = TIER_DOT.get(tier, "mute")
+        stock_type = detail.get("stock_type", "")
+        reasons = r.get("reasons") or []
+        core = reasons[0] if reasons else (detail.get("meso_view") or "")
+        subtitle = "　·　".join(x for x in (stock_type, core) if x)
+        meta = f"生成 {str(r.get('created_at') or '')[:16]}"
+        # 可建仓状态标签（展示层，与顶部统计/筛选同源 trade_map）
+        _tb = trade_map.get(r["stock_code"]) or {}
+        _tb_label = _tb.get("label") or ""
+        _badge_cls = {"可建仓": "badge-ok", "建议关注": "badge-info", "观察": "badge-mute"}
+        _badge_html = (f'<span class="badge {_badge_cls.get(_tb_label, "badge-mute")}">'
+                       f'{_tb_label or "未判定"}</span>')
+        # API 行不含 ORM id：用 代码+日期+rank 组成稳定唯一键（同日同股已按最新版去重）
+        key = f"cand_{r['stock_code']}_{r['trade_date']}_{r.get('rank')}"
+        if render.list_item_toggle(key, f"#{r.get('rank', '-')} {label}　{tier_label}　{_badge_html}",
+                                   subtitle=subtitle, dot=dot, meta=meta, scope="cand"):
+            with st.container(border=True):
+                code, name = r["stock_code"], r["stock_name"]
+                tk = f"traces_{code}_{r['trade_date']}"
+                _trace_open = st.session_state.get(tk) == "open"
+                # 批次2：操作前置——原埋在底部的 3 个操作按钮提到详情首行
+                _act = render.quick_actions(f"cand_act_{key}", [
+                    {"label": "🧭 生成建仓方案", "type": "primary"},
+                    {"label": "💬 单标的追问", "type": "secondary"},
+                    {"label": "🔍 收起 AI 研判留痕" if _trace_open else "🔍 AI 研判留痕",
+                     "type": "secondary"},
+                ])
+                if _act == 0:
+                    render.submit_task("position", {"stock_code": code, "stock_name": name},
+                                       label="建仓方案生成")
+                if _act == 1:
+                    st.session_state["_batch_open"] = True
+                    st.session_state["_batch_scope"] = "manual"
+                    st.session_state["_batch_codes"] = [code]
+                    st.rerun()
+                if _act == 2:
+                    if _trace_open:
+                        st.session_state.pop(tk, None)
+                    else:
+                        st.session_state[tk] = "open"
+                    st.rerun()
+                # 溯源行保留在 Tab 上方
+                render.trace_line("本轮挖掘执行时间", r.get("created_at"),
+                                  source="行情快照 + LLM 研判", confidence=detail.get("confidence"))
+                # 批次2：8 个垂直堆叠分区 → detail_tabs（>6 自动降级 selectbox，默认停在结论性分区）；
+                # 字段与文案零删减，仅换容器（风险点合并「核心风险点 + 风险初判」两类字段）
+                def _tab_dims():
+                    render.section_title("维度归因（五维白盒，主结论）")
+                    render.dimension_bars(detail.get("dimensions"),
+                                          final_advice=detail.get("final_advice"))
+
+                def _tab_reasons():
+                    render.section_title("候选理由")
+                    if reasons:
+                        for i, reason in enumerate(reasons, 1):
+                            st.markdown(f"{render.num(i)}. {html.escape(str(reason))}",
+                                        unsafe_allow_html=True)
+                    else:
+                        st.markdown("（该轮未输出）")
+
+                def _tab_tech():
+                    render.section_title("技术面研判（威科夫/量价/K线形态/谐波交叉验证）")
+                    st.markdown(detail.get("tech_view") or detail.get("meso_view")
+                                or "（该轮未输出，可重新触发挖掘生成）")
+
+                def _tab_volume():
+                    render.section_title("量价与资金结论（主力动向/量能结构）")
+                    st.markdown(detail.get("volume_analysis") or "（无）")
+
+                def _tab_levels():
+                    render.section_title("关键价位（支撑位/压力位/建议关注区间）")
+                    st.markdown(detail.get("price_levels") or "（未输出）")
+
+                def _tab_risks():
+                    render.section_title("核心风险点（≥2 项）")
+                    risks = detail.get("risks") or []
+                    if risks:
+                        for i, risk in enumerate(risks, 1):
+                            st.markdown(f"{render.num(i)}. {html.escape(str(risk))}",
+                                        unsafe_allow_html=True)
+                    else:
+                        st.markdown("（无）")
+                    render.section_title("风险初判")
+                    risk_notice = r.get("risk_notice") or []
+                    if risk_notice:
+                        for risk in risk_notice:
+                            st.markdown(f"- {risk}")
+                    else:
+                        st.markdown("（无）")
+
+                def _tab_advice():
+                    render.section_title("操作建议（标的类型 + 关注类型 + 参考仓位）")
+                    focus = detail.get("focus_type", "")
+                    st.markdown(f"- 标的类型：{stock_type or '（未输出）'}（威科夫阶段定位，参考权重）")
+                    st.markdown(f"- 关注类型：{focus or '观察'}")
+                    hint = detail.get("position_hint") or ""
+                    st.markdown(f"- 参考建议：{hint}" if hint else "- 参考建议：（该轮未输出）")
+
+                def _tab_macro():
+                    render.section_title("三维验证（宏观 / 中观 / 微观）")
+                    st.markdown(f"- 宏观：{detail.get('macro_view', '（无）')}")
+                    st.markdown(f"- 中观：{detail.get('meso_view', '（无）')}")
+                    st.markdown(f"- 微观：{detail.get('micro_view', '（无）')}")
+
+                render.detail_tabs([
+                    ("维度归因", _tab_dims),
+                    ("候选理由", _tab_reasons),
+                    ("技术面", _tab_tech),
+                    ("量价资金", _tab_volume),
+                    ("关键价位", _tab_levels),
+                    ("风险点", _tab_risks),
+                    ("操作建议", _tab_advice),
+                    ("三维验证", _tab_macro),
+                ], key=f"cand_tabs_{key}", default_index=0)
+                # ===== AI 研判留痕（推理链路可溯源）：按钮触发真懒加载，未点击零接口调用；
+                # 已展开时 quick_actions 按钮切换为「收起」支持再次收起 =====
+                if st.session_state.get(tk) == "open":
+                    if f"{tk}_rows" not in st.session_state:
+                        try:
+                            st.session_state[f"{tk}_rows"] = api.traces(
+                                code=code, date=r["trade_date"], limit=10)
+                        except Exception:  # noqa: BLE001 留痕接口异常不阻塞候选展示
+                            st.session_state[f"{tk}_rows"] = False
+                    trace_rows = st.session_state.get(f"{tk}_rows")
+                    if trace_rows is False:
+                        st.caption("留痕接口暂不可用，可点击下方重试。")
+                        if st.button("重试", key=f"retry_trace_{key}"):
+                            st.session_state.pop(f"{tk}_rows", None)
+                            st.rerun()
+                    elif not trace_rows:
+                        st.caption("该标的本交易日暂无留痕记录（历史快照或留痕启用前数据）。")
+                    else:
+                        for t in trace_rows:
+                            dk = f"trace_open_{t['trace_id']}"
+                            opened = st.session_state.get(dk, False)
+                            mlabel = _TRACE_MODULE.get(t.get("source_module", ""),
+                                                       t.get("source_module", ""))
+                            if st.button(f"查看 {mlabel} 留痕（{str(t.get('create_time') or '')[:16]}）",
+                                         key=f"trace_btn_{t['trace_id']}",
+                                         use_container_width=True):
+                                opened = not opened
+                                st.session_state[dk] = opened
+                                st.rerun()
+                            if opened:
+                                try:
+                                    render.trace_card(api.trace_detail(t["trace_id"]),
+                                                      key=f"tc_{t['trace_id']}")
+                                except Exception as exc:  # noqa: BLE001 详情失败只降级为提示
+                                    st.caption(f"留痕详情暂不可用：{exc}")
+                render.raw_json_expander(
+                    {"reasons": r.get("reasons"), "risk_notice": r.get("risk_notice"),
+                     "detail": detail},
+                    key=f"raw_cand_{code}_{r['trade_date']}")
+
+    # 详情懒加载：首屏 20 条，点「加载更多」增量展示；切换日期/筛选自动回首屏
+    cand_keys = [f"cand_{r['stock_code']}_{r['trade_date']}_{r.get('rank')}" for r in day_rows]
+    render.batch_fold_bar("cand", cand_keys,
+                          label="点击行内「查看详情」展开完整研判（维度归因/理由/风险/操作建议）。")
+    _empty_text = ("今日无满足可建仓判定的标的，建议观望。"
+                   if filter_opt == "可建仓 A+B"
+                   else "当日无候选：可切换日期，或点击上方「手动触发每日挖掘」重新生成。")
+    render.record_list(day_rows, _cand_detail, batch=20,
+                       key=f"_cand_vis_{date}_{filter_opt}_{sector}",
+                       empty_text=_empty_text)
+
+# ===== 候选池全局批量验证对话面板（只读分析 + 调整建议；确认生效才写入覆盖，可回滚） =====
+_SCOPE_LABELS = {"all": "全部候选", "tradeable": "仅可建仓", "A": "仅 A 级",
+                 "B": "仅 B 级", "C": "仅 C 级", "manual": "手动勾选"}
+
+
+def _batch_meta_by_assistant_id(mid: int) -> dict:
+    """取某条批量回答消息的完整 meta（含 adjust_plan/共性/差异/建议，结果字段只含标量）"""
+    if not mid:
+        return {}
+    try:
+        msgs = api.chat_history("discover", limit=50, message_type="batch")
+    except Exception:  # noqa: BLE001 历史读取失败只降级为空 meta
+        return {}
+    for _m in msgs:
+        if _m.get("id") == mid:
+            return _m.get("meta") or {}
+    return {}
+
+
+def _do_batch_ask(scope_val: str, codes_val: list[str], question: str, trade_date: str) -> None:
+    if not question or not question.strip():
+        render.msg_card("warn", "问题不能为空", "请输入批量验证问题后再提交。")
+        return
+    if scope_val == "manual" and not codes_val:
+        render.msg_card("warn", "未勾选标的", "手动范围需至少勾选 1 只候选。")
+        return
+    try:
+        resp = api.batch_ask(scope_val, codes_val, question.strip(), trade_date)
+        st.session_state["_batch_tid"] = resp["task_id"]
+        st.toast(f"已提交批量验证任务（{resp['task_id']}），完成后自动展示")
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001 提交失败统一提示，不向页面抛原始报错
+        render.msg_card("err", "提交失败", "未能提交批量验证任务，可稍后重试或检查后端服务。", detail=exc)
+
+
+def _batch_panel(trade_date: str, day_rows: list[dict], trade_map: dict) -> None:
+    """批量验证对话面板：范围选择 + 快捷提问 + 多行输入 → 后台任务 → 总分答案 + 调整方案确认"""
+    import chat_cards as cc
+
+    _scope_key, _codes_key = "_batch_scope", "_batch_codes"
+    with st.expander("批量验证对话（一次提问，统一研判所选范围候选）",
+                     expanded=bool(st.session_state.get("_batch_open"))):
+        st.caption("按所选范围注入候选上下文（最多 20 只）；回答按「整体结论/共性/差异/建议」总分结构，"
+                   "调整方案需人工「确认生效」后才写入候选覆盖，可回滚留痕。")
+        # ---- 范围选择（默认取自「单标的追问」/顶部按钮设置） ----
+        scope = st.session_state.get(_scope_key, "all")
+        if scope not in _SCOPE_LABELS:
+            scope = "all"
+        sel_scope = st.selectbox("提问范围", list(_SCOPE_LABELS),
+                                 index=list(_SCOPE_LABELS).index(scope),
+                                 format_func=lambda s: _SCOPE_LABELS[s])
+        st.session_state[_scope_key] = sel_scope
+        manual_codes: list[str] = []
+        if sel_scope == "manual":
+            opts = {r["stock_code"]: r["stock_name"] for r in day_rows}
+            default_codes = [c for c in (st.session_state.get(_codes_key) or []) if c in opts]
+            picked = st.multiselect("手动勾选标的（最多 20 只）", options=list(opts),
+                                    default=default_codes[:20],
+                                    format_func=lambda c: f"{opts.get(c, c)}（{c}）")
+            manual_codes = picked[:20]
+            st.session_state[_codes_key] = manual_codes
+        # ---- 快捷提问 ----
+        qk = "_batch_quick"
+        c1, c2, c3, c4 = st.columns(4)
+        quick_q = ""
+        with c1:
+            if st.button("吸筹逻辑是否合理", key=f"{qk}_abs", use_container_width=True):
+                quick_q = "这批候选的吸筹逻辑是否合理？吸筹阶段是否真实，有无明显分歧或证伪点？"
+        with c2:
+            if st.button("共性风险", key=f"{qk}_risk", use_container_width=True):
+                quick_q = "这批候选存在哪些共性风险？请重点提示需要人工复核的高风险项。"
+        with c3:
+            if st.button("评级松紧", key=f"{qk}_tier", use_container_width=True):
+                quick_q = "当前评级（A/B/C）松紧是否合理？是否有评级与质量明显不匹配的标的？"
+        with c4:
+            if st.button("遗漏优质标的", key=f"{qk}_miss", use_container_width=True):
+                quick_q = "这批候选中是否遗漏了值得提升关注度的优质标的？"
+        if quick_q:
+            st.session_state["_batch_q_input"] = quick_q
+            _do_batch_ask(sel_scope, manual_codes, quick_q, trade_date)
+        # ---- 多行输入 + 提交 ----
+        with st.form("batch_ask_form"):
+            st.text_area("验证问题（多行；可改用上方快捷提问）", height=80,
+                         key="_batch_q_input",
+                         placeholder="如：这批候选当前是否适合分批建仓？优先顺序如何？")
+            submitted = st.form_submit_button("提交批量验证（后台处理，约需 30-90 秒）", type="primary")
+        if submitted:
+            _do_batch_ask(sel_scope, manual_codes,
+                          st.session_state.get("_batch_q_input", ""), trade_date)
+        # ---- 结果展示（总-分结构 + 调整方案确认） ----
+        tid = st.session_state.get("_batch_tid")
+        if tid:
+            try:
+                task = api.task_detail(tid)
+            except Exception:  # noqa: BLE001 轮询失败按未完成处理，页面不崩
+                task = None
+            if task and task.get("status") == "done" and task.get("result"):
+                r = task["result"]
+                meta = _batch_meta_by_assistant_id(r.get("assistant_msg_id"))
+                with st.container(border=True):
+                    st.markdown(f"**整体结论**（范围：{_SCOPE_LABELS.get(r.get('scope', ''), r.get('scope', ''))}"
+                                f" · 注入 {r.get('count', 0)} 只 · 信心 {r.get('confidence', 0)}/100）")
+                    st.markdown(r.get("answer", ""))
+                    for _title, _k in (("共性分析", "common_points"), ("差异说明", "differences"),
+                                       ("调整建议", "suggestions")):
+                        _items = meta.get(_k) or []
+                        if _items:
+                            st.markdown(f"**{_title}**")
+                            for _it in _items:
+                                st.markdown(f"- {_it}")
+                    if r.get("sources"):
+                        render.trace_line("依据来源", source=str(r["sources"]))
+                    bid = int(r.get("batch_id") or 0)
+                    plan = meta.get("adjust_plan") or []
+                    if bid and plan:
+                        st.markdown("**调整方案（仅建议，确认生效后才写入候选覆盖）**")
+                        for p in plan:
+                            _nm = (trade_map.get(p.get("stock_code"), {})
+                                   .get("stock_name", p.get("stock_code")))
+                            st.markdown(f"- {_nm}（{p.get('stock_code')}）："
+                                        f"{p.get('new_tier', '')} / {p.get('new_label', '')}"
+                                        f" —— {p.get('reason', '')}（{p.get('evidence', '')}）")
+                        if st.button("确认生效（写入候选覆盖，可回滚）", key=f"apply_batch_{bid}",
+                                     type="primary"):
+                            try:
+                                res = api.apply_batch_adjust(bid)
+                                st.toast(f"已生效 {res.get('count', 0)} 条调整，可回滚")
+                                st.session_state.pop("_batch_tid", None)
+                                st.rerun()
+                            except Exception as exc:  # noqa: BLE001
+                                render.msg_card("err", "确认生效失败", "写入失败，可稍后重试。", detail=exc)
+                    elif bid:
+                        render.msg_card("info", "本次回答未生成调整方案",
+                                        "未提出需要确认的调整建议，仅展示分析结果。")
+                    if st.button("清空本次回答", key=f"clear_batch_{tid}"):
+                        st.session_state.pop("_batch_tid", None)
+                        st.rerun()
+            elif task and task.get("status") == "failed":
+                render.msg_card("err", "批量验证失败", "后台处理未完成，可重新提交。",
+                                detail=task.get("error", ""))
+                st.session_state.pop("_batch_tid", None)
+            elif task and task.get("status") in ("pending", "running"):
+                st.info(f"批量验证处理中（任务 {tid}），完成后自动展示……")
+        # ---- 批量对话历史（回溯留痕；30s 会话缓存：每次 rerun 不重复拉取） ----
+        import time as _t
+        if _t.time() - st.session_state.get("_batch_hist_ts", 0.0) >= 30:
+            try:
+                _msgs = api.chat_history("discover", limit=30, message_type="batch")
+                st.session_state["_batch_hist"] = _msgs
+                st.session_state["_batch_hist_ts"] = _t.time()
+            except Exception:  # noqa: BLE001 历史失败只降级，不阻塞面板
+                _msgs = st.session_state.get("_batch_hist") or []
+        else:
+            _msgs = st.session_state.get("_batch_hist") or []
+        if _msgs:
+            st.markdown("**批量对话历史（可追溯）**")
+            _units = cc.pair_messages(_msgs)[:8]
+            cc.render_batch_bar("discover", _units)
+            for _u in _units:
+                cc.render_conversation_unit("discover", _u)
+
+
+_batch_panel(date, day_rows, trade_map)

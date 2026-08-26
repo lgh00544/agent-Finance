@@ -196,9 +196,37 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 读取失败不阻塞评分
         logger.warning("因子校准摘要获取失败（降级跳过）: %s", exc)
 
+    # 派发期判定（batch D）：6 维自动判定事实（LLM 一票否决）；失败为 None 不阻断打分
+    distribution_phase_context = None
+    try:
+        from app.services.distribution_phase import compute_distribution_phase
+        distribution_phase_context = compute_distribution_phase(code, today)
+    except Exception as exc:  # noqa: BLE001 派发期判定失败跳过注入，不阻塞打分
+        logger.warning("派发期判定失败（跳过注入）: %s", exc)
+
+    # 资本视图（批次E）：游资/龙虎榜/资金流三维 + K189 对倒纯代码判定；失败 None 不阻断打分
+    capital_view_context = None
+    try:
+        from app.services.capital_view import compute_capital_view
+        capital_view_context = compute_capital_view(code, today)
+    except Exception as exc:  # noqa: BLE001 资本视图失败跳过注入，不阻塞打分
+        logger.warning("资本视图失败（跳过注入）: %s", exc)
+
+    # 周期复利（批次H）：该股历史多次操作汇总（历史胜率/拖累率 → 资金维度加分/扣分依据）；
+    # D 派发期 + E 游资后追加；失败 None 不阻断打分
+    cycle_attribution = None
+    try:
+        from app.services.track_verify import build_stock_cycle_attribution
+        cycle_attribution = build_stock_cycle_attribution(code)
+    except Exception as exc:  # noqa: BLE001 周期复利失败跳过注入，不阻塞打分
+        logger.warning("周期复利读取失败（跳过注入）: %s", exc)
+
     state["discover_context"] = discover_ctx
     state["market_intel_summary"] = intel_summary
     state["factor_calibration"] = factor_calibration
+    state["distribution_phase_context"] = distribution_phase_context
+    state["capital_view_context"] = capital_view_context
+    state["cycle_attribution"] = cycle_attribution
     state["trace"] = [*state.get("trace", []),
                       f"聚合完成: K线{len(kline)}行 财务{len(fin_rows)}期 资金流{len(ff_rows)}日 新闻{len(news_rows)}条"]
     return state
@@ -224,6 +252,12 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "行业板块行情": (state.get("basic_info") or {}).get("industry_spot", [])[:15],
         # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
         "游资聚合": state.get("hot_money"),
+        # 派发期判定（batch D）：6 维 + phase/confidence，供 LLM 单一票否决参考（缺失为 None）
+        "distribution_phase_context": state.get("distribution_phase_context"),
+        # 资本视图（批次E）：游资/龙虎榜/资金流三维 + K189 对倒 + 30日胜率（缺失为 None）
+        "capital_view_context": state.get("capital_view_context"),
+        # 周期复利（批次H）：该股历史多次操作汇总（参考权重，缺失为 None 不注入噪音）
+        "cycle_attribution": state.get("cycle_attribution"),
     }
 
     output = agent_call(
@@ -241,6 +275,41 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         model_level=ModelLevel.DEEP,
     )
 
+    # ---- 派发期判定（batch D）：phase≥2 视为派发/砸盘风险，评分上限压至 90 + 追加风险提示 ----
+    # 不单独占一维（六因子维度不变），只做总分上限约束；缺失/失败不触发
+    _dist = state.get("distribution_phase_context") or {}
+    if int(_dist.get("phase") or 0) >= 2:
+        output.score = min(output.score, 90)
+        _trig = sum(1 for s in (_dist.get("six_dim") or {}).values() if s.get("triggered"))
+        _notice = (f"⚠️ 派发期判定: {_dist.get('phase_label') or '派发期'}（6维触发 {_trig} 项），"
+                   "评分上限压至 90，追高风险提示")
+        if _notice not in output.risk_list:
+            output.risk_list.append(_notice)
+
+    # ---- 资本视图（批次E）：加分/减分仿 D 派发期（K189 对倒纯代码判定不交 LLM，减分压上限；
+    #      多游资同买仅 +3 加分提示跟买≠必胜；30日无数据不触发）----
+    _cv = state.get("capital_view_context") or {}
+    if _cv.get("wash_suspect"):
+        output.score = min(output.score, 88)
+        _notice = ("⚠️ K189 对倒嫌疑（同营业部近5日买卖共存且单次≥1000万），评分上限压至 88")
+        if _notice not in output.risk_list:
+            output.risk_list.append(_notice)
+    elif _cv.get("coordination") == "多游资同买":
+        output.score = min(100, output.score + 3)
+    # ---- 周期复利（批次H）：历史胜率/拖累率回流 —— 胜率≥60% 资金维度 +5；拖累率≥30% 扣 -10；无历史不动 ----
+    _cycle = state.get("cycle_attribution") or {}
+    if _cycle.get("win_rate") is not None and _cycle["win_rate"] >= 60.0:
+        output.score = min(100, output.score + 5)
+        _notice = (f"📈 历史胜率 {_cycle['win_rate']}% ≥ 60%（已了结 "
+                   f"{_cycle.get('closed_cycle_count') or 0} 周期），资金维度 +5 分")
+        if _notice not in output.risk_list:
+            output.risk_list.append(_notice)
+    if _cycle.get("drag_rate") is not None and _cycle["drag_rate"] >= 30.0:
+        output.score = max(0, output.score - 10)
+        _notice = (f"⚠️ 历史拖累率 {_cycle['drag_rate']}% ≥ 30%（已了结 "
+                   f"{_cycle.get('closed_cycle_count') or 0} 周期），资金维度 -10 分")
+        if _notice not in output.risk_list:
+            output.risk_list.append(_notice)
     # ---- v4.0 代码层推导 potential_flag（不信任 LLM 自报；factor 分值为 LLM 判断，flag 为事实换算）----
     _催化 = next((f.score for f in output.factors if f.factor == "催化"), 0)
     _动量 = next((f.score for f in output.factors if f.factor == "动量"), 0)

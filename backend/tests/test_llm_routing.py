@@ -231,7 +231,7 @@ def _patch_sections(monkeypatch, base="【基线】", rules="【规则】", prof
     monkeypatch.setattr(common_mod, "global_base_prompt", lambda: base)
     monkeypatch.setattr(common_mod, "hard_rules_section", lambda: rules)
     monkeypatch.setattr(common_mod, "profile_section", lambda: profile)
-    monkeypatch.setattr(common_mod, "knowledge_section", lambda agent: knowledge)
+    monkeypatch.setattr(common_mod, "knowledge_section", lambda agent, docs=None: (knowledge, None))
     monkeypatch.setattr(common_mod, "_agent_knowledge_text", lambda agent: tactic)
     monkeypatch.setattr(common_mod, "_agent_knowledge_version", lambda agent: tactic_ver)
     captured = {}
