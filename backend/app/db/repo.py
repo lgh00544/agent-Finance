@@ -362,6 +362,18 @@ def list_sector_daily_history(sector_name: str, days: int) -> list[dict]:
         ]
 
 
+def list_sector_daily_dates(limit: int = 60) -> list[str]:
+    """取有全板块快照的交易日（trade_date 降序），批次 B 取「昨日 top5」必要管道"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorDailySnapshot.trade_date)
+            .distinct()
+            .order_by(SectorDailySnapshot.trade_date.desc())
+            .limit(limit)
+        ).scalars().all()
+        return list(result)
+
+
 # ==================== 板块轮动·轮动指标快照（sector_daily_rank_log） ====================
 
 def upsert_sector_rank_log(row: dict) -> int:
