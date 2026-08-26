@@ -24,10 +24,11 @@ def calc_churn_rate(today_top5: list[str], yesterday_top5: list[str]) -> float:
 
 
 def calc_streak(sector_name: str, days: int = 10) -> int:
-    """板块连续居 top5 天数（含最新交易日；从最新往回数连续 rank_no≤5）"""
+    """板块连续居 top5 天数（含最新交易日；从最新往回数连续 rank_no≤5）
+    list_sector_daily_history 返回升序（旧→新），reversed 后最新在前。"""
     hist = repo.list_sector_daily_history(sector_name, days)
     streak = 0
-    for row in reversed(hist):  # 最新在前
+    for row in reversed(hist):
         if row["rank_no"] <= TOP_N:
             streak += 1
         else:
