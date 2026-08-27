@@ -737,7 +737,9 @@ def list_batch_adjusts(limit: int = 50) -> list[dict]:
 
 
 def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float,
-                 grade: str, detail: dict, risk_list: list) -> None:
+                 grade: str, detail: dict, risk_list: list,
+                 thinking_summary: tuple[str, str] | None = None) -> None:
+    """业务表存干净 detail；agentic thinking 只透传 trace（thinking_summary=(model_thinking, tool_trace)）。"""
     with SessionLocal() as db:
         row = db.execute(
             select(StockScore).where(
@@ -750,8 +752,12 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
         db.commit()
         _invalidate("score")
         # 推理留痕：score 五维分项研判（dimensions[].comment 按维度归入技术/资金/基本面）
+        # thinking 仅注入 trace 副本，绝不进业务表 detail
+        trace_ctx = dict(detail)
+        if thinking_summary:
+            trace_ctx["model_thinking"], trace_ctx["tool_trace"] = thinking_summary
         reasoning_trace.trace_score(stock_code, stock_name, trade_date,
-                                    score, grade, detail, risk_list)
+                                    score, grade, trace_ctx, risk_list)
 
 
 def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: float,

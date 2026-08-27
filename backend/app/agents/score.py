@@ -332,12 +332,12 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "cross_validation_note": output.cross_validation_note,
         "final_advice": output.final_advice,
     }
-    if agentic_trace:
-        detail["model_thinking"], detail["tool_trace"] = summarize_agentic_trace(agentic_trace)
+    # thinking 只进 trace（thinking_summary 透传），detail 业务表保持干净
     repo.upsert_score(
         code, name, today, float(output.score), output.grade,
         detail,
         output.risk_list,
+        thinking_summary=(summarize_agentic_trace(agentic_trace) if agentic_trace else None),
     )
     state["score_result"] = output.model_dump()
     state["risk_notice"] = output.risk_list
