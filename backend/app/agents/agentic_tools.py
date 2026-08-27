@@ -140,3 +140,12 @@ TOOL_FUNCS = {
     "get_fund_flow": _wrap(_get_fund_flow),
     "search_knowledge": _wrap(_search_knowledge),
 }
+
+
+def select_tools(allowlist: list[str] | None = None):
+    """按白名单裁剪工具子集；None/空 = 全量6工具（旧行为零变化）。"""
+    if not allowlist:
+        return TOOLS, TOOL_FUNCS
+    tools = [t for t in TOOLS if t["function"]["name"] in allowlist]
+    funcs = {k: v for k, v in TOOL_FUNCS.items() if k in allowlist}
+    return tools, funcs

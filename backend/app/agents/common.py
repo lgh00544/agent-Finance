@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 from typing import Type, TypeVar
 
-from app.agents.agentic_tools import TOOLS, TOOL_FUNCS
+from app.agents.agentic_tools import select_tools
 from app.cache import cache
 from app.db import repo
 from app.llm.structured import ModelLevel, _model_for, call_llm_cached
@@ -380,9 +380,11 @@ def agentic_call(agent: str, cache_key: str, system_prompt: str, user_prompt: st
                  with_profile: bool = True, with_knowledge: bool = True,
                  model_level: ModelLevel = ModelLevel.DEEP,
                  knowledge_docs: list | None = None,
-                 target_label: str = "") -> tuple[T, dict]:
-    """agentic 平行通道：build_agent_context 拼上下文 → ReAct 只读工具环（max_rounds=8）。
-    产物校验通过 → 结果与单式共用缓存键回写；任一环节失败（None）→ 回退单发，不抛异常。"""
+                 target_label: str = "",
+                 tools_allowlist: list[str] | None = None,
+                 max_rounds: int | None = None) -> tuple[T, dict]:
+    """agentic 平行通道：build_agent_context 拼上下文 → ReAct 只读工具环。
+    tools_allowlist=None=全量6工具；max_rounds=None=8 轮。任一环节失败 → 回退单发。"""
     from app.llm.agentic import run_agentic_judge
 
     sys_prompt, user_prompt = build_agent_context(
@@ -390,9 +392,10 @@ def agentic_call(agent: str, cache_key: str, system_prompt: str, user_prompt: st
         with_knowledge=with_knowledge, knowledge_docs=knowledge_docs,
         target_label=target_label)
     full_key = _fingerprint_key(agent, cache_key)
+    tools, tool_funcs = select_tools(tools_allowlist)
     result, trace = run_agentic_judge(
-        sys_prompt, user_prompt, schema, TOOLS, TOOL_FUNCS,
-        max_rounds=8, model_level=model_level)
+        sys_prompt, user_prompt, schema, tools, tool_funcs,
+        max_rounds=(max_rounds or 8), model_level=model_level)
     if result is not None:
         cache.set_llm_json(f"{agent}:{_model_for(model_level)}",
                            full_key, result.model_dump(), ttl_seconds)

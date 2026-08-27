@@ -789,8 +789,9 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
 
 def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: str,
                  message: str, action: str, signal: dict, pushed: bool,
-                 source: str = "monitor") -> int:
-    """写告警日志；source 标记来源（monitor/portfolio_sentinel），默认 monitor 保持旧链路不变"""
+                 source: str = "monitor", extra: dict | None = None) -> int:
+    """写告警日志；source 标记来源（monitor/portfolio_sentinel）。extra=thinking 摘要，仅进 trace_alert.ext_info，
+    业务表 signal 保持干净。默认 None 零行为。"""
     with SessionLocal() as db:
         row = AlertLog(stock_code=stock_code, stock_name=stock_name, alert_type=alert_type,
                        severity=severity, message=message, action=action, signal=signal,
@@ -803,7 +804,8 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
         # 无 LLM 研判，不写留痕（避免污染推理留痕视图）
         if source == "monitor":
             reasoning_trace.trace_alert(stock_code, stock_name, _now().strftime("%Y-%m-%d"),
-                                        alert_type, severity, message, action, signal or {})
+                                        alert_type, severity, message, action, signal or {},
+                                        extra=extra)
         return row.id
 
 

@@ -277,6 +277,10 @@ def llm_score(state: StockAgentState) -> StockAgentState:
             user_prompt=score_user_prompt,
             schema=ScoreOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP,
             target_label=f"{name}({code})",
+            # 决策瓶颈：全量6工具 + 8 轮预算（显式示例，等价默认 None）
+            tools_allowlist=["get_quote", "get_daily_kline", "get_news",
+                             "get_financial", "get_fund_flow", "search_knowledge"],
+            max_rounds=8,
         )
     else:
         output = agent_call(

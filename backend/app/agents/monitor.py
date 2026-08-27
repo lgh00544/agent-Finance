@@ -7,7 +7,8 @@ MonitorAgent 持仓监控 - LangGraph 节点（每持仓执行一次）
 import logging
 import time
 
-from app.agents.common import ModelLevel, agent_call
+from app.agents.common import ModelLevel, agent_call, agentic_call, summarize_agentic_trace
+from app.agents.agentic_tools import _AGENTIC_TOOL_NOTE
 from agent_prompts import monitor_prompt
 from app.agents.schemas import MonitorOutput
 from app.cache import cache
@@ -231,6 +232,24 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         _rule_fallback_alert(code, name, today, math)
         raise
 
+    # 批4-B 高危复核：仅 agentic_enable 且 LIGHT 判出高危时升级走 ReAct 环核验（info 零额外成本）
+    if settings.agentic_enable and output.severity in ("warning", "critical"):
+        _recheck_out, _recheck_trace = agentic_call(
+            agent="monitor", cache_key=f"{code}:{today}:{time.strftime('%H')}:agentic",
+            system_prompt=_AGENTIC_TOOL_NOTE + monitor_prompt.SYSTEM_PROMPT,
+            user_prompt=monitor_prompt.build_user_prompt(
+                holding_info, _compact(quote_data), news_context),
+            schema=MonitorOutput, ttl_seconds=3600, model_level=ModelLevel.DEEP,
+            tools_allowlist=["get_quote", "get_daily_kline", "get_news",
+                             "get_fund_flow", "search_knowledge"],
+            max_rounds=4, target_label=f"{name}({code})",
+        )
+        if _recheck_out is not None:  # 复核成功覆盖；失败(None)回退 LIGHT 结果，不中断
+            output = _recheck_out
+            state["agentic_trace"] = _recheck_trace
+            logger.info("高危信号 agentic 复核通过: %s %s(%s) %s", code, output.action,
+                        output.severity, output.alert_type)
+
     state["holding_signal"] = output.model_dump()
     state["stage"] = "holding_monitor"
     state["trace"] = [*state.get("trace", []),
@@ -286,9 +305,15 @@ def push_alert_node(state: StockAgentState) -> StockAgentState:
         else:
             logger.info("告警去重命中，跳过推送: %s", dedup_key)
 
+    # 批4-C 高危复核留痕：thinking 剥到 extra（仅进 trace_alert.ext_info），AlertLog.signal 保持干净
+    extra = None
+    if state.get("agentic_trace"):
+        _mt, _tt = summarize_agentic_trace(state["agentic_trace"])
+        if _mt or _tt:
+            extra = {"model_thinking": _mt, "tool_trace": _tt}
     repo.insert_alert(code, name, signal.get("alert_type", "常规跟踪"),
                       signal.get("severity", "info"), signal.get("message", ""),
-                      signal.get("action", "hold"), signal, pushed)
+                      signal.get("action", "hold"), signal, pushed, extra=extra)
     return state
 
 

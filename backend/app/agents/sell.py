@@ -214,6 +214,10 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
             user_prompt=sell_user_prompt,
             schema=SellOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP,
             target_label=f"{name}({code})",
+            # 卖出判断看行情/消息/资金，不查财务 → 5工具 + 6 轮预算
+            tools_allowlist=["get_quote", "get_daily_kline", "get_news",
+                             "get_fund_flow", "search_knowledge"],
+            max_rounds=6,
         )
     else:
         output = agent_call(

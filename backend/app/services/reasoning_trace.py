@@ -270,9 +270,12 @@ def trace_plan(stock_code: str, stock_name: str, plan_date: str,
 
 def trace_alert(stock_code: str, stock_name: str, trade_date: str,
                 alert_type: str, severity: str, message: str,
-                action: str, signal: dict) -> None:
-    """MonitorAgent：事实=signal 全量；推理=研判依据 reasons；结论=动作/严重度"""
+                action: str, signal: dict, extra: dict | None = None) -> None:
+    """MonitorAgent：事实=signal 全量；推理=研判依据 reasons；结论=动作/严重度。extra=thinking 摘要，仅进 ext_info。"""
     signal = signal or {}
+    _ext = {k: v for k, v in signal.items() if k not in ("reasons", "key_levels", "risks")}
+    if extra:
+        _ext.update(extra)
     submit({
         "stock_code": stock_code, "stock_name": stock_name,
         "source_module": "alert", "generate_date": trade_date,
@@ -286,8 +289,7 @@ def trace_alert(stock_code: str, stock_name: str, trade_date: str,
                                 "action": action, "message": message}),
         "confidence": 0.0,
         "data_source": "实时行情/公告/指标 + LLM 信号研判",
-        "ext_info": _j({k: v for k, v in signal.items()
-                        if k not in ("reasons", "key_levels", "risks")}),
+        "ext_info": _j(_ext),
     })
 
 
