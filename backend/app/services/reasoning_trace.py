@@ -375,6 +375,9 @@ def trace_sell(stock_code: str, stock_name: str, trade_date: str, decision: dict
     """SellAgent：推理=决策依据；结论=动作/置信度/离场区间 + v3.0 维度归因
     （final_advice 主结论 + dimensions dim→verdict 摘要；旧数据缺省为空）"""
     decision = decision or {}
+    # agentic 模式留痕：sell.py 把 ReAct 思考/工具摘要写入 decision，这里透传到 ext_info（单发模式空串）
+    model_thinking = str(decision.pop("model_thinking", "") or "")
+    tool_trace = str(decision.pop("tool_trace", "") or "")
     submit({
         "stock_code": stock_code, "stock_name": stock_name,
         "source_module": "sell", "generate_date": trade_date,
@@ -394,7 +397,7 @@ def trace_sell(stock_code: str, stock_name: str, trade_date: str, decision: dict
                                                if isinstance(d, dict)}}),
         "confidence": 0.0,
         "data_source": "持仓实时行情/近期监控信号 + LLM 卖出决策",
-        "ext_info": "",
+        "ext_info": _j({"model_thinking": model_thinking, "tool_trace": tool_trace}),
     })
 
 

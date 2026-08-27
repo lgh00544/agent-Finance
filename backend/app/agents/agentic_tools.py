@@ -88,6 +88,17 @@ def _search_knowledge(code: str, query: str, top_k: int = 5) -> dict:
                       "摘要": (h.get("summary") or h.get("content") or "")[:120]} for h in hits]}
 
 
+# ---- 公共注入（agentic 分支统一消费，禁止节点内重抄）----
+# 工具引导：提示模型已有只读工具可按需调用核验数据（工具由调用层挂载，本段仅行为约束）
+_AGENTIC_TOOL_NOTE = (
+    "【只读工具（已挂载，按需调用核验数据）】你已收到聚合数据包，通常足以直接评分；"
+    "若某维度数据缺失、过期或需最新确认，可调用只读工具核验/补充：get_quote 实时行情、"
+    "get_daily_kline 日K、get_news 新闻公告、get_financial 财务、get_fund_flow 资金流、"
+    "search_knowledge 私有知识库检索。调用后据返回继续推理，证据充分即输出最终 JSON；"
+    "数据已充分时直接输出，勿空转调工具。\n\n"
+)
+
+
 # ---- OpenAI function 定义 + 函数注册表 ----
 
 TOOLS = [

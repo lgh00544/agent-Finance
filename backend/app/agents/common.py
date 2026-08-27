@@ -257,10 +257,13 @@ def _fingerprint_key(agent: str, cache_key: str) -> str:
 
 def build_agent_context(agent: str, system_prompt: str, user_prompt: str,
                         with_profile: bool = True, with_knowledge: bool = True,
-                        knowledge_docs: list | None = None) -> tuple[str, str]:
+                        knowledge_docs: list | None = None,
+                        target_label: str = "") -> tuple[str, str]:
     """统一上下文拼接（agent_call / agentic_call 共用，agentic 不裸传 SYSTEM_PROMPT）：
     sys 段固定序：全局基线→硬性规则→复盘采纳→偏好档案→私有知识→经验→战法→专属 Prompt；
-    user 段注入市场研判参考 + 选股表现回顾。返回 (sys_prompt, user_prompt)。"""
+    user 段注入标的标识 + 市场研判参考 + 选股表现回顾。返回 (sys_prompt, user_prompt)。"""
+    if target_label:
+        user_prompt = f"【本次研判标的】{target_label}\n\n{user_prompt}"
     sections: list[str] = []
     # 拼接位0 · 全局通用知识库基线（最先加载，所有 Agent 统一生效）
     base = global_base_prompt()
@@ -376,14 +379,16 @@ def agentic_call(agent: str, cache_key: str, system_prompt: str, user_prompt: st
                  schema: Type[T], ttl_seconds: int = 86400,
                  with_profile: bool = True, with_knowledge: bool = True,
                  model_level: ModelLevel = ModelLevel.DEEP,
-                 knowledge_docs: list | None = None) -> tuple[T, dict]:
+                 knowledge_docs: list | None = None,
+                 target_label: str = "") -> tuple[T, dict]:
     """agentic 平行通道：build_agent_context 拼上下文 → ReAct 只读工具环（max_rounds=8）。
     产物校验通过 → 结果与单式共用缓存键回写；任一环节失败（None）→ 回退单发，不抛异常。"""
     from app.llm.agentic import run_agentic_judge
 
     sys_prompt, user_prompt = build_agent_context(
         agent, system_prompt, user_prompt, with_profile=with_profile,
-        with_knowledge=with_knowledge, knowledge_docs=knowledge_docs)
+        with_knowledge=with_knowledge, knowledge_docs=knowledge_docs,
+        target_label=target_label)
     full_key = _fingerprint_key(agent, cache_key)
     result, trace = run_agentic_judge(
         sys_prompt, user_prompt, schema, TOOLS, TOOL_FUNCS,
@@ -395,3 +400,12 @@ def agentic_call(agent: str, cache_key: str, system_prompt: str, user_prompt: st
     logger.warning("AGENTIC_FALLBACK: agent=%s key=%s 回退单发", agent, cache_key)
     return call_llm_cached(agent, full_key, sys_prompt, user_prompt, schema,
                            ttl_seconds=ttl_seconds, model_level=model_level), {}
+
+
+def summarize_agentic_trace(trace: dict) -> tuple[str, str]:
+    """把 agentic 环过程日志压成两行摘要：思考轨迹 + 工具调用轨迹（供留痕）。"""
+    steps = trace.get("trace") or []
+    thinking = [s.get("text", "") for s in steps if s.get("kind") == "thinking"]
+    tools = [f"轮{s.get('round')} {s.get('tool')}({s.get('args')})"
+             for s in steps if s.get("kind") == "tool"]
+    return "；".join(thinking), "；".join(tools)

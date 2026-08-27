@@ -9,7 +9,9 @@ import json
 import logging
 import time
 
-from app.agents.common import ModelLevel, agent_call, agentic_call
+from app.agents.common import (ModelLevel, agent_call, agentic_call,
+                               summarize_agentic_trace)
+from app.agents.agentic_tools import _AGENTIC_TOOL_NOTE
 from agent_prompts import score_prompt
 from app.agents.schemas import PrefilterOutput, ScoreOutput
 from app.core.config import settings
@@ -274,6 +276,7 @@ def llm_score(state: StockAgentState) -> StockAgentState:
             system_prompt=_AGENTIC_TOOL_NOTE + score_prompt.SYSTEM_PROMPT,
             user_prompt=score_user_prompt,
             schema=ScoreOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP,
+            target_label=f"{name}({code})",
         )
     else:
         output = agent_call(
@@ -330,7 +333,7 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "final_advice": output.final_advice,
     }
     if agentic_trace:
-        detail["model_thinking"], detail["tool_trace"] = _summarize_agentic_trace(agentic_trace)
+        detail["model_thinking"], detail["tool_trace"] = summarize_agentic_trace(agentic_trace)
     repo.upsert_score(
         code, name, today, float(output.score), output.grade,
         detail,
@@ -351,25 +354,6 @@ def _compact(data: dict) -> str:
     import json
 
     return json.dumps(data, ensure_ascii=False, default=str)
-
-
-# agentic 通道专属：引导模型在数据缺失/需最新确认时调用只读工具（工具由调用层挂载，本段仅行为约束）
-_AGENTIC_TOOL_NOTE = (
-    "【只读工具（已挂载，按需调用核验数据）】你已收到聚合数据包，通常足以直接评分；"
-    "若某维度数据缺失、过期或需最新确认，可调用只读工具核验/补充：get_quote 实时行情、"
-    "get_daily_kline 日K、get_news 新闻公告、get_financial 财务、get_fund_flow 资金流、"
-    "search_knowledge 私有知识库检索。调用后据返回继续推理，证据充分即输出最终 JSON；"
-    "数据已充分时直接输出，勿空转调工具。\n\n"
-)
-
-
-def _summarize_agentic_trace(trace: dict) -> tuple[str, str]:
-    """把 agentic 环过程日志压成两行摘要：思考轨迹 + 工具调用轨迹（供留痕）。"""
-    steps = trace.get("trace") or []
-    thinking = [s.get("text", "") for s in steps if s.get("kind") == "thinking"]
-    tools = [f"轮{s.get('round')} {s.get('tool')}({s.get('args')})"
-             for s in steps if s.get("kind") == "tool"]
-    return "；".join(thinking), "；".join(tools)
 
 
 def _days_ago(n: int) -> str:

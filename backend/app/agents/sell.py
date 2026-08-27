@@ -8,14 +8,18 @@ import json
 import logging
 import time
 
-from app.agents.common import ModelLevel, agent_call
+from app.agents.common import (ModelLevel, agent_call, agentic_call,
+                               summarize_agentic_trace)
+from app.agents.agentic_tools import _AGENTIC_TOOL_NOTE
 from agent_prompts import sell_prompt
 from app.agents.schemas import SellOutput
 from app.cache import cache
+from app.core.config import settings
 from app.datasource.base import DataSource
 from app.datasource.fallback import get_datasource
 from app.db import repo
 from app.graph.state import StockAgentState
+from app.services import reasoning_trace
 from app.services.indicator import compute_indicators
 
 logger = logging.getLogger(__name__)
@@ -197,21 +201,37 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
         portfolio_risk_text = (risk_ctx.get("note")
                                or "组合数据不可用（PortfolioSentinel 未运行或快照过期）")
 
-    output = agent_call(
-        agent="sell",
-        cache_key=f"selldec:{code}:{today}",
-        system_prompt=sell_prompt.SYSTEM_PROMPT,
-        user_prompt=sell_prompt.build_user_prompt(
-            holding_info, signals_text, plan_info,
-            json.dumps(quote_pack, ensure_ascii=False, default=str),
-            portfolio_risk_context=portfolio_risk_text),
-        schema=SellOutput,
-        ttl_seconds=86400,
-        model_level=ModelLevel.DEEP,
-    )
+    sell_cache_key = f"selldec:{code}:{today}"
+    sell_user_prompt = sell_prompt.build_user_prompt(
+        holding_info, signals_text, plan_info,
+        json.dumps(quote_pack, ensure_ascii=False, default=str),
+        portfolio_risk_context=portfolio_risk_text)
+    agentic_trace: dict = {}
+    if settings.agentic_enable:
+        output, agentic_trace = agentic_call(
+            agent="sell", cache_key=sell_cache_key,
+            system_prompt=_AGENTIC_TOOL_NOTE + sell_prompt.SYSTEM_PROMPT,
+            user_prompt=sell_user_prompt,
+            schema=SellOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP,
+            target_label=f"{name}({code})",
+        )
+    else:
+        output = agent_call(
+            agent="sell", cache_key=sell_cache_key,
+            system_prompt=sell_prompt.SYSTEM_PROMPT, user_prompt=sell_user_prompt,
+            schema=SellOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP,
+        )
 
-    repo.insert_sell_decision(state["holding_id"], code, name, output.model_dump())
-    state["sell_decision"] = output.model_dump()
+    decision = output.model_dump()
+    if agentic_trace:
+        decision["model_thinking"], decision["tool_trace"] = summarize_agentic_trace(agentic_trace)
+        # 落库前删两字段：sell_decision 表本体不写 thinking，仅 trace 透传（覆盖 insert 内部空 ext_info 行）
+        clean = {k: v for k, v in decision.items() if k not in ("model_thinking", "tool_trace")}
+        repo.insert_sell_decision(state["holding_id"], code, name, clean)
+        reasoning_trace.trace_sell(code, name, time.strftime("%Y-%m-%d"), decision)
+    else:
+        repo.insert_sell_decision(state["holding_id"], code, name, decision)
+    state["sell_decision"] = decision
     state["stage"] = "sell_decision"
     state["trace"] = [*state.get("trace", []),
                       f"卖出决策完成: {output.action}({output.confidence})"]
