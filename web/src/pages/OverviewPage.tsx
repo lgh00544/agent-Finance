@@ -4,10 +4,11 @@ import { dashboard, jobStatus, llmStats as fetchLlm, datasourceStats as fetchDs 
 import { recentTasks, retryTask } from '@/api/tasks'
 import { hotSectors, marketCondition, marketIndices } from '@/api/market'
 import { holdingQuotes, redLineCheck, takeProfitPlan } from '@/api/holdings'
+import { accountPnl } from '@/api/account'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { ChartCard, hotSectorBarOption } from '@/components/charts/ChartCard'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StockLabel } from '@/components/common'
-import type { HotSector } from '@/types'
+import type { AccountPnl, HotSector } from '@/types'
 
 const { Text } = Typography
 
@@ -24,6 +25,52 @@ function bandColor(b: string): string {
 /** 严格度档位 → Tag 色（宽松绿/标准蓝/严格橙/极严红） */
 function strictColor(s: string): string {
   return s.includes('宽松') ? 'green' : s.includes('标准') ? 'blue' : s.includes('严格') ? 'orange' : s.includes('极严') ? 'red' : 'default'
+}
+
+/** 今日真实盈亏（同花顺）cell：三态诚实展示（未接入/有值/过期错误），绝不出假正数 */
+function PnlCell({ pnl }: { pnl?: AccountPnl }) {
+  if (!pnl?.configured) {
+    return (
+      <div>
+        <Text type="secondary" style={{ fontSize: 12 }}>今日盈亏（同花顺）</Text>
+        <div style={{ marginTop: 2 }}><Text type="secondary">未接入 · 同花顺真实盈亏未启用</Text></div>
+      </div>
+    )
+  }
+  const s = pnl.snapshot ?? {}
+  const yk = s.pnl_yk as number | null | undefined
+  const pct = s.pnl_pct as number | null | undefined
+  const sh = s.sh_pct as number | null | undefined
+  const up = (v: number | null | undefined) => (v == null ? 'default' : Number(v) >= 0 ? 'red' : 'green')
+  const ykText = yk == null ? '—' : `${Number(yk) >= 0 ? '+' : ''}¥${Math.abs(Number(yk)).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const pctText = pct == null ? '—' : `${Number(pct) >= 0 ? '+' : ''}${Number(pct).toFixed(2)}%`
+  const expired = s.token_expired === true
+  const err = String(s.error ?? '').trim()
+  const updatedAt = String(s.updated_at ?? '')
+  const parsed = new Date(updatedAt.replace(' ', 'T')).getTime()
+  const stale = !!updatedAt && !Number.isNaN(parsed) && Date.now() - parsed > 10 * 60 * 1000
+  return (
+    <div>
+      <Text type="secondary" style={{ fontSize: 12 }}>今日盈亏（同花顺）</Text>
+      <div style={{ marginTop: 2 }}>
+        <Text strong style={{ color: up(yk) === 'red' ? '#cf1322' : up(yk) === 'green' ? '#389e0d' : undefined }}>
+          {ykText} {pctText}
+        </Text>
+      </div>
+      {sh != null && !Number.isNaN(Number(sh)) ? (
+        <div style={{ marginTop: 2 }}><Tag color={up(sh)}>上证 {Number(sh) >= 0 ? '+' : ''}{Number(sh).toFixed(2)}%</Tag></div>
+      ) : null}
+      {expired ? (
+        <div style={{ marginTop: 2 }}><Tag color="orange">同花顺 Cookie 已过期，请到 DSH 插件重新登录</Tag></div>
+      ) : null}
+      {err ? (
+        <div style={{ marginTop: 2, color: '#cf1322', fontSize: 12 }}>{err.length > 40 ? `${err.slice(0, 40)}…` : err}</div>
+      ) : null}
+      <div style={{ marginTop: 2, fontSize: 12 }}>
+        <Text type="secondary">{updatedAt ? updatedAt.slice(5, 19) : '—'}{stale ? '（可能过期）' : ''}</Text>
+      </div>
+    </div>
+  )
 }
 
 /** detail.factors 最高分因子 → "因子 分/10"（缺 → —） */
@@ -119,6 +166,8 @@ export function OverviewPage() {
   // 市况速览：三大指数 + 严格度（dashboard 的 market_condition 无 strictness，复用 /market-condition 已有 api）
   const { data: idx } = useQuery({ queryKey: ['market-indices'], queryFn: marketIndices })
   const { data: mcStrict } = useQuery({ queryKey: ['market-cond-strict'], queryFn: marketCondition })
+  // 同花顺真实今日盈亏（只读展示；默认关返回 {configured:false} → PnlCell 灰态）
+  const { data: pnl } = useQuery({ queryKey: ['account-pnl'], queryFn: accountPnl, refetchInterval: 60_000 })
   // 持仓红线预警（复用已有 /red_line_check，5 分钟轮询平衡开销）
   const { data: redRes } = useQuery({
     queryKey: ['red-line-check'],
@@ -210,6 +259,7 @@ export function OverviewPage() {
               </Space>
             </div>
           </div>
+          <div><PnlCell pnl={pnl} /></div>
         </div>
         <div style={{ marginTop: 8, fontSize: 13 }}><Text type="secondary">{String(marketCond.summary ?? '—')}</Text></div>
       </Card>

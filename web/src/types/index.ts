@@ -150,6 +150,27 @@ export interface AccountSummary {
   [k: string]: unknown
 }
 
+/** 同花顺真实盈亏快照（ths_pnl）字段可空，展示层缺字段一律 "—"，绝不出假正数 */
+export interface AccountPnlSnapshot {
+  id?: number
+  trade_date?: string
+  ts?: string
+  pnl_yk?: number | null
+  pnl_pct?: number | null
+  sh_pct?: number | null
+  chart_data?: unknown
+  source?: string
+  error?: string | null
+  token_expired?: boolean | null
+  updated_at?: string | null
+  [k: string]: unknown
+}
+export interface AccountPnl {
+  configured: boolean
+  snapshot?: AccountPnlSnapshot | null
+  [k: string]: unknown
+}
+
 // ===== 候选 / 评分 / 建仓 / 持仓 =====
 export interface Candidate {
   id?: number
