@@ -45,6 +45,9 @@ _probe_*.py
 .codex/
 .mcp.json.tmp
 
+# 一次性临时脚本/日志（_tmp_* 一律不入库，仅留 workspace）
+_tmp_*
+
 # 个人提示词备份
 CLAUDE_CODE_PROMPT*.md
 CONFIDENCE_UPGRADE_PROMPT.md
