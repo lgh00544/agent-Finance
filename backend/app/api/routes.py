@@ -103,13 +103,19 @@ def _task_market_intel() -> dict:
 
 
 def _task_sector_rotation() -> dict:
-    """板块轮动分析（手动入口）：状态机判定 + 归因子 Agent → 落库"""
+    """板块轮动分析（手动入口）：先拉全板块日快照再状态机判定+归因（盘中可用）"""
+    from app.services.sector_daily import refresh_sector_daily_snapshot
+    refresh = refresh_sector_daily_snapshot()
     result = graph_router.run_sector_rotation()
     launch = result.get("launch") or {}
+    error = result.get("error")
+    if not error and not refresh.get("success"):
+        error = f"快照刷新失败: {refresh.get('error')}"
     return {"trade_date": result.get("trade_date"),
             "rotation_state": result.get("rotation_state"),
             "rows": launch.get("rows", 0),
-            "error": result.get("error")}
+            "refresh": refresh,
+            "error": error}
 
 
 def _task_monitor_all() -> dict:

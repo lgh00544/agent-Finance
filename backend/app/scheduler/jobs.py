@@ -260,6 +260,11 @@ def sector_daily_job() -> None:
             cache.set("job:last_sector_daily",
                       time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
             logger.info("全板块日快照完成: %s 条", result.get("rows", 0))
+            # cron 闭环：快照就绪后追加触发状态机判定+归因，失败不抛
+            from app.graph.router import run_sector_rotation
+            run_result = run_sector_rotation()
+            logger.info("板块轮动判定+归因完成: %s",
+                        run_result.get("rotation_state") or run_result.get("error"))
         else:
             logger.warning("全板块日快照失败: %s", result.get("error"))
     except Exception as exc:  # noqa: BLE001 调度入口吞异常
