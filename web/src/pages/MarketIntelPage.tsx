@@ -1,5 +1,5 @@
 import { type CSSProperties, useState } from 'react'
-import { App, Alert, Button, Card, Descriptions, Select, Space, Tabs, Typography } from 'antd'
+import { App, Alert, Button, Card, Collapse, Descriptions, List, Select, Space, Tabs, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { marketIntel, marketIntelDates, sectorPatterns, sectorRotation } from '@/api/market'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
@@ -22,6 +22,26 @@ function flatten(v: unknown, indent = 0): string {
       .join('\n')
   }
   return String(v)
+}
+
+/** 未知值 → 可读文本：缺失显（无）；数组用；连接；嵌套对象走 flatten */
+function fmt(v: unknown): string {
+  if (v == null) return '（无）'
+  if (Array.isArray(v)) return v.map(fmt).filter(Boolean).join('；')
+  if (typeof v === 'object') return flatten(v)
+  const s = String(v)
+  return s === '' ? '（无）' : s
+}
+
+/** 自由 dict → Descriptions（字段名中文化展示，缺失显（无）） */
+function DictTab({ dict, empty }: { dict?: Record<string, unknown>; empty: string }) {
+  const entries = Object.entries(dict ?? {})
+  if (!entries.length) return <Text type="secondary">{empty}</Text>
+  return (
+    <Descriptions size="small" column={1} items={entries.map(([k, v], i) => ({
+      key: `f-${i}`, label: k, children: <div style={{ whiteSpace: 'pre-wrap' }}>{fmt(v)}</div>,
+    }))} />
+  )
 }
 
 /** 深度化模块：量能成色 / 主线结构 / 箱位理解 / 个股三维验证 */
@@ -184,10 +204,10 @@ export function MarketIntelPage() {
     qc.invalidateQueries({ queryKey: ['market-intel'] })
   })
 
-  const appetite: Record<string, { label: string; color: string }> = {
-    进取: { label: '进取', color: 'red' },
-    中性: { label: '中性', color: 'default' },
-    避险: { label: '避险', color: 'orange' },
+  const appetite: Record<string, { label: string; color: string; 含义: string }> = {
+    进取: { label: '进取', color: 'red', 含义: '资金转进攻，可增配主线强势方向' },
+    中性: { label: '中性', color: 'default', 含义: '资金偏好均衡，维持中性仓位右侧确认' },
+    避险: { label: '避险', color: 'orange', 含义: '资金退守防御，控制仓位等待企稳' },
   }
 
   return (
@@ -217,6 +237,40 @@ export function MarketIntelPage() {
             />
           ) : null}
 
+          {mi?.phase ? (
+            <Card size="small" style={{ marginBottom: 10, background: 'var(--bg-input)' }}
+              title={<span>判定依据 <Text type="secondary" style={{ fontSize: 12 }}>支撑本轮阶段定性的关键数据与证据</Text></span>}>
+              {(() => {
+                const m = mi as unknown as Record<string, unknown>
+                const vs = (mi.volume_signal ?? {}) as Record<string, unknown>
+                const ra = mi.risk_appetite
+                const ap = ra ? appetite[ra] : undefined
+                const breadth = m.breadth ?? vs['分布']
+                const leading = ((Array.isArray(m.leading_sectors) ? m.leading_sectors : Array.isArray(vs['放量板块']) ? vs['放量板块'] : vs['放量板块'] != null ? [vs['放量板块']] : []) as unknown[]).slice(0, 3)
+                const evRaw = (Array.isArray(m.evidence) ? m.evidence.map(String) : m.evidence != null ? [String(m.evidence)] : []) as string[]
+                const ev = evRaw.length ? evRaw.slice(0, 3) : (mi.core_conflict ?? '').split(/[。；\n]/).map((s) => s.trim()).filter(Boolean).concat(mi.summary ? [mi.summary] : []).slice(0, 3)
+                const breadthItems = (breadth == null ? '' : fmt(breadth)).split(/[，,;；\n]/).map((s) => s.trim()).filter(Boolean)
+                return (
+                  <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                    <div style={{ flex: '1 1 260px', minWidth: 240 }}>
+                      <Descriptions size="small" column={1} items={[
+                        { key: 'ph', label: '阶段定性', children: <span>{mi.phase}{ap ? <Tag color={ap.color} style={{ marginLeft: 6 }}>{ap.label}</Tag> : null}</span> },
+                        { key: 'bd', label: '市场广度', children: breadthItems.length ? <Space size={[4, 4]} wrap>{breadthItems.map((t, i) => <Tag key={i} style={{ marginInlineEnd: 0 }}>{t}</Tag>)}</Space> : <Text type="secondary">（未提供）</Text> },
+                        { key: 'ml', label: '主线板块', children: leading.length ? <Space size={[4, 4]} wrap>{leading.map((s, i) => <Tag key={i} color="red" style={{ marginInlineEnd: 0 }}>{String(s)}</Tag>)}</Space> : <Text type="secondary">（未提供）</Text> },
+                        { key: 'ra', label: '风险偏好', children: <span>{ap?.label ?? '（未提供）'}{ap?.含义 ? <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>{ap.含义}</Text> : null}</span> },
+                      ]} />
+                    </div>
+                    <div style={{ flex: '1 1 260px', minWidth: 240 }}>
+                      <Text strong>作证证据</Text>
+                      {ev.length ? <List size="small" dataSource={ev} renderItem={(it) => <List.Item style={{ padding: '2px 0' }}>{it}</List.Item>} />
+                        : <Text type="secondary">（未提供）</Text>}
+                    </div>
+                  </div>
+                )
+              })()}
+            </Card>
+          ) : null}
+
           <Tabs
             items={[
               {
@@ -241,19 +295,11 @@ export function MarketIntelPage() {
               },
               {
                 key: 'operative', label: '操作含义',
-                children: (() => {
-                  const om = mi?.operative_meaning ?? {}
-                  if (!Object.keys(om).length) return <Text type="secondary">（该轮未输出操作含义）</Text>
-                  return <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{flatten(om)}</pre>
-                })(),
+                children: <DictTab dict={mi?.operative_meaning} empty="（该轮未输出操作含义）" />,
               },
               {
                 key: 'watch', label: '次日盯盘点',
-                children: (() => {
-                  const nw = mi?.next_day_watch ?? {}
-                  if (!Object.keys(nw).length) return <Text type="secondary">（该轮未输出次日盯盘点）</Text>
-                  return <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{flatten(nw)}</pre>
-                })(),
+                children: <DictTab dict={mi?.next_day_watch} empty="（该轮未输出次日盯盘点）" />,
               },
               {
                 key: 'rotation', label: '板块轮动',
@@ -264,11 +310,22 @@ export function MarketIntelPage() {
 
           <DeepModules mi={mi ?? ({} as MarketIntelInfo)} />
 
-          <Card size="small" title="原始数据（可追溯，不编造）" style={{ marginTop: 10, background: 'var(--bg-input)' }}>
-            <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: 0 }}>
-              {JSON.stringify(mi ?? {}, null, 2)}
-            </pre>
-          </Card>
+          <Collapse
+            size="small"
+            style={{ marginTop: 10, background: 'var(--bg-input)' }}
+            items={[{
+              key: 'raw',
+              label: '查看 AI 原始返回（高级/可追溯）',
+              children: (
+                <div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>此处为模型返回原文，普通用户无需展开</Text>
+                  <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: '8px 0 0' }}>
+                    {JSON.stringify(mi ?? {}, null, 2)}
+                  </pre>
+                </div>
+              ),
+            }]}
+          />
         </>
       )}
     </div>
