@@ -36,6 +36,17 @@ const FRESHNESS_LABEL: Record<string, { label: string; color: string }> = {
   cache30m: { label: '30分钟缓存', color: 'orange' },
 }
 
+/** 触发信号：止盈已触发=涨=红(var--up) / 止损已触发=跌=绿(var--down) / 正常待评估=橙(var--warn) */
+function signalOf(p: PositionPlan): { label: string; color: string; bar: string } {
+  const q = (p.detail?.quant ?? {}) as Record<string, unknown>
+  const cur = Number(q.current_price)
+  const tp = parseFloat(String(q.take_profit ?? ''))
+  const sl = parseFloat(String(q.initial_stop ?? ''))
+  if (Number.isFinite(cur) && Number.isFinite(tp) && cur >= tp) return { label: '止盈已触发', color: 'red', bar: 'var(--up)' }
+  if (Number.isFinite(cur) && Number.isFinite(sl) && cur <= sl) return { label: '止损已触发', color: 'green', bar: 'var(--down)' }
+  return { label: '正常待评估', color: 'orange', bar: 'var(--warn)' }
+}
+
 /** 维度归因条（与候选池页同款渲染：名称 + 分数条 + 结论 + 建议） */
 function DimensionBars({ dims, finalAdvice }: { dims: Array<Record<string, unknown>>; finalAdvice?: unknown }) {
   return (
@@ -231,7 +242,7 @@ function NewPlanModal({ open, onClose, scoreMap }: { open: boolean; onClose: () 
 /** 建仓计划页（Phase 2） */
 export function PlansPage() {
   const [status, setStatus] = useState('全部')
-  const [date, setDate] = useState('全部日期')
+  const [date, setDate] = useState('')
   const [grade, setGrade] = useState('全部评级')
   const [source, setSource] = useState('全部来源')
   const [newOpen, setNewOpen] = useState(false)
@@ -245,15 +256,21 @@ export function PlansPage() {
     return m
   }, {})
 
+  // 日期下拉选项：plan_date 倒序（最新优先），dates[0] 即最近一天
+  const dates = Array.from(new Set((rows ?? []).map((p) => p.plan_date || (p.created_at ?? '').slice(0, 10)).filter(Boolean))).sort((a, b) => b.localeCompare(a))
+
+  // 首次进入且日期已加载 → 默认只查最近一天（prev 仍为 '' 表示尚未手动选择，仅在首次生效）
+  useEffect(() => { if (dates.length) setDate((prev) => (prev === '' ? dates[0] : prev)) }, [dates])
+
   // 筛选条件变化 → 分页重置到第一页
   useEffect(() => { setPage(1) }, [status, date, grade, source])
 
   if (isError) return <ErrorCard title="建仓计划加载失败" message={error?.message} onRetry={() => refetch()} />
 
-  const dates = Array.from(new Set((rows ?? []).map((p) => p.plan_date || (p.created_at ?? '').slice(0, 10)).filter(Boolean))).sort((a, b) => b.localeCompare(a))
-
   let shown = (rows ?? []).filter((p) => status === '全部' || STATUS_MAP[p.status ?? '']?.label === status)
-  if (date !== '全部日期') shown = shown.filter((p) => (p.plan_date || '') === date)
+  // date=''（数据刚加载、默认日期落定前）以最近一天兜底，避免全量闪烁
+  const curDate = date || (dates.length ? dates[0] : '全部日期')
+  if (curDate !== '全部日期') shown = shown.filter((p) => (p.plan_date || '') === curDate)
   if (grade !== '全部评级') {
     shown = shown.filter((p) => {
       const g = scoreMap[p.stock_code]?.grade ?? ''
@@ -268,6 +285,17 @@ export function PlansPage() {
   if (!shown.length) return <EmptyState text="暂无匹配的建仓方案。可点击「新建建仓方案」生成。" icon="🧭" />
 
   const cols = [
+    {
+      title: '信号', key: 'signal', width: 130,
+      render: (_: unknown, p: PositionPlan) => {
+        const s = signalOf(p)
+        return (
+          <div style={{ borderLeft: `4px solid ${s.bar}`, paddingLeft: 8 }}>
+            <Tag color={s.color}>{s.label}</Tag>
+          </div>
+        )
+      },
+    },
     {
       title: '股票', key: 'stock', width: 160,
       render: (_: unknown, p: PositionPlan) => <StockLabel code={p.stock_code} name={p.stock_name} />,
@@ -312,6 +340,9 @@ export function PlansPage() {
         key={`${status}|${date}|${grade}|${source}`}
         rowKey="id" size="small" dataSource={shown} columns={cols}
         pagination={{ pageSize: 20, current: page, onChange: setPage }}
+        onRow={(p) => ({ style: p.status === 'accepted'
+          ? { borderTop: '1px solid var(--down)', borderBottom: '1px solid var(--down)', borderRight: '1px solid var(--down)' }
+          : undefined })}
         expandable={{ expandedRowRender: (p) => <PlanExpand p={p} scoreMap={scoreMap} /> }}
       />
       <NewPlanModal open={newOpen} onClose={() => setNewOpen(false)} scoreMap={scoreMap} />
