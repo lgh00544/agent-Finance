@@ -9,6 +9,7 @@ APScheduler 定时任务（Asia/Shanghai）
 import logging
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -448,10 +449,11 @@ def ths_pnl_job() -> None:
     Cookie 零日志（红线 R6）。"""
     if not settings.ths_pnl_enable:
         return
-    today = time.strftime("%Y-%m-%d")
+    now_tz = datetime.now(ZoneInfo("Asia/Shanghai"))
+    today = now_tz.strftime("%Y-%m-%d")
     if not _is_trading_day(today):
         return
-    if not _in_trading_window(datetime.now()):
+    if not _in_trading_window(now_tz):
         return
     from app.services import ths_pnl
 
