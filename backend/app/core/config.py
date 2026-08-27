@@ -180,6 +180,10 @@ class Settings(BaseSettings):
     #   none = 明确只用东财单源（置信度不足降级保留）。
     dragon_tiger_second_source: str = "auto"
 
+    # ---------- ReAct 智能体研判环（agentic 平行通道，默认关闭）----------
+    # 开启后 score 等节点走 run_agentic_judge 只读工具环，失败自动回退单发；关闭时主链零影响。
+    agentic_enable: bool = False    # 总开关 AGENTIC_ENABLE（开启 agentic 通道）
+
     # ---------- 存储空间维护（低频自动清理，防无限堆积）----------
     news_retention_days: int = 90        # 新闻/公告保留周期（天），超期自动清理（关键分析数据不清理）
     db_maintenance_enabled: bool = True  # 定时空间维护总开关（SQLite VACUUM + 超期数据清理）

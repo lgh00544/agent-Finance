@@ -190,6 +190,9 @@ def trace_score(stock_code: str, stock_name: str, trade_date: str,
     v3.0 旧格式：detail["维度名"] 字典（score/verdict/advice/comment）→ 按维度名归入（兼容历史数据）；
     final_advice + potential_flag + cross_validation_note 进 final_conclusion"""
     detail = detail or {}
+    # agentic 模式留痕：score.py 把 ReAct 思考/工具摘要写入 detail，这里透传到 ext_info（单发模式空串）
+    model_thinking = str(detail.pop("model_thinking", "") or "")
+    tool_trace = str(detail.pop("tool_trace", "") or "")
 
     # ---- v4.0 新格式：factors 列表 ----
     factors_list = detail.get("factors")
@@ -233,7 +236,7 @@ def trace_score(stock_code: str, stock_name: str, trade_date: str,
         "final_conclusion": _j(final_conclusion),
         "confidence": 0.0,
         "data_source": "行情/财务/资金流/新闻原始数据 + LLM 六因子透明评分",
-        "ext_info": "",
+        "ext_info": _j({"model_thinking": model_thinking, "tool_trace": tool_trace}),
     })
 
 

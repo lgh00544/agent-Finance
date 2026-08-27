@@ -18,8 +18,10 @@ import logging
 from pathlib import Path
 from typing import Type, TypeVar
 
+from app.agents.agentic_tools import TOOLS, TOOL_FUNCS
+from app.cache import cache
 from app.db import repo
-from app.llm.structured import ModelLevel, call_llm_cached
+from app.llm.structured import ModelLevel, _model_for, call_llm_cached
 from app.services import track_verify
 from pydantic import BaseModel
 
@@ -246,19 +248,19 @@ def _agent_knowledge_version(agent: str) -> str:
     return "a" + hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
 
 
-def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
-               schema: Type[T], ttl_seconds: int = 86400,
-               with_profile: bool = True, with_knowledge: bool = True,
-               model_level: ModelLevel = ModelLevel.DEEP,
-               knowledge_docs: list | None = None) -> T:
-    """统一 LLM 调用：固定段序拼接 + 版本指纹入缓存键。
+def _fingerprint_key(agent: str, cache_key: str) -> str:
+    """版本指纹缓存键：基线/偏好/知识/战法/规则 任一版本变更 → 键变 → 缓存自动失效。"""
+    version = repo.get_trade_profile().version
+    return (f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}:"
+            f"{_agent_knowledge_version(agent)}:r{_rule_version()}")
 
-    system prompt 段序（永久固定，利于服务端前缀缓存命中）：
-    全局通用知识库基线 → 硬性规则 HARD_RULES → 个人交易偏好档案 → 私有知识库检索结果
-    → 分职能战法知识库（方法论文本沉淀） → Agent 专属 Prompt
-    （动态数据一律在 user 段，前置段同版本内 100% 重复）。
 
-    model_level 声明场景等级：LIGHT=高频轻量（初筛/巡检），DEEP=深度复杂（默认）。"""
+def build_agent_context(agent: str, system_prompt: str, user_prompt: str,
+                        with_profile: bool = True, with_knowledge: bool = True,
+                        knowledge_docs: list | None = None) -> tuple[str, str]:
+    """统一上下文拼接（agent_call / agentic_call 共用，agentic 不裸传 SYSTEM_PROMPT）：
+    sys 段固定序：全局基线→硬性规则→复盘采纳→偏好档案→私有知识→经验→战法→专属 Prompt；
+    user 段注入市场研判参考 + 选股表现回顾。返回 (sys_prompt, user_prompt)。"""
     sections: list[str] = []
     # 拼接位0 · 全局通用知识库基线（最先加载，所有 Agent 统一生效）
     base = global_base_prompt()
@@ -346,8 +348,50 @@ def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
                 f"{perf_summary}"
             )
 
-    version = repo.get_trade_profile().version
-    return call_llm_cached(agent,
-                           f"{cache_key}:v{version}:{_knowledge_version()}:g{_global_base_version()}:{_agent_knowledge_version(agent)}:r{_rule_version()}",
+    return sys_prompt, user_prompt
+
+
+def agent_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
+               schema: Type[T], ttl_seconds: int = 86400,
+               with_profile: bool = True, with_knowledge: bool = True,
+               model_level: ModelLevel = ModelLevel.DEEP,
+               knowledge_docs: list | None = None) -> T:
+    """统一 LLM 调用：固定段序拼接 + 版本指纹入缓存键。
+
+    system prompt 段序（永久固定，利于服务端前缀缓存命中）：
+    全局通用知识库基线 → 硬性规则 HARD_RULES → 个人交易偏好档案 → 私有知识库检索结果
+    → 分职能战法知识库（方法论文本沉淀） → Agent 专属 Prompt
+    （动态数据一律在 user 段，前置段同版本内 100% 重复）。
+
+    model_level 声明场景等级：LIGHT=高频轻量（初筛/巡检），DEEP=深度复杂（默认）。"""
+    sys_prompt, user_prompt = build_agent_context(
+        agent, system_prompt, user_prompt, with_profile=with_profile,
+        with_knowledge=with_knowledge, knowledge_docs=knowledge_docs)
+    return call_llm_cached(agent, _fingerprint_key(agent, cache_key),
                            sys_prompt, user_prompt, schema, ttl_seconds=ttl_seconds,
                            model_level=model_level)
+
+
+def agentic_call(agent: str, cache_key: str, system_prompt: str, user_prompt: str,
+                 schema: Type[T], ttl_seconds: int = 86400,
+                 with_profile: bool = True, with_knowledge: bool = True,
+                 model_level: ModelLevel = ModelLevel.DEEP,
+                 knowledge_docs: list | None = None) -> tuple[T, dict]:
+    """agentic 平行通道：build_agent_context 拼上下文 → ReAct 只读工具环（max_rounds=8）。
+    产物校验通过 → 结果与单式共用缓存键回写；任一环节失败（None）→ 回退单发，不抛异常。"""
+    from app.llm.agentic import run_agentic_judge
+
+    sys_prompt, user_prompt = build_agent_context(
+        agent, system_prompt, user_prompt, with_profile=with_profile,
+        with_knowledge=with_knowledge, knowledge_docs=knowledge_docs)
+    full_key = _fingerprint_key(agent, cache_key)
+    result, trace = run_agentic_judge(
+        sys_prompt, user_prompt, schema, TOOLS, TOOL_FUNCS,
+        max_rounds=8, model_level=model_level)
+    if result is not None:
+        cache.set_llm_json(f"{agent}:{_model_for(model_level)}",
+                           full_key, result.model_dump(), ttl_seconds)
+        return result, trace
+    logger.warning("AGENTIC_FALLBACK: agent=%s key=%s 回退单发", agent, cache_key)
+    return call_llm_cached(agent, full_key, sys_prompt, user_prompt, schema,
+                           ttl_seconds=ttl_seconds, model_level=model_level), {}
