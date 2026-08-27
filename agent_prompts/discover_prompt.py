@@ -148,17 +148,19 @@ def build_user_prompt(stock_table: str, market_context: str, market_note: str = 
 
 def build_final_prompt(stock_table: str, news_context: str, cap: int | None = None,
                        market_note: str = "", hot_money_context: str = "",
-                       horizon_context: str = "") -> str:
+                       horizon_context: str = "", rotation_context: str = "") -> str:
     """news_context: 候选股新闻/公告检索结果；cap: 当日候选池上限（v2.0 市况档位）；
     hot_money_context: 候选游资聚合数据段（services/hot_money 组装，空串整段省略）；
-    horizon_context: 前瞻兑现对照事实段（services/track_verify 组装，空串整段省略）"""
+    horizon_context: 前瞻兑现对照事实段（services/track_verify 组装，空串整段省略）；
+    rotation_context: 板块轮动状态 + top5 启动归因段（空串整段省略）"""
     cap_section = ""
     if cap is not None:
         cap_section = f"\n【当日候选池规模上限】今日候选池不得超过 {cap} 只，按优先级排序，宁缺毋滥。"
     note_section = f"\n{market_note}" if market_note else ""
     hm_section = f"\n\n{hot_money_context}" if hot_money_context else ""
     hz_section = f"\n\n{horizon_context}" if horizon_context else ""
-    return f"""{stock_table}{cap_section}{note_section}{hm_section}{hz_section}
+    rot_section = f"\n\n{rotation_context}" if rotation_context else ""
+    return f"""{stock_table}{cap_section}{note_section}{hm_section}{hz_section}{rot_section}
 
 【候选股新闻/公告检索结果】（向量检索相关资讯，用于核实基本面与风险）
 {news_context}

@@ -266,6 +266,33 @@ def raw_to_text(raw: dict) -> str:
     else:
         lines.append("主线板块个股抽样: 数据缺失")
 
+    # 段10 板块轮动状态 + 段11 强势板块启动归因（sector_rotation 已落库；缺数据如实「数据缺失」不编造）
+    try:
+        from app.services.sector_rotation_pattern import get_rotation_daily
+        rot = get_rotation_daily()
+        st = rot.get("rotation_state")
+        if st:
+            lines.append(f"板块轮动状态: {st} churn={rot.get('churn_rate')} "
+                         f"主线={rot.get('mainline_sector') or '无'}")
+        else:
+            lines.append("板块轮动状态: 数据缺失")
+        launch = rot.get("launch") or []
+        top5 = [r["sector_name"] for r in (rot.get("top10") or [])[:5]]
+        if launch:
+            lmap = {r["sector_name"]: r for r in launch}
+            attr_lines = []
+            for n in top5:
+                lr = lmap.get(n) or {}
+                attr_lines.append(f"{n}→tags={lr.get('reason_tags') or '（数据缺失）'}；"
+                                  f"{lr.get('reason_text') or '（数据缺失）'}")
+            lines.append(f"强势板块启动归因(top5): {'；'.join(attr_lines)}")
+        else:
+            lines.append("强势板块启动归因: 数据缺失")
+    except Exception as exc:  # noqa: BLE001 轮动注入失败不阻塞研判，如实标注缺失
+        logger.warning("板块轮动注入失败（标注缺失）: %s", exc)
+        lines.append("板块轮动状态: 数据缺失")
+        lines.append("强势板块启动归因: 数据缺失")
+
     return "\n".join(lines)
 
 

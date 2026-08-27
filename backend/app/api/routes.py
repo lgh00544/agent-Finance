@@ -62,6 +62,7 @@ def _task_experience_worker(params: dict) -> dict:
 _TASK_KINDS: dict[str, tuple[str, object]] = {
     "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
     "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
+    "sector_rotation": ("板块轮动分析", lambda p: _task_sector_rotation()),
     "score": ("单股评分",
               lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
     "position": ("分批建仓方案",
@@ -98,6 +99,16 @@ def _task_market_intel() -> dict:
             "phase": mi.get("phase"),
             "risk_appetite": mi.get("risk_appetite"),
             "summary": mi.get("summary"),
+            "error": result.get("error")}
+
+
+def _task_sector_rotation() -> dict:
+    """板块轮动分析（手动入口）：状态机判定 + 归因子 Agent → 落库"""
+    result = graph_router.run_sector_rotation()
+    launch = result.get("launch") or {}
+    return {"trade_date": result.get("trade_date"),
+            "rotation_state": result.get("rotation_state"),
+            "rows": launch.get("rows", 0),
             "error": result.get("error")}
 
 
@@ -300,6 +311,28 @@ def market_intel_dates(limit: int = 30):
     """已生成市场研判的日期列表（最新在前，页面选日期）。
     返回裸数组（原包裹 {"dates": [...]} 与前端期望 string[] 不一致，致 React SPA 黑屏）"""
     return repo.list_market_intel_dates(limit)
+
+
+# ================= 板块轮动（sector_rotation：状态机 + 归因子 Agent + 手动触发） =================
+
+@router.post("/market/sector-rotation/run")
+def run_sector_rotation_job():
+    """手动触发板块轮动分析（异步提交：状态机判定 + 归因子 Agent → 落库）"""
+    return _submit_task("sector_rotation", {})
+
+
+@router.get("/market/sector-patterns")
+def get_sector_patterns():
+    """多窗口规律（3/10/20/60 日）：轮动周期/生命周期/高切低/启动延续率，读真实落库"""
+    from app.services.sector_rotation_pattern import analyze_patterns
+    return {"patterns": {f"{w}d": analyze_patterns(w) for w in (3, 10, 20, 60)}}
+
+
+@router.get("/market/sector-rotation")
+def get_sector_rotation(date: str | None = None):
+    """当日板块轮动：状态 + top10 + 归因（默认最新一日；无数据返回空结构）"""
+    from app.services.sector_rotation_pattern import get_rotation_daily
+    return get_rotation_daily(date)
 
 
 @router.get("/jobs/status")

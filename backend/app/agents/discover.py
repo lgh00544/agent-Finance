@@ -679,6 +679,14 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         logger.warning("前瞻对照事实组装失败（省略前瞻段）: %s", exc)
         horizon_text = ""
 
+    # 板块轮动宏观注入（sector_rotation 结果：状态 + churn + 主线 + top5 归因；无数据省略不阻塞）
+    try:
+        from app.services.sector_rotation_pattern import build_rotation_context
+        rotation_ctx = build_rotation_context(date_key)
+    except Exception as exc:  # noqa: BLE001 组装失败省略板块轮动段
+        logger.warning("板块轮动注入组装失败（省略）: %s", exc)
+        rotation_ctx = ""
+
     cap = state.get("market_cap")
     output = agent_call(
         agent="discover_final",
@@ -686,7 +694,8 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         system_prompt=discover_prompt.SYSTEM_PROMPT,
         user_prompt=discover_prompt.build_final_prompt(
             table, news_text, cap=cap, market_note=_market_note(state),
-            hot_money_context=hm_text, horizon_context=horizon_text),
+            hot_money_context=hm_text, horizon_context=horizon_text,
+            rotation_context=rotation_ctx),
         schema=DiscoverOutput,
         ttl_seconds=86400,
         model_level=ModelLevel.DEEP,

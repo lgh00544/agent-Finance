@@ -19,6 +19,8 @@ def refresh_sector_daily_snapshot() -> dict:
     全板块落库（不截取 top5），rank_no 按当日涨幅 1~N 排序。
     """
     from app.datasource.akshare_source import AkshareSource
+    # 领涨股代码解析链（复用 sector_snapshot 既有逻辑，供批C 连板/资金/新闻证据取数）
+    from app.services.market_view import _leading_from_cons, _spot_name_map
     today = time.strftime("%Y-%m-%d")
     try:
         board_df = AkshareSource().fetch_industry_spot()
@@ -28,6 +30,7 @@ def refresh_sector_daily_snapshot() -> dict:
     if board_df is None or board_df.empty or "board_name" not in board_df.columns:
         return {"success": False, "rows": 0, "error": "板块行情返回空表"}
 
+    name_to_code = _spot_name_map()
     rows = []
     for _, r in board_df.iterrows():
         try:
@@ -37,6 +40,13 @@ def refresh_sector_daily_snapshot() -> dict:
         name = str(r.get("board_name") or "").strip()
         if not name:
             continue
+        leading_name = str(r.get("leading_stock") or "").strip()
+        leading_code = name_to_code.get(leading_name) if leading_name else ""
+        if not leading_code and leading_name:
+            try:
+                leading_code = _leading_from_cons(name)
+            except Exception:  # noqa: BLE001 代码解析失败降级空串
+                leading_code = ""
         rows.append({
             "trade_date": today,
             "sector_name": name,
@@ -46,8 +56,8 @@ def refresh_sector_daily_snapshot() -> dict:
             "down_count": _num(r, "down_count"),
             "volume_ratio": _num(r, "volume_ratio"),
             "turnover_rate": _num(r, "turnover_rate"),
-            "leading_stock_name": str(r.get("leading_stock") or "").strip(),
-            "leading_stock_code": "",
+            "leading_stock_name": leading_name,
+            "leading_stock_code": leading_code,
             "leading_chg": _num(r, "leading_chg"),
             "source": "em",
         })
