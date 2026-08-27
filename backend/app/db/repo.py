@@ -16,7 +16,7 @@ from sqlalchemy import delete, func, select, text, update
 from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
-    AccountBaseline, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
+    AccountBaseline, AccountPnlSnapshot, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
     CapitalActor, CapitalFlow, CapitalStats, DragonTiger,
     Experience, ExperienceConfig, ForwardViewHistory, Holding, HotMoneyProfile,
@@ -1054,6 +1054,69 @@ def get_latest_account_baseline() -> dict | None:
         return {"id": r.id, "trade_date": r.trade_date, "total_asset": r.total_asset,
                 "available_cash": r.available_cash, "position_pct": r.position_pct,
                 "source": r.source, "created_at": str(r.created_at)}
+
+
+# ==================== 同花顺真实账户今日盈亏快照（ths_pnl，默认关闭） ====================
+
+def upsert_account_pnl_snapshot(trade_date: str, ts: str, pnl_yk: float | None = None,
+                                pnl_pct: float | None = None, sh_pct: float | None = None,
+                                chart_data: list | None = None, source: str = "ths",
+                                error: str = "", token_expired: bool = False) -> int:
+    """按 (trade_date, ts) 幂等 upsert 同花顺盈亏快照；返回行 id"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(AccountPnlSnapshot).where(
+                AccountPnlSnapshot.trade_date == trade_date,
+                AccountPnlSnapshot.ts == ts,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = AccountPnlSnapshot(
+                trade_date=trade_date, ts=ts, pnl_yk=pnl_yk, pnl_pct=pnl_pct,
+                sh_pct=sh_pct, chart_data=chart_data or [], source=source,
+                error=error, token_expired=token_expired)
+            db.add(row)
+        else:
+            row.pnl_yk = pnl_yk
+            row.pnl_pct = pnl_pct
+            row.sh_pct = sh_pct
+            row.chart_data = chart_data or []
+            row.source = source
+            row.error = error
+            row.token_expired = token_expired
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def get_latest_account_pnl() -> dict | None:
+    """读取最新同花顺盈亏快照；无记录返回 None"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(AccountPnlSnapshot).order_by(AccountPnlSnapshot.id.desc()).limit(1)
+        ).first()
+        if row is None:
+            return None
+        r = row[0]
+        return {"id": r.id, "trade_date": r.trade_date, "ts": r.ts, "pnl_yk": r.pnl_yk,
+                "pnl_pct": r.pnl_pct, "sh_pct": r.sh_pct, "chart_data": r.chart_data,
+                "source": r.source, "error": r.error, "token_expired": r.token_expired,
+                "updated_at": str(r.updated_at)}
+
+
+def list_account_pnl_history(days: int = 30) -> list[dict]:
+    """近 N 天同花顺盈亏快照历史（按日降序；每行只取核心字段）"""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(AccountPnlSnapshot)
+            .where(AccountPnlSnapshot.trade_date >= cutoff)
+            .order_by(AccountPnlSnapshot.trade_date.desc(), AccountPnlSnapshot.ts.desc())
+            .limit(500)
+        ).scalars().all()
+    return [{"trade_date": r.trade_date, "ts": r.ts, "pnl_yk": r.pnl_yk, "pnl_pct": r.pnl_pct,
+             "sh_pct": r.sh_pct, "source": r.source, "error": r.error,
+             "token_expired": r.token_expired} for r in rows]
 
 
 def _default_profile() -> dict:

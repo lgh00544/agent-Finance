@@ -442,6 +442,36 @@ def calibrate_forward_view_job() -> None:
         logger.error("前瞻先验校准异常: %s", exc)
 
 
+def ths_pnl_job() -> None:
+    """同花顺真实账户今日盈亏采集（P0 数据通道，默认关闭）
+    开关 ths_pnl_enable 才跑 + 交易日 + 交易时段；失败只落 error 不抛异常；
+    Cookie 零日志（红线 R6）。"""
+    if not settings.ths_pnl_enable:
+        return
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        return
+    if not _in_trading_window(datetime.now()):
+        return
+    from app.services import ths_pnl
+
+    try:
+        snapshot = ths_pnl.get_snapshot()
+    except Exception as exc:  # noqa: BLE001 采集异常不崩调度，只落 error
+        logger.error("同花顺盈亏采集异常: %s", exc)
+        snapshot = {"error": "采集异常", "token_expired": False}
+    if snapshot.get("error"):
+        logger.warning("同花顺盈亏采集未成功: %s", snapshot["error"])
+    try:
+        repo.upsert_account_pnl_snapshot(
+            trade_date=time.strftime("%Y-%m-%d"), ts=time.strftime("%H:%M:%S"),
+            pnl_yk=snapshot.get("pnl_yk"), pnl_pct=snapshot.get("pnl_pct"),
+            sh_pct=snapshot.get("sh_pct"), chart_data=snapshot.get("chart_data") or [],
+            error=snapshot.get("error") or "", token_expired=snapshot.get("token_expired") or False)
+    except Exception as exc:  # noqa: BLE001 落库失败不阻塞调度
+        logger.error("同花顺盈亏快照落库失败: %s", exc)
+
+
 def start_scheduler() -> None:
     global scheduler
     if scheduler is not None:
@@ -540,6 +570,12 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-15", minute="*/5",
                       id="quote_snapshot_refresh", name="持仓价快照刷新",
                       replace_existing=True, misfire_grace_time=300)
+    # 同花顺真实账户今日盈亏采集（开关开启才注册；函数内再按交易日+交易时段过滤）
+    if settings.ths_pnl_enable:
+        scheduler.add_job(ths_pnl_job, "interval",
+                          seconds=max(10, int(settings.ths_pnl_poll_seconds)),
+                          id="ths_pnl", name="同花顺今日盈亏采集",
+                          replace_existing=True, misfire_grace_time=60)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")
 

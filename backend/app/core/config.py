@@ -180,6 +180,17 @@ class Settings(BaseSettings):
     #   none = 明确只用东财单源（置信度不足降级保留）。
     dragon_tiger_second_source: str = "auto"
 
+    # ---------- 同花顺投资账本真实账户采集（P0 数据通道，默认关闭）----------
+    # 直连同花顺账本 API 拉取真实「今日盈亏 + 上证指数」（替代估算/akshare 延迟值）。
+    # 默认关不改变现有行为；Cookie/密钥只进内存与 HTTP 头，禁止任何日志/输出明文（红线）；
+    # 采集失败只写 error 字段，不抛异常、不伪造 0、不阻塞调度。
+    ths_pnl_enable: bool = False          # 总开关 THS_PNL_ENABLE（关闭时无采集、路由返回 configured:false）
+    ths_pnl_cookie: str = ""               # 直接给 Cookie（可选，绕过 DSH 凭证文件）
+    ths_pnl_cookie_file: str = r"D:\AI\Deepseek Harness\.dsh\.credentials.yaml"  # DSH 凭证文件
+    ths_pnl_poll_seconds: int = 20         # 采集间隔（交易时段）
+    ths_pnl_user_id: str = ""              # 可选；空则从 Cookie 的 userid= 提取
+    ths_pnl_fund_key: str = ""             # 可选；空则调 account_list 自动发现
+
     # ---------- ReAct 智能体研判环（agentic 平行通道，默认关闭）----------
     # 开启后 score 等节点走 run_agentic_judge 只读工具环，失败自动回退单发；关闭时主链零影响。
     agentic_enable: bool = False    # 总开关 AGENTIC_ENABLE（开启 agentic 通道）

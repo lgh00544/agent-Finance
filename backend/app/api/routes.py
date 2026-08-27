@@ -444,6 +444,20 @@ def account_summary():
     return holding_view.build_account_summary()
 
 
+@router.get("/account/pnl")
+def account_pnl():
+    """同花顺真实账户今日盈亏（P0 数据通道，默认关闭）
+    未配置（ths_pnl_enable=false 或 Cookie 空）返回 {configured:false} 优雅降级，不报错；
+    配置后返回最新快照（含 error/token_expired，展示层诚实展示不伪造）。"""
+    if not settings.ths_pnl_enable:
+        return {"configured": False}
+    from app.services import ths_pnl as ths_pnl_service
+
+    if not ths_pnl_service.load_cookie():
+        return {"configured": False}
+    return {"configured": True, "snapshot": repo.get_latest_account_pnl()}
+
+
 class AccountBaselineBody(BaseModel):
     """账户基准（券商持仓截图 OCR 提取，人工确认后保存）"""
     total_asset: float = Field(gt=0, description="总资产（元）")

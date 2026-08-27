@@ -376,6 +376,28 @@ class AccountBaseline(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class AccountPnlSnapshot(Base):
+    """同花顺投资账本真实账户今日盈亏快照（P0 数据通道；默认 ths_pnl_enable=false 不采集）
+
+    trade_date+ts 唯一，upsert 幂等（R5 防重复采集/误报）；
+    失败快照写 error 字段，不伪造 0 值（R1 token 过期标记 token_expired）。
+    """
+    __tablename__ = "account_pnl_snapshot"
+    __table_args__ = (UniqueConstraint("trade_date", "ts", name="uq_account_pnl_date_ts"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)   # YYYY-MM-DD
+    ts: Mapped[str] = mapped_column(String(32))                       # 当日采集时间 HH:MM:SS
+    pnl_yk: Mapped[float | None] = mapped_column(Float, nullable=True)   # 今日盈亏额（元）
+    pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # 今日盈亏（%）
+    sh_pct: Mapped[float | None] = mapped_column(Float, nullable=True)   # 上证指数涨跌幅（%）
+    chart_data: Mapped[list] = mapped_column(SafeJSON, default=list)     # 当日分时曲线 [{t, v}]
+    source: Mapped[str] = mapped_column(String(32), default="ths")       # 数据来源 ths
+    error: Mapped[str] = mapped_column(Text, default="")                 # 失败原因（空=成功）
+    token_expired: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
 class AgentSuggestion(Base):
     """复盘进化Agent 输出的各 Agent 规则/参数优化建议（策略闭环）
     状态机：pending → approved/rejected；任何生效必须先经人工审核确认。
