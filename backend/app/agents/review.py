@@ -35,9 +35,10 @@ def collect_review(state: StockAgentState) -> StockAgentState:
     sells = [t for t in trades if t.side == "sell"]
     buys = [t for t in trades if t.side == "buy"]
 
-    # 客观数值：持仓天数 = 末次卖出日 - 首次买入日；盈亏 = 卖出额 - 买入额（简化口径）
+    # 客观数值：持仓天数 = 末次卖出日 - 首次买入日；盈亏：exited 用总成本口径（治建仓流水缺失漏计底仓），cost 缺失回退 Σ卖−Σ买
     hold_days = 0
     pnl_pct = 0.0
+    pnl_caliber = ""  # 口径回退标注（进 trace）
     if sells and buys:
         from datetime import date
 
@@ -45,10 +46,15 @@ def collect_review(state: StockAgentState) -> StockAgentState:
             return date.fromisoformat(s)
 
         hold_days = (_d(sells[-1].trade_date) - _d(buys[0].trade_date)).days
-        buy_amount = sum(t.amount for t in buys)
         sell_amount = sum(t.amount for t in sells)
-        if buy_amount > 0:
-            pnl_pct = round((sell_amount - buy_amount) / buy_amount * 100, 2)
+        cost = holding.cost
+        if holding.status == "exited" and cost and cost > 0:
+            pnl_pct = round((sell_amount - cost) / cost * 100, 2)
+        else:
+            buy_amount = sum(t.amount for t in buys)
+            if buy_amount > 0:
+                pnl_pct = round((sell_amount - buy_amount) / buy_amount * 100, 2)
+                pnl_caliber = "（cost 缺失，回退 Σ卖−Σ买 口径）"
 
     plan = repo.get_latest_plan(code)
     score_row = repo.get_latest_score(code)
@@ -125,7 +131,7 @@ def collect_review(state: StockAgentState) -> StockAgentState:
         "portfolio_curve": _portfolio_curve_summary(),
     }
     state["trace"] = [*state.get("trace", []),
-                      f"复盘数据聚合: 持有{hold_days}天 盈亏{pnl_pct}% 信号{len(signal_rows)}条 "
+                      f"复盘数据聚合: 持有{hold_days}天 盈亏{pnl_pct}%{pnl_caliber} 信号{len(signal_rows)}条 "
                       f"卖出决策{len(sell_rows)}条 游资信号{len(hm_signals)}条"]
     return state
 

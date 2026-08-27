@@ -57,7 +57,8 @@ def test_add_shares_weighted_cost_and_c3():
     assert row.stop_loss == round(new_entry * 0.92, 2)
 
     t = _trades(hid)
-    assert len(t) == 1 and t[0].side == "buy"
+    # 建仓补录 buy + 本次加仓 buy（insert_holding 自动补开仓）
+    assert len(t) == 2 and t[0].side == "buy"
     assert t[0].price == 12.0 and t[0].shares == 100
     assert t[0].trade_date == "2026-08-06"
 
@@ -97,7 +98,8 @@ def test_adjust_cost_records_adjust_trade():
     assert row.stop_loss == round(10.5 * 0.92, 2)
 
     t = _trades(hid)
-    assert len(t) == 1 and t[0].side == "adjust"
+    # 建仓补录 buy + 成本修正 adjust（insert_holding 自动补开仓）
+    assert len(t) == 2 and t[0].side == "adjust"
     assert "实盘核对修正" in t[0].note
 
 
@@ -145,6 +147,6 @@ def test_trades_desc_order(monkeypatch):
 
     trades = routes.holding_trades(hid)
     assert [t["id"] for t in trades] == sorted([t["id"] for t in trades], reverse=True)
-    assert [t["side"] for t in trades] == ["sell", "buy"]
+    assert [t["side"] for t in trades] == ["sell", "buy", "buy"]
     assert trades[0]["trade_date"] == "2026-08-06"
     assert trades[0]["created_at"]

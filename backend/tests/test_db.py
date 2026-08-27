@@ -73,8 +73,9 @@ def test_holding_trade_lifecycle():
     assert holding.entry_price == 10.0
 
     trades = repo.get_trades(hid)
-    assert [t.side for t in trades] == ["buy", "sell"]
-    assert trades[1].amount == pytest.approx(6000.0)
+    # 建仓补录 buy 流水 + 手工首笔 buy + sell（insert_holding 自动补开仓）
+    assert [t.side for t in trades] == ["buy", "buy", "sell"]
+    assert trades[2].amount == pytest.approx(6000.0)
 
     assert hid in [h.id for h in repo.get_active_holdings()]
     repo.update_holding(hid, status="exited", note="清仓")

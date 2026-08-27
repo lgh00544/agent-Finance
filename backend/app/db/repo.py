@@ -1151,7 +1151,59 @@ def insert_holding(stock_code: str, stock_name: str, entry_date: str, entry_pric
         db.commit()
         db.refresh(row)
         _invalidate("holding")
-        return row.id
+    # 建仓即补开仓 buy 流水（新建仓恒缺首笔；幂等，cost/shares 非法时跳过不抛）
+    ensure_opening_trade(row)
+    return row.id
+
+
+def ensure_opening_trade(holding_row: Holding) -> dict:
+    """确保持仓有建仓 buy 流水：缺首笔时补录 note='建仓补录'（幂等，禁止重复插入）。
+
+    补法（§二口径）：金额 = cost − Σ已有 buy；股数 = 首条 buy 的 before_shares
+    （无 buy 则取当时 shares）；价格 = 金额÷股数 四舍五入 2 位。
+    K227：cost≤0 / Σbuy>cost / 股数未知 → 不硬凑，如实跳过。
+    返回 {"applied", "amount", "shares", "price", "reason"}。
+    """
+    with SessionLocal() as db:
+        if db.execute(select(TradeRecord).where(
+                TradeRecord.holding_id == holding_row.id,
+                TradeRecord.note == "建仓补录")).scalar_one_or_none() is not None:
+            return {"applied": False, "amount": 0.0, "shares": 0, "price": None,
+                    "reason": "already-backfilled"}
+        trades = list(db.execute(
+            select(TradeRecord).where(TradeRecord.holding_id == holding_row.id)
+            .order_by(TradeRecord.trade_date, TradeRecord.id)).scalars().all())
+        buys = [t for t in trades if t.side == "buy"]
+        first_buy = buys[0] if buys else None
+        # 缺首笔判定：首条 buy 的 before_shares>0（操作前已有底仓）或全无 buy
+        if first_buy is not None and not (first_buy.before_shares or 0) > 0:
+            return {"applied": False, "amount": 0.0, "shares": 0, "price": None,
+                    "reason": "opening-exists"}
+        cost = holding_row.cost or 0.0
+        buy_sum = round(sum(t.amount for t in buys), 2)
+        missing = round(cost - buy_sum, 2)
+        if cost <= 0:
+            return {"applied": False, "amount": 0.0, "shares": 0, "price": None,
+                    "reason": "cost-invalid"}
+        if missing < -0.01:
+            return {"applied": False, "amount": 0.0, "shares": 0, "price": None,
+                    "reason": "buy-overflow"}
+        if missing <= 0.01:
+            return {"applied": False, "amount": 0.0, "shares": 0, "price": None,
+                    "reason": "complete"}
+        shares = first_buy.before_shares if first_buy else holding_row.shares
+        if not shares or shares <= 0:
+            return {"applied": False, "amount": 0.0, "shares": 0, "price": None,
+                    "reason": "shares-unknown"}
+        price = round(missing / shares, 2)
+        db.add(TradeRecord(holding_id=holding_row.id, stock_code=holding_row.stock_code,
+                           side="buy", price=price, shares=shares, amount=missing,
+                           trade_date=holding_row.entry_date, note="建仓补录",
+                           before_shares=0, after_shares=shares))
+        db.commit()
+        _invalidate("holding")
+        return {"applied": True, "amount": missing, "shares": shares, "price": price,
+                "reason": "backfilled"}
 
 
 def add_trade(holding_id: int, stock_code: str, side: str, price: float,
