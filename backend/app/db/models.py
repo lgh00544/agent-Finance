@@ -133,7 +133,7 @@ class MarketIntel(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD 唯一
-    phase: Mapped[str] = mapped_column(String(32), default="")       # 阶段定性（启动/主升/分化/存量博弈…）
+    phase: Mapped[str] = mapped_column(String(128), default="")       # 阶段定性（启动/主升/分化/存量博弈…）
     core_conflict: Mapped[str] = mapped_column(Text, default="")     # 核心矛盾
     risk_appetite: Mapped[str] = mapped_column(String(16), default="")  # 风险偏好（进取/中性/避险）
     volume_signal: Mapped[dict] = mapped_column(SafeJSON, default=dict)  # 板块量比明细+放量/缩量分布
@@ -233,7 +233,7 @@ class AlertLog(Base):
     action: Mapped[str] = mapped_column(String(16), default="hold")  # hold/reduce/exit（LLM 输出）
     signal: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # 完整信号结构化输出
     pushed: Mapped[bool] = mapped_column(Boolean, default=False)     # 是否已推飞书
-    source: Mapped[str] = mapped_column(String(16), default="monitor")  # 告警来源标记 monitor/portfolio_sentinel
+    source: Mapped[str] = mapped_column(String(32), default="monitor")  # 告警来源标记 monitor/portfolio_sentinel
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -671,7 +671,7 @@ class ReviewLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     experience_id: Mapped[int | None] = mapped_column(
         ForeignKey("experience.id"), nullable=True)
-    action: Mapped[str] = mapped_column(String(16))                  # approve/reject/auto_merge/rollback
+    action: Mapped[str] = mapped_column(String(32))                  # approve/reject/auto_merge/rollback/strictness_freeze
     reviewer: Mapped[str] = mapped_column(String(16))                # sir/auto
     at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     note: Mapped[str | None] = mapped_column(Text)

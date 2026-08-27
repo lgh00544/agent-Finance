@@ -24,7 +24,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = PROJECT_DIR / "backend"
 sys.path.insert(0, str(BACKEND_DIR))  # 项目自身 import：backend.app.db.*
 
-from sqlalchemy import create_engine, select  # noqa: E402
+from sqlalchemy import create_engine, select, UniqueConstraint, PrimaryKeyConstraint  # noqa: E402
 from sqlalchemy.dialects.mysql import insert as mysql_insert  # noqa: E402
 from sqlalchemy.engine import Engine  # noqa: E402
 
@@ -62,7 +62,9 @@ def local_engine() -> Engine:
     @event.listens_for(eng, "connect")
     def _pragmas(dbapi_connection, connection_record):  # noqa: ARG001
         cur = dbapi_connection.cursor()
-        for stmt in ("PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON",
+        # foreign_keys=OFF：本地库在本脚本里是「全表快照替换」语义（先删后插），
+        # 外键顺序与批量替换互斥（如 experience 先于 pending_experience），完整性由云端保证
+        for stmt in ("PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=OFF",
                      "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=5000"):
             cur.execute(stmt)
         cur.close()
@@ -76,13 +78,36 @@ def all_tables() -> list[str]:
     return sorted(Base.metadata.tables.keys())
 
 
+def _ordered_tables() -> list[str]:
+    """外键依赖拓扑序（父表在前）：先插父表再插子表，避免云端 FK 1452
+    （如 experience.source_pending_id → pending_experience.id，字母序会先插子表）。
+    循环依赖/未知父表兜底按字母序收尾，不阻塞同步。"""
+    parents = {n: {fk.column.table.name for fk in Base.metadata.tables[n].foreign_keys}
+               for n in all_tables()}
+    ordered: list[str] = []
+    remaining = set(all_tables())
+    while remaining:
+        ready = sorted(n for n in remaining if not (parents[n] & remaining))
+        if not ready:
+            ready = sorted(remaining)
+        ordered.extend(ready)
+        remaining -= set(ready)
+    return ordered
+
+
 def table_pk_and_unique(name: str) -> tuple[list[str], list[str]]:
-    """返回 (主键列, 首个唯一约束列组)；无唯一约束的表用主键。"""
+    """返回 (主键列, 首个唯一约束列组)；无唯一约束的表用主键。
+
+    约束判定必须用 isinstance：UniqueConstraint 对象没有 .unique 属性，
+    此前 getattr 探测恒为 False → 全部表退化成按主键 upsert；本地历史数据
+    含同唯一键多行时（旧 dev.db 建表早于唯一约束上线，SQLite 不迁移旧表），
+    TiDB 对多行 INSERT 内重复唯一键直接报 1062（MySQL 则可自行处理）。
+    """
     tbl = Base.metadata.tables[name]
     pk = [c.name for c in tbl.primary_key.columns]
     uniqs = []
     for constr in tbl.constraints:
-        if getattr(constr, "unique", False) and not getattr(constr, "primary_key", False):
+        if isinstance(constr, UniqueConstraint) and not isinstance(constr, PrimaryKeyConstraint):
             cols = [c.name for c in constr.columns]
             uniqs.append(cols)
     return pk, uniqs
@@ -129,6 +154,25 @@ def _ensure_database() -> None:
         conn.close()
 
 
+def _dedup_by_unique(rows: list[dict], pk: list[str], key_cols: list[str]) -> list[dict]:
+    """同批内按唯一键去重，保留 id 最大（最新写入）的一行。
+
+    场景：本地 dev.db 建表早于唯一约束上线（SQLite 不迁移旧表），历史数据
+    含同唯一键多行；TiDB 对多行 INSERT 内重复唯一键直接报 1062。按
+    「最后一次写入为准」语义取最大 id 行，其余丢弃。
+    """
+    if not key_cols or len(rows) < 2:
+        return rows
+    id_col = pk[0] if pk else None
+    best: dict[tuple, dict] = {}
+    for r in rows:
+        k = tuple(r[c] for c in key_cols)
+        prev = best.get(k)
+        if prev is None or (id_col and (r.get(id_col) or 0) > (prev.get(id_col) or 0)):
+            best[k] = r
+    return list(best.values())
+
+
 def _upsert_rows(eng: Engine, name: str, rows: list[dict]) -> int:
     """按唯一键批量 upsert：MySQL/TiDB 方言 INSERT ... ON DUPLICATE KEY UPDATE
     （SQLAlchemy dialects.mysql 内置，非手写 DDL；一次提交全部行，规避海外节点往返延迟）。"""
@@ -137,6 +181,7 @@ def _upsert_rows(eng: Engine, name: str, rows: list[dict]) -> int:
     tbl = Base.metadata.tables[name]
     pk, uniqs = table_pk_and_unique(name)
     key_cols = uniqs[0] if uniqs else pk
+    rows = _dedup_by_unique(rows, pk, key_cols)
     non_key = [c.name for c in tbl.columns
                if c.name not in key_cols and c.name not in pk]
     stmt = mysql_insert(tbl).values(rows)
@@ -149,7 +194,13 @@ def _upsert_rows(eng: Engine, name: str, rows: list[dict]) -> int:
 
 # 历史上模型列宽过窄（SQLite 不校验、TiDB 严格模式拒绝）的兼容修正表：
 # {表: {列: 目标宽度}}，init 时幂等 MODIFY（create_all 不改已建表，需显式扩宽一次）
-_COLUMN_WIDTH_FIXES = {"agent_chat_message": {"role": 16}}
+_COLUMN_WIDTH_FIXES = {
+    "agent_chat_message": {"role": 16},
+    "alert_log": {"source": 32},            # 实际值 portfolio_sentinel=18 > 16
+    "batch_adjust": {"rollback_time": 32},  # 实际值含秒（YYYY-MM-DD HH:mm:ss）19 > 16
+    "market_intel": {"phase": 128},         # LLM 阶段定性长句 58 > 32
+    "review_log": {"action": 32},           # 实际值 strictness_freeze=17 > 16
+}
 
 
 def _ensure_column_widths(eng: Engine) -> None:
@@ -185,22 +236,20 @@ def cmd_init() -> int:
         return 1
     _ensure_column_widths(cloud_engine())
 
-    # 读本地 SQLite 全量数据 → 云端 upsert
+    # 读本地 SQLite 全量数据 → 云端 upsert（外键拓扑序：父表先插）
     local = local_engine()
     cloud = cloud_engine()
     print(f"{'表名':<28}{'本地行数':>8}{'灌云行数':>8}  状态")
     total_ok, total_fail = 0, 0
-    for name in all_tables():
+    for name in _ordered_tables():
         try:
             with local.connect() as conn:
                 rows = [dict(r._mapping) for r in conn.execute(select(Base.metadata.tables[name]))]
-            if rows:
-                done = _upsert_rows(cloud, name, rows)
-            else:
-                done = 0
-            total_ok += len(rows)
-            print(f"{name:<28}{len(rows):>8}{done:>8}  [OK]" if len(rows) == done
-                  else f"{name:<28}{len(rows):>8}{done:>8}  [WARN] 有差异")
+            raw_n = len(rows)
+            done = _upsert_rows(cloud, name, rows) if rows else 0
+            note = f"（去重 {raw_n - done}）" if done != raw_n else ""
+            total_ok += raw_n
+            print(f"{name:<28}{raw_n:>8}{done:>8}  [OK]{note}")
         except Exception as exc:  # noqa: BLE001 单表失败不中断
             total_fail += 1
             print(f"{name:<28}{'-':>8}{'-':>8}  [FAIL] {type(exc).__name__}: {str(exc)[:80]}")
@@ -209,6 +258,12 @@ def cmd_init() -> int:
 
 
 # ==================== backup ====================
+
+def _snapshot_files() -> list[Path]:
+    """backup/ 下真实快照（排除 sqlite 附属的 -wal/-shm，它们不是数据库文件）。"""
+    return sorted((p for p in BACKUP_DIR.glob("dev.db.*")
+                   if not p.name.endswith(("-wal", "-shm"))), reverse=True)
+
 
 def _snapshot_local_db() -> Path | None:
     """同步前备份当前 dev.db 到 backup/（时间戳命名，保留最近 10 份）。"""
@@ -222,8 +277,8 @@ def _snapshot_local_db() -> Path | None:
     except Exception as exc:  # noqa: BLE001
         log.warning("本地备份失败（继续同步）: %s", exc)
         return None
-    # 保留最近 BACKUP_KEEP 份
-    snaps = sorted(BACKUP_DIR.glob("dev.db.*"))
+    # 保留最近 BACKUP_KEEP 份（只数真实快照）
+    snaps = _snapshot_files()
     for old in snaps[:-BACKUP_KEEP]:
         try:
             old.unlink()
@@ -241,7 +296,7 @@ def cmd_backup() -> int:
     cloud = cloud_engine()
     print(f"{'表名':<28}{'云端行数':>8}{'本地写入':>8}  状态")
     total_ok, total_fail = 0, 0
-    for name in all_tables():
+    for name in _ordered_tables():
         tbl = Base.metadata.tables[name]
         try:
             with cloud.connect() as conn:
@@ -262,7 +317,7 @@ def cmd_backup() -> int:
 # ==================== restore ====================
 
 def cmd_restore() -> int:
-    snaps = sorted(BACKUP_DIR.glob("dev.db.*"), reverse=True)
+    snaps = _snapshot_files()
     if not snaps:
         print("[FAIL] backup/ 下无快照，无法恢复")
         return 1
