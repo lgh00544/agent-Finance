@@ -1,10 +1,11 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   App,
   Alert,
   Button,
   Card,
   Col,
+  Collapse,
   Drawer,
   Input,
   List,
@@ -24,7 +25,7 @@ import { portfolioAttribution, reviews, stockCycleAttribution } from '@/api/revi
 import { candidateTradeable } from '@/api/candidates'
 import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion } from '@/api/suggestions'
 import { trackVerifyDates, trackVerifyList, trackVerifyStats, runTrackVerify, runTrackSuggest } from '@/api/track'
-import { traces } from '@/api/traces'
+import { traceDetail, traces } from '@/api/traces'
 import { ChartCard } from '@/components/charts/ChartCard'
 import type { EChartsOption } from 'echarts'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StatusBadge, StockLabel } from '@/components/common'
@@ -93,6 +94,22 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
     queryFn: () => traces(r?.stock_code, String(r?.exit_date ?? ''), undefined, 20),
     enabled: open && !!r?.stock_code,
   })
+  // 批5 留痕展开：点开才单查 traceDetail → 解析 ext_info，渲染 agentic 思考/工具轨迹（非 agentic 仅回退摘要）
+  const [expandedTrace, setExpandedTrace] = useState<number | null>(null)
+  const [traceExt, setTraceExt] = useState<Record<string, unknown> | null>(null)
+  useEffect(() => { setExpandedTrace(null); setTraceExt(null) }, [r?.id])
+  const toggleTraceDetail = async (id: number) => {
+    if (expandedTrace === id) { setExpandedTrace(null); return }
+    setExpandedTrace(id); setTraceExt(null)
+    try {
+      const res = await traceDetail(id)
+      const raw = res.ext_info
+      let ex: Record<string, unknown> = {}
+      if (typeof raw === 'string') { try { ex = JSON.parse(raw) } catch { ex = {} } }
+      else if (raw && typeof raw === 'object') { ex = raw as Record<string, unknown> }
+      setTraceExt(ex)
+    } catch { setTraceExt(null) }
+  }
   if (!r) return null
   const fb = (r.feedback ?? {}) as Record<string, unknown>
   const suggestion = (fb.profile_suggestion ?? {}) as Record<string, unknown>
@@ -147,16 +164,34 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
           {traceRows?.length ? (
             <List size="small" dataSource={traceRows} renderItem={(t) => {
               const tc = t as unknown as Record<string, unknown>
+              const isOpen = expandedTrace === t.trace_id
+              const ex = traceExt ?? {}
+              const thinking = isOpen && typeof ex.model_thinking === 'string' && ex.model_thinking
+                ? String(ex.model_thinking) : ''
+              const tools = isOpen && typeof ex.tool_trace === 'string' && ex.tool_trace
+                ? String(ex.tool_trace) : ''
               return (
                 <List.Item>
                   <div style={{ width: '100%' }}>
                     <Space wrap>
                       <Tag>{String(tc.source_module ?? '—')}</Tag>
                       <Text type="secondary" style={{ fontSize: 12 }}>{String(tc.create_time ?? '').slice(0, 16)}</Text>
+                      <Button type="link" size="small" style={{ padding: 0, fontSize: 12 }}
+                        onClick={() => toggleTraceDetail(t.trace_id)}>
+                        {isOpen ? '收起轨迹' : '展开轨迹'}
+                      </Button>
                     </Space>
                     <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>
                       {String(tc.summary ?? '') || String(tc.final_conclusion ?? '—').slice(0, 140)}
                     </div>
+                    {isOpen && (thinking || tools) ? (
+                      <Collapse size="small" ghost style={{ marginTop: 8 }} items={[
+                        ...(thinking ? [{ key: 'thinking', label: '🧠 思考轨迹',
+                          children: <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, margin: 0 }}>{thinking}</pre> }] : []),
+                        ...(tools ? [{ key: 'tools', label: '🛠 工具执行轨迹',
+                          children: <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, margin: 0 }}>{tools}</pre> }] : []),
+                      ]} />
+                    ) : null}
                   </div>
                 </List.Item>
               )
