@@ -15,6 +15,8 @@ from app.db import repo
 from app.db.session import init_db
 from app.scheduler.jobs import start_scheduler, stop_scheduler
 from app.services import holding_view, market_view, reasoning_trace
+from app.services.feishu_bridge import start_bridge as start_feishu_bridge
+from app.services.feishu_bridge import stop_bridge as stop_feishu_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ async def lifespan(app: FastAPI):
     init_db()
     repo.seed_default_hot_money_profiles()  # 游资档案种子（幂等，席位名仅作模糊匹配参考）
     start_scheduler()
+    start_feishu_bridge()
 
     # 首屏预热：三大指数后台异步拉取（akshare 冷启动约 36s，后台跑不阻塞启动；
     # 失败静默降级，60s 缓存命中后首屏秒回）
@@ -47,6 +50,7 @@ async def lifespan(app: FastAPI):
     logger.info("系统启动完成")
     yield
     stop_scheduler()
+    stop_feishu_bridge()
     reasoning_trace.flush()  # 退出前兜底写入未落库的留痕记录
 
 

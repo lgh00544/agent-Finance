@@ -352,6 +352,14 @@ def system_status():
     return status_service.system_status()
 
 
+@router.get("/feishu/status")
+def feishu_status():
+    """飞书机器人桥状态（bridge_enabled=配置开关 / connected=实际连接态，区分运维）"""
+    from app.services.feishu_bridge import status as bridge_status
+
+    return bridge_status()
+
+
 @router.get("/llm/stats")
 def llm_stats():
     """LLM 运行统计（当日累计：请求次数 / 缓存命中·未命中 token / 命中率 / 模型分布），

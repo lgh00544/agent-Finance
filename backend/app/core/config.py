@@ -72,6 +72,14 @@ class Settings(BaseSettings):
     # ---------- 飞书告警 ----------
     feishu_webhook_url: str = ""
 
+    # ---------- 飞书机器人桥（手机接入，默认关闭零依赖）----------
+    feishu_bot_enable: bool = False  # 总开关，false 时零加载零依赖
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_admin_open_ids: str = ""  # 白名单 open_id，逗号分隔；空=只打印 open_id 不回复
+    feishu_bridge_alert_direct: bool = False  # 告警双通道：true=webhook 外同时机器人直发
+    feishu_media_dir: str = "data/feishu_media"  # 视频/文件存档目录（批3 预留）
+
     # ---------- 资金与交易风格 ----------
     total_capital: float = 100000.0
     max_single_position_pct: float = 40.0

@@ -32,6 +32,9 @@ APScheduler==3.11.0
 # HTTP（飞书推送等）
 httpx==0.28.1
 
+# 飞书机器人桥（手机接入：长连接收消息 + 机器人直发；已验 Python 3.14.3）
+lark-oapi==1.7.3
+
 # ===== OCR 持仓截图识别（可选依赖，.env 设置 OCR_ENABLE=true 时启用）=====
 # 本地 PaddleOCR 离线识别，不调用外部 API。不用 OCR 时可直接注释本组依赖（OCR_ENABLE 保持 false）。
 #   仅安装必要组件，GPU 版/额外模型均为可选项，按需手动安装：
