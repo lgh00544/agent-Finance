@@ -484,6 +484,31 @@ def ths_pnl_job() -> None:
         logger.error("同花顺盈亏快照落库失败: %s", exc)
 
 
+def feishu_daily_report_job() -> None:
+    """每日收盘日报直发：今日盈亏 + 持仓概览 + 当日候选 + 告警数（只搬运现有服务结果，不新写研判）"""
+    if not settings.feishu_daily_report or not _is_trading_day(time.strftime("%Y-%m-%d")):
+        return
+    from app.services import holding_view, ths_pnl
+    from app.services.feishu_sender import send_text
+
+    lines = [f"📊 {time.strftime('%Y-%m-%d')} 收盘日报"]
+    snap = ths_pnl.get_snapshot()
+    lines.append(f"今日盈亏: ¥{snap['pnl_yk']:,.0f}（{snap.get('pnl_pct')}%）"
+                 if snap.get("pnl_yk") is not None else f"今日盈亏: {snap.get('error') or '未接入'}")
+    view = holding_view.build_holding_view()
+    rows = view["rows"]
+    mv = sum(r["market_value"] or 0 for r in rows)
+    pnl = sum(r["pnl_amount"] or 0 for r in rows)
+    lines.append(f"持仓 {len(rows)} 只 | 总市值 ¥{mv:,.0f} | 浮动盈亏 ¥{pnl:,.0f}")
+    cands = repo.list_candidates(time.strftime("%Y-%m-%d"), 5)
+    if cands:
+        lines.append("当日候选: " + "、".join(f"{c['stock_code']} {c['stock_name'] or ''}" for c in cands))
+    alerts = [a for a in repo.list_alerts(50) if str(a.get("created_at", "")).startswith(time.strftime("%Y-%m-%d"))]
+    lines.append(f"今日告警 {len(alerts)} 条")
+    for oid in [s.strip() for s in settings.feishu_admin_open_ids.split(",") if s.strip()]:
+        send_text(oid, "\n".join(lines))
+
+
 def start_scheduler() -> None:
     global scheduler
     if scheduler is not None:
@@ -565,6 +590,14 @@ def start_scheduler() -> None:
                           hour=settings.dragon_tiger_hour,
                           minute=settings.dragon_tiger_minute,
                           id="dragon_tiger", name="龙虎榜T+1拉取",
+                          replace_existing=True, misfire_grace_time=3600)
+    # 飞书每日收盘日报（默认关；开启才注册，避免空转）
+    if settings.feishu_daily_report:
+        scheduler.add_job(feishu_daily_report_job, "cron",
+                          day_of_week="mon-fri",
+                          hour=settings.feishu_daily_report_hour,
+                          minute=settings.feishu_daily_report_minute,
+                          id="feishu_daily_report", name="飞书日报直发",
                           replace_existing=True, misfire_grace_time=3600)
     # 板块快照刷新：每 5 分钟 9:00-15:55（独立锁，不与 monitor 冲突）
     scheduler.add_job(sector_refresh_job, "cron",

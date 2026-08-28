@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     feishu_bridge_alert_direct: bool = False  # 告警双通道：true=webhook 外同时机器人直发
     feishu_media_dir: str = "data/feishu_media"  # 视频/文件存档目录（批3 预留）
 
+    # ---------- 飞书每日日报（默认关闭） ----------
+    feishu_daily_report: bool = False  # true=每日收盘后直发日报到管理员单聊
+    feishu_daily_report_hour: int = 16
+    feishu_daily_report_minute: int = 30
+
     # ---------- 资金与交易风格 ----------
     total_capital: float = 100000.0
     max_single_position_pct: float = 40.0

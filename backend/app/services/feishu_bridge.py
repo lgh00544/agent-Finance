@@ -60,6 +60,9 @@ def _on_message(data) -> None:
             logger.info("飞书桥忽略非白名单 sender=%s", sender)
             return
         msg = event.message
+        if (msg.chat_type or "") == "group" and not _is_mentioned_bot(msg):
+            logger.info("飞书群聊非 @ 消息忽略")
+            return
         if msg.message_type == "text":
             try:
                 text = (json.loads(msg.content or "{}") or {}).get("text", "")
@@ -82,6 +85,41 @@ def _on_message(data) -> None:
             _reply(sender, "暂不支持该消息类型（批4 上线）")
     except Exception as exc:  # noqa: BLE001 单条消息异常不崩溃
         logger.error("飞书桥消息处理失败: %s", exc)
+
+
+def _is_mentioned_bot(msg) -> bool:
+    """群聊仅处理 @ 机器人的消息（mentions 含机器人 open_id）；单聊不走此过滤"""
+    from app.services.feishu_sender import get_bot_open_id
+
+    bot_id = get_bot_open_id()
+    if not bot_id:
+        return False
+    return any(m.id and m.id.open_id == bot_id for m in (msg.mentions or []))
+
+
+def _on_card_action(data) -> None:
+    """卡片按钮回调：确认/取消 → 复用 pending 落库/丢弃；白名单校验"""
+    try:
+        event = data.event
+        operator = event.operator.open_id if event.operator else None
+        value = (event.action.value or {}) if event.action else {}
+        action = value.get("action", "")
+        if not operator or operator not in _admin_open_ids():
+            return
+        if action == "confirm":
+            pending = _pending.get(operator)
+            if pending and pending["expires"] >= time.monotonic():
+                _reply(operator, _apply_pending(operator, pending))
+            else:
+                _pending.pop(operator, None)
+                _reply(operator, "该识别结果已过期，请重新发送截图")
+        elif action == "cancel":
+            if _pending.pop(operator, None):
+                _reply(operator, "已取消，未保存")
+        else:
+            logger.info("飞书卡片未知动作: %s", action)
+    except Exception as exc:  # noqa: BLE001 单次回调异常不崩溃
+        logger.error("飞书卡片回调处理失败: %s", exc)
 
 
 def _dedup(file_key: str) -> bool:
@@ -153,7 +191,11 @@ def _handle_image(open_id: str, message_id: str, content: str) -> None:
                              f"{r.get('shares')}股 成本{r.get('cost_price')} "
                              f"现价{r.get('current_price')} 盈亏{r.get('pnl_pct')}%")
             _pending[open_id] = {"result": result, "expires": time.monotonic() + _PENDING_TTL}
-            _reply(open_id, "\n".join(lines))
+            from app.services.feishu_sender import send_card
+
+            send_card(open_id, "持仓识别", "\n".join(lines),
+                      [{"label": "确认", "value": {"action": "confirm"}},
+                       {"label": "取消", "value": {"action": "cancel"}}])
         else:  # 非持仓图 → 描述
             _reply(open_id, _describe_image(data))
     except Exception as exc:  # noqa: BLE001 单图失败回无法识别，不崩溃
@@ -234,13 +276,38 @@ def _cleanup_media_dir() -> None:
 
 def _run() -> None:
     global _ws_client
+    import base64
+    import http
+    import lark_oapi.ws.client as _ws_mod
     from lark_oapi import EventDispatcherHandler
-    from lark_oapi.ws import Client
+    from lark_oapi.ws import Client as _BaseClient
+
+    class _CardWsClient(_BaseClient):
+        """SDK 1.7.3 长连接默认丢弃 CARD 帧（卡片按钮回调），子类补分发不丢事件"""
+
+        async def _handle_data_frame(self, frame):
+            try:
+                if _ws_mod.MessageType(_ws_mod._get_by_key(frame.headers, _ws_mod.HEADER_TYPE)) \
+                        == _ws_mod.MessageType.CARD:
+                    await self._dispatch_card(frame)
+                    return
+            except Exception as exc:  # noqa: BLE001 卡片帧异常不拖垮连接
+                logger.error("飞书卡片帧处理失败: %s", exc)
+            await super()._handle_data_frame(frame)
+
+        async def _dispatch_card(self, frame):
+            result = self._event_handler._do_without_validation(frame.payload)
+            resp = _ws_mod.Response(code=http.HTTPStatus.OK)
+            if result is not None:
+                resp.data = base64.b64encode(_ws_mod.JSON.marshal(result).encode(_ws_mod.UTF_8))
+            frame.payload = _ws_mod.JSON.marshal(resp).encode(_ws_mod.UTF_8)
+            await self._write_message(frame.SerializeToString())
 
     handler = (EventDispatcherHandler.builder("", "")
-               .register_p2_im_message_receive_v1(_on_message).build())
-    _ws_client = Client(settings.feishu_app_id, settings.feishu_app_secret,
-                        event_handler=handler)
+               .register_p2_im_message_receive_v1(_on_message)
+               .register_p2_card_action_trigger(_on_card_action).build())
+    _ws_client = _CardWsClient(settings.feishu_app_id, settings.feishu_app_secret,
+                               event_handler=handler)
     _ws_client.start()
 
 
@@ -266,4 +333,5 @@ def status() -> dict:
     return {"bridge_enabled": settings.feishu_bot_enable,
             "connected": conn is not None,
             "last_event_at": _last_event_at,
-            "admin_count": len(_admin_open_ids())}
+            "admin_count": len(_admin_open_ids()),
+            "pending_count": len(_pending)}

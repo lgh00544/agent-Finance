@@ -104,3 +104,57 @@ def download_resource(message_id: str, file_key: str, resource_type: str = "imag
     )
     resp.raise_for_status()
     return resp.content
+
+
+def send_card(open_id: str, title: str, text: str, buttons: list[dict] | None = None) -> bool:
+    """发交互卡片（msg_type=interactive，按钮 value 回传 action）；复用现有 token。"""
+    if not (settings.feishu_bot_enable and settings.feishu_app_id and open_id):
+        return False
+    try:
+        token = _get_tenant_token()
+        if not token:
+            return False
+        elements = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}]
+        for b in buttons or []:
+            elements.append({"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": b["label"]},
+                 "type": b.get("type", "default"), "value": b.get("value", {})}]})
+        card = {"config": {"wide_screen_mode": True},
+                "header": {"title": {"tag": "plain_text", "content": title}, "template": "blue"},
+                "elements": elements}
+        resp = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages",
+            params={"receive_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+            json={"receive_id": open_id, "msg_type": "interactive",
+                  "content": json.dumps(card, ensure_ascii=False)}, timeout=10)
+        data = resp.json()
+        if data.get("code") == 0:
+            logger.info("飞书卡片发送成功: %s", open_id)
+            return True
+        logger.warning("飞书卡片发送失败 code=%s msg=%s", data.get("code"), data.get("msg"))
+    except Exception as exc:  # noqa: BLE001 卡片失败不阻断
+        logger.error("飞书卡片发送异常: %s", exc)
+    return False
+
+
+_bot_open_id: str = ""
+
+
+def get_bot_open_id() -> str:
+    """取机器人自身 open_id（群聊 @ 过滤用）；进程内缓存，失败返回空。"""
+    global _bot_open_id
+    if _bot_open_id:
+        return _bot_open_id
+    token = _get_tenant_token()
+    if not token:
+        return ""
+    try:
+        resp = requests.get("https://open.feishu.cn/open-apis/bot/v3/info",
+                            headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        data = resp.json()
+        if data.get("code") == 0:
+            _bot_open_id = str((data.get("bot") or {}).get("open_id", ""))
+    except Exception as exc:  # noqa: BLE001 bot 信息获取失败不阻断
+        logger.warning("获取机器人 open_id 失败: %s", exc)
+    return _bot_open_id
