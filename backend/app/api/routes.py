@@ -403,6 +403,13 @@ def get_sector_forecast_verify(start_date: str | None = None, end_date: str | No
     return {"rows": repo.list_sector_forecast_verify(start_date, end_date)}
 
 
+@router.get("/market/sector-forecast-stats")
+def get_sector_forecast_stats(end_date: str | None = None):
+    """近 30/60/90 日前瞻准确率，按 regime 分组；只读 E'-1 结果。"""
+    from app.services.sector_forecast_stats import summarize_forecast_accuracy
+    return summarize_forecast_accuracy(end_date)
+
+
 @router.get("/jobs/status")
 def job_status():
     return {"jobs": scheduler_jobs.job_status()}
