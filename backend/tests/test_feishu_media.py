@@ -11,12 +11,16 @@ _REAL_DEDUP = fb._dedup  # 幂等测试需真实实现（其他用例覆盖为�
 
 
 def _run_image(fb_, content, download=lambda mid, fk, rt: b"\x89PNG\r\n\x1a\nfake"):
+    """运行图片 handler；批4 起预览走卡片，捕获 send_card 的 text"""
+    import app.services.feishu_sender as fs
+
     out = []
     fb_._reply = lambda oid, t: out.append(t)
     fb_._download_resource = download
     fb_._pending.clear()
     fb_._recent_files.clear()
     fb_._dedup = lambda k: True
+    fs.send_card = lambda oid, title, text, buttons=None: out.append(text) or True
     fb_._handle_image("ou_t", "m", content)
     return out
 
