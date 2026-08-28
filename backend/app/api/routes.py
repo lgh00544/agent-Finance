@@ -951,6 +951,9 @@ def list_agent_suggestions(status: Optional[str] = None, target_agent: Optional[
              "file_path": s.file_path or "", "insert_position": s.insert_position or "",
              "conflict_note": s.conflict_note or "", "dedup_note": s.dedup_note or "",
              "suggestion_source": s.suggestion_source or "llm",
+             "audit_verdict": getattr(s, "audit_verdict", None) or "",
+             "audit_round": getattr(s, "audit_round", 0) or 0,
+             "last_audit_id": getattr(s, "last_audit_id", None),
              "created_at": str(s.created_at)} for s in suggestions]
 
 

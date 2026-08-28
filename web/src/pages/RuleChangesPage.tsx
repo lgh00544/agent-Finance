@@ -1,7 +1,7 @@
-import { App, Button, Space, Table, Tag, Typography } from 'antd'
+import { App, Button, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ruleChanges, rollbackRuleChange } from '@/api/suggestions'
-import { EmptyState } from '@/components/common'
+import { agentSuggestions, ruleChanges, rollbackRuleChange } from '@/api/suggestions'
+import { EmptyState, StatusBadge } from '@/components/common'
 
 const { Text } = Typography
 
@@ -15,12 +15,24 @@ const TYPE_TONE: Record<string, { label: string; color: string }> = {
   soft: { label: '软性', color: 'orange' },
   profile: { label: '偏好', color: 'blue' },
 }
+/** AI 审核三态（复用 StatusBadge tone：pending 待审 / ok 已过 / err 驳回） */
+const AUDIT_TONE: Record<string, { label: string; tone: string }> = {
+  pending: { label: '待审', tone: 'pending' },
+  pass: { label: '已过', tone: 'ok' },
+  fail: { label: '驳回', tone: 'err' },
+}
 
 /** 规则变更记录页（Phase 4，最轻） */
 export function RuleChangesPage() {
   const { message, modal } = App.useApp()
   const qc = useQueryClient()
   const { data: rows, isError, error, refetch } = useQuery({ queryKey: ['rule-changes'], queryFn: () => ruleChanges() })
+  // 建议审核状态 join（60s 节流；source_suggestion_id → audit_verdict/audit_round）
+  const { data: sugRows } = useQuery({
+    queryKey: ['agent-suggestions-audit'], queryFn: () => agentSuggestions(),
+    staleTime: 60_000, refetchInterval: 60_000, retry: 0,
+  })
+  const sugById = new Map((sugRows ?? []).map((s) => [s.id, s]))
 
   if (isError) return (
     <div>
@@ -63,6 +75,22 @@ export function RuleChangesPage() {
     {
       title: '状态', dataIndex: 'status', width: 90,
       render: (v: string) => <Tag color={STATUS[v]?.color ?? 'default'}>{STATUS[v]?.label ?? v}</Tag>,
+    },
+    {
+      title: 'AI 审核', key: 'audit', width: 90,
+      render: (_: unknown, r: Record<string, unknown>) => {
+        const sug = sugById.get(Number(r.source_suggestion_id ?? 0))
+        if (!sug) return <Text type="secondary">—</Text>
+        const v = String((sug as unknown as Record<string, unknown>).audit_verdict ?? '')
+        const m = AUDIT_TONE[v]
+        if (!m) return <Text type="secondary">—</Text>
+        const round = String((sug as unknown as Record<string, unknown>).audit_round ?? '')
+        return (
+          <Tooltip title={`AI 审核：${m.label}${round ? ` · 第${round}轮` : ''}`}>
+            <StatusBadge text={m.label} tone={m.tone} />
+          </Tooltip>
+        )
+      },
     },
     { title: '时间', dataIndex: 'created_at', width: 150, render: (v: string) => String(v ?? '').slice(0, 16) },
     {

@@ -5,6 +5,8 @@ import { recentTasks, retryTask } from '@/api/tasks'
 import { hotSectors, marketCondition, marketIndices } from '@/api/market'
 import { holdingQuotes, redLineCheck, takeProfitPlan } from '@/api/holdings'
 import { accountPnl } from '@/api/account'
+import { getAuditStats } from '@/api/audit'
+import { useNavigate } from 'react-router-dom'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { ChartCard, hotSectorBarOption } from '@/components/charts/ChartCard'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StockLabel } from '@/components/common'
@@ -175,6 +177,12 @@ export function OverviewPage() {
   const { data: mcStrict } = useQuery({ queryKey: ['market-cond-strict'], queryFn: marketCondition })
   // 同花顺真实今日盈亏（只读展示；默认关返回 {configured:false} → PnlCell 灰态）
   const { data: pnl } = useQuery({ queryKey: ['account-pnl'], queryFn: accountPnl, refetchInterval: 60_000 })
+  // AI 审核待审统计（60s 节流；无数据灰态，点击跳规则变更页）
+  const navigate = useNavigate()
+  const { data: auditStat } = useQuery({
+    queryKey: ['audit-stats'], queryFn: getAuditStats,
+    staleTime: 60_000, refetchInterval: 60_000, retry: 0,
+  })
   // 持仓红线预警（复用已有 /red_line_check，5 分钟轮询平衡开销）
   const { data: redRes } = useQuery({
     queryKey: ['red-line-check'],
@@ -235,6 +243,20 @@ export function OverviewPage() {
         </Button>
         <Button onClick={() => qc.invalidateQueries({ queryKey: ['dashboard'] })}>刷新看板</Button>
       </Space>
+
+      {/* AI 审核待审统计卡（红=有待审 / 绿=已全审 / 灰=无数据；点击跳规则变更页） */}
+      <Card size="small" hoverable onClick={() => navigate('/rule-changes')}
+        style={{ background: 'var(--bg-card)', marginBottom: 12, cursor: 'pointer' }}>
+        <Text type="secondary" style={{ fontSize: 12 }}>AI 审核待审</Text>
+        <div style={{ marginTop: 2 }}>
+          <Text strong style={{ fontSize: 20, color: auditStat == null ? 'var(--text-muted)' : auditStat.pending > 0 ? '#cf1322' : '#389e0d' }}>
+            {auditStat == null ? '—' : auditStat.pending}
+          </Text>
+        </div>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {auditStat == null ? '加载中' : auditStat.pending > 0 ? '条待辩证审核' : `已过 ${auditStat.pass} · 驳回 ${auditStat.fail}`}
+        </Text>
+      </Card>
 
       {/* ① 市况速览（替换原 4 StatCard 位置；数据缺失全 "—" 降级） */}
       <Card size="small" title="市况速览" style={{ background: 'var(--bg-card)', marginBottom: 12 }}>
