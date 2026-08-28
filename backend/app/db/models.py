@@ -858,6 +858,26 @@ class SectorForwardForecast(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class SectorForecastVerify(Base):
+    """行情结构前瞻后验验证（E'-1，每个预测日每个窗口一条）"""
+    __tablename__ = "sector_forecast_verify"
+    __table_args__ = (
+        UniqueConstraint("forecast_date", "verify_horizon", name="uq_sfv_date_horizon"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    forecast_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    verify_horizon: Mapped[str] = mapped_column(String(4), nullable=False)
+    verify_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    regime_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    top5_continue_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mainline_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    regime_forecast: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    miss_reason: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class QuoteSnapshot(Base):
     """持仓实时价快照（每 5 分钟腾讯批量落库；持仓监控页 DB 兜底，首页热路径 <50ms）
 

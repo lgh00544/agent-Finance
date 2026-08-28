@@ -72,6 +72,7 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
     "sector_rotation": ("板块轮动分析", lambda p: _task_sector_rotation()),
     "sector_forward": ("行情结构与板块前瞻", lambda p: _task_sector_forward(p)),
+    "sector_forecast_verify": ("行情结构前瞻验证回填", lambda p: _task_sector_forecast_verify(p)),
     "score": ("单股评分",
               lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
     "position": ("分批建仓方案",
@@ -146,6 +147,12 @@ def _task_sector_forward(params: dict) -> dict:
     return {"success": forward.get("success"), "trade_date": forward.get("trade_date"),
             "refresh": refresh, "regime": regime, "forward": forward,
             "error": forward.get("error")}
+
+
+def _task_sector_forecast_verify(params: dict) -> dict:
+    """手动触发 E'-1 前瞻验证回填，不重新生成预测。"""
+    from app.services.sector_forecast_verify import run_sector_forecast_verify
+    return run_sector_forecast_verify(params.get("forecast_date") or params.get("trade_date"))
 
 
 def _task_monitor_all() -> dict:
@@ -363,6 +370,12 @@ def run_sector_forward_job():
     return _submit_task("sector_forward", {})
 
 
+@router.post("/market/sector-forecast-verify/run")
+def run_sector_forecast_verify_job(forecast_date: str | None = None):
+    """手动触发前瞻验证回填（异步提交 E'-1）。"""
+    return _submit_task("sector_forecast_verify", {"forecast_date": forecast_date})
+
+
 @router.get("/market/sector-patterns")
 def get_sector_patterns():
     """多窗口规律（3/10/20/60 日）：轮动周期/生命周期/高切低/启动延续率，读真实落库"""
@@ -382,6 +395,12 @@ def get_sector_forward(date: str | None = None):
     """读取指定交易日 top10 板块 T+1/T+3/T+5 前瞻。"""
     d = date or time.strftime("%Y-%m-%d")
     return {"trade_date": d, "forecasts": repo.list_sector_forward_forecast(d)}
+
+
+@router.get("/market/sector-forecast-verify")
+def get_sector_forecast_verify(start_date: str | None = None, end_date: str | None = None):
+    """读取 E'-1 前瞻验证回填结果。"""
+    return {"rows": repo.list_sector_forecast_verify(start_date, end_date)}
 
 
 @router.get("/jobs/status")

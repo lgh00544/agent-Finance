@@ -24,7 +24,7 @@ from app.db.models import (
     LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
     PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
     SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
-    SectorRegimeForecast, SectorForwardForecast,
+    SectorRegimeForecast, SectorForwardForecast, SectorForecastVerify,
     SellDecision, StockCandidate, StockScore, TradeProfile,
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
@@ -529,6 +529,58 @@ def list_sector_forward_forecast(trade_date: str) -> list[dict]:
             "switch_candidate": bool(r.switch_candidate), "regime": r.regime,
             "forward_bias": r.forward_bias, "forecast_horizon": r.forecast_horizon,
             "evidence": r.evidence or {},
+        } for r in result]
+
+
+def upsert_sector_forecast_verify(rows: list[dict]) -> int:
+    """前瞻验证删后插（forecast_date + horizon 唯一）。"""
+    if not rows:
+        return 0
+    with SessionLocal() as db:
+        for row in rows:
+            db.execute(
+                text("DELETE FROM sector_forecast_verify "
+                     "WHERE forecast_date = :d AND verify_horizon = :h"),
+                {"d": row["forecast_date"], "h": row["verify_horizon"]},
+            )
+            db.add(SectorForecastVerify(
+                forecast_date=row["forecast_date"],
+                verify_horizon=row["verify_horizon"],
+                verify_date=row.get("verify_date"),
+                regime_hit=row.get("regime_hit"),
+                top5_continue_rate=row.get("top5_continue_rate"),
+                mainline_hit=row.get("mainline_hit"),
+                regime_forecast=row.get("regime_forecast"),
+                miss_reason=row.get("miss_reason", ""),
+                detail=row.get("detail") or {},
+            ))
+        db.commit()
+    return len(rows)
+
+
+def list_sector_forecast_verify(start_date: str | None = None,
+                                end_date: str | None = None) -> list[dict]:
+    """读取前瞻验证结果，供准确率统计只读聚合。"""
+    with SessionLocal() as db:
+        stmt = select(SectorForecastVerify)
+        if start_date:
+            stmt = stmt.where(SectorForecastVerify.forecast_date >= start_date)
+        if end_date:
+            stmt = stmt.where(SectorForecastVerify.forecast_date <= end_date)
+        result = db.execute(
+            stmt.order_by(SectorForecastVerify.forecast_date.desc(),
+                          SectorForecastVerify.verify_horizon.asc())
+        ).scalars().all()
+        return [{
+            "forecast_date": r.forecast_date,
+            "verify_horizon": r.verify_horizon,
+            "verify_date": r.verify_date,
+            "regime_hit": r.regime_hit,
+            "top5_continue_rate": r.top5_continue_rate,
+            "mainline_hit": r.mainline_hit,
+            "regime_forecast": r.regime_forecast,
+            "miss_reason": r.miss_reason,
+            "detail": r.detail or {},
         } for r in result]
 
 

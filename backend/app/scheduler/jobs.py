@@ -315,6 +315,26 @@ def sector_forward_job() -> None:
         cache.release_lock("sector_forward")
 
 
+def sector_forecast_verify_job() -> None:
+    """前瞻验证回填：16:05 用后续真实快照验证历史 C'/D' 预测。"""
+    if not cache.acquire_lock("sector_forecast_verify", ttl_seconds=900):
+        logger.info("sector_forecast_verify 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.sector_forecast_verify import run_sector_forecast_verify
+        result = run_sector_forecast_verify()
+        if result.get("success"):
+            cache.set("job:last_sector_forecast_verify",
+                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("前瞻验证回填完成: %s 条", result.get("count", 0))
+        else:
+            logger.warning("前瞻验证回填失败: %s", result.get("error"))
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("前瞻验证回填异常: %s", exc)
+    finally:
+        cache.release_lock("sector_forecast_verify")
+
+
 def distribution_phase_job() -> None:
     """派发期判定：每日 15:30 收盘后，遍历「今日候选 + 当前持仓」逐只判定落库
 
@@ -664,6 +684,11 @@ def start_scheduler() -> None:
     scheduler.add_job(sector_forward_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=45,
                       id="sector_forward", name="板块前瞻预测",
+                      replace_existing=True, misfire_grace_time=3600)
+    # E'-1 前瞻验证回填：使用后续真实板块快照校验历史预测（收盘后 16:05）
+    scheduler.add_job(sector_forecast_verify_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=5,
+                      id="sector_forecast_verify", name="前瞻验证回填",
                       replace_existing=True, misfire_grace_time=3600)
     # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
     scheduler.add_job(quote_snapshot_refresh_job, "cron",
