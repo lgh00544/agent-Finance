@@ -274,6 +274,27 @@ def sector_daily_job() -> None:
         cache.release_lock("sector_daily")
 
 
+def sector_regime_job() -> None:
+    """行情结构识别：15:40 独立运行，不依赖 C 归因子。"""
+    if not cache.acquire_lock("sector_regime", ttl_seconds=900):
+        logger.info("sector_regime 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.sector_regime import judge_regime
+        result = judge_regime()
+        if result.get("success"):
+            cache.set("job:last_sector_regime",
+                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("行情结构识别完成: %s/%s",
+                        result.get("current_regime"), result.get("regime_stage"))
+        else:
+            logger.warning("行情结构识别失败: %s", result.get("error"))
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("行情结构识别异常: %s", exc)
+    finally:
+        cache.release_lock("sector_regime")
+
+
 def distribution_phase_job() -> None:
     """派发期判定：每日 15:30 收盘后，遍历「今日候选 + 当前持仓」逐只判定落库
 
@@ -613,6 +634,11 @@ def start_scheduler() -> None:
     scheduler.add_job(sector_daily_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=35,
                       id="sector_daily", name="板块轮动日快照",
+                      replace_existing=True, misfire_grace_time=3600)
+    # C' 行情结构识别：多窗口结构综合（收盘后 15:40，独立于 C 归因子）
+    scheduler.add_job(sector_regime_job, "cron",
+                      day_of_week="mon-fri", hour=15, minute=40,
+                      id="sector_regime", name="行情结构识别",
                       replace_existing=True, misfire_grace_time=3600)
     # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
     scheduler.add_job(quote_snapshot_refresh_job, "cron",

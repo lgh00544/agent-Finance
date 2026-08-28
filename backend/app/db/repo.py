@@ -24,6 +24,7 @@ from app.db.models import (
     LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
     PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
     SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
+    SectorRegimeForecast,
     SellDecision, StockCandidate, StockScore, TradeProfile,
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
@@ -436,6 +437,52 @@ def list_sector_launch_by_date(trade_date: str) -> list[dict]:
                 "evidence": r.evidence or {}, "confidence": r.confidence,
             })
         return out
+
+
+def upsert_sector_regime_forecast(row: dict) -> int:
+    """行情结构预测删后插（trade_date 唯一，当日最后一次覆盖）。"""
+    if not row or not row.get("trade_date"):
+        return 0
+    with SessionLocal() as db:
+        db.execute(
+            text("DELETE FROM sector_regime_forecast WHERE trade_date = :d"),
+            {"d": row["trade_date"]},
+        )
+        db.add(SectorRegimeForecast(
+            trade_date=row["trade_date"],
+            current_regime=row.get("current_regime", "chaos"),
+            regime_stage=row.get("regime_stage", "unknown"),
+            regime_confidence=row.get("regime_confidence"),
+            forward_bias_t1=row.get("forward_bias_t1", "uncertain"),
+            forward_bias_t3=row.get("forward_bias_t3", "uncertain"),
+            forward_bias_t5=row.get("forward_bias_t5", "uncertain"),
+            evidence=row.get("evidence") or {},
+            notes=row.get("notes", ""),
+        ))
+        db.commit()
+    return 1
+
+
+def get_sector_regime_forecast(trade_date: str) -> dict | None:
+    """读取指定交易日行情结构预测。"""
+    with SessionLocal() as db:
+        r = db.execute(
+            select(SectorRegimeForecast)
+            .where(SectorRegimeForecast.trade_date == trade_date)
+        ).scalars().first()
+        if r is None:
+            return None
+        return {
+            "trade_date": r.trade_date,
+            "current_regime": r.current_regime,
+            "regime_stage": r.regime_stage,
+            "regime_confidence": r.regime_confidence,
+            "forward_bias_t1": r.forward_bias_t1,
+            "forward_bias_t3": r.forward_bias_t3,
+            "forward_bias_t5": r.forward_bias_t5,
+            "evidence": r.evidence or {},
+            "notes": r.notes,
+        }
 
 
 # ==================== 持仓实时价快照（quote_snapshot，持仓监控页 DB 兜底） ====================
@@ -1961,6 +2008,24 @@ def insert_audit_log(target_type: str, target_id: int, audit_round: int, verdict
 def get_audit_log(audit_id: int) -> AuditLog | None:
     with SessionLocal() as db:
         return db.get(AuditLog, audit_id)
+
+
+def get_latest_audit_log_by_target(target_type: str, target_id: int) -> dict | None:
+    """按目标查最新一条审核记录（created_at desc；含 dissent_view 完整字段）；无 → None"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(AuditLog).where(AuditLog.target_type == target_type,
+                                   AuditLog.target_id == target_id)
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {"id": row.id, "target_type": row.target_type, "target_id": row.target_id,
+                "round": row.round, "verdict": row.verdict, "confidence": row.confidence,
+                "support_view": row.support_view, "dissent_view": row.dissent_view,
+                "boundary_cases": row.boundary_cases, "evidence_refs": row.evidence_refs or [],
+                "audit_model": row.audit_model, "reasoning": row.reasoning,
+                "duration_ms": row.duration_ms, "created_at": str(row.created_at)}
 
 
 def update_audit_log_verdict(audit_id: int, verdict: str) -> None:

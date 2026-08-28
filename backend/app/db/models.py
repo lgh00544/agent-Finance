@@ -814,6 +814,26 @@ class SectorLaunchReason(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class SectorRegimeForecast(Base):
+    """行情结构与板块轮动前瞻（C' 多窗口结构识别，每个交易日一条）"""
+    __tablename__ = "sector_regime_forecast"
+    __table_args__ = (
+        UniqueConstraint("trade_date", name="uq_srf_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    current_regime: Mapped[str] = mapped_column(String(16), nullable=False)
+    regime_stage: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    regime_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    forward_bias_t1: Mapped[str] = mapped_column(String(32), nullable=False, default="uncertain")
+    forward_bias_t3: Mapped[str] = mapped_column(String(32), nullable=False, default="uncertain")
+    forward_bias_t5: Mapped[str] = mapped_column(String(32), nullable=False, default="uncertain")
+    evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    notes: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class QuoteSnapshot(Base):
     """持仓实时价快照（每 5 分钟腾讯批量落库；持仓监控页 DB 兜底，首页热路径 <50ms）
 
