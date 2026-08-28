@@ -834,6 +834,30 @@ class SectorRegimeForecast(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class SectorForwardForecast(Base):
+    """板块级前瞻预测（D' 纯代码评分；同板块按 T+1/T+3/T+5 分窗口保存）"""
+    __tablename__ = "sector_forward_forecast"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "sector_name", "forecast_horizon",
+                         name="uq_sff_date_name_horizon"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    sector_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    rank_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    continuation_prob: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exhaustion_risk: Mapped[float | None] = mapped_column(Float, nullable=True)
+    chase_risk: Mapped[float | None] = mapped_column(Float, nullable=True)
+    switch_candidate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    regime: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    forward_bias: Mapped[str] = mapped_column(String(32), nullable=False, default="uncertain")
+    forecast_horizon: Mapped[str] = mapped_column(String(4), nullable=False, default="t1")
+    evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class QuoteSnapshot(Base):
     """持仓实时价快照（每 5 分钟腾讯批量落库；持仓监控页 DB 兜底，首页热路径 <50ms）
 

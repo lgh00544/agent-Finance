@@ -295,6 +295,26 @@ def sector_regime_job() -> None:
         cache.release_lock("sector_regime")
 
 
+def sector_forward_job() -> None:
+    """板块前瞻：15:45 读取 C' 结构结果，独立执行 D' 纯代码计算。"""
+    if not cache.acquire_lock("sector_forward", ttl_seconds=900):
+        logger.info("sector_forward 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.sector_forward_view import run_sector_forward
+        result = run_sector_forward()
+        if result.get("success"):
+            cache.set("job:last_sector_forward",
+                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("板块前瞻完成: %s 条", result.get("count", 0))
+        else:
+            logger.warning("板块前瞻失败: %s", result.get("error"))
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("板块前瞻异常: %s", exc)
+    finally:
+        cache.release_lock("sector_forward")
+
+
 def distribution_phase_job() -> None:
     """派发期判定：每日 15:30 收盘后，遍历「今日候选 + 当前持仓」逐只判定落库
 
@@ -639,6 +659,11 @@ def start_scheduler() -> None:
     scheduler.add_job(sector_regime_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=40,
                       id="sector_regime", name="行情结构识别",
+                      replace_existing=True, misfire_grace_time=3600)
+    # D' 板块前瞻：读取 C' 结构结果，纯代码计算（收盘后 15:45）
+    scheduler.add_job(sector_forward_job, "cron",
+                      day_of_week="mon-fri", hour=15, minute=45,
+                      id="sector_forward", name="板块前瞻预测",
                       replace_existing=True, misfire_grace_time=3600)
     # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
     scheduler.add_job(quote_snapshot_refresh_job, "cron",

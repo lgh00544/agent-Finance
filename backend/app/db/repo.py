@@ -24,7 +24,7 @@ from app.db.models import (
     LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
     PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
     SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
-    SectorRegimeForecast,
+    SectorRegimeForecast, SectorForwardForecast,
     SellDecision, StockCandidate, StockScore, TradeProfile,
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
@@ -483,6 +483,53 @@ def get_sector_regime_forecast(trade_date: str) -> dict | None:
             "evidence": r.evidence or {},
             "notes": r.notes,
         }
+
+
+def upsert_sector_forward_forecast(rows: list[dict]) -> int:
+    """板块前瞻删后插（trade_date 全量覆盖，板块+窗口唯一）。"""
+    if not rows or not rows[0].get("trade_date"):
+        return 0
+    trade_date = rows[0]["trade_date"]
+    with SessionLocal() as db:
+        db.execute(text("DELETE FROM sector_forward_forecast WHERE trade_date = :d"),
+                   {"d": trade_date})
+        for row in rows:
+            db.add(SectorForwardForecast(
+                trade_date=trade_date,
+                sector_name=row["sector_name"],
+                rank_no=row["rank_no"],
+                stage=row.get("stage", "unknown"),
+                continuation_prob=row.get("continuation_prob"),
+                exhaustion_risk=row.get("exhaustion_risk"),
+                chase_risk=row.get("chase_risk"),
+                switch_candidate=bool(row.get("switch_candidate", False)),
+                regime=row.get("regime", "unknown"),
+                forward_bias=row.get("forward_bias", "uncertain"),
+                forecast_horizon=row.get("forecast_horizon", "t1"),
+                evidence=row.get("evidence") or {},
+            ))
+        db.commit()
+    return len(rows)
+
+
+def list_sector_forward_forecast(trade_date: str) -> list[dict]:
+    """读取指定日期板块前瞻，按窗口、排名升序。"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorForwardForecast)
+            .where(SectorForwardForecast.trade_date == trade_date)
+            .order_by(SectorForwardForecast.forecast_horizon.asc(),
+                      SectorForwardForecast.rank_no.asc())
+        ).scalars().all()
+        return [{
+            "trade_date": r.trade_date, "sector_name": r.sector_name,
+            "rank_no": r.rank_no, "stage": r.stage,
+            "continuation_prob": r.continuation_prob,
+            "exhaustion_risk": r.exhaustion_risk, "chase_risk": r.chase_risk,
+            "switch_candidate": bool(r.switch_candidate), "regime": r.regime,
+            "forward_bias": r.forward_bias, "forecast_horizon": r.forecast_horizon,
+            "evidence": r.evidence or {},
+        } for r in result]
 
 
 # ==================== 持仓实时价快照（quote_snapshot，持仓监控页 DB 兜底） ====================

@@ -460,3 +460,22 @@ CREATE TABLE IF NOT EXISTS sector_regime_forecast (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_srf_date (trade_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 行情结构与板块轮动前瞻·板块级预测（D'，每日 15:45）
+CREATE TABLE IF NOT EXISTS sector_forward_forecast (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    sector_name VARCHAR(64) NOT NULL,
+    rank_no INT NOT NULL,
+    stage VARCHAR(16) NOT NULL DEFAULT 'unknown',
+    continuation_prob FLOAT NULL,
+    exhaustion_risk FLOAT NULL,
+    chase_risk FLOAT NULL,
+    switch_candidate TINYINT(1) NOT NULL DEFAULT 0,
+    regime VARCHAR(16) NOT NULL DEFAULT 'unknown',
+    forward_bias VARCHAR(32) NOT NULL DEFAULT 'uncertain',
+    forecast_horizon VARCHAR(4) NOT NULL DEFAULT 't1',
+    evidence JSON NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_sff_date_name_horizon (trade_date, sector_name, forecast_horizon)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
