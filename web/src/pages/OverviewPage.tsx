@@ -1,4 +1,4 @@
-import { App, Button, Card, Col, Row, Space, Tag, Typography } from 'antd'
+import { Alert, App, Button, Card, Col, Row, Space, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { dashboard, jobStatus, llmStats as fetchLlm, datasourceStats as fetchDs } from '@/api/system'
 import { recentTasks, retryTask } from '@/api/tasks'
@@ -61,7 +61,14 @@ function PnlCell({ pnl }: { pnl?: AccountPnl }) {
         <div style={{ marginTop: 2 }}><Tag color={up(sh)}>上证 {Number(sh) >= 0 ? '+' : ''}{Number(sh).toFixed(2)}%</Tag></div>
       ) : null}
       {expired ? (
-        <div style={{ marginTop: 2 }}><Tag color="orange">同花顺 Cookie 已过期，请到 DSH 插件重新登录</Tag></div>
+        <Alert type="warning" showIcon style={{ marginTop: 2, padding: '4px 8px' }}
+          message="🍪 同花顺 Cookie 已过期"
+          description={
+            <>
+              <a href="https://tzzb.10jqka.com.cn/pc/index.html" target="_blank" rel="noreferrer">同花顺账本 · 重新登录</a>
+              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>重新登录后无需重启，页面会自动恢复正常</div>
+            </>
+          } />
       ) : null}
       {err ? (
         <div style={{ marginTop: 2, color: '#cf1322', fontSize: 12 }}>{err.length > 40 ? `${err.slice(0, 40)}…` : err}</div>

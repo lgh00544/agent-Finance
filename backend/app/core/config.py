@@ -184,7 +184,7 @@ class Settings(BaseSettings):
     # 直连同花顺账本 API 拉取真实「今日盈亏 + 上证指数」（替代估算/akshare 延迟值）。
     # 默认关不改变现有行为；Cookie/密钥只进内存与 HTTP 头，禁止任何日志/输出明文（红线）；
     # 采集失败只写 error 字段，不抛异常、不伪造 0、不阻塞调度。
-    ths_pnl_enable: bool = False          # 总开关 THS_PNL_ENABLE（关闭时无采集、路由返回 configured:false）
+    ths_pnl_enable: bool = True           # 总开关 THS_PNL_ENABLE（默认开；Cookie 已配，Collect 失败只落 error 不崩、前端诚实降级）
     ths_pnl_cookie: str = ""               # 直接给 Cookie（可选，绕过 DSH 凭证文件）
     ths_pnl_cookie_file: str = r"D:\AI\Deepseek Harness\.dsh\.credentials.yaml"  # DSH 凭证文件
     ths_pnl_poll_seconds: int = 20         # 采集间隔（交易时段）
