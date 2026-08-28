@@ -957,6 +957,15 @@ def list_agent_suggestions(status: Optional[str] = None, target_agent: Optional[
              "created_at": str(s.created_at)} for s in suggestions]
 
 
+@router.get("/audit-log")
+def get_audit_log_detail(target_type: str, target_id: int):
+    """通用审核 Agent：最新一条审核记录（含 dissent_view 完整字段）；无 → 404"""
+    row = repo.get_latest_audit_log_by_target(target_type, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return row
+
+
 def _coerce_value(raw: str):
     """建议值字符串 → 合理类型（数字/布尔/列表原样，其余保留字符串）"""
     import json

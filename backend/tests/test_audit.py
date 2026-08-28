@@ -85,3 +85,33 @@ def test_round2_still_fail_no_round3(monkeypatch):
 
     r3 = run_pending_audits(cutoff_id=0)
     assert r3["audited"] == 0  # 无第 3 轮
+
+
+def test_get_latest_audit_log_by_target():
+    """① repo 层：同目标多条取最新（created_at desc），无记录返回 None"""
+    from app.db import repo as _r
+
+    _r.insert_audit_log("agent_suggestion", 900, 1, "pass", 80, "支持", "反对1", "边界",
+                        ["K223"], "deepseek", "{}", 100)
+    _r.insert_audit_log("agent_suggestion", 900, 2, "fail", 70, "支持", "反对2", "边界",
+                        ["K223"], "deepseek", "{}", 200)
+    row = _r.get_latest_audit_log_by_target("agent_suggestion", 900)
+    assert row["round"] == 2 and row["dissent_view"] == "反对2"
+    assert _r.get_latest_audit_log_by_target("agent_suggestion", 999999) is None
+
+
+def test_audit_log_get():
+    """② 端点：命中返回含 dissent_view 的行，未命中 404（detail='not found'）"""
+    from fastapi import HTTPException
+    from app.api.routes import get_audit_log_detail
+
+    repo.insert_audit_log("agent_suggestion", 901, 1, "pass", 85, "支持", "反例场景", "边界",
+                          ["K223"], "deepseek", "{}", 100)
+    r = get_audit_log_detail("agent_suggestion", 901)
+    assert r["dissent_view"] == "反例场景" and r["verdict"] == "pass"
+    try:
+        get_audit_log_detail("agent_suggestion", 999999)
+        raise AssertionError("应 404")
+    except HTTPException as e:
+        assert e.status_code == 404
+        assert e.detail == "not found"

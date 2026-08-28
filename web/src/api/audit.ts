@@ -35,17 +35,9 @@ export const getAuditPending = async (): Promise<AgentSuggestion[]> => {
   })
 }
 
-/** GET /api/audit-log（后端端点待批 1C 接线；404 返回 null 诚实降级，不崩） */
-export const getAuditLog = async (
+/** GET /api/audit-log（404 抛错 → 页面用 React Query error 态展示「未审核」） */
+export const getAuditLog = (
   targetType: string,
   targetId: number,
-): Promise<Record<string, unknown> | null> => {
-  try {
-    return await get<Record<string, unknown>>('/audit-log', {
-      target_type: targetType,
-      target_id: targetId,
-    })
-  } catch {
-    return null
-  }
-}
+): Promise<Record<string, unknown>> =>
+  get('/audit-log', { target_type: targetType, target_id: targetId })

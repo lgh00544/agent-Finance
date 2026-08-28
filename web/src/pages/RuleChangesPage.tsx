@@ -1,6 +1,8 @@
+import { useState } from 'react'
 import { App, Button, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { agentSuggestions, ruleChanges, rollbackRuleChange } from '@/api/suggestions'
+import { getAuditLog } from '@/api/audit'
 import { EmptyState, StatusBadge } from '@/components/common'
 
 const { Text } = Typography
@@ -33,6 +35,14 @@ export function RuleChangesPage() {
     staleTime: 60_000, refetchInterval: 60_000, retry: 0,
   })
   const sugById = new Map((sugRows ?? []).map((s) => [s.id, s]))
+  // hover 懒取该建议最新审核记录（dissent_view 摘要；未审核 404 → 降级行内 verdict/round）
+  const [hoverSid, setHoverSid] = useState<number | null>(null)
+  const { data: hoverLog } = useQuery({
+    queryKey: ['audit-log', hoverSid],
+    queryFn: () => getAuditLog('agent_suggestion', hoverSid as number),
+    enabled: hoverSid != null,
+    staleTime: 60_000, retry: 0,
+  })
 
   if (isError) return (
     <div>
@@ -79,14 +89,18 @@ export function RuleChangesPage() {
     {
       title: 'AI 审核', key: 'audit', width: 90,
       render: (_: unknown, r: Record<string, unknown>) => {
-        const sug = sugById.get(Number(r.source_suggestion_id ?? 0))
+        const sid = Number(r.source_suggestion_id ?? 0)
+        const sug = sugById.get(sid)
         if (!sug) return <Text type="secondary">—</Text>
         const v = String((sug as unknown as Record<string, unknown>).audit_verdict ?? '')
         const m = AUDIT_TONE[v]
         if (!m) return <Text type="secondary">—</Text>
         const round = String((sug as unknown as Record<string, unknown>).audit_round ?? '')
+        const dissent = hoverSid === sid && hoverLog
+          ? `[${String(hoverLog.verdict ?? '')}] 第${String(hoverLog.round ?? round)}轮: ${String(hoverLog.dissent_view ?? '').slice(0, 40)}...`
+          : `[${m.label}] 第${round || '?'}轮`
         return (
-          <Tooltip title={`AI 审核：${m.label}${round ? ` · 第${round}轮` : ''}`}>
+          <Tooltip onOpenChange={(o) => setHoverSid(o ? sid : null)} title={dissent}>
             <StatusBadge text={m.label} tone={m.tone} />
           </Tooltip>
         )
