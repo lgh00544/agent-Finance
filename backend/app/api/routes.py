@@ -397,6 +397,13 @@ def get_sector_forward(date: str | None = None):
     return {"trade_date": d, "forecasts": repo.list_sector_forward_forecast(d)}
 
 
+@router.get("/market/regime-view")
+def get_market_regime_view(date: str | None = None):
+    """行情结构主视图：C' 结构 + D' 板块前瞻 + E' 验证/准确率。"""
+    from app.services.sector_rotation_pattern import get_regime_view
+    return get_regime_view(date)
+
+
 @router.get("/market/sector-forecast-verify")
 def get_sector_forecast_verify(start_date: str | None = None, end_date: str | None = None):
     """读取 E'-1 前瞻验证回填结果。"""

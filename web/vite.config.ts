@@ -15,7 +15,7 @@ export default defineConfig({
     proxy: {
       // 开发期：/api → FastAPI 8000（后端零改动；生产期由 FastAPI 静态挂载 web/dist）
       '/api': {
-        target: 'http://localhost:8000',
+        target: process.env.VITE_API_PROXY || 'http://localhost:8000',
         changeOrigin: true,
       },
     },

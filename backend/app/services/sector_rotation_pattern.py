@@ -152,3 +152,73 @@ def build_rotation_context(trade_date: str | None = None) -> str:
             lines.append(f"- {r['sector_name']}({r.get('change_pct')}%)："
                          f"tags={lr.get('reason_tags') or '（数据缺失）'}；{lr.get('reason_text') or '（数据缺失）'}")
     return "\n".join(lines)
+
+
+def get_regime_view(trade_date: str | None = None) -> dict:
+    """行情结构主视图：C' + D' + E' 结果聚合；无 market_intel 也可独立展示。"""
+    dates = repo.list_sector_daily_dates(limit=30)
+    d = trade_date or (dates[0] if dates else None)
+    if not d:
+        return {"trade_date": None, "regime": None, "forecasts": [],
+                "verify": [], "accuracy": {"windows": []}}
+    regime = repo.get_sector_regime_forecast(d)
+    forecasts = repo.list_sector_forward_forecast(d)
+    verify = repo.list_sector_forecast_verify(d, d)
+    try:
+        from app.services.sector_forecast_stats import summarize_forecast_accuracy
+        accuracy = summarize_forecast_accuracy(d)
+    except Exception:  # noqa: BLE001 统计失败不阻塞主视图
+        accuracy = {"windows": []}
+    return {
+        "trade_date": d,
+        "regime": regime,
+        "forecasts": forecasts,
+        "verify": verify,
+        "accuracy": accuracy,
+    }
+
+
+def build_regime_context(trade_date: str | None = None) -> str:
+    """Agent 注入段：当前行情结构、前瞻倾向、高追风险、切换候选与历史准确率。"""
+    try:
+        view = get_regime_view(trade_date)
+    except Exception:  # noqa: BLE001 读取失败降级空串
+        return ""
+    regime = view.get("regime") or {}
+    forecasts = view.get("forecasts") or []
+    if not regime and not forecasts:
+        return ""
+    lines = [
+        "【行情结构与板块前瞻】",
+        f"预测日={view.get('trade_date')}；当前结构={regime.get('current_regime') or '数据缺失'}；"
+        f"阶段={regime.get('regime_stage') or '数据缺失'}；置信度={regime.get('regime_confidence')}",
+        f"T+1={regime.get('forward_bias_t1') or '数据缺失'}；"
+        f"T+3={regime.get('forward_bias_t3') or '数据缺失'}；"
+        f"T+5={regime.get('forward_bias_t5') or '数据缺失'}",
+    ]
+    for horizon in ("t1", "t3", "t5"):
+        rows = [r for r in forecasts if r.get("forecast_horizon") == horizon]
+        if not rows:
+            continue
+        focus = rows[:3]
+        high_chase = [r for r in rows if (r.get("chase_risk") or 0) >= 0.6][:3]
+        switches = [r for r in rows if r.get("switch_candidate")][:3]
+        lines.append(f"{horizon.upper()} 观察: " + "、".join(
+            f"{r.get('sector_name')}({r.get('forward_bias')}, 延续={r.get('continuation_prob')}, "
+            f"退潮={r.get('exhaustion_risk')}, 追高={r.get('chase_risk')})"
+            for r in focus
+        ))
+        if high_chase:
+            lines.append(f"{horizon.upper()} 高追风险: " + "、".join(r.get("sector_name", "") for r in high_chase))
+        if switches:
+            lines.append(f"{horizon.upper()} 潜在切换: " + "、".join(r.get("sector_name", "") for r in switches))
+    acc = ((view.get("accuracy") or {}).get("windows") or [])
+    first_win = acc[0] if acc else {}
+    groups = first_win.get("groups") or []
+    if groups:
+        lines.append("近30日前瞻准确率: " + "；".join(
+            f"{g.get('regime')} 样本={g.get('sample_count')} "
+            f"结构命中={g.get('regime_hit_rate')} 主线命中={g.get('mainline_hit_rate')}"
+            for g in groups
+        ))
+    return "\n".join(lines)

@@ -679,12 +679,12 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         logger.warning("前瞻对照事实组装失败（省略前瞻段）: %s", exc)
         horizon_text = ""
 
-    # 板块轮动宏观注入（sector_rotation 结果：状态 + churn + 主线 + top5 归因；无数据省略不阻塞）
+    # 行情结构前瞻注入（C'/D'/E' 结果；无数据省略不阻塞）
     try:
-        from app.services.sector_rotation_pattern import build_rotation_context
-        rotation_ctx = build_rotation_context(date_key)
+        from app.services.sector_rotation_pattern import build_regime_context
+        rotation_ctx = build_regime_context(date_key)
     except Exception as exc:  # noqa: BLE001 组装失败省略板块轮动段
-        logger.warning("板块轮动注入组装失败（省略）: %s", exc)
+        logger.warning("行情结构注入组装失败（省略）: %s", exc)
         rotation_ctx = ""
 
     cap = state.get("market_cap")

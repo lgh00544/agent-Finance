@@ -1,10 +1,10 @@
 import { type CSSProperties, useState } from 'react'
-import { App, Alert, Button, Card, Collapse, Descriptions, List, Select, Space, Tabs, Tag, Typography } from 'antd'
+import { App, Alert, Button, Card, Collapse, Descriptions, List, Progress, Select, Space, Tabs, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { marketIntel, marketIntelDates, sectorPatterns, sectorRotation } from '@/api/market'
+import { marketIntel, marketIntelDates, sectorPatterns, sectorRegimeView, sectorRotation } from '@/api/market'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard } from '@/components/common'
-import type { MarketIntelInfo } from '@/types'
+import type { MarketIntelInfo, RegimeViewInfo, SectorForwardForecast } from '@/types'
 
 const { Text } = Typography
 
@@ -93,6 +93,181 @@ function DeepModules({ mi }: { mi: MarketIntelInfo }) {
 
 const thStyle: CSSProperties = { textAlign: 'left', padding: '4px 8px', borderBottom: '1px solid var(--border)', fontWeight: 600 }
 const tdStyle: CSSProperties = { padding: '4px 8px', borderBottom: '1px solid var(--border)' }
+const panelStyle: CSSProperties = { border: '1px solid var(--border)', borderRadius: 8, padding: 12, background: 'var(--bg-input)' }
+const metricStyle: CSSProperties = { ...panelStyle, minWidth: 180, flex: '1 1 180px' }
+
+function pct(v?: number | null, digits = 0): string {
+  if (v == null || Number.isNaN(Number(v))) return '—'
+  return `${(Number(v) * 100).toFixed(digits)}%`
+}
+
+function regimeLabel(v?: string | null): string {
+  return ({ mainline: '主线行情', rotation: '轮动行情', chaos: '混沌行情' } as Record<string, string>)[v ?? ''] ?? '数据缺失'
+}
+
+function biasLabel(v?: string | null): string {
+  return ({
+    continue: '延续',
+    switch: '切换',
+    fade: '退潮',
+    diverge: '分歧',
+    uncertain: '不确定',
+    mainline_confirm: '主线确认',
+    new_mainline_switch: '新主线切换',
+    invalid_rotation: '无效轮动',
+  } as Record<string, string>)[v ?? ''] ?? (v || '—')
+}
+
+function riskColor(v?: number | null): string {
+  if (v == null) return 'default'
+  if (v >= 0.7) return 'red'
+  if (v >= 0.5) return 'orange'
+  return 'green'
+}
+
+function byHorizon(rows: SectorForwardForecast[] | undefined, h: string): SectorForwardForecast[] {
+  return (rows ?? []).filter((r) => r.forecast_horizon === h)
+}
+
+function RegimeStructureTab({ date }: { date?: string }) {
+  const { data, isError, error, refetch } = useQuery({
+    queryKey: ['sector-regime-view', date],
+    queryFn: () => sectorRegimeView(date),
+  })
+  if (isError) return <ErrorCard title="行情结构加载失败" message={error?.message} onRetry={() => refetch()} />
+  const view = data ?? ({} as RegimeViewInfo)
+  const regime = view.regime
+  const t1 = byHorizon(view.forecasts, 't1')
+  const t3 = byHorizon(view.forecasts, 't3')
+  const t5 = byHorizon(view.forecasts, 't5')
+  const watch = t1.slice(0, 5)
+  const highChase = t1.filter((r) => (r.chase_risk ?? 0) >= 0.6).slice(0, 5)
+  const switches = t3.concat(t5).filter((r, i, arr) =>
+    r.switch_candidate && arr.findIndex((x) => x.sector_name === r.sector_name) === i).slice(0, 5)
+  const acc30 = (view.accuracy?.windows ?? []).find((w) => w.window_days === 30)
+
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size={12}>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ ...panelStyle, flex: '2 1 360px' }}>
+          <Text type="secondary">当前行情结构 · {view.trade_date ?? '—'}</Text>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginTop: 4 }}>
+            <span style={{ fontSize: 28, fontWeight: 700 }}>{regimeLabel(regime?.current_regime)}</span>
+            <Tag color={regime?.current_regime === 'mainline' ? 'red' : regime?.current_regime === 'rotation' ? 'orange' : 'default'}>
+              {regime?.regime_stage ?? 'unknown'}
+            </Tag>
+          </div>
+          <Text type="secondary">不是判断“今天风口”，而是用 3/10/20/60 日窗口给当前结构和后续倾向定档。</Text>
+        </div>
+        <div style={metricStyle}>
+          <Text type="secondary">结构置信度</Text>
+          <Progress percent={Math.round((regime?.regime_confidence ?? 0) * 100)} size="small" />
+        </div>
+        <div style={metricStyle}>
+          <Text type="secondary">近30日样本</Text>
+          <div style={{ fontSize: 24, fontWeight: 700 }}>{acc30?.sample_count ?? 0}</div>
+          <Text type="secondary">用于校准这套前瞻准不准</Text>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+        {[
+          ['T+1', regime?.forward_bias_t1],
+          ['T+3', regime?.forward_bias_t3],
+          ['T+5', regime?.forward_bias_t5],
+        ].map(([k, v]) => (
+          <div key={k} style={panelStyle}>
+            <Text type="secondary">{k} 倾向</Text>
+            <div style={{ fontSize: 20, fontWeight: 650 }}>{biasLabel(v)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
+        <div style={panelStyle}>
+          <Text strong>最值得观察</Text>
+          <List size="small" dataSource={watch} locale={{ emptyText: '暂无板块前瞻' }} renderItem={(r) => (
+            <List.Item style={{ paddingInline: 0 }}>
+              <Space wrap>
+                <Tag>{r.rank_no}</Tag><Text strong>{r.sector_name}</Text><Tag color="blue">{biasLabel(r.forward_bias)}</Tag>
+                <Text type="secondary">延续 {pct(r.continuation_prob)}</Text>
+              </Space>
+            </List.Item>
+          )} />
+        </div>
+        <div style={panelStyle}>
+          <Text strong>高追风险</Text>
+          <List size="small" dataSource={highChase} locale={{ emptyText: '暂无显著高追风险' }} renderItem={(r) => (
+            <List.Item style={{ paddingInline: 0 }}>
+              <Space wrap>
+                <Text strong>{r.sector_name}</Text><Tag color={riskColor(r.chase_risk)}>追高 {pct(r.chase_risk)}</Tag>
+                <Text type="secondary">退潮 {pct(r.exhaustion_risk)}</Text>
+              </Space>
+            </List.Item>
+          )} />
+        </div>
+        <div style={panelStyle}>
+          <Text strong>潜在切换</Text>
+          <List size="small" dataSource={switches} locale={{ emptyText: '暂无切换候选' }} renderItem={(r) => (
+            <List.Item style={{ paddingInline: 0 }}>
+              <Space wrap>
+                <Text strong>{r.sector_name}</Text><Tag color="purple">{String(r.forecast_horizon).toUpperCase()}</Tag>
+                <Text type="secondary">{biasLabel(r.forward_bias)}</Text>
+              </Space>
+            </List.Item>
+          )} />
+        </div>
+      </div>
+
+      <Card size="small" title="三窗口板块前瞻" style={{ background: 'var(--bg-input)' }}>
+        <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+          <thead>
+            <tr><th style={thStyle}>窗口</th><th style={thStyle}>板块</th><th style={thStyle}>倾向</th><th style={thStyle}>延续</th><th style={thStyle}>退潮</th><th style={thStyle}>追高</th><th style={thStyle}>切换</th></tr>
+          </thead>
+          <tbody>
+            {[...t1.slice(0, 5), ...t3.slice(0, 5), ...t5.slice(0, 5)].map((r, i) => (
+              <tr key={`${r.forecast_horizon}-${r.sector_name}-${i}`}>
+                <td style={tdStyle}>{String(r.forecast_horizon).toUpperCase()}</td>
+                <td style={tdStyle}>{r.sector_name}</td>
+                <td style={tdStyle}>{biasLabel(r.forward_bias)}</td>
+                <td style={tdStyle}>{pct(r.continuation_prob)}</td>
+                <td style={tdStyle}>{pct(r.exhaustion_risk)}</td>
+                <td style={tdStyle}>{pct(r.chase_risk)}</td>
+                <td style={tdStyle}>{r.switch_candidate ? '是' : '否'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card size="small" title="历史准确率" style={{ background: 'var(--bg-input)' }}>
+        <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+          <thead>
+            <tr><th style={thStyle}>窗口</th><th style={thStyle}>结构</th><th style={thStyle}>样本</th><th style={thStyle}>结构命中</th><th style={thStyle}>Top5延续</th><th style={thStyle}>主线命中</th></tr>
+          </thead>
+          <tbody>
+            {(view.accuracy?.windows ?? []).flatMap((w) => (w.groups ?? []).map((g) => ({ w, g }))).map(({ w, g }, i) => (
+              <tr key={i}>
+                <td style={tdStyle}>{w.window_days}日</td>
+                <td style={tdStyle}>{regimeLabel(g.regime)}</td>
+                <td style={tdStyle}>{g.sample_count ?? 0}</td>
+                <td style={tdStyle}>{pct(g.regime_hit_rate)}</td>
+                <td style={tdStyle}>{pct(g.top5_continue_rate)}</td>
+                <td style={tdStyle}>{pct(g.mainline_hit_rate)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Collapse size="small" items={[{
+        key: 'evidence',
+        label: '证据与后验明细',
+        children: <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12 }}>{JSON.stringify({ evidence: regime?.evidence, verify: view.verify }, null, 2)}</pre>,
+      }]} />
+    </Space>
+  )
+}
 
 /** 板块轮动 Tab：状态徽章 + top10 表 + 归因卡片（可展开 reason_chain）+ 规律表 */
 function SectorRotationTab() {
@@ -203,6 +378,14 @@ export function MarketIntelPage() {
     qc.invalidateQueries({ queryKey: ['mi-dates'] })
     qc.invalidateQueries({ queryKey: ['market-intel'] })
   })
+  const runRegime = useTaskSubmit('sector_forward', () => {
+    message.success('行情结构前瞻已完成')
+    qc.invalidateQueries({ queryKey: ['sector-regime-view'] })
+  })
+  const runVerify = useTaskSubmit('sector_forecast_verify', () => {
+    message.success('前瞻验证回填已完成')
+    qc.invalidateQueries({ queryKey: ['sector-regime-view'] })
+  })
 
   const appetite: Record<string, { label: string; color: string; 含义: string }> = {
     进取: { label: '进取', color: 'red', 含义: '资金转进攻，可增配主线强势方向' },
@@ -215,31 +398,43 @@ export function MarketIntelPage() {
       <Space style={{ marginBottom: 10 }} wrap>
         <Select placeholder="选择研判日期" style={{ width: 160 }} value={date ?? dates?.[0]} onChange={setDate}
           options={(dates ?? []).map((d) => ({ label: d, value: d }))} />
+        <Button type="primary" loading={runRegime.submit.isPending} onClick={() => runRegime.submit.mutate({ trade_date: date })}>
+          刷新行情结构
+        </Button>
+        <Button loading={runVerify.submit.isPending} onClick={() => runVerify.submit.mutate({ forecast_date: date })}>
+          回填验证
+        </Button>
         <Button type="primary" loading={run.submit.isPending} onClick={() => run.submit.mutate({})}>
           立即研判（后台）
         </Button>
         <Button onClick={() => refetch()}>刷新</Button>
       </Space>
 
-      {!dates?.length ? (
-        <EmptyState text="当日暂无市场研判，可点击上方「立即研判」生成（后台约 1-2 分钟）。" icon="🧠"
-          actionLabel="立即研判" onAction={() => run.submit.mutate({})} />
-      ) : isLoading ? null : isError ? (
-        <ErrorCard title="市场研判加载失败" message={error?.message} onRetry={() => refetch()} />
-      ) : (
-        <>
-          {mi?.phase ? (
-            <Alert
-              style={{ marginBottom: 10 }}
-              type="info" showIcon
-              message={`阶段定性 · ${appetite[mi.risk_appetite ?? '']?.label ?? '（无）'}：${mi.phase}`}
-              description={mi.summary ? `一句话总结：${mi.summary}` : undefined}
-            />
-          ) : null}
+      {mi?.phase ? (
+        <Alert
+          style={{ marginBottom: 10 }}
+          type="info" showIcon
+          message={`阶段定性 · ${appetite[mi.risk_appetite ?? '']?.label ?? '（无）'}：${mi.phase}`}
+          description={mi.summary ? `一句话总结：${mi.summary}` : undefined}
+        />
+      ) : null}
 
-          {mi?.phase ? (
-            <Card size="small" style={{ marginBottom: 10, background: 'var(--bg-input)' }}
-              title={<span>判定依据 <Text type="secondary" style={{ fontSize: 12 }}>支撑本轮阶段定性的关键数据与证据</Text></span>}>
+      <Tabs
+        defaultActiveKey="regime"
+        items={[
+          {
+            key: 'regime', label: '行情结构',
+            children: <RegimeStructureTab date={date ?? dates?.[0]} />,
+          },
+          {
+            key: 'basis', label: '市场判定依据',
+            children: isError ? (
+              <ErrorCard title="市场研判加载失败" message={error?.message} onRetry={() => refetch()} />
+            ) : isLoading ? null : !mi?.phase ? (
+              <EmptyState text="当日暂无市场研判，可点击上方「立即研判」生成。" actionLabel="立即研判" onAction={() => run.submit.mutate({})} />
+            ) : (
+              <Card size="small" style={{ marginBottom: 10, background: 'var(--bg-input)' }}
+                title={<span>判定依据 <Text type="secondary" style={{ fontSize: 12 }}>支撑本轮阶段定性的关键数据与证据</Text></span>}>
               {(() => {
                 const m = mi as unknown as Record<string, unknown>
                 const vs = (mi.volume_signal ?? {}) as Record<string, unknown>
@@ -268,66 +463,65 @@ export function MarketIntelPage() {
                   </div>
                 )
               })()}
-            </Card>
-          ) : null}
-
-          <Tabs
-            items={[
-              {
-                key: 'conflict', label: '核心矛盾',
-                children: mi?.core_conflict ? <div style={{ whiteSpace: 'pre-wrap' }}>{mi.core_conflict}</div>
-                  : <Text type="secondary">（该轮未输出）</Text>,
-              },
-              {
-                key: 'volume', label: '板块量能信号',
-                children: (() => {
-                  const vs = (mi?.volume_signal ?? {}) as Record<string, unknown>
-                  if (!Object.keys(vs).length) return <Text type="secondary">（该轮未输出量能信号）</Text>
-                  return (
-                    <Descriptions size="small" column={1} items={[
-                      { key: 'fc', label: '放量板块', children: String(vs['放量板块'] ?? '（无/数据缺失）') },
-                      { key: 'sc', label: '缩量板块', children: String(vs['缩量板块'] ?? '（无/数据缺失）') },
-                      ...(vs['极端量能'] ? [{ key: 'ext', label: '极端量能', children: String(vs['极端量能']) }] : []),
-                      ...(vs['分布'] != null ? [{ key: 'dist', label: '放量/缩量分布', children: String(vs['分布']) }] : []),
-                    ]} />
-                  )
-                })(),
-              },
-              {
-                key: 'operative', label: '操作含义',
-                children: <DictTab dict={mi?.operative_meaning} empty="（该轮未输出操作含义）" />,
-              },
-              {
-                key: 'watch', label: '次日盯盘点',
-                children: <DictTab dict={mi?.next_day_watch} empty="（该轮未输出次日盯盘点）" />,
-              },
-              {
-                key: 'rotation', label: '板块轮动',
-                children: <SectorRotationTab />,
-              },
-            ]}
-          />
-
-          <DeepModules mi={mi ?? ({} as MarketIntelInfo)} />
-
-          <Collapse
-            size="small"
-            style={{ marginTop: 10, background: 'var(--bg-input)' }}
-            items={[{
-              key: 'raw',
-              label: '查看 AI 原始返回（高级/可追溯）',
-              children: (
-                <div>
-                  <Text type="secondary" style={{ fontSize: 12 }}>此处为模型返回原文，普通用户无需展开</Text>
-                  <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: '8px 0 0' }}>
-                    {JSON.stringify(mi ?? {}, null, 2)}
-                  </pre>
-                </div>
-              ),
-            }]}
-          />
-        </>
-      )}
+              </Card>
+            ),
+          },
+          {
+            key: 'conflict', label: '核心矛盾',
+            children: mi?.core_conflict ? <div style={{ whiteSpace: 'pre-wrap' }}>{mi.core_conflict}</div>
+              : <Text type="secondary">（该轮未输出）</Text>,
+          },
+          {
+            key: 'volume', label: '板块量能信号',
+            children: (() => {
+              const vs = (mi?.volume_signal ?? {}) as Record<string, unknown>
+              if (!Object.keys(vs).length) return <Text type="secondary">（该轮未输出量能信号）</Text>
+              return (
+                <Descriptions size="small" column={1} items={[
+                  { key: 'fc', label: '放量板块', children: String(vs['放量板块'] ?? '（无/数据缺失）') },
+                  { key: 'sc', label: '缩量板块', children: String(vs['缩量板块'] ?? '（无/数据缺失）') },
+                  ...(vs['极端量能'] ? [{ key: 'ext', label: '极端量能', children: String(vs['极端量能']) }] : []),
+                  ...(vs['分布'] != null ? [{ key: 'dist', label: '放量/缩量分布', children: String(vs['分布']) }] : []),
+                ]} />
+              )
+            })(),
+          },
+          {
+            key: 'operative', label: '操作含义',
+            children: <DictTab dict={mi?.operative_meaning} empty="（该轮未输出操作含义）" />,
+          },
+          {
+            key: 'watch', label: '次日盯盘点',
+            children: <DictTab dict={mi?.next_day_watch} empty="（该轮未输出次日盯盘点）" />,
+          },
+          {
+            key: 'rotation', label: '旧轮动归因',
+            children: <SectorRotationTab />,
+          },
+          {
+            key: 'raw',
+            label: '原始返回',
+            children: (
+              <>
+                <DeepModules mi={mi ?? ({} as MarketIntelInfo)} />
+                <Collapse
+                  size="small"
+                  style={{ marginTop: 10, background: 'var(--bg-input)' }}
+                  items={[{
+                    key: 'raw',
+                    label: '查看 AI 原始返回（高级/可追溯）',
+                    children: (
+                      <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: 0 }}>
+                        {JSON.stringify(mi ?? {}, null, 2)}
+                      </pre>
+                    ),
+                  }]}
+                />
+              </>
+            ),
+          },
+        ]}
+      />
     </div>
   )
 }

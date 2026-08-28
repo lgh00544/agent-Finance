@@ -64,3 +64,37 @@ def test_window_stats():
     assert res["switch_frequency"] == 0
     # 轮动周期：日均换手 0.25 → 10/0.25 = 40
     assert res["rotation_cycle_days"] == 40
+
+
+def test_build_regime_context_includes_forecast_and_accuracy(monkeypatch):
+    from app.services import sector_rotation_pattern as srp
+
+    monkeypatch.setattr(srp, "get_regime_view", lambda d=None: {
+        "trade_date": "2026-08-28",
+        "regime": {
+            "current_regime": "mainline",
+            "regime_stage": "confirm",
+            "regime_confidence": 0.8,
+            "forward_bias_t1": "continue",
+            "forward_bias_t3": "continue",
+            "forward_bias_t5": "mainline_confirm",
+        },
+        "forecasts": [
+            {"forecast_horizon": "t1", "sector_name": "半导体", "forward_bias": "continue",
+             "continuation_prob": 0.7, "exhaustion_risk": 0.2, "chase_risk": 0.3},
+            {"forecast_horizon": "t3", "sector_name": "机器人", "forward_bias": "switch",
+             "continuation_prob": 0.5, "exhaustion_risk": 0.2, "chase_risk": 0.3,
+             "switch_candidate": True},
+        ],
+        "accuracy": {"windows": [{"window_days": 30, "groups": [
+            {"regime": "mainline", "sample_count": 3,
+             "regime_hit_rate": 0.67, "mainline_hit_rate": 0.67},
+        ]}]},
+    })
+
+    ctx = srp.build_regime_context("2026-08-28")
+
+    assert "当前结构=mainline" in ctx
+    assert "T+1=continue" in ctx
+    assert "T3 潜在切换: 机器人" in ctx
+    assert "近30日前瞻准确率" in ctx

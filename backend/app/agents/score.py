@@ -190,6 +190,13 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("MarketIntel 获取失败（降级跳过）: %s", exc)
 
+    regime_context = ""
+    try:
+        from app.services.sector_rotation_pattern import build_regime_context
+        regime_context = build_regime_context(today)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("行情结构上下文获取失败（降级跳过）: %s", exc)
+
     # 因子校准相关性参考（评级重做-C；只读 track_verify 统计，读取失败不阻塞评分）
     factor_calibration = ""
     try:
@@ -225,6 +232,7 @@ def collect_data(state: StockAgentState) -> StockAgentState:
 
     state["discover_context"] = discover_ctx
     state["market_intel_summary"] = intel_summary
+    state["regime_context"] = regime_context
     state["factor_calibration"] = factor_calibration
     state["distribution_phase_context"] = distribution_phase_context
     state["capital_view_context"] = capital_view_context
@@ -269,6 +277,8 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         market_intel_summary=state.get("market_intel_summary") or "",
         factor_calibration=state.get("factor_calibration") or "",
     )
+    if state.get("regime_context"):
+        score_user_prompt = f"{score_user_prompt}\n\n{state['regime_context']}"
     agentic_trace: dict = {}
     if settings.agentic_enable:
         output, agentic_trace = agentic_call(

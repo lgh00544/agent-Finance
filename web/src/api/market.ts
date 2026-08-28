@@ -1,5 +1,13 @@
 import { get } from './client'
-import type { HotSector, IndexItem, MarketConditionInfo, MarketIntelInfo, SectorPattern, SectorRotationInfo } from '@/types'
+import type {
+  HotSector,
+  IndexItem,
+  MarketConditionInfo,
+  MarketIntelInfo,
+  RegimeViewInfo,
+  SectorPattern,
+  SectorRotationInfo,
+} from '@/types'
 
 /** GET /api/market/indices（三大指数） */
 export const marketIndices = (): Promise<{ indices?: IndexItem[]; updated_at?: string }> =>
@@ -31,3 +39,7 @@ export const sectorRotation = (date?: string): Promise<SectorRotationInfo> =>
 /** GET /api/market/sector-patterns（多窗口规律） */
 export const sectorPatterns = (): Promise<{ patterns?: Record<string, SectorPattern> }> =>
   get('/market/sector-patterns')
+
+/** GET /api/market/regime-view（行情结构主视图：C' + D' + E'） */
+export const sectorRegimeView = (date?: string): Promise<RegimeViewInfo> =>
+  get('/market/regime-view', date ? { date } : undefined)

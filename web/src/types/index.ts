@@ -137,6 +137,64 @@ export interface SectorPattern {
   [k: string]: unknown
 }
 
+export interface SectorRegimeForecast {
+  trade_date?: string
+  current_regime?: string | null
+  regime_stage?: string | null
+  regime_confidence?: number | null
+  forward_bias_t1?: string | null
+  forward_bias_t3?: string | null
+  forward_bias_t5?: string | null
+  evidence?: Record<string, unknown>
+  notes?: string
+}
+export interface SectorForwardForecast {
+  trade_date?: string
+  sector_name?: string
+  rank_no?: number
+  stage?: string
+  continuation_prob?: number | null
+  exhaustion_risk?: number | null
+  chase_risk?: number | null
+  switch_candidate?: boolean
+  regime?: string
+  forward_bias?: string
+  forecast_horizon?: 't1' | 't3' | 't5' | string
+  evidence?: Record<string, unknown>
+}
+export interface SectorForecastVerify {
+  forecast_date?: string
+  verify_horizon?: string
+  verify_date?: string | null
+  regime_hit?: boolean | null
+  top5_continue_rate?: number | null
+  mainline_hit?: boolean | null
+  regime_forecast?: string | null
+  miss_reason?: string
+  detail?: Record<string, unknown>
+}
+export interface SectorForecastAccuracyGroup {
+  regime?: string
+  sample_count?: number
+  regime_hit_rate?: number | null
+  top5_continue_rate?: number | null
+  mainline_hit_rate?: number | null
+}
+export interface SectorForecastAccuracyWindow {
+  window_days?: number
+  start_date?: string
+  end_date?: string
+  sample_count?: number
+  groups?: SectorForecastAccuracyGroup[]
+}
+export interface RegimeViewInfo {
+  trade_date?: string | null
+  regime?: SectorRegimeForecast | null
+  forecasts?: SectorForwardForecast[]
+  verify?: SectorForecastVerify[]
+  accuracy?: { windows?: SectorForecastAccuracyWindow[] }
+}
+
 // ===== 账户 =====
 export interface AccountSummary {
   total_asset?: number | null

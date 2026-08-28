@@ -97,6 +97,14 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
             f"对倒嫌疑: {_rl.get('wash_suspect') if _rl.get('wash_suspect') is not None else '无数据'}；"
             f"K192 建仓策略: {_rl.get('k192_note')}"
         )
+    try:
+        from app.services.sector_rotation_pattern import build_regime_context
+        regime_context = build_regime_context(today)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("行情结构上下文获取失败（跳过注入）: %s", exc)
+        regime_context = ""
+    if regime_context:
+        capital_constraints += f"\n{regime_context}"
     stock_data = _compact(info.get("indicators", {}))
 
     output = agent_call(
