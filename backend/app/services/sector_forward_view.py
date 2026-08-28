@@ -45,8 +45,8 @@ def _score(row, hist, previous, boxes, regime):
     box_pct = (boxes.get(name) or {}).get("box60_pct")
     box = float(box_pct) / 100 if box_pct is not None else None
     high_box = 1 if box is not None and box >= 0.7 else 0
-    breadth = _clamp((_mean([row.get("up_count")]) or 0) /
-                     max(_mean([r.get("up_count") for r in hist[-10:]]) or 1) - 1)
+    historical_up = _mean([r.get("up_count") for r in hist[-10:]]) or 1
+    breadth = _clamp(((_mean([row.get("up_count")]) or 0) / historical_up) - 1)
     continuation = None
     if volume_term is not None and box is not None:
         continuation = _clamp(0.35 * top10_freq + 0.20 * volume_term +

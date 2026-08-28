@@ -71,6 +71,7 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
     "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
     "sector_rotation": ("板块轮动分析", lambda p: _task_sector_rotation()),
+    "sector_forward": ("行情结构与板块前瞻", lambda p: _task_sector_forward(p)),
     "score": ("单股评分",
               lambda p: graph_router.run_score(p.get("stock_code", ""), p.get("stock_name", ""))),
     "position": ("分批建仓方案",
@@ -125,6 +126,26 @@ def _task_sector_rotation() -> dict:
             "rows": launch.get("rows", 0),
             "refresh": refresh,
             "error": error}
+
+
+def _task_sector_forward(params: dict) -> dict:
+    """手动触发：刷新快照 → C' 行情结构 → D' 板块前瞻，不依赖归因子 Agent。"""
+    from app.services.sector_daily import refresh_sector_daily_snapshot
+    from app.services.sector_forward_view import run_sector_forward
+    from app.services.sector_regime import judge_regime
+
+    refresh = refresh_sector_daily_snapshot()
+    if not refresh.get("success"):
+        return {"success": False, "trade_date": time.strftime("%Y-%m-%d"),
+                "refresh": refresh, "error": refresh.get("error")}
+    regime = judge_regime(params.get("trade_date"))
+    if not regime.get("success"):
+        return {"success": False, "trade_date": regime.get("trade_date"),
+                "refresh": refresh, "regime": regime, "error": regime.get("error")}
+    forward = run_sector_forward(regime.get("trade_date"))
+    return {"success": forward.get("success"), "trade_date": forward.get("trade_date"),
+            "refresh": refresh, "regime": regime, "forward": forward,
+            "error": forward.get("error")}
 
 
 def _task_monitor_all() -> dict:
@@ -336,6 +357,12 @@ def run_sector_rotation_job():
     return _submit_task("sector_rotation", {})
 
 
+@router.post("/market/sector-forward/run")
+def run_sector_forward_job():
+    """手动触发行情结构 + 板块前瞻（刷新快照、C'、D'；异步提交）。"""
+    return _submit_task("sector_forward", {})
+
+
 @router.get("/market/sector-patterns")
 def get_sector_patterns():
     """多窗口规律（3/10/20/60 日）：轮动周期/生命周期/高切低/启动延续率，读真实落库"""
@@ -348,6 +375,13 @@ def get_sector_rotation(date: str | None = None):
     """当日板块轮动：状态 + top10 + 归因（默认最新一日；无数据返回空结构）"""
     from app.services.sector_rotation_pattern import get_rotation_daily
     return get_rotation_daily(date)
+
+
+@router.get("/market/sector-forward")
+def get_sector_forward(date: str | None = None):
+    """读取指定交易日 top10 板块 T+1/T+3/T+5 前瞻。"""
+    d = date or time.strftime("%Y-%m-%d")
+    return {"trade_date": d, "forecasts": repo.list_sector_forward_forecast(d)}
 
 
 @router.get("/jobs/status")
