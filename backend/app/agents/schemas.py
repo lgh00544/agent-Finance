@@ -279,6 +279,18 @@ class ReviewOutput(BaseModel):
                     "basis, weight_suggestion}；无游资信号可回溯时输出 null。只留痕，不直接改任何配置")
 
 
+# ================= 通用审核 Agent（批1：辩证审核 agent_suggestion 建议） =================
+class AuditOutput(BaseModel):
+    """辩证审核裁决：强制正反辩论 + 具体反例 + 边界场景 + 基础库引用"""
+    verdict: str = Field(description="pass/fail：fail=建议有实质缺陷需重思考")
+    confidence: int = Field(description="置信度 0-100")
+    support_view: str = Field(description="支持意见，≥30 字")
+    dissent_view: str = Field(description="反对意见，≥50 字且必含 1 个具体反例/场景")
+    boundary_cases: str = Field(description="边界场景（什么情况下结论会失效），≥30 字")
+    evidence_refs: list[str] = Field(description="证据引用，至少 1 条，格式 K223 / knowledge_id=42 / rule_change#15")
+    one_line_summary: str = Field(description="一句话摘要，≤40 字")
+
+
 # ================= PortfolioSentinel 组合哨兵（组合级风控，与 MonitorAgent 零耦合） =================
 class SectorAlert(BaseModel):
     """板块退潮预警（LLM 研判：板块是否从强势转弱势/量比显著下降）"""

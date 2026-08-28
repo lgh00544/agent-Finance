@@ -59,6 +59,14 @@ def _task_experience_worker(params: dict) -> dict:
     return worker_run(force=True)
 
 
+def _task_audit_pending(params: dict) -> dict:
+    """手动触发建议辩证审核（audit_pending）：cutoff_id=启用边界，last_scanned_id=增量游标"""
+    from app.agents.audit import run_pending_audits
+    return run_pending_audits(cutoff_id=params.get("cutoff_id", 0),
+                              last_scanned_id=params.get("last_scanned_id"),
+                              limit=params.get("limit", 50))
+
+
 _TASK_KINDS: dict[str, tuple[str, object]] = {
     "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
     "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
@@ -88,6 +96,7 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "track_backfill": ("候选池T+N历史回填", lambda p: _task_track_verify(True)),
     "track_suggest": ("选股验证建议生成", lambda p: _task_track_suggest()),
     "experience_worker": ("经验沉淀识别", lambda p: _task_experience_worker()),
+    "audit_pending": ("建议辩证审核", lambda p: _task_audit_pending(p)),
 }
 
 

@@ -423,6 +423,16 @@ def experience_worker_job(force: bool = False) -> None:
         logger.error("经验沉淀 Worker 异常: %s", exc)
 
 
+def audit_pending_job() -> None:
+    """通用审核批处理：每日 03:30 低峰扫描待审建议辩证审核（audit_log 落库；首审失败触发 rethink 重审）"""
+    try:
+        from app.agents.audit import run_pending_audits
+        result = run_pending_audits(cutoff_id=0)
+        logger.info("建议辩证审核: %s", result)
+    except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
+        logger.error("建议辩证审核异常: %s", exc)
+
+
 def fill_forward_view_job() -> None:
     """预测性选股 2.5：每日 16:00 回填前瞻 T+5 实际涨跌（纯统计，复用 track_verify.t5_pct 不新算）"""
     try:
@@ -538,6 +548,10 @@ def start_scheduler() -> None:
     scheduler.add_job(experience_worker_job, "cron", minute="*/30",
                       args=[False], id="experience_worker_probe", name="经验沉淀积压探针",
                       replace_existing=True, misfire_grace_time=1800)
+    # 通用审核 Agent：每日 03:30 低峰批量辩证审核待审建议（游标增量，幂等）
+    scheduler.add_job(audit_pending_job, "cron", hour=3, minute=30,
+                      id="audit_pending", name="建议辩证审核",
+                      replace_existing=True, misfire_grace_time=3600)
     # 每周一次空间维护（默认周日 05:30，低频）
     scheduler.add_job(maintenance_job, "cron",
                       day_of_week=settings.db_maintenance_day_of_week,

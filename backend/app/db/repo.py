@@ -11,12 +11,13 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 
 from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
     AccountBaseline, AccountPnlSnapshot, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
+    AuditLog,
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
     CapitalActor, CapitalFlow, CapitalStats, DragonTiger,
     Experience, ExperienceConfig, ForwardViewHistory, Holding, HotMoneyProfile,
@@ -1937,6 +1938,64 @@ def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
         db.commit()
         db.refresh(row)
         return row.id
+
+
+# ==================== 通用审核 Agent（批1：audit_log + agent_suggestion audit 字段） ====================
+
+def insert_audit_log(target_type: str, target_id: int, audit_round: int, verdict: str,
+                     confidence: int, support_view: str, dissent_view: str, boundary_cases: str,
+                     evidence_refs: list, audit_model: str, reasoning: str,
+                     duration_ms: int) -> int:
+    with SessionLocal() as db:
+        row = AuditLog(target_type=target_type, target_id=target_id, round=audit_round,
+                       verdict=verdict, confidence=confidence, support_view=support_view,
+                       dissent_view=dissent_view, boundary_cases=boundary_cases,
+                       evidence_refs=evidence_refs or [], audit_model=audit_model,
+                       reasoning=reasoning or "", duration_ms=duration_ms)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def get_audit_log(audit_id: int) -> AuditLog | None:
+    with SessionLocal() as db:
+        return db.get(AuditLog, audit_id)
+
+
+def update_audit_log_verdict(audit_id: int, verdict: str) -> None:
+    """人工/应急标绿（批4 confirm-fail 前留位）：仅改 verdict"""
+    with SessionLocal() as db:
+        row = db.get(AuditLog, audit_id)
+        if row is None:
+            return
+        row.verdict = verdict
+        db.commit()
+
+
+def update_agent_suggestion_audit(suggestion_id: int, audit_verdict: str,
+                                  audit_round: int, last_audit_id: int | None) -> None:
+    with SessionLocal() as db:
+        row = db.get(AgentSuggestion, suggestion_id)
+        if row is None:
+            return
+        row.audit_verdict = audit_verdict
+        row.audit_round = audit_round
+        row.last_audit_id = last_audit_id
+        db.commit()
+
+
+def list_agent_suggestions_for_audit(cursor_id: int, limit: int = 50) -> list[AgentSuggestion]:
+    """扫描待审/漏审/未完成二审的建议（id > 游标；pass 或 round2-fail 不再返回）"""
+    with SessionLocal() as db:
+        return list(db.execute(
+            select(AgentSuggestion).where(
+                AgentSuggestion.id > cursor_id,
+                or_(AgentSuggestion.audit_verdict == "pending",
+                    AgentSuggestion.last_audit_id.is_(None),
+                    and_(AgentSuggestion.audit_verdict == "fail",
+                         AgentSuggestion.audit_round < 2)))
+            .order_by(AgentSuggestion.id).limit(limit)).scalars().all())
 
 
 def get_agent_suggestion(suggestion_id: int) -> AgentSuggestion | None:

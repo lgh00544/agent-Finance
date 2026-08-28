@@ -228,6 +228,30 @@ CREATE TABLE IF NOT EXISTS ai_reasoning_trace (
     KEY idx_trace_module_date (source_module, generate_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================
+-- 通用审核 Agent 留痕（audit_log：辩证审核结果，批1 只审 agent_suggestion）
+-- 与 backend/app/db/models.py 的 AuditLog 一致；evidence_refs JSON 存 list[str]
+-- ============================================================
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    target_type VARCHAR(24) NOT NULL DEFAULT 'agent_suggestion',
+    target_id INT NOT NULL,
+    round INT NOT NULL DEFAULT 1,
+    verdict VARCHAR(8) NOT NULL DEFAULT 'pending',
+    confidence INT NOT NULL DEFAULT 0,
+    support_view LONGTEXT NULL,
+    dissent_view LONGTEXT NULL,
+    boundary_cases LONGTEXT NULL,
+    evidence_refs LONGTEXT NULL,
+    audit_model VARCHAR(32) NOT NULL DEFAULT '',
+    reasoning LONGTEXT NULL,
+    duration_ms INT NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_audit_target (target_type, target_id),
+    KEY idx_audit_verdict (verdict),
+    KEY idx_audit_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- 候选池标的 T+N 自动追踪验证（选股效果闭环·代码侧客观统计）
 -- 与 backend/app/db/models.py 的 CandidateTrackVerify 一致；t3/t5/t10 不足时为 NULL 表示未到期
 CREATE TABLE IF NOT EXISTS candidate_track_verify (

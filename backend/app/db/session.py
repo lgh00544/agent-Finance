@@ -273,6 +273,9 @@ def _ensure_agent_suggestion_columns(eng=None) -> None:
         "conflict_note": "TEXT DEFAULT ''",
         "dedup_note": "TEXT DEFAULT ''",
         "suggestion_source": "VARCHAR(16) DEFAULT 'llm'",
+        "audit_verdict": "VARCHAR(8) DEFAULT 'pending'",
+        "audit_round": "INTEGER DEFAULT 0",
+        "last_audit_id": "INTEGER NULL",
     }
     with eng.begin() as conn:
         if eng.dialect.name == "sqlite":

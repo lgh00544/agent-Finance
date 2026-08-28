@@ -432,6 +432,35 @@ class AgentSuggestion(Base):
     conflict_note: Mapped[str] = mapped_column(Text, default="")   # 代码侧冲突校验拦截说明（非空=拦截）
     dedup_note: Mapped[str] = mapped_column(Text, default="")      # 代码侧去重校验拦截说明（非空=拦截）
     suggestion_source: Mapped[str] = mapped_column(String(16), default="llm", index=True)  # llm=LLM生成 / template=确定性模板兜底（选股验证统计）
+    # ---------- 通用审核 Agent（批1）：辩证审核状态，只写 audit_log + 本 3 字段 ----------
+    audit_verdict: Mapped[str] = mapped_column(String(8), default="pending", index=True)  # pending/pass/fail
+    audit_round: Mapped[int] = mapped_column(Integer, default=0)   # 0=未审 1=首审 2=重审（不超 2）
+    last_audit_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 最近一次 audit_log.id
+
+
+class AuditLog(Base):
+    """通用审核 Agent 辩证审核留痕（批1：只审 agent_suggestion；只写本表 + 原表 audit 字段，不改原表其它）"""
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("ix_audit_target", "target_type", "target_id"),
+        Index("ix_audit_verdict", "verdict"),
+        Index("ix_audit_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_type: Mapped[str] = mapped_column(String(24), default="agent_suggestion")  # agent_suggestion/pending_experience/rule_change/review_result
+    target_id: Mapped[int] = mapped_column(Integer, index=True)
+    round: Mapped[int] = mapped_column(Integer, default=1)   # 1=首审 2=重审
+    verdict: Mapped[str] = mapped_column(String(8), default="pending")  # pending/pass/fail
+    confidence: Mapped[int] = mapped_column(Integer, default=0)
+    support_view: Mapped[str] = mapped_column(Text, default="")
+    dissent_view: Mapped[str] = mapped_column(Text, default="")        # 强制非空 ≥50 字且含具体反例
+    boundary_cases: Mapped[str] = mapped_column(Text, default="")
+    evidence_refs: Mapped[list] = mapped_column(SafeJSON, default=list)  # list[str]，≥1 条
+    audit_model: Mapped[str] = mapped_column(String(32), default="")
+    reasoning: Mapped[str] = mapped_column(Text, default="")           # LLM 原始 JSON 全文
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class RuleChange(Base):
