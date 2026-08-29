@@ -495,3 +495,18 @@ CREATE TABLE IF NOT EXISTS sector_forecast_verify (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_sfv_date_horizon (forecast_date, verify_horizon)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE sector_forward_forecast ADD COLUMN sector_tag VARCHAR(16) NOT NULL DEFAULT 'none';
+
+CREATE TABLE IF NOT EXISTS sector_next_hot (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    trade_date VARCHAR(10) NOT NULL,
+    sector_name VARCHAR(64) NOT NULL,
+    rank_no INT NOT NULL,
+    hot_score FLOAT NOT NULL,
+    expected_horizon_days INT NOT NULL,
+    confidence FLOAT NOT NULL,
+    trigger_evidence JSON NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_snh_date_name (trade_date, sector_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

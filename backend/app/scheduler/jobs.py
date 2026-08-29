@@ -41,6 +41,12 @@ def _in_trading_window(now: datetime) -> bool:
     return (930 <= hm <= 1130) or (1300 <= hm <= 1500)
 
 
+def _in_ths_pnl_window(now: datetime) -> bool:
+    """同花顺盈亏采集窗口 9:15-16:00（用户指定：盘前 15 分钟起覆盖集合竞价）"""
+    hm = now.hour * 100 + now.minute
+    return 915 <= hm <= 1600
+
+
 def _in_close_check_window(now: datetime) -> bool:
     """收盘校验窗口 15:00-15:30：非交易时段低频兜底，当天仅执行一次收盘数据校验"""
     hm = now.hour * 100 + now.minute
@@ -335,6 +341,26 @@ def sector_forecast_verify_job() -> None:
         cache.release_lock("sector_forecast_verify")
 
 
+def sector_next_hot_job() -> None:
+    """下一个风口预测：15:50 基于 D' 指标派生 top10 外候选。"""
+    if not cache.acquire_lock("sector_next_hot", ttl_seconds=900):
+        logger.info("sector_next_hot 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.sector_next_hot import judge_next_hot
+        result = judge_next_hot()
+        if result.get("success"):
+            cache.set("job:last_sector_next_hot",
+                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            logger.info("下一个风口预测完成: %s 条", result.get("count", 0))
+        else:
+            logger.warning("下一个风口预测失败: %s", result.get("error"))
+    except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        logger.error("下一个风口预测异常: %s", exc)
+    finally:
+        cache.release_lock("sector_next_hot")
+
+
 def distribution_phase_job() -> None:
     """派发期判定：每日 15:30 收盘后，遍历「今日候选 + 当前持仓」逐只判定落库
 
@@ -516,7 +542,7 @@ def calibrate_forward_view_job() -> None:
 
 def ths_pnl_job() -> None:
     """同花顺真实账户今日盈亏采集（P0 数据通道，默认关闭）
-    开关 ths_pnl_enable 才跑 + 交易日 + 交易时段；失败只落 error 不抛异常；
+    开关 ths_pnl_enable 才跑 + 交易日 + 采集窗口 9:15-16:00；失败只落 error 不抛异常；
     Cookie 零日志（红线 R6）。"""
     if not settings.ths_pnl_enable:
         return
@@ -524,7 +550,7 @@ def ths_pnl_job() -> None:
     today = now_tz.strftime("%Y-%m-%d")
     if not _is_trading_day(today):
         return
-    if not _in_trading_window(now_tz):
+    if not _in_ths_pnl_window(now_tz):
         return
     from app.services import ths_pnl
 
@@ -685,6 +711,11 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=15, minute=45,
                       id="sector_forward", name="板块前瞻预测",
                       replace_existing=True, misfire_grace_time=3600)
+    # G' 下一个风口预测：基于 D' 指标派生 top10 外候选（收盘后 15:50）
+    scheduler.add_job(sector_next_hot_job, "cron",
+                      day_of_week="mon-fri", hour=15, minute=50,
+                      id="sector_next_hot", name="下一个风口预测",
+                      replace_existing=True, misfire_grace_time=3600)
     # E'-1 前瞻验证回填：使用后续真实板块快照校验历史预测（收盘后 16:05）
     scheduler.add_job(sector_forecast_verify_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=5,
@@ -695,11 +726,21 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-15", minute="*/5",
                       id="quote_snapshot_refresh", name="持仓价快照刷新",
                       replace_existing=True, misfire_grace_time=300)
-    # 同花顺真实账户今日盈亏采集（开关开启才注册；函数内再按交易日+交易时段过滤）
+    # 同花顺真实账户今日盈亏采集（开关开启才注册；cron 精确 9:15-16:00 窗口、
+    # 按 ths_pnl_poll_seconds 触发，仅工作日；函数内再按交易日+窗口过滤，夜间不空转）
     if settings.ths_pnl_enable:
-        scheduler.add_job(ths_pnl_job, "interval",
-                          seconds=max(10, int(settings.ths_pnl_poll_seconds)),
-                          id="ths_pnl", name="同花顺今日盈亏采集",
+        _poll = max(10, int(settings.ths_pnl_poll_seconds))
+        scheduler.add_job(ths_pnl_job, "cron", day_of_week="mon-fri",
+                          hour=9, minute="15-59", second=f"*/{_poll}",
+                          id="ths_pnl_915", name="同花顺今日盈亏采集",
+                          replace_existing=True, misfire_grace_time=60)
+        scheduler.add_job(ths_pnl_job, "cron", day_of_week="mon-fri",
+                          hour="10-15", minute="*", second=f"*/{_poll}",
+                          id="ths_pnl_mid", name="同花顺今日盈亏采集",
+                          replace_existing=True, misfire_grace_time=60)
+        scheduler.add_job(ths_pnl_job, "cron", day_of_week="mon-fri",
+                          hour=16, minute=0, second=f"*/{_poll}",
+                          id="ths_pnl_1600", name="同花顺今日盈亏采集",
                           replace_existing=True, misfire_grace_time=60)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")

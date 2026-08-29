@@ -794,6 +794,24 @@ class SectorDailyRankLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class SectorNextHot(Base):
+    """下一个风口预测（G'，每日 15:50，当前 top10 外候选）"""
+    __tablename__ = "sector_next_hot"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "sector_name", name="uq_snh_date_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    sector_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    rank_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    hot_score: Mapped[float] = mapped_column(Float, nullable=False)
+    expected_horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    trigger_evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class SectorLaunchReason(Base):
     """板块启动归因（批次 C 子 Agent 输出；reason_chain 为 LLM 推导证据链，K227 证据须真实）
     """
@@ -854,6 +872,7 @@ class SectorForwardForecast(Base):
     regime: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
     forward_bias: Mapped[str] = mapped_column(String(32), nullable=False, default="uncertain")
     forecast_horizon: Mapped[str] = mapped_column(String(4), nullable=False, default="t1")
+    sector_tag: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
     evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 

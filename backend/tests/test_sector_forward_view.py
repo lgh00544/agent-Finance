@@ -64,3 +64,13 @@ def test_missing_box_keeps_risk_and_null_continuation(monkeypatch):
     assert result["success"] is True
     assert saved["items"][0]["continuation_prob"] is None
     assert saved["items"][0]["switch_candidate"] is False
+
+
+def test_sector_tag_written_to_forecast_payload(monkeypatch):
+    row = _row(pct=8.0, volume=2.0)
+    history = [_row(rank=1, pct=1.0, volume=1.0) for _ in range(10)]
+    saved = _patch(monkeypatch, [row], history,
+                   {"current_regime": "mainline", "regime_stage": "accelerate"},
+                   {"A": {"box60_pct": 80}})
+    sector_forward_view.run_sector_forward("2026-08-28")
+    assert saved["items"][0]["sector_tag"] == "fade_warn"

@@ -24,7 +24,7 @@ from app.db.models import (
     LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
     PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
     SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
-    SectorRegimeForecast, SectorForwardForecast, SectorForecastVerify,
+    SectorRegimeForecast, SectorForwardForecast, SectorForecastVerify, SectorNextHot,
     SellDecision, StockCandidate, StockScore, TradeProfile,
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
@@ -506,6 +506,7 @@ def upsert_sector_forward_forecast(rows: list[dict]) -> int:
                 regime=row.get("regime", "unknown"),
                 forward_bias=row.get("forward_bias", "uncertain"),
                 forecast_horizon=row.get("forecast_horizon", "t1"),
+                sector_tag=row.get("sector_tag", "none"),
                 evidence=row.get("evidence") or {},
             ))
         db.commit()
@@ -528,7 +529,50 @@ def list_sector_forward_forecast(trade_date: str) -> list[dict]:
             "exhaustion_risk": r.exhaustion_risk, "chase_risk": r.chase_risk,
             "switch_candidate": bool(r.switch_candidate), "regime": r.regime,
             "forward_bias": r.forward_bias, "forecast_horizon": r.forecast_horizon,
+            "sector_tag": r.sector_tag,
             "evidence": r.evidence or {},
+        } for r in result]
+
+
+def upsert_sector_next_hot(rows: list[dict], trade_date: str | None = None) -> int:
+    """下一个风口预测删后插（trade_date 全量覆盖）。"""
+    trade_date = trade_date or (rows[0].get("trade_date") if rows else None)
+    if not trade_date:
+        return 0
+    with SessionLocal() as db:
+        db.execute(text("DELETE FROM sector_next_hot WHERE trade_date = :d"),
+                   {"d": trade_date})
+        for row in rows:
+            db.add(SectorNextHot(
+                trade_date=trade_date,
+                sector_name=row["sector_name"],
+                rank_no=row["rank_no"],
+                hot_score=row["hot_score"],
+                expected_horizon_days=row["expected_horizon_days"],
+                confidence=row["confidence"],
+                trigger_evidence=row.get("trigger_evidence") or {},
+            ))
+        db.commit()
+    return len(rows)
+
+
+def list_sector_next_hot_by_date(trade_date: str, limit: int = 5) -> list[dict]:
+    """读取指定日期下一个风口候选，按 hot_score 降序。"""
+    with SessionLocal() as db:
+        result = db.execute(
+            select(SectorNextHot)
+            .where(SectorNextHot.trade_date == trade_date)
+            .order_by(SectorNextHot.hot_score.desc())
+            .limit(limit)
+        ).scalars().all()
+        return [{
+            "trade_date": r.trade_date,
+            "sector_name": r.sector_name,
+            "rank_no": r.rank_no,
+            "hot_score": r.hot_score,
+            "expected_horizon_days": r.expected_horizon_days,
+            "confidence": r.confidence,
+            "trigger_evidence": r.trigger_evidence or {},
         } for r in result]
 
 

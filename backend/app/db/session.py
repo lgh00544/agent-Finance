@@ -71,6 +71,7 @@ def init_db() -> None:
     _ensure_forward_view_history()
     _ensure_market_condition_next_day()
     _add_factor_scores_column()
+    _ensure_sector_forward_tag()
     _ensure_indexes()
     _ensure_sector_snapshot_table()
     _ensure_quote_snapshot_table()
@@ -406,6 +407,23 @@ def _ensure_market_condition_next_day(eng=None) -> None:
             # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
             try:
                 conn.exec_driver_sql("ALTER TABLE market_condition ADD COLUMN next_day_index_pct FLOAT")
+            except Exception:  # noqa: BLE001 列已存在
+                pass
+
+
+def _ensure_sector_forward_tag(eng=None) -> None:
+    """幂等补齐 sector_forward_forecast.sector_tag 列（老数据默认 none）。"""
+    eng = eng or engine
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(sector_forward_forecast)")}
+            if "sector_tag" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE sector_forward_forecast ADD COLUMN sector_tag VARCHAR(16) NOT NULL DEFAULT 'none'")
+        else:
+            try:
+                conn.exec_driver_sql(
+                    "ALTER TABLE sector_forward_forecast ADD COLUMN sector_tag VARCHAR(16) NOT NULL DEFAULT 'none'")
             except Exception:  # noqa: BLE001 列已存在
                 pass
 

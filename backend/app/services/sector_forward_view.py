@@ -69,11 +69,23 @@ def _score(row, hist, previous, boxes, regime):
     switch = bool(box is not None and box < 0.7 and top10_two_days and expanding and fading)
     bias = "continue" if continuation is not None and continuation >= 0.6 and exhaustion < 0.6 else (
         "switch" if switch else "fade" if exhaustion >= 0.6 else "uncertain")
+    sector_tag = "none"
+    if switch and continuation is not None and continuation >= 0.5 and streak >= 2:
+        sector_tag = "mainline_seed"
+    elif exhaustion >= 0.6:
+        sector_tag = "fade_warn"
+    elif regime.get("regime_stage") == "accelerate" and chase >= 0.5:
+        sector_tag = "accelerate_warn"
+    elif exhaustion < 0.4 and continuation is not None and continuation >= 0.5 and box is not None and box < 0.6:
+        sector_tag = "low_buy"
+    elif chase >= 0.6 and top10_freq < 0.3 and streak < 2:
+        sector_tag = "one_day_fly"
     return {
         "sector_name": name, "rank_no": row["rank_no"], "stage": regime.get("regime_stage", "unknown"),
         "continuation_prob": continuation, "exhaustion_risk": exhaustion,
         "chase_risk": chase, "switch_candidate": switch,
         "regime": regime.get("current_regime", "unknown"), "forward_bias": bias,
+        "sector_tag": sector_tag,
         "evidence": {"top10_freq_10d": top10_freq, "streak": streak,
                      "volume_ratio": volume, "box_position_60d": box,
                      "breadth_expansion": breadth, "mainline_fading": fading,
