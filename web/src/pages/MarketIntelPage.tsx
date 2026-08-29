@@ -1,4 +1,4 @@
-import { type CSSProperties, useState } from 'react'
+import { type CSSProperties, useEffect, useState } from 'react'
 import { App, Alert, Button, Card, Collapse, Descriptions, List, Progress, Select, Space, Tabs, Tag, Tooltip, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { marketIntel, marketIntelDates, sectorPatterns, sectorRegimeView, sectorRotation } from '@/api/market'
@@ -430,10 +430,16 @@ export function MarketIntelPage() {
   const [date, setDate] = useState<string>()
 
   const { data: dates } = useQuery({ queryKey: ['mi-dates'], queryFn: () => marketIntelDates(30) })
+  useEffect(() => {
+    if (!date && dates && dates.length > 0) {
+      setDate(dates[0])
+    }
+  }, [date, dates])
+  const selectedDate = date ?? dates?.[0]
   const { data: mi, isLoading, isError, error, refetch } = useQuery({
-    queryKey: ['market-intel', date],
-    queryFn: () => marketIntel(date),
-    enabled: !!date || !!dates?.length,
+    queryKey: ['market-intel', selectedDate],
+    queryFn: () => marketIntel(selectedDate),
+    enabled: !!selectedDate,
   })
 
   const run = useTaskSubmit('market_intel', () => {
@@ -459,12 +465,12 @@ export function MarketIntelPage() {
   return (
     <div>
       <Space style={{ marginBottom: 10 }} wrap>
-        <Select placeholder="选择研判日期" style={{ width: 160 }} value={date ?? dates?.[0]} onChange={setDate}
+        <Select placeholder="选择研判日期" style={{ width: 160 }} value={selectedDate} onChange={setDate}
           options={(dates ?? []).map((d) => ({ label: d, value: d }))} />
-        <Button type="primary" loading={runRegime.submit.isPending} onClick={() => runRegime.submit.mutate({ trade_date: date })}>
+        <Button type="primary" disabled={!selectedDate} loading={runRegime.submit.isPending} onClick={() => runRegime.submit.mutate({ trade_date: selectedDate })}>
           刷新行情结构
         </Button>
-        <Button loading={runVerify.submit.isPending} onClick={() => runVerify.submit.mutate({ forecast_date: date })}>
+        <Button disabled={!selectedDate} loading={runVerify.submit.isPending} onClick={() => runVerify.submit.mutate({ forecast_date: selectedDate })}>
           回填验证
         </Button>
         <Button type="primary" loading={run.submit.isPending} onClick={() => run.submit.mutate({})}>
@@ -487,7 +493,7 @@ export function MarketIntelPage() {
         items={[
           {
             key: 'regime', label: '行情结构',
-            children: <RegimeStructureTab date={date ?? dates?.[0]} />,
+            children: <RegimeStructureTab date={selectedDate} />,
           },
           {
             key: 'basis', label: '市场判定依据',

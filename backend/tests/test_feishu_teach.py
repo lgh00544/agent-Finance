@@ -3,7 +3,17 @@
 只测 chat_handlers 分发逻辑，LLM 与偏好存储均 mock（不触真实 DB / 不调网络）。"""
 from types import SimpleNamespace
 
+import pytest
+
 from app.services import agent_chat, chat_handlers as ch
+from app.services import feishu_bridge as fb
+
+
+@pytest.fixture(autouse=True)
+def _clear_drafts():
+    fb._drafts.clear()
+    yield
+    fb._drafts.clear()
 
 
 def _mock_teach(monkeypatch, profile=None, pending=None, verdict="adopted"):
@@ -77,9 +87,41 @@ def test_teach_long_proposal_async(monkeypatch):
     assert "处理中" in r and submitted.get("kind") == "feishu_teach"
 
 
+def test_draft_collects_mixed_pieces_and_finishes(monkeypatch):
+    store, pend = _mock_teach(monkeypatch)
+    assert "开启草稿" in ch.dispatch("教·存草稿", "draft", {}, "", "ou_1")
+    assert "已存第 1 条" in ch.dispatch("补一条 我持有 600519", "draft", {}, "", "ou_1")
+    assert "已存第 2 条" in ch.dispatch("教 以后都止损先看量能", "teach", {"agent": "sell"}, "", "ou_1")
+    r = ch.dispatch("完成", "draft", {}, "", "ou_1")
+    assert "草稿已提交" in r and store.get("我持有 600519") == "我持有 600519"
+    assert pend and pend[0][0] == "feishu_tutoring" and "ou_1" not in fb._drafts
+
+
+def test_draft_cancel_and_empty_finish():
+    assert "开启草稿" in ch.dispatch("先存着", "draft", {}, "", "ou_1")
+    assert ch.dispatch("放弃", "draft", {}, "", "ou_1") == "已丢弃 0 条"
+    assert ch.dispatch("完成", "draft", {}, "", "ou_1") == "草稿为空，无可提交"
+
+
+def test_teach_reject_guides_to_draft(monkeypatch):
+    _, pend = _mock_teach(monkeypatch, verdict="maintained")
+    r = ch.dispatch("教 以后都追涨停", "teach", {"agent": "score"}, "", "ou_1")
+    assert "维持原规则" in r and "如需多轮教，先发「教·存草稿」开草稿" in r and not pend
+
+
+def test_draft_cleanup_expires_old_state():
+    fb._drafts["ou_1"] = fb.DraftState(created_at=1)
+    assert fb._cleanup_drafts(now=1 + fb._DRAFT_TTL + 1) == 1
+    assert fb._drafts == {}
+
+
 def test_router_keywords():
     from app.services.chat_router import _route_regex
 
+    assert _route_regex("教·存草稿")[0] == "draft"
+    assert _route_regex("补一条 我持有 600519")[0] == "draft"
+    assert _route_regex("完成")[0] == "draft"
+    assert _route_regex("放弃")[0] == "draft"
     assert _route_regex("记住 我持有 600519")[0] == "remember"
     assert _route_regex("忘掉 我持有 600519")[0] == "forget"  # forget 优先于 remember
     assert _route_regex("教 以后都止损")[0] == "teach"

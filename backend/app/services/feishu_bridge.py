@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.core.config import settings
@@ -17,8 +18,19 @@ _thread = None
 _last_event_at = None
 _sessions: dict[str, deque] = {}  # open_id → 最近 5 轮用户文本（供指代消解）
 _pending: dict[str, dict] = {}  # open_id → 持仓识别待确认 {result, expires}
+
+
+@dataclass
+class DraftState:
+    created_at: float = field(default_factory=time.time)
+    pieces: list[dict] = field(default_factory=list)
+
+
+_drafts: dict[str, DraftState] = {}  # open_id → 多轮 teach 草稿（仅内存）
+_draft_cleanup_timer = None
 _recent_files: dict[str, float] = {}  # file_key → 处理时间（5 分钟幂等）
 _PENDING_TTL = 300
+_DRAFT_TTL = 24 * 60 * 60
 _MAX_IMG = 10 * 1024 * 1024
 _MAX_MEDIA = 50 * 1024 * 1024
 _DESCRIBE_PROMPT = "用一句中文描述这张图片内容；若是 K 线/行情截图请简要说明。只输出描述。"
@@ -41,6 +53,30 @@ def _prev_turn(open_id: str) -> str:
 
 def _remember(open_id: str, user_text: str) -> None:
     _sessions.setdefault(open_id, deque(maxlen=5)).append(user_text)
+
+
+def _cleanup_drafts(now: float | None = None) -> int:
+    now = now or time.time()
+    expired = [k for k, v in _drafts.items() if now - v.created_at > _DRAFT_TTL]
+    for k in expired:
+        _drafts.pop(k, None)
+    return len(expired)
+
+
+def _start_draft_cleanup() -> None:
+    global _draft_cleanup_timer
+    if _draft_cleanup_timer:
+        return
+
+    def _tick():
+        global _draft_cleanup_timer
+        _cleanup_drafts()
+        _draft_cleanup_timer = None
+        _start_draft_cleanup()
+
+    _draft_cleanup_timer = threading.Timer(3600, _tick)
+    _draft_cleanup_timer.daemon = True
+    _draft_cleanup_timer.start()
 
 
 def _on_message(data) -> None:
@@ -317,6 +353,7 @@ def start_bridge() -> None:
     if not settings.feishu_bot_enable:
         return
     _cleanup_media_dir()
+    _start_draft_cleanup()
     _thread = threading.Thread(target=_run, name="feishu-bridge", daemon=True)
     _thread.start()
     logger.info("飞书桥线程已启动（app_id=%s）", settings.feishu_app_id)

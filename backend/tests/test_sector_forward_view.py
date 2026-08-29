@@ -74,3 +74,49 @@ def test_sector_tag_written_to_forecast_payload(monkeypatch):
                    {"A": {"box60_pct": 80}})
     sector_forward_view.run_sector_forward("2026-08-28")
     assert saved["items"][0]["sector_tag"] == "fade_warn"
+
+
+def test_sector_forward_task_skips_refresh_when_target_snapshot_exists(monkeypatch):
+    from app.api import routes
+    from app.services import sector_daily, sector_regime
+
+    monkeypatch.setattr(routes.repo, "list_sector_daily_by_date",
+                        lambda d: [{"trade_date": d}] if d == "2026-08-28" else [])
+    monkeypatch.setattr(sector_daily, "refresh_sector_daily_snapshot",
+                        lambda trade_date=None: (_ for _ in ()).throw(AssertionError("unexpected refresh")))
+    monkeypatch.setattr(sector_regime, "judge_regime",
+                        lambda trade_date=None: {"success": True, "trade_date": trade_date})
+    monkeypatch.setattr(sector_forward_view, "run_sector_forward",
+                        lambda trade_date=None: {"success": True, "trade_date": trade_date})
+
+    result = routes._task_sector_forward({"trade_date": "2026-08-28"})
+
+    assert result["success"] is True
+    assert result["trade_date"] == "2026-08-28"
+    assert result["refresh"]["skipped"] is True
+
+
+def test_sector_forward_task_refreshes_missing_target_date(monkeypatch):
+    from app.api import routes
+    from app.services import sector_daily, sector_regime
+
+    seen = {}
+    def fake_refresh(trade_date=None):
+        seen["refresh_date"] = trade_date
+        return {"success": True, "trade_date": trade_date, "rows": 88, "error": None}
+
+    def fake_judge(trade_date=None):
+        seen["regime_date"] = trade_date
+        return {"success": True, "trade_date": trade_date}
+
+    monkeypatch.setattr(routes.repo, "list_sector_daily_by_date", lambda d: [])
+    monkeypatch.setattr(sector_daily, "refresh_sector_daily_snapshot", fake_refresh)
+    monkeypatch.setattr(sector_regime, "judge_regime", fake_judge)
+    monkeypatch.setattr(sector_forward_view, "run_sector_forward",
+                        lambda trade_date=None: {"success": True, "trade_date": trade_date})
+
+    result = routes._task_sector_forward({"trade_date": "2026-08-28"})
+
+    assert result["success"] is True
+    assert result["trade_date"] == "2026-08-28"
+    assert seen == {"refresh_date": "2026-08-28", "regime_date": "2026-08-28"}

@@ -46,6 +46,9 @@ _KEYWORDS = (  # 意图 → 触发词（含"跑一次"/"触发"优先级最高�
 def _route_regex(text: str) -> tuple[str, dict] | None:
     """正则快路径（方案 §5.3 关键词 + teach 三意图）：高频指令零 LLM 直达"""
     t = text.strip()
+    if (any(k in t for k in ("存草稿", "先存着", "开始草稿", "补一条"))
+            or t in ("完成", "放弃", "继续")):
+        return "draft", {}
     if any(k in t for k in ("忘掉", "删掉", "不要再说")):  # 先于 remember：忘掉 X 内可含"我持有"
         return "forget", {}
     if any(k in t for k in ("记住", "别忘了", "我持有", "我的风格")):

@@ -12,7 +12,7 @@ from app.db import repo
 logger = logging.getLogger(__name__)
 
 
-def refresh_sector_daily_snapshot() -> dict:
+def refresh_sector_daily_snapshot(trade_date: str | None = None) -> dict:
     """全板块日快照刷新（工作日 15:35，由 scheduler 触发；失败不抛）
 
     返回 {"success": bool, "rows": int, "error": str|None}
@@ -21,14 +21,14 @@ def refresh_sector_daily_snapshot() -> dict:
     from app.datasource.akshare_source import AkshareSource
     # 领涨股代码解析链（复用 sector_snapshot 既有逻辑，供批C 连板/资金/新闻证据取数）
     from app.services.market_view import _leading_from_cons, _spot_name_map
-    today = time.strftime("%Y-%m-%d")
+    today = trade_date or time.strftime("%Y-%m-%d")
     try:
         board_df = AkshareSource().fetch_industry_spot()
     except Exception as exc:  # noqa: BLE001
-        return {"success": False, "rows": 0, "error": f"板块行情获取失败: {exc}"}
+        return {"success": False, "trade_date": today, "rows": 0, "error": f"板块行情获取失败: {exc}"}
 
     if board_df is None or board_df.empty or "board_name" not in board_df.columns:
-        return {"success": False, "rows": 0, "error": "板块行情返回空表"}
+        return {"success": False, "trade_date": today, "rows": 0, "error": "板块行情返回空表"}
 
     name_to_code = _spot_name_map()
     rows = []
@@ -63,14 +63,14 @@ def refresh_sector_daily_snapshot() -> dict:
         })
 
     if not rows:
-        return {"success": False, "rows": 0, "error": "无有效板块数据"}
+        return {"success": False, "trade_date": today, "rows": 0, "error": "无有效板块数据"}
 
     rows.sort(key=lambda x: x["change_pct"], reverse=True)
     for i, row in enumerate(rows):
         row["rank_no"] = i + 1
 
     inserted = repo.upsert_sector_daily_snapshot(rows)
-    return {"success": True, "rows": inserted, "error": None}
+    return {"success": True, "trade_date": today, "rows": inserted, "error": None}
 
 
 def _num(row, key):

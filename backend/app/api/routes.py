@@ -135,11 +135,19 @@ def _task_sector_forward(params: dict) -> dict:
     from app.services.sector_forward_view import run_sector_forward
     from app.services.sector_regime import judge_regime
 
-    refresh = refresh_sector_daily_snapshot()
+    requested_date = str(params.get("trade_date") or "").strip() or None
+    target_date = requested_date
+    refresh = {"success": True, "trade_date": target_date, "rows": 0,
+               "error": None, "skipped": bool(target_date and repo.list_sector_daily_by_date(target_date))}
+    if not refresh["skipped"]:
+        refresh = refresh_sector_daily_snapshot(target_date)
     if not refresh.get("success"):
-        return {"success": False, "trade_date": time.strftime("%Y-%m-%d"),
+        return {"success": False, "trade_date": target_date or time.strftime("%Y-%m-%d"),
                 "refresh": refresh, "error": refresh.get("error")}
-    regime = judge_regime(params.get("trade_date"))
+    if not target_date:
+        dates = repo.list_sector_daily_dates(limit=1)
+        target_date = refresh.get("trade_date") or (dates[0] if dates else time.strftime("%Y-%m-%d"))
+    regime = judge_regime(target_date)
     if not regime.get("success"):
         return {"success": False, "trade_date": regime.get("trade_date"),
                 "refresh": refresh, "regime": regime, "error": regime.get("error")}

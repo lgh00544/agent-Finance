@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.db import repo
 from app.graph import router as graph_router
 from app.llm.structured import ModelLevel
-from app.services import agent_chat, holding_view, market_view, status as status_service
+from app.services import agent_chat, feishu_bridge, holding_view, market_view, status as status_service
 from app.services import task_queue, ths_pnl
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,8 @@ def dispatch(text: str, intent: str, params: dict, hint: str, open_id: str) -> s
             return "任务进行中，完成会通知你" + _NOTE
         return "同类任务正在执行中，请稍后再试"
     try:
+        if intent == "draft":
+            return _handle_draft(open_id, text)
         if intent == "teach":
             return _handle_teach(text, params, open_id)
         if intent in ("remember", "forget"):
@@ -204,6 +206,9 @@ _HARD_MOD, _THRESHOLD = ("改成", "设为", "改为"), ("止损", "止盈", "�
 _AGENT_KW = (("sell", ("卖出", "减仓", "止盈", "止损")), ("monitor", ("监控", "告警", "盘中")),
              ("review", ("复盘", "反思", "迭代")), ("score", ("评分", "选股", "候选")))
 _MEM = {"remember": ("记住", "别忘了"), "forget": ("忘掉", "删掉", "不要再说")}
+_DRAFT_START = ("教·存草稿", "教 存草稿", "存草稿", "先存着", "开始草稿")
+_DRAFT_APPEND = ("补一条", "继续", "记住", "教")
+_DRAFT_PREFIX = _DRAFT_START + _DRAFT_APPEND
 
 
 def _teach_agent(text: str) -> str:
@@ -227,7 +232,63 @@ def _guard_hard(text: str) -> str | None:
     return None
 
 
+def _draft_body(text: str) -> str:
+    return _strip_prefix(text, _DRAFT_PREFIX).replace("不存了", "").strip(" ，,：:")
+
+
+def _draft_piece(raw: str, body: str) -> dict:
+    is_rule = (raw.strip().startswith("教") or any(k in body for k in _THRESHOLD)
+               or any(k in body for k in ("教战法", "新规则", "以后都", "永远")))
+    return {"content": body, "agent_tag": _teach_agent(body), "piece_type": "rule" if is_rule else "fact"}
+
+
+def _handle_draft(open_id: str, text: str) -> str:
+    t = text.strip()
+    draft = feishu_bridge._drafts.get(open_id)
+    if t.startswith("放弃"):
+        n = len(draft.pieces) if draft else 0
+        feishu_bridge._drafts.pop(open_id, None)
+        return f"已丢弃 {n} 条"
+    if t in ("完成", "教 完成", "教·完成"):
+        if not draft or not draft.pieces:
+            feishu_bridge._drafts.pop(open_id, None)
+            return "草稿为空，无可提交"
+        pieces = draft.pieces[:]
+        feishu_bridge._drafts.pop(open_id, None)
+        lines = []
+        for i, piece in enumerate(pieces, 1):
+            if piece["piece_type"] == "fact":
+                content = repo.get_trade_profile_content()
+                content[piece["content"]] = piece["content"]
+                repo.update_trade_profile(content)
+                result = f"已记住：{piece['content']}"
+            else:
+                result = _handle_teach(piece["content"], {"agent": piece["agent_tag"]}, open_id, True)
+            lines.append(f"{i}. {piece['piece_type']}：{result}")
+        return "草稿已提交：\n" + "\n".join(lines)
+    if any(k in t for k in _DRAFT_START):
+        if draft:
+            return f"已有 {len(draft.pieces)} 条草稿，继续/放弃？"
+        draft = feishu_bridge.DraftState()
+        feishu_bridge._drafts[open_id] = draft
+        body = _draft_body(t)
+        if not body:
+            return "已开启草稿，请继续发「补一条 内容」或「完成」"
+    else:
+        if not draft:
+            return "还没有草稿，先发「教·存草稿」开草稿"
+        if "不存了" in t:
+            return f"已取消本条，草稿仍有 {len(draft.pieces)} 条"
+        body = _draft_body(t)
+        if not body:
+            return f"草稿已有 {len(draft.pieces)} 条，请继续发「补一条 内容」或「完成」"
+    draft.pieces.append(_draft_piece(t, body))
+    return f"已存第 {len(draft.pieces)} 条（{draft.pieces[-1]['piece_type']}）"
+
+
 def _handle_memory(text: str, open_id: str, mode: str) -> str:
+    if mode == "remember" and open_id in feishu_bridge._drafts:
+        return _handle_draft(open_id, text)
     hard = _guard_hard(text)  # remember=事实直写（阈值类降级 teach 待审）；forget=删键
     if hard:
         return hard
@@ -249,7 +310,9 @@ def _handle_memory(text: str, open_id: str, mode: str) -> str:
     return f"已{'删除' if mode == 'forget' else '记住'}：{fact}" + ("（下次对话生效）" if mode == "remember" else "")
 
 
-def _handle_teach(text: str, params: dict, open_id: str) -> str:
+def _handle_teach(text: str, params: dict, open_id: str, draft_bypass: bool = False) -> str:
+    if not draft_bypass and open_id in feishu_bridge._drafts:
+        return _handle_draft(open_id, text)
     hard = _guard_hard(text)
     if hard:
         return hard
@@ -259,22 +322,23 @@ def _handle_teach(text: str, params: dict, open_id: str) -> str:
     agent = params.get("agent") or "score"
     if len(proposal) > _TEACH_SYNC_MAX:
         task_queue.submit("feishu_teach", "飞书·规则教学",
-                          lambda p, a=agent, o=open_id: _teach_job(a, p, o), {"proposal": proposal})
+                          lambda p, a=agent, o=open_id, g=not draft_bypass: _teach_job(a, p, o, g),
+                          {"proposal": proposal})
         return "已提交处理中，完成会通知你"
-    return _teach_validate(proposal, agent, open_id)
+    return _teach_validate(proposal, agent, open_id, guide=not draft_bypass)
 
 
-def _teach_job(agent: str, params: dict, open_id: str) -> dict:
+def _teach_job(agent: str, params: dict, open_id: str, guide: bool = True) -> dict:
     from app.services.feishu_sender import send_text
 
     try:
-        send_text(open_id, _teach_validate(params.get("proposal", ""), agent, open_id))
+        send_text(open_id, _teach_validate(params.get("proposal", ""), agent, open_id, guide=guide))
     except Exception as exc:  # noqa: BLE001 长任务失败回处理失败，不崩
         send_text(open_id, f"处理失败: {str(exc)[:120]}")
     return {"replied": True}
 
 
-def _teach_validate(proposal: str, agent: str, open_id: str) -> str:
+def _teach_validate(proposal: str, agent: str, open_id: str, guide: bool = True) -> str:
     """自组装 LLM 校验（复用 agent_chat 提示词/schema，不调 rule_feedback 避免双写绕过）"""
     meta = agent_chat._require_agent(agent)
     fb = common.agent_call(
@@ -283,7 +347,8 @@ def _teach_validate(proposal: str, agent: str, open_id: str) -> str:
         user_prompt=agent_chat._rule_user_prompt(agent, proposal, meta),
         schema=agent_chat.RuleFeedback, ttl_seconds=0, model_level=ModelLevel.DEEP)
     if fb.verdict not in ("adopted", "partial"):
-        return f"维持原规则：{fb.reason or '与现有硬性规则/方法论冲突'}"
+        msg = f"维持原规则：{fb.reason or '与现有硬性规则/方法论冲突'}"
+        return msg + ("\n如需多轮教，先发「教·存草稿」开草稿" if guide else "")
     if not (fb.rule_title and fb.rule_content):
         return f"校验结论：{agent_chat._VERDICT_LABELS[fb.verdict]}，但缺少可沉淀正文，未提交"
     repo.add_pending_experience(
