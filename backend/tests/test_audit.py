@@ -45,6 +45,16 @@ def test_audit_output_schema():
         AuditOutput(verdict="pass")  # 缺其余必填字段
 
 
+def test_audit_output_normalizes_common_llm_shapes():
+    out = AuditOutput(verdict="pass", confidence=0.6,
+                      support_view="有数据支持且符合资金管理原则",
+                      dissent_view="弱势市况下分批可能错过反弹，需结合流动性场景判断",
+                      one_line_summary="建议可通过")
+    assert out.confidence == 60
+    assert out.boundary_cases == ""
+    assert out.evidence_refs == []
+
+
 def test_pending_scan_respects_cutoff_and_cursor(monkeypatch):
     """③ 扫描补漏：cutoff 前存量不审、新增被审、pass 落库 + 游标推进到本轮最大"""
     old = _mk_suggestion()
@@ -59,18 +69,23 @@ def test_pending_scan_respects_cutoff_and_cursor(monkeypatch):
     assert repo.get_config("audit_cursor.last_id") == str(new)
 
 
-def test_manual_re_audit_endpoint_runs_one_suggestion(monkeypatch):
+def test_manual_re_audit_endpoint_submits_one_suggestion_task(monkeypatch):
     from fastapi import HTTPException
     from app.api.routes import re_audit_suggestion
 
     sid = _mk_suggestion()
-    monkeypatch.setattr("app.agents.audit.llm_audit", lambda s: _audit_out("pass"))
+    submitted = {}
+    monkeypatch.setattr("app.api.routes._submit_task",
+                        lambda kind, params: submitted.update({"kind": kind, "params": params}) or {
+                            "task_id": "t-audit-one", "status": "pending"})
     res = re_audit_suggestion(sid)
     row = repo.get_agent_suggestion(sid)
-    assert res["audited"] is True and row.audit_verdict == "pass" and row.audit_round == 1
+    assert res == {"task_id": "t-audit-one", "status": "pending"}
+    assert submitted == {"kind": "audit_one", "params": {"suggestion_id": sid}}
+    assert row.audit_verdict == "pending" and row.audit_round == 0
     with pytest.raises(HTTPException) as ei:
-        re_audit_suggestion(sid)
-    assert ei.value.status_code == 400
+        re_audit_suggestion(999999999)
+    assert ei.value.status_code == 404
 
 
 def test_round2_still_fail_no_round3(monkeypatch):
@@ -84,20 +99,21 @@ def test_round2_still_fail_no_round3(monkeypatch):
     monkeypatch.setattr("app.agents.audit.llm_audit", lambda s: _audit_out("fail"))
     monkeypatch.setattr("app.agents.audit.llm_re_audit", lambda s, d: _audit_out("fail"))
     monkeypatch.setattr("app.agents.audit.llm_rethink_suggestion", fake_rethink)
+    repo.set_config("audit_cursor.last_id", str(sid - 1))
 
-    r1 = run_pending_audits(cutoff_id=0)
+    r1 = run_pending_audits(cutoff_id=sid - 1)
     assert r1["rethunk"] == 1 and rethink_calls["n"] == 1
     s1 = repo.get_agent_suggestion(sid)
     assert s1.audit_verdict == "fail" and s1.audit_round == 1
     assert r1["cursor"] < sid  # 首审 fail 游标不越过未处理 id
 
-    r2 = run_pending_audits(cutoff_id=0)
+    r2 = run_pending_audits(cutoff_id=sid - 1)
     assert r2["audited"] == 1  # round2 重审
     s2 = repo.get_agent_suggestion(sid)
     assert s2.audit_verdict == "fail" and s2.audit_round == 2
     assert rethink_calls["n"] == 1  # 不再触发 rethink
 
-    r3 = run_pending_audits(cutoff_id=0)
+    r3 = run_pending_audits(cutoff_id=sid - 1)
     assert r3["audited"] == 0  # 无第 3 轮
 
 

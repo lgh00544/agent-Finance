@@ -57,6 +57,8 @@ def test_valid_json_first_try(monkeypatch):
     assert out.stock_code == "600001"
     assert out.reason == "量能放大"
     assert len(client.chat.completions.calls) == 1
+    sent = client.chat.completions.calls[0]["messages"][0]["content"].lower()
+    assert "json" in sent
 
 
 def test_invalid_then_valid_retries(monkeypatch):

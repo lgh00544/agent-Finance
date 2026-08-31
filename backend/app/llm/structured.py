@@ -96,6 +96,8 @@ def llm_call_json(
     level = model_level if isinstance(model_level, ModelLevel) else ModelLevel(model_level)
     max_tokens = _max_tokens_for(level, max_tokens)
     client = get_client()
+    if "json" not in f"{system_prompt}\n{user_prompt}".lower():
+        system_prompt = f"{system_prompt}\n\n输出必须是合法 JSON 对象，不要输出 JSON 之外的任何文字。"
 
     # 尝试序列：轻量场景 = flash×3 → 降级 chat×3；深度场景 = chat×3
     attempts = [(settings.deepseek_reasoning_model, settings.reasoning_effort)] * 3
@@ -125,8 +127,8 @@ def llm_call_json(
                 time.sleep(2 ** (idx % 3))
 
     raise LLMError(
-        f"LLM 结构化输出全部尝试均失败（agent={system_prompt[:30]}，"
-        f"level={level.value}）")
+        f"LLM 结构化输出全部尝试均失败（level={level.value}，"
+        f"system_prompt={system_prompt[:30]}）")
 
 
 def call_llm_cached(agent: str, cache_key: str, system_prompt: str, user_prompt: str,

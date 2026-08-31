@@ -2,7 +2,7 @@
 5 个 Agent 的结构化输出模型（pydantic 严格校验，强制 JSON）
 所有市场研判结论均出自 LLM，模型定义只约束结构，不含任何业务阈值。
 """
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ================= DiscoverAgent 潜力发掘 =================
@@ -286,9 +286,26 @@ class AuditOutput(BaseModel):
     confidence: int = Field(description="置信度 0-100")
     support_view: str = Field(description="支持意见，≥30 字")
     dissent_view: str = Field(description="反对意见，≥50 字且必含 1 个具体反例/场景")
-    boundary_cases: str = Field(description="边界场景（什么情况下结论会失效），≥30 字")
-    evidence_refs: list[str] = Field(description="证据引用，至少 1 条，格式 K223 / knowledge_id=42 / rule_change#15")
+    boundary_cases: str = Field(default="", description="边界场景（什么情况下结论会失效），≥30 字")
+    evidence_refs: list[str] = Field(default_factory=list,
+        description="证据引用，至少 1 条，格式 K223 / knowledge_id=42 / rule_change#15")
     one_line_summary: str = Field(description="一句话摘要，≤40 字")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v):
+        if isinstance(v, float) and 0 <= v <= 1:
+            return round(v * 100)
+        return v
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def _normalize_evidence_refs(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [v]
+        return v
 
 
 # ================= PortfolioSentinel 组合哨兵（组合级风控，与 MonitorAgent 零耦合） =================

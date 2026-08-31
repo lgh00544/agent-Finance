@@ -1,7 +1,10 @@
 """D' 板块级前瞻：纯代码计算延续、退潮、追高风险与切换候选。"""
 import logging
+import queue
+import threading
 import time
 
+from app.core.config import settings
 from app.db import repo
 
 logger = logging.getLogger(__name__)
@@ -94,6 +97,30 @@ def _score(row, hist, previous, boxes, regime):
     }
 
 
+def _fetch_boxes(names: list[str]) -> dict:
+    """箱位是辅助标注；数据源慢/卡住时降级为空，不能阻塞 D' 主结果落库。"""
+    result_q: queue.Queue[tuple[dict | None, Exception | None]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            from app.datasource.akshare_source import AkshareSource
+            result_q.put((AkshareSource().fetch_board_box_positions(names), None))
+        except Exception as exc:  # noqa: BLE001
+            result_q.put((None, exc))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    try:
+        boxes, error = result_q.get(timeout=max(0.1, float(settings.datasource_timeout)))
+    except queue.Empty:
+        logger.warning("板块前瞻箱位获取超时，降级为空箱位")
+        return {}
+    if error is not None:
+        logger.warning("板块前瞻箱位获取失败（标注缺失）: %s", error)
+        return {}
+    return boxes or {}
+
+
 def run_sector_forward(trade_date: str | None = None) -> dict:
     """读取 C' 结构结果，按 D' 硬公式计算 top10 三窗口前瞻并落库。"""
     today = trade_date or time.strftime("%Y-%m-%d")
@@ -104,12 +131,7 @@ def run_sector_forward(trade_date: str | None = None) -> dict:
     if not regime:
         return {"success": False, "trade_date": today, "count": 0, "error": "行情结构预测不存在"}
     names = [r["sector_name"] for r in rows]
-    try:
-        from app.datasource.akshare_source import AkshareSource
-        boxes = AkshareSource().fetch_board_box_positions(names)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("板块前瞻箱位获取失败（标注缺失）: %s", exc)
-        boxes = {}
+    boxes = _fetch_boxes(names)
     forecasts = []
     for row in rows:
         hist = _history(row["sector_name"], 10)
@@ -124,7 +146,7 @@ def run_sector_forward(trade_date: str | None = None) -> dict:
                         "fade" if score["exhaustion_risk"] >= 0.6 else
                         "mainline_confirm" if bias == "continue" else
                         "invalid_rotation" if regime["current_regime"] == "rotation" else "uncertain")
-            forecasts.append({**score, "forward_bias": bias,
+            forecasts.append({**score, "trade_date": today, "forward_bias": bias,
                               "forecast_horizon": horizon})
     count = repo.upsert_sector_forward_forecast(forecasts)
     return {"success": True, "trade_date": today, "count": count,

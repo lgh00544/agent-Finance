@@ -1,8 +1,11 @@
 """行情结构与板块轮动前瞻·C' 多窗口纯代码识别。"""
 import logging
+import queue
 import statistics
+import threading
 import time
 
+from app.core.config import settings
 from app.db import repo
 
 logger = logging.getLogger(__name__)
@@ -20,6 +23,30 @@ def _top(rows):
 def _mean(values):
     values = [float(v) for v in values if v is not None]
     return sum(values) / len(values) if values else None
+
+
+def _fetch_boxes(names: list[str]) -> dict:
+    """箱位是辅助证据；数据源慢/卡住时降级为空，不能阻塞 C' 结构判定。"""
+    result_q: queue.Queue[tuple[dict | None, Exception | None]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            from app.datasource.akshare_source import AkshareSource
+            result_q.put((AkshareSource().fetch_board_box_positions(names), None))
+        except Exception as exc:  # noqa: BLE001
+            result_q.put((None, exc))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    try:
+        boxes, error = result_q.get(timeout=max(0.1, float(settings.datasource_timeout)))
+    except queue.Empty:
+        logger.warning("行情结构箱位获取超时，降级为空箱位")
+        return {}
+    if error is not None:
+        logger.warning("行情结构箱位获取失败（标注缺失）: %s", error)
+        return {}
+    return boxes or {}
 
 
 def _metrics(today, dates):
@@ -57,11 +84,7 @@ def _metrics(today, dates):
     volume_confirm = _clamp((recent_vol or 0) - (old_vol or 0)) if recent_vol is not None and old_vol is not None else None
     boxes = {}
     if top_today:
-        try:
-            from app.datasource.akshare_source import AkshareSource
-            boxes = AkshareSource().fetch_board_box_positions(top_today)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("行情结构箱位获取失败（标注缺失）: %s", exc)
+        boxes = _fetch_boxes(top_today)
     box_values = [v.get("box60_pct") for v in boxes.values() if v.get("box60_pct") is not None]
     box_median = statistics.median(box_values) / 100 if box_values else None
     return {

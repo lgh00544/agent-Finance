@@ -5,6 +5,8 @@ import {
   Button,
   Card,
   Checkbox,
+  Descriptions,
+  Drawer,
   Input,
   Modal,
   Radio,
@@ -15,6 +17,7 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -29,21 +32,96 @@ import {
   setExperienceConfig,
 } from '@/api/experience'
 import { EmptyState, ErrorCard, StatusBadge, ConfidenceBar } from '@/components/common'
-import type { Experience, ExperienceConfig } from '@/types'
+import type { Experience, ExperienceConfig, PendingExperience } from '@/types'
 
 const { Text } = Typography
 
 const STAGE_TONE: Record<string, string> = { 选股: 'blue', 建仓: 'orange', 持仓: 'green' }
 const IMPACT_BADGE = { high: <Tag color="red">高影响</Tag>, low: <Tag>低影响</Tag> }
+const val = (v: unknown, empty = '—') => String(v ?? '').trim() || empty
+const M1_STATUS: Record<string, { text: string; tone: string; tip: string }> = {
+  pending: { text: '待识别', tone: 'pending', tip: '队列堆积中，Worker 还未开始处理' },
+  processing: { text: '识别中', tone: 'processing', tip: 'Worker 正在提炼为正式经验条目' },
+  done: { text: '已生成', tone: 'ok', tip: 'Worker 已产出，待 M2/M3 审核通过后才生效 LLM' },
+}
+const INFO_LABEL: Record<string, string> = {
+  count: '合并次数',
+  first_at: '首次出现',
+  last_at: '最近出现',
+  stock_code: '股票代码',
+  signal_type: '信号类型',
+  original_ref: '原始引用',
+}
+
+function renderInfo(v: unknown) {
+  if (typeof v !== 'string' || !v.trim()) return '（无）'
+  try {
+    const data = JSON.parse(v) as Record<string, unknown>
+    return (
+      <Descriptions size="small" column={1} items={Object.entries(data).map(([label, children]) => ({
+        label: INFO_LABEL[label] ?? label,
+        children: children == null || children === '' ? '（无）' : String(children),
+      }))} />
+    )
+  } catch { return v }
+}
+
+function M1StatusBadge({ status }: { status?: string }) {
+  const s = M1_STATUS[status ?? ''] ?? { text: val(status), tone: 'mute', tip: '未知状态，按后端原文展示' }
+  return <Tooltip title={s.tip}><span><StatusBadge text={s.text} tone={s.tone} /></span></Tooltip>
+}
+
+function M1Detail({ row }: { row: PendingExperience & Record<string, unknown> }) {
+  const status = String(row.status ?? '')
+  const next = status === 'done' ? '待 M2 审核；高影响经验会转 M3，两步确认通过后才生效 LLM'
+    : status === 'processing' ? '等待 Worker 产出正式经验，再进入 M2/M3'
+      : status === 'pending' ? '可点击“立即触发识别”让 Worker 处理队列'
+        : status === 'rejected' ? '不会生效 LLM' : '按后端状态继续流转'
+  return (
+    <Space orientation="vertical" style={{ width: '100%' }} size={12}>
+      <Card size="small" title="原始信息" style={{ background: 'var(--bg-input)' }}>
+        <Descriptions size="small" column={1} items={[
+          { label: '摘要', children: val(row.summary) },
+          { label: '任务 ID', children: val(row.task_id) },
+          { label: '阶段', children: val(row.stage) },
+          { label: '创建时间', children: val(row.created_at) },
+        ]} />
+      </Card>
+      <Card size="small" title="关联上下文" style={{ background: 'var(--bg-input)' }}>
+        <Descriptions size="small" column={1} items={[
+          { label: '来源任务 ID', children: val(row.source_task_id ?? row.task_id) },
+          { label: '来源', children: val(row.source, '（无）') },
+          { label: '依据', children: val(row.evidence, '（无）') },
+          { label: '影响等级', children: val(row.impact, '（无）') },
+        ]} />
+      </Card>
+      <Card size="small" title="Worker 提炼结果" style={{ background: 'var(--bg-input)' }}>
+        <Descriptions size="small" column={1} items={[
+          { label: '经验 ID', children: val(row.experience_id, '（无）') },
+          { label: '经验标题', children: val(row.title, '（无）') },
+          { label: '影响等级', children: val(row.impact, '（无）') },
+          { label: '置信度', children: val(row.confidence, '（无）') },
+          { label: '结构化信息', children: renderInfo(row.ext_info ?? row.artifacts_ref) },
+        ]} />
+      </Card>
+      <Alert type="info" showIcon title="下一步" description={`当前状态：${M1_STATUS[status]?.text ?? val(status)}；下一步：${next}`} />
+    </Space>
+  )
+}
+
+function ModuleHint({ message, description }: { message: string; description: string }) {
+  return <Alert type="info" showIcon style={{ marginBottom: 10 }} title={message} description={description} />
+}
 
 // ================= M1 沉淀队列（只读看板） =================
 function ExpQueuePanel() {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [stage, setStage] = useState('全部')
+  const [selected, setSelected] = useState<(PendingExperience & Record<string, unknown>) | null>(null)
   const { data: rows, isError, error, refetch } = useQuery({
     queryKey: ['exp-pending', stage],
-    queryFn: () => getExperiencePending(stage === '全部' ? undefined : stage, undefined, 100),
+    queryFn: () => getExperiencePending(undefined, stage === '全部' ? undefined : stage, 100),
   })
   const run = async () => {
     try {
@@ -55,9 +133,10 @@ function ExpQueuePanel() {
     }
   }
   if (isError) return <ErrorCard title="沉淀队列加载失败" message={error?.message} onRetry={() => refetch()} />
-  const list = rows ?? []
+  const list = (rows ?? []) as Array<PendingExperience & Record<string, unknown>>
   return (
-    <div>
+    <Card>
+      <ModuleHint message="M1 沉淀队列" description="任务执行完成后，AI 提炼出的经验条目暂存于此，待 Worker 识别为正式条目（pending → processing → done）。done 只代表已生成，不代表已生效 LLM。" />
       <Space style={{ marginBottom: 10 }} wrap>
         <Select value={stage} onChange={setStage} style={{ width: 100 }}
           options={['全部', '选股', '建仓', '持仓'].map((s) => ({ label: s, value: s }))} />
@@ -67,24 +146,33 @@ function ExpQueuePanel() {
         <EmptyState text="沉淀队列为空。任务执行完成后，经验摘要会自动进入队列等待识别。" icon="📭" />
       ) : (
         <Table size="small" rowKey="id" dataSource={list} pagination={{ pageSize: 20 }}
+          onRow={(r) => ({ onClick: () => setSelected(r), style: { cursor: 'pointer' } })}
           columns={[
             {
               title: '摘要', dataIndex: 'summary', ellipsis: true,
               render: (v: string, r) => (
-                <Space direction="vertical" size={0}>
-                  <Text>{v}</Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>任务 {r.task_id} · {String(r.created_at ?? '').slice(0, 16)}</Text>
+                <Space orientation="vertical" size={0}>
+                  <Text ellipsis>{val(v)}</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>任务 {val(r.task_id)} · {String(r.created_at ?? '').slice(0, 16) || '—'}</Text>
                 </Space>
               ),
             },
-            { title: '阶段', dataIndex: 'stage', width: 70, render: (v: string) => <Tag color={STAGE_TONE[v] ?? 'default'}>{v}</Tag> },
+            { title: '阶段', dataIndex: 'stage', width: 80, render: (v: string) => <Tag color={STAGE_TONE[v] ?? 'default'}>{val(v)}</Tag> },
             {
-              title: '状态', dataIndex: 'status', width: 90,
-              render: (v: string) => <StatusBadge text={{ pending: '待识别', processing: '识别中', done: '已完成' }[v] ?? v} tone={({ pending: 'pending', processing: 'processing', done: 'ok' } as Record<string, string>)[v] ?? 'mute'} />,
+              title: '状态', dataIndex: 'status', width: 120,
+              render: (v: string) => <M1StatusBadge status={v} />,
             },
-          ]} />
+            {
+              title: '操作', key: 'op', width: 90,
+              render: (_: unknown, r) => <Button size="small" onClick={(e) => { e.stopPropagation(); setSelected(r as PendingExperience & Record<string, unknown>) }}>查看详情</Button>,
+            },
+          ]}
+          expandable={{ expandedRowRender: (r) => <M1Detail row={r as PendingExperience & Record<string, unknown>} /> }} />
       )}
-    </div>
+      <Drawer title="M1 队列详情" open={!!selected} size={720} onClose={() => setSelected(null)} destroyOnHidden>
+        {selected ? <M1Detail row={selected} /> : null}
+      </Drawer>
+    </Card>
   )
 }
 
@@ -99,9 +187,10 @@ function ExpDigestPanel({ onGoHigh }: { onGoHigh: (eid: number) => void }) {
   const list = rows ?? []
   const high = list.filter((r) => r.impact === 'high')
   const digest = list.filter((r) => r.impact !== 'high')
+  const intro = <ModuleHint message="M2 每日 Digest" description="每天汇总待过目的低影响经验，可批量过目/批量驳回；高影响经验会自动转到 M3。" />
 
-  if (isError) return <ErrorCard title="Digest 加载失败" message={error?.message} onRetry={() => refetch()} />
-  if (!list.length) return <EmptyState text="当前无待过目经验。识别 Worker 产出新经验后会出现在这里。" icon="📭" />
+  if (isError) return <>{intro}<ErrorCard title="Digest 加载失败" message={error?.message} onRetry={() => refetch()} /></>
+  if (!list.length) return <>{intro}<EmptyState text="当前无待过目经验。识别 Worker 产出新经验后会出现在这里。" icon="📭" /></>
 
   const approveOne = async (r: Experience) => {
     try {
@@ -125,9 +214,10 @@ function ExpDigestPanel({ onGoHigh }: { onGoHigh: (eid: number) => void }) {
 
   return (
     <div>
+      {intro}
       {high.length ? (
         <Alert type="warning" showIcon style={{ marginBottom: 10 }}
-          message={`⛔ 高影响 ${high.length} 条：涉及规则/标准修改，必须走 M3 硬审核（两步确认），不可在此批量通过`}
+          title={`高影响 ${high.length} 条：涉及规则/标准修改，必须走 M3 硬审核（两步确认），不可在此批量通过`}
           action={high.map((r) => (
             <Button key={r.id} size="small" onClick={() => onGoHigh(r.id)} style={{ marginLeft: 4 }}>
               前往硬审核 → {r.title.slice(0, 12)}
@@ -144,7 +234,7 @@ function ExpDigestPanel({ onGoHigh }: { onGoHigh: (eid: number) => void }) {
           </Space>
           {digest.map((r) => (
             <Card key={r.id} size="small" style={{ background: 'var(--bg-input)', marginBottom: 8 }}>
-              <Space direction="vertical" style={{ width: '100%' }} size={6}>
+              <Space orientation="vertical" style={{ width: '100%' }} size={6}>
                 <Space wrap>
                   <Text strong>{r.title}</Text>
                   <Tag color={STAGE_TONE[r.stage ?? ''] ?? 'default'}>{r.stage}</Tag>
@@ -229,8 +319,9 @@ function ExpReviewPanel({ selEid, setSelEid }: { selEid: number | null; setSelEi
     select: (rows) => rows.filter((r) => r.impact === 'high'),
   })
   const selected = selEid ?? highList?.[0]?.id ?? null
+  const intro = <ModuleHint message="M3 高影响审核" description="涉及规则/标准修改的高影响经验，必须经人工两步确认才能生效 LLM。" />
 
-  if (!selected) return <EmptyState text="当前无高影响经验待审核。" icon="🛡️" />
+  if (!selected) return <>{intro}<EmptyState text="当前无高影响经验待审核。" icon="🛡️" /></>
 
   const cur = (highList ?? []).find((r) => r.id === selected)
 
@@ -257,8 +348,9 @@ function ExpReviewPanel({ selEid, setSelEid }: { selEid: number | null; setSelEi
 
   return (
     <div>
+      {intro}
       <Alert type="error" showIcon style={{ marginBottom: 10 }}
-        message="⚠️ 高影响经验审核 — 此操作可能修改交易规则或研判标准，请谨慎确认"
+        title="高影响经验审核 — 此操作可能修改交易规则或研判标准，请谨慎确认"
         description="批准后该经验将注入全部相关 Agent；驳回必须填写理由（留痕可追溯）。" />
       <Space style={{ marginBottom: 10 }}>
         <Select
@@ -269,7 +361,7 @@ function ExpReviewPanel({ selEid, setSelEid }: { selEid: number | null; setSelEi
       </Space>
       {curDetail ? (
         <Card size="small" style={{ background: 'var(--bg-input)', marginBottom: 10 }}>
-          <Space direction="vertical" style={{ width: '100%' }} size={6}>
+          <Space orientation="vertical" style={{ width: '100%' }} size={6}>
             <Space wrap>
               <Text strong style={{ fontSize: 15 }}>{curDetail.title}</Text>
               <Tag color={STAGE_TONE[curDetail.stage ?? ''] ?? 'default'}>{curDetail.stage}</Tag>
@@ -285,7 +377,7 @@ function ExpReviewPanel({ selEid, setSelEid }: { selEid: number | null; setSelEi
           </Space>
         </Card>
       ) : null}
-      <Space direction="vertical" style={{ width: '100%', maxWidth: 420 }} size={8}>
+      <Space orientation="vertical" style={{ width: '100%', maxWidth: 420 }} size={8}>
         <Radio.Group value={action} onChange={(e) => setAction(e.target.value)} optionType="button" buttonStyle="solid"
           options={[{ label: '批准', value: 'approve' }, { label: '驳回', value: 'reject' }]} />
         {action === 'reject' ? (
@@ -336,6 +428,7 @@ function ExpLibraryPanel() {
     if (incRolled) rows = [...rows, ...(rolledRows ?? [])]
   }
   if (onlyAuto) rows = rows.filter((r) => r.auto_merged === 1)
+  const intro = <ModuleHint message="M4 经验库" description="全部经验条目（已生效/已回滚/已驳回），支持回滚、关键词搜索、影响筛选。" />
 
   const rollback = async (r: Experience) => {
     try {
@@ -356,6 +449,7 @@ function ExpLibraryPanel() {
 
   return (
     <div>
+      {intro}
       <Space style={{ marginBottom: 10 }} wrap>
         <Input.Search placeholder="全文搜索（FTS5，仅已生效经验）" style={{ width: 240 }}
           onSearch={(v) => { setQ(v); setSearched(true) }} allowClear
@@ -373,13 +467,15 @@ function ExpLibraryPanel() {
             {
               title: '经验', dataIndex: 'title', ellipsis: true,
               render: (v: string, r) => (
-                <Space direction="vertical" size={0}>
+                <Space orientation="vertical" size={0}>
                   <Space wrap>
                     <Text>{v}</Text>
                     <Tag color={STAGE_TONE[r.stage ?? ''] ?? 'default'}>{r.stage}</Tag>
                     {r.auto_merged === 1 ? <Tag color="purple">🤖 自动</Tag> : <Tag>👤 人工</Tag>}
-                    <StatusBadge text={({ active: '已生效', rolled_back: '已回滚', rejected: '已驳回', pending_review: '待审核' } as Record<string, string>)[r.status ?? ''] ?? r.status ?? ''}
-                      tone={({ active: 'ok', rolled_back: 'rolled_back' } as Record<string, string>)[r.status ?? ''] ?? 'mute'} />
+                    <Tooltip title={({ active: '已注入后续 Agent 决策', rolled_back: '已停止注入 Agent', rejected: '人工驳回，未生效', pending_review: '待 M2/M3 审核' } as Record<string, string>)[r.status ?? ''] ?? '按后端状态展示'}>
+                      <span><StatusBadge text={({ active: '已生效', rolled_back: '已回滚', rejected: '已驳回', pending_review: '待审核' } as Record<string, string>)[r.status ?? ''] ?? r.status ?? ''}
+                        tone={({ active: 'ok', rolled_back: 'rolled_back' } as Record<string, string>)[r.status ?? ''] ?? 'mute'} /></span>
+                    </Tooltip>
                     {IMPACT_BADGE[r.impact ?? 'low']}
                   </Space>
                   <Text type="secondary" style={{ fontSize: 12 }}>{r.body.slice(0, 60)}{r.body.length > 60 ? '…' : ''}</Text>
@@ -396,7 +492,7 @@ function ExpLibraryPanel() {
           ]}
           expandable={{
             expandedRowRender: (r) => (
-              <Space direction="vertical" size={4}>
+              <Space orientation="vertical" size={4}>
                 <div><b>正文：</b>{r.body}</div>
                 <Text type="secondary">来源：{r.source_summary ?? '（无来源摘要）'} · 任务 {r.source_task_id ?? '—'}</Text>
                 <Text type="secondary">影响 {r.impact} · 创建 {String(r.created_at ?? '').slice(0, 16)} · 最后审核 {r.last_reviewed_at ?? '—'}</Text>
@@ -427,6 +523,7 @@ function ExpSettingsPanel() {
   // 后端 config 全 string → number 化（加载完成同步一次状态）
   useEffect(() => {
     if (cfg) {
+      // eslint-disable-next-line react/set-state-in-effect
       setConf(Number(cfg.confidence_threshold) || 0.85)
       setAuto(cfg.auto_merge_enabled === '1')
       setSleep(Number(cfg.worker_sleep_sec) || 3)
@@ -434,7 +531,9 @@ function ExpSettingsPanel() {
     }
   }, [cfg])
 
-  if (isError) return <ErrorCard title="设置加载失败" message={error?.message} onRetry={() => refetch()} />
+  const intro = <ModuleHint message="M5 设置" description="经验提炼阈值、AI 提示词热加载等系统配置。" />
+
+  if (isError) return <>{intro}<ErrorCard title="设置加载失败" message={error?.message} onRetry={() => refetch()} /></>
 
   const save = async () => {
     try {
@@ -450,7 +549,8 @@ function ExpSettingsPanel() {
   }
 
   return (
-    <Space direction="vertical" style={{ width: '100%', maxWidth: 520 }} size={16}>
+    <Space orientation="vertical" style={{ width: '100%', maxWidth: 520 }} size={16}>
+      {intro}
       <Card size="small" title="分流策略" style={{ background: 'var(--bg-input)' }}>
         <div style={{ marginBottom: 8 }}>自动合并置信阈值：<Text strong>{conf.toFixed(2)}</Text></div>
         <Slider min={0.5} max={0.95} step={0.05} value={conf} onChange={setConf} />
@@ -485,14 +585,29 @@ function ExpPanelRoot() {
   const [tab, setTab] = useState('M1')
   const [selEid, setSelEid] = useState<number | null>(null)
   return (
-    <div>
-      <Segmented value={tab} onChange={(v) => setTab(String(v))} options={TABS} style={{ marginBottom: 14 }} />
-      {tab === 'M1' && <ExpQueuePanel />}
-      {tab === 'M2' && <ExpDigestPanel onGoHigh={(eid) => { setSelEid(eid); setTab('M3') }} />}
-      {tab === 'M3' && <ExpReviewPanel selEid={selEid} setSelEid={setSelEid} />}
-      {tab === 'M4' && <ExpLibraryPanel />}
-      {tab === 'M5' && <ExpSettingsPanel />}
-    </div>
+    <Space orientation="vertical" style={{ width: '100%' }} size={12}>
+      <Card>
+        <Alert type="info" showIcon title="经验沉淀模块"
+          description={(
+            <Space orientation="vertical" size={2}>
+              <Text>Agent 执行后提炼出的规则、标准、经验，经人工审核后写入偏好档案，影响后续 Agent 决策。</Text>
+              <Text>M1 沉淀队列：任务完成后的经验摘要暂存区，等待 Worker 识别。</Text>
+              <Text>M2 每日 Digest：低影响经验批量过目，高影响自动转 M3。</Text>
+              <Text>M3 高影响审核：涉及规则/标准修改，必须人工两步确认。</Text>
+              <Text>M4 经验库：查看已生效、已回滚、已驳回经验并支持回滚。</Text>
+              <Text>M5 设置：配置经验提炼阈值、Worker 与热加载参数。</Text>
+            </Space>
+          )} />
+      </Card>
+      <Card>
+        <Segmented value={tab} onChange={(v) => setTab(String(v))} options={TABS} style={{ marginBottom: 14 }} />
+        {tab === 'M1' && <ExpQueuePanel />}
+        {tab === 'M2' && <ExpDigestPanel onGoHigh={(eid) => { setSelEid(eid); setTab('M3') }} />}
+        {tab === 'M3' && <ExpReviewPanel selEid={selEid} setSelEid={setSelEid} />}
+        {tab === 'M4' && <ExpLibraryPanel />}
+        {tab === 'M5' && <ExpSettingsPanel />}
+      </Card>
+    </Space>
   )
 }
 

@@ -1,4 +1,6 @@
 """D' 板块前瞻：硬公式关键分支与三窗口落库测试。"""
+import time
+
 from app.datasource.akshare_source import AkshareSource
 from app.services import sector_forward_view
 
@@ -32,6 +34,7 @@ def test_high_box_and_surge_raise_risk(monkeypatch):
     result = sector_forward_view.run_sector_forward("2026-08-28")
     item = saved["items"][0]
     assert result["success"] is True
+    assert item["trade_date"] == "2026-08-28"
     assert item["exhaustion_risk"] >= 0.6
     assert item["chase_risk"] >= 0.6
     assert item["forward_bias"] == "fade"
@@ -74,6 +77,17 @@ def test_sector_tag_written_to_forecast_payload(monkeypatch):
                    {"A": {"box60_pct": 80}})
     sector_forward_view.run_sector_forward("2026-08-28")
     assert saved["items"][0]["sector_tag"] == "fade_warn"
+
+
+def test_fetch_boxes_timeout_degrades_to_empty(monkeypatch):
+    def slow_fetch(self, names):
+        time.sleep(0.3)
+        return {"A": {"box60_pct": 80}}
+
+    monkeypatch.setattr(sector_forward_view.settings, "datasource_timeout", 0.1)
+    monkeypatch.setattr(AkshareSource, "fetch_board_box_positions", slow_fetch)
+
+    assert sector_forward_view._fetch_boxes(["A"]) == {}
 
 
 def test_sector_forward_task_skips_refresh_when_target_snapshot_exists(monkeypatch):

@@ -67,6 +67,12 @@ def _task_audit_pending(params: dict) -> dict:
                               limit=params.get("limit", 50))
 
 
+def _task_audit_one(params: dict) -> dict:
+    """手动触发单条建议辩证审核；耗时 LLM 调用必须走后台任务。"""
+    from app.agents.audit import trigger_audit_for_suggestion
+    return trigger_audit_for_suggestion(int(params.get("suggestion_id") or 0))
+
+
 _TASK_KINDS: dict[str, tuple[str, object]] = {
     "daily_pipeline": ("每日挖掘（Discover → 候选打分）", _task_daily_pipeline),
     "market_intel": ("市场研判（Market Intel）", lambda p: _task_market_intel()),
@@ -99,6 +105,7 @@ _TASK_KINDS: dict[str, tuple[str, object]] = {
     "track_suggest": ("选股验证建议生成", lambda p: _task_track_suggest()),
     "experience_worker": ("经验沉淀识别", lambda p: _task_experience_worker()),
     "audit_pending": ("建议辩证审核", lambda p: _task_audit_pending(p)),
+    "audit_one": ("单条建议辩证审核", lambda p: _task_audit_one(p)),
 }
 
 
@@ -1043,14 +1050,10 @@ def get_audit_log_detail(target_type: str, target_id: int):
 
 @router.post("/audit/re_audit/{suggestion_id}")
 def re_audit_suggestion(suggestion_id: int):
-    """手动触发单条建议 AI 审核；不改表结构，不推进 cron 游标。"""
-    from app.agents.audit import trigger_audit_for_suggestion
-    try:
-        return trigger_audit_for_suggestion(suggestion_id)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    """手动触发单条建议 AI 审核；提交后台任务，不在 HTTP 请求里等待 LLM。"""
+    if repo.get_agent_suggestion(suggestion_id) is None:
+        raise HTTPException(status_code=404, detail="建议不存在")
+    return _submit_task("audit_one", {"suggestion_id": suggestion_id})
 
 
 def _coerce_value(raw: str):

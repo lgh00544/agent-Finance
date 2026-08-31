@@ -1,6 +1,8 @@
 """C' 行情结构识别：四个纯代码场景，不触网。"""
-from app.services import sector_regime
+import time
+
 from app.datasource.akshare_source import AkshareSource
+from app.services import sector_regime
 
 
 def _fixture(monkeypatch, current, history, boxes=None, days=None):
@@ -83,3 +85,14 @@ def test_single_day_strength_does_not_become_mainline(monkeypatch):
     assert result["current_regime"] != "mainline"
     assert result["evidence"]["data_insufficient"] is True
     assert result["regime_confidence"] == 0.2
+
+
+def test_fetch_boxes_timeout_degrades_to_empty(monkeypatch):
+    def slow_fetch(self, names):
+        time.sleep(0.3)
+        return {"A": {"box60_pct": 80}}
+
+    monkeypatch.setattr(sector_regime.settings, "datasource_timeout", 0.1)
+    monkeypatch.setattr(AkshareSource, "fetch_board_box_positions", slow_fetch)
+
+    assert sector_regime._fetch_boxes(["A"]) == {}
