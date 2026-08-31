@@ -23,6 +23,10 @@ export const adoptSuggestion = (sid: number, confirm = false): Promise<Record<st
 export const rejectSuggestion = (sid: number, reason = ''): Promise<Record<string, unknown>> =>
   post(`/agent-suggestions/${sid}/reject`, reason ? { reason } : undefined)
 
+/** POST /api/agent-suggestions/{id}/re_review */
+export const reReviewSuggestion = (sid: number): Promise<Record<string, unknown>> =>
+  post(`/agent-suggestions/${sid}/re_review`)
+
 /** GET /api/rule-changes */
 export const ruleChanges = (
   status?: string,

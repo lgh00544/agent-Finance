@@ -1,7 +1,7 @@
 import { App, Button, Descriptions, Popover, Space, Table, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { agentSuggestions, ruleChanges, rollbackRuleChange } from '@/api/suggestions'
-import { getAuditLogFull } from '@/api/audit'
+import { getAuditLogFull, reAuditSuggestion } from '@/api/audit'
 import { EmptyState, StatusBadge } from '@/components/common'
 
 const { Text } = Typography
@@ -24,6 +24,7 @@ const AUDIT_TONE: Record<string, { label: string; tone: string }> = {
 }
 
 const val = (v: unknown) => String(v ?? '').trim() || '—'
+const desc = (items: Array<[string, string | number]>) => <Descriptions size="small" column={1} items={items.map(([label, children]) => ({ label, children }))} />
 
 function AuditPopoverContent({ sid, sug }: { sid: number; sug: Record<string, unknown> }) {
   const { data: log } = useQuery({ queryKey: ['audit-log', 'agent_suggestion', sid], queryFn: () => getAuditLogFull('agent_suggestion', sid), enabled: !!sid, staleTime: 30_000, retry: 0 })
@@ -57,6 +58,24 @@ function AuditPopoverContent({ sid, sug }: { sid: number; sug: Record<string, un
         </Descriptions>
       )}
     </div>
+  )
+}
+
+function ExpandedRuleChange({ r, sug }: { r: Record<string, unknown>; sug: Record<string, unknown> }) {
+  const sid = Number(r.source_suggestion_id ?? 0)
+  const { data: log } = useQuery({ queryKey: ['audit-log', 'agent_suggestion', sid], queryFn: () => getAuditLogFull('agent_suggestion', sid), enabled: !!sid, staleTime: 30_000, retry: 0 })
+  const verdict = String(sug.audit_verdict || r.audit_verdict || 'pending')
+  const ruleText = val(sug.rule_text) === val(sug.suggested_value) ? '—' : val(sug.rule_text)
+  return (
+    <Space direction="vertical" size={10} style={{ width: '100%' }}>
+      <div><Text strong>原建议</Text>{desc([
+        ['规则名', val(sug.rule_name ?? r.rule_name)], ['当前值', val(sug.current_value)], ['建议值', val(sug.suggested_value ?? r.after_text)], ['原因', val(sug.reason)], ['依据', val(sug.evidence)], ['问题', val(sug.problem_desc)], ['规则条文', ruleText], ['风险', val(sug.risk_note)], ['状态', `${val(sug.status)} / ${val(sug.reject_reason)}`],
+      ])}</div>
+      <div><Text strong>AI 审核</Text>{desc(!log || verdict === 'pending'
+        ? [['结论', '⏳ 未审核 — 等待 03:30 cron 或点击右上方“重新审核”按钮手动触发'], ['轮次', val(sug.audit_round ?? r.audit_round ?? 0)]]
+        : [['结论', `${val(log.verdict)} / 第${val(log.round)}轮 / ${val(log.confidence)}`], ['支持', val(log.support_view)], ['反对', val(log.dissent_view)], ['边界', val(log.boundary_cases)], ['证据', Array.isArray(log.evidence_refs) ? log.evidence_refs.join(', ') : val(log.evidence_refs)], ['模型', `${val(log.audit_model)} / ${val(log.created_at)}`], ['原始 reasoning', val(log.reasoning).slice(0, 300)]])}</div>
+      <div><Text strong>变更记录元信息</Text>{desc([['来源复盘', val(r.review_id)], ['创建时间', val(r.created_at)]])}</div>
+    </Space>
   )
 }
 
@@ -100,6 +119,20 @@ export function RuleChangesPage() {
       },
     })
   }
+  const reAudit = (r: Record<string, unknown>) => {
+    const sid = Number(r.source_suggestion_id ?? 0)
+    modal.confirm({
+      title: `重新审核建议：${val(r.rule_name)}`, okText: '重新审核',
+      onOk: async () => {
+        try {
+          await reAuditSuggestion(sid)
+          message.success('已触发重新审核')
+          qc.invalidateQueries({ queryKey: ['agent-suggestions-audit'] })
+          qc.invalidateQueries({ queryKey: ['audit-log', 'agent_suggestion', sid] })
+        } catch (e) { message.error(e instanceof Error ? e.message : '重新审核失败'); return Promise.reject() }
+      },
+    })
+  }
 
   const cols = [
     { title: '归属 Agent', dataIndex: 'target_agent', width: 100, render: (v: string) => <Text strong>[{v ?? '—'}]</Text> },
@@ -114,26 +147,29 @@ export function RuleChangesPage() {
       render: (v: string) => <Tag color={STATUS[v]?.color ?? 'default'}>{STATUS[v]?.label ?? v}</Tag>,
     },
     {
-      title: 'AI 审核', key: 'audit', width: 90,
+      title: 'AI 审核', key: 'audit', width: 130,
       render: (_: unknown, r: Record<string, unknown>) => {
         const sid = Number(r.source_suggestion_id ?? 0)
-        const sug = sugById.get(sid)
-        if (!sug) return <Text type="secondary">—</Text>
-        const v = String((sug as unknown as Record<string, unknown>).audit_verdict ?? '')
+        const sug = (sugById.get(sid) ?? r) as unknown as Record<string, unknown>
+        const v = String(sug.audit_verdict ?? 'pending')
         const m = AUDIT_TONE[v]
         if (!m) return <Text type="secondary">—</Text>
         return (
-          <Popover trigger="hover" content={<AuditPopoverContent sid={sid} sug={sug as unknown as Record<string, unknown>} />}>
-            <StatusBadge text={m.label} tone={m.tone} />
+          <Popover trigger="hover" content={<AuditPopoverContent sid={sid} sug={sug} />}>
+            {v === 'pending' ? <Tag color="orange">⏳ 待审</Tag>
+              : <StatusBadge text={m.label} tone={m.tone} />}
           </Popover>
         )
       },
     },
     { title: '时间', dataIndex: 'created_at', width: 150, render: (v: string) => String(v ?? '').slice(0, 16) },
     {
-      title: '操作', key: 'ops', width: 90,
-      render: (_: unknown, r: { id: number; status?: string; rule_name?: string }) => r.status === 'active' ? (
-        <Button size="small" danger onClick={() => rollback(r)}>回滚</Button>
+      title: '操作', key: 'ops', width: 160,
+      render: (_: unknown, r: Record<string, unknown>) => r.status === 'active' ? (
+        <Space size={4}>
+          <Button size="small" danger onClick={() => rollback(r as { id: number; rule_name?: string })}>回滚</Button>
+          {['pending', 'fail'].includes(String(r.audit_verdict ?? 'pending')) ? <Button size="small" type="default" onClick={() => reAudit(r)}>重新审核</Button> : null}
+        </Space>
       ) : null,
     },
   ]
@@ -146,10 +182,7 @@ export function RuleChangesPage() {
       <Table size="small" rowKey="id" dataSource={list} columns={cols} pagination={{ pageSize: 20 }}
         expandable={{
           expandedRowRender: (r) => (
-            <div>
-              <div><b>变更后：</b>{r.after_text}</div>
-              <div><Text type="secondary">来源复盘 {r.review_id ?? '—'} · 归属 {r.target_agent ?? '—'}</Text></div>
-            </div>
+            <ExpandedRuleChange r={r as Record<string, unknown>} sug={(sugById.get(Number(r.source_suggestion_id ?? 0)) ?? r) as Record<string, unknown>} />
           ),
         }} />
     </div>

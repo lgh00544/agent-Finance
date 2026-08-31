@@ -86,3 +86,25 @@ def run_pending_audits(cutoff_id: int = 0, last_scanned_id: int | None = None,
         cursor = max(cursor, s.id)
     repo.set_config("audit_cursor.last_id", str(cursor))
     return {"audited": audited, "rethunk": rethunk, "cursor": cursor}
+
+
+def trigger_audit_for_suggestion(suggestion_id: int) -> dict:
+    """手动触发单条建议审核：仅 pending/fail 跑一次，不推进批量游标。"""
+    s = repo.get_agent_suggestion(suggestion_id)
+    if s is None:
+        raise LookupError("建议不存在")
+    verdict = s.audit_verdict or "pending"
+    if verdict not in ("pending", "fail"):
+        raise ValueError(f"仅待审/驳回建议可重新审核（{verdict}）")
+    if verdict == "fail":
+        repo.update_agent_suggestion_audit(s.id, "pending", s.audit_round or 0, s.last_audit_id)
+    nxt = (s.audit_round or 0) + 1
+    prev_dissent = ""
+    if nxt >= 2 and s.last_audit_id:
+        prev_log = repo.get_audit_log(s.last_audit_id)
+        prev_dissent = prev_log.dissent_view if prev_log else ""
+    t0 = time.time()
+    out = llm_re_audit(s, prev_dissent) if nxt >= 2 else llm_audit(s)
+    log_id = _persist(s, nxt, out, int((time.time() - t0) * 1000))
+    return {"audited": True, "suggestion_id": suggestion_id, "verdict": out.verdict,
+            "round": nxt, "audit_log_id": log_id}

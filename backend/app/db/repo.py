@@ -2238,6 +2238,21 @@ def update_agent_suggestion_status(suggestion_id: int, status: str,
         return row
 
 
+def reset_agent_suggestion_to_pending(suggestion_id: int) -> AgentSuggestion | None:
+    """重新审核：仅 rejected → pending，并清空驳回原因。"""
+    with SessionLocal() as db:
+        row = db.get(AgentSuggestion, suggestion_id)
+        if row is None:
+            return None
+        if row.status != "rejected":
+            return row
+        row.status = "pending"
+        row.reject_reason = ""
+        db.commit()
+        db.refresh(row)
+        return row
+
+
 def update_agent_suggestion_notes(suggestion_id: int, conflict_note: str = "",
                                   dedup_note: str = "") -> None:
     """校验拦截回填：采纳被拦时把冲突/去重说明写回建议记录（前端直接展示原因）"""

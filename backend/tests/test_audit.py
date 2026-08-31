@@ -59,6 +59,20 @@ def test_pending_scan_respects_cutoff_and_cursor(monkeypatch):
     assert repo.get_config("audit_cursor.last_id") == str(new)
 
 
+def test_manual_re_audit_endpoint_runs_one_suggestion(monkeypatch):
+    from fastapi import HTTPException
+    from app.api.routes import re_audit_suggestion
+
+    sid = _mk_suggestion()
+    monkeypatch.setattr("app.agents.audit.llm_audit", lambda s: _audit_out("pass"))
+    res = re_audit_suggestion(sid)
+    row = repo.get_agent_suggestion(sid)
+    assert res["audited"] is True and row.audit_verdict == "pass" and row.audit_round == 1
+    with pytest.raises(HTTPException) as ei:
+        re_audit_suggestion(sid)
+    assert ei.value.status_code == 400
+
+
 def test_round2_still_fail_no_round3(monkeypatch):
     """④ round1 fail → rethink 触发 + 游标不越过；round2 仍 fail → 定格 round2，不再第 3 轮"""
     sid = _mk_suggestion()

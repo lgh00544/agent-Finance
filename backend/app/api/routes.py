@@ -1041,6 +1041,18 @@ def get_audit_log_detail(target_type: str, target_id: int):
     return row
 
 
+@router.post("/audit/re_audit/{suggestion_id}")
+def re_audit_suggestion(suggestion_id: int):
+    """手动触发单条建议 AI 审核；不改表结构，不推进 cron 游标。"""
+    from app.agents.audit import trigger_audit_for_suggestion
+    try:
+        return trigger_audit_for_suggestion(suggestion_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _coerce_value(raw: str):
     """建议值字符串 → 合理类型（数字/布尔/列表原样，其余保留字符串）"""
     import json
@@ -1087,6 +1099,18 @@ def reject_agent_suggestion(sid: int, body: RejectSuggestionBody | None = None):
     reason = (body.reason if body else "") or ""
     repo.update_agent_suggestion_status(sid, "rejected", reason=reason)
     return {"rejected": True, "suggestion_id": sid, "reason": reason}
+
+
+@router.post("/agent-suggestions/{sid}/re_review")
+def re_review_agent_suggestion(sid: int):
+    """重新审核：仅允许已驳回建议回到待审核，并清空驳回原因。"""
+    suggestion = repo.get_agent_suggestion(sid)
+    if suggestion is None:
+        raise HTTPException(status_code=404, detail="建议不存在")
+    if suggestion.status != "rejected":
+        raise HTTPException(status_code=400, detail=f"仅已驳回建议可重新审核（{suggestion.status}）")
+    row = repo.reset_agent_suggestion_to_pending(sid)
+    return {"re_reviewed": True, "suggestion_id": sid, "status": row.status}
 
 
 # ================= 一键采纳自动落地（规则存库 + agent_call 动态注入，绝不写源码文件） =================
@@ -1188,7 +1212,13 @@ def list_rule_changes(status: Optional[str] = None, target_agent: Optional[str] 
                       suggestion_id: Optional[int] = None, limit: int = 50):
     """规则变更记录（一键采纳/回滚全量留痕，时间倒序；记录页数据源；
     suggestion_id 过滤供复盘页回显某条建议的生效记录）"""
-    return repo.list_rule_changes(status, target_agent, suggestion_id, limit)
+    rows = repo.list_rule_changes(status, target_agent, suggestion_id, limit)
+    for row in rows:
+        sug = repo.get_agent_suggestion(row.get("source_suggestion_id") or 0)
+        row["audit_verdict"] = getattr(sug, "audit_verdict", None) or "pending"
+        row["audit_round"] = getattr(sug, "audit_round", 0) or 0
+        row["last_audit_id"] = getattr(sug, "last_audit_id", None)
+    return rows
 
 
 @router.get("/rule-changes/{rid}")

@@ -13,8 +13,9 @@ from sqlalchemy import delete, inspect
 
 from app.agents.common import HARD_RULES, dynamic_rules_section
 from app.api.routes import (AdoptSuggestionBody, RollbackRuleBody, _validate_adopt,
-                            adopt_agent_suggestion, approve_agent_suggestion,
-                            rollback_rule_change as rollback_route)
+                             adopt_agent_suggestion, approve_agent_suggestion,
+                             re_review_agent_suggestion,
+                             rollback_rule_change as rollback_route)
 from app.db import repo
 from app.db.models import AgentSuggestion, RuleChange
 from app.db.session import SessionLocal, engine, init_db
@@ -216,6 +217,18 @@ def test_profile_approve_flow_unaffected():
     with pytest.raises(HTTPException) as ei:
         approve_agent_suggestion(sid2)
     assert ei.value.status_code == 400 and "adopt" in ei.value.detail
+
+
+def test_re_review_rejected_suggestion_resets_to_pending():
+    sid = _make_suggestion("规则文本")
+    repo.update_agent_suggestion_status(sid, "rejected", reason="证据不足")
+    res = re_review_agent_suggestion(sid)
+    row = repo.get_agent_suggestion(sid)
+    assert res["status"] == "pending"
+    assert row.status == "pending" and row.reject_reason == ""
+    with pytest.raises(HTTPException) as ei:
+        re_review_agent_suggestion(sid)
+    assert ei.value.status_code == 400
 
 
 # ==================== 5. 回滚 ====================

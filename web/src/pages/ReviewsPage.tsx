@@ -23,7 +23,7 @@ import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { get } from '@/api/client'
 import { portfolioAttribution, reviews, stockCycleAttribution } from '@/api/reviews'
 import { candidateTradeable } from '@/api/candidates'
-import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion } from '@/api/suggestions'
+import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion, reReviewSuggestion } from '@/api/suggestions'
 import { trackVerifyDates, trackVerifyList, trackVerifyStats, runTrackVerify, runTrackSuggest } from '@/api/track'
 import { traceDetail, traces } from '@/api/traces'
 import { ChartCard } from '@/components/charts/ChartCard'
@@ -37,6 +37,32 @@ const SUG_STATUS: Record<string, { label: string; color: string }> = {
   approved: { label: '已采纳', color: 'green' },
   adopted: { label: '已采纳', color: 'green' },
   rejected: { label: '已驳回', color: 'default' },
+}
+
+function openRejectConfirm(
+  modal: ReturnType<typeof App.useApp>['modal'],
+  message: ReturnType<typeof App.useApp>['message'],
+  title: string,
+  submit: (reason: string) => Promise<unknown>,
+  refresh: () => void,
+  success = '已驳回',
+) {
+  let reason = ''
+  let inst: ReturnType<typeof modal.confirm> | undefined
+  const updateReason = (value: string) => {
+    reason = value
+    inst?.update({ okButtonProps: { danger: true, disabled: !reason.trim() } })
+  }
+  inst = modal.confirm({
+    title, okText: '提交', cancelText: '取消', okButtonProps: { danger: true, disabled: true },
+    content: <Input.TextArea rows={3} placeholder="请录入驳回原因" onChange={(e) => updateReason(e.target.value)} />,
+    onOk: async () => {
+      const text = reason.trim()
+      if (!text) { message.warning('请录入驳回原因'); return Promise.reject(new Error('missing reject reason')) }
+      try { await submit(text); message.success(success); refresh() }
+      catch (e) { message.error(e instanceof Error ? e.message : '驳回失败'); return Promise.reject(e) }
+    },
+  })
 }
 // AI 自动决策记录：模块（target_agent）→ 中文
 const MODULE_LABEL: Record<string, string> = {
@@ -97,6 +123,7 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
   // 批5 留痕展开：点开才单查 traceDetail → 解析 ext_info，渲染 agentic 思考/工具轨迹（非 agentic 仅回退摘要）
   const [expandedTrace, setExpandedTrace] = useState<number | null>(null)
   const [traceExt, setTraceExt] = useState<Record<string, unknown> | null>(null)
+  // oxlint-disable-next-line react/set-state-in-effect
   useEffect(() => { setExpandedTrace(null); setTraceExt(null) }, [r?.id])
   const toggleTraceDetail = async (id: number) => {
     if (expandedTrace === id) { setExpandedTrace(null); return }
@@ -122,14 +149,8 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
       catch (e) { message.error(e instanceof Error ? e.message : '采纳失败') }
     },
   })
-  const reject = () => modal.confirm({
-    title: '驳回该建议', okText: '确认驳回', okButtonProps: { danger: true },
-    content: '驳回后该建议标记为「已驳回」，不写入偏好档案；可在策略闭环建议列表重新处理。',
-    onOk: async () => {
-      try { await rejectSuggestion(r.id, '人工驳回'); message.success('已驳回'); qc.invalidateQueries({ queryKey: ['reviews'] }) }
-      catch (e) { message.error(e instanceof Error ? e.message : '驳回失败') }
-    },
-  })
+  const reject = () => openRejectConfirm(modal, message, '驳回该建议',
+    (reason) => rejectSuggestion(r.id, reason), () => qc.invalidateQueries({ queryKey: ['reviews'] }))
 
   const klineRows = klines ?? []
   const klineOption: EChartsOption | null = klineRows.length ? {
@@ -251,21 +272,8 @@ function ReviewsList() {
   const winRate = list.length ? (winCount / list.length) * 100 : null
   const avgHold = list.length ? list.reduce((s, r) => s + (r.hold_days ?? 0), 0) / list.length : 0
 
-  const openFeedback = (s: AgentSuggestion) => {
-    let reason = ''
-    modal.confirm({
-      title: '对这条 AI 自动决策提意见（以「驳回 + 理由」记录）',
-      content: <Input.TextArea rows={3} placeholder="说明不同意的理由…" onChange={(e) => { reason = e.target.value }} />,
-      okText: '提交', cancelText: '取消', okButtonProps: { danger: true },
-      onOk: async () => {
-        try {
-          await rejectSuggestion(s.id, reason.trim() || '人工驳回')
-          message.success('已记录驳回意见')
-          qc.invalidateQueries({ queryKey: ['agent-sug'] })
-        } catch (e) { message.error(e instanceof Error ? e.message : '提交失败') }
-      },
-    })
-  }
+  const openFeedback = (s: AgentSuggestion) => openRejectConfirm(modal, message, '对这条 AI 自动决策提意见（以「驳回 + 理由」记录）',
+    (reason) => rejectSuggestion(s.id, reason), () => qc.invalidateQueries({ queryKey: ['agent-sug'] }), '已记录驳回意见')
 
   const cols = [
     {
@@ -837,14 +845,18 @@ function Suggestions() {
   if (!list.length) return <EmptyState text="暂无优化建议。" icon="💡" />
 
   const act = (r: (typeof list)[number], action: 'approve' | 'adopt' | 'reject') => {
+    if (action === 'reject') {
+      openRejectConfirm(modal, message, `驳回建议：${r.rule_name}`,
+        (reason) => rejectSuggestion(r.id, reason), () => qc.invalidateQueries({ queryKey: ['agent-sug'] }))
+      return
+    }
     const confirmMap: Record<string, { title: string; fn: () => Promise<unknown> }> = {
       approve: { title: `确认采纳建议：${r.rule_name}`, fn: () => approveSuggestion(r.id) },
       adopt: { title: `应用生效：${r.rule_name}（硬规则需二次确认）`, fn: () => adoptSuggestion(r.id, r.rule_type === 'hard') },
-      reject: { title: `驳回建议：${r.rule_name}`, fn: () => rejectSuggestion(r.id, '人工驳回') },
     }
     modal.confirm({
       title: confirmMap[action].title,
-      okText: '确认', okButtonProps: action === 'reject' ? { danger: true } : { type: 'primary' as const },
+      okText: '确认', okButtonProps: { type: 'primary' as const },
       onOk: async () => {
         try {
           await confirmMap[action].fn()
@@ -857,6 +869,13 @@ function Suggestions() {
 
   const byStatus = (st: string) => list.filter((s) => s.status === st).length
   const hardCount = list.filter((s) => s.rule_type === 'hard').length
+  const reReview = async (r: (typeof list)[number]) => {
+    try {
+      await reReviewSuggestion(r.id)
+      message.success('已重新进入待审核')
+      qc.invalidateQueries({ queryKey: ['agent-sug'] })
+    } catch (e) { message.error(e instanceof Error ? e.message : '重新审核失败') }
+  }
 
   return (
     <>
@@ -866,7 +885,7 @@ function Suggestions() {
         <StatCard label="待审建议" value={byStatus('pending')} tone={byStatus('pending') ? 'warn' : 'mute'} sub="需人工审核后生效" />
         <StatCard label="已通过" value={byStatus('approved')} tone="ok" sub="待应用生效" />
         <StatCard label="已采纳生效" value={byStatus('adopted')} tone="ok" sub="已写入偏好/规则" />
-        <StatCard label="已驳回" value={byStatus('rejected')} tone="mute" sub="含人工驳回" />
+        <StatCard label="已驳回" value={byStatus('rejected')} tone="mute" sub="含驳回留痕" />
       </StatCardGrid>
       <Space wrap style={{ margin: '10px 0' }}>
         <Text type="secondary">规则类型：</Text>
@@ -887,7 +906,12 @@ function Suggestions() {
           { title: '规则', dataIndex: 'rule_name', ellipsis: true },
           { title: '当前→建议', key: 'val', width: 160, render: (_: unknown, r: (typeof list)[number]) => <Text>{(r.current_value ?? '—')} → {r.suggested_value ?? '—'}</Text> },
           { title: '时间', dataIndex: 'created_at', width: 130, render: (v: string) => String(v ?? '').slice(0, 16) },
-          { title: '状态', dataIndex: 'status', width: 80, render: (v: string) => <Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? v}</Tag> },
+          { title: '状态', dataIndex: 'status', width: 150, render: (v: string, r: (typeof list)[number]) => (
+            <Space direction="vertical" size={0}>
+              <Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? v}</Tag>
+              {v === 'rejected' ? <Text type="secondary" style={{ fontSize: 12 }}>驳回原因：{String(r.reject_reason || '（未录入原因）')}</Text> : null}
+            </Space>
+          ) },
           {
             title: '操作', key: 'ops', width: 200,
             render: (_: unknown, r: (typeof list)[number]) => (
@@ -897,6 +921,7 @@ function Suggestions() {
                   : <Button size="small" onClick={() => act(r, 'adopt')}>应用生效</Button>
                 ) : null}
                 {r.status === 'pending' ? <Button size="small" onClick={() => act(r, 'reject')}>驳回</Button> : null}
+                {r.status === 'rejected' ? <Button size="small" type="default" danger onClick={() => reReview(r)}>重新审核</Button> : null}
               </Space>
             ),
           },

@@ -1,4 +1,4 @@
-import { get } from './client'
+import { get, post } from './client'
 import type { AgentSuggestion } from '@/types'
 
 export interface AuditStat {
@@ -47,3 +47,6 @@ export const getAuditLogFull = async (
   targetId: number,
 ): Promise<Record<string, unknown>> =>
   await get('/audit-log', { target_type: targetType, target_id: targetId })
+
+export const reAuditSuggestion = (sid: number): Promise<Record<string, unknown>> =>
+  post(`/audit/re_audit/${sid}`)
