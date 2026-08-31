@@ -16,6 +16,10 @@ class RouteIntent(BaseModel):
     intent: str = Field(description="11 类意图之一（仅枚举，不得自造）")
     params: RouteParams = RouteParams()
     reply_hint: str = Field(default="", description="用户意图一句话摘要")
+    target_agent: str = Field(default="", description="目标 Agent，不确定时留空")
+    workflow_id: str = Field(default="", description="目标 workflow，不确定时留空")
+    required_params: list[str] = Field(default_factory=list, description="执行所需参数名")
+    permission_note: str = Field(default="", description="协作权限说明，不确定时留空")
 
 
 SYSTEM_PROMPT = """你是股票决策系统的意图识别器。把用户消息映射到唯一意图并提取标的。
@@ -26,10 +30,13 @@ SYSTEM_PROMPT = """你是股票决策系统的意图识别器。把用户消息�
 - help 帮助/系统状态   chat 闲聊/知识问答/无把握
 标的提取：用户提到股票时 params.code 填 6 位数字（如 600519），params.name 填名称（如 贵州茅台）。
 chat 意图时 params.agent 填最相关 Agent（discover/score/position/monitor/sell/review）。
-无法明确执行意图、信息不足或闲聊 → intent=chat，绝不瞎猜执行。只输出 JSON。"""
+系统地图：目标 Agent/workflow 必须来自已注册能力；未知能力 → intent=chat，绝不执行。
+路由可优先参考系统地图和协作关系，但只输出短字段，不要复述完整地图。无法明确执行意图、信息不足或闲聊 → intent=chat，绝不瞎猜执行。只输出 JSON。"""
 
 
 def user_prompt(text: str, prev: str) -> str:
     return (f"上轮对话（供「它/那个」指代消解，无关可忽略）：{prev or '（无）'}\n"
             f"用户消息：{text}\n"
-            f"输出 JSON：{{\"intent\":\"...\",\"params\":{{\"code\":\"\",\"name\":\"\",\"agent\":\"\"}},\"reply_hint\":\"...\"}}")
+            f"输出 JSON：{{\"intent\":\"...\",\"params\":{{\"code\":\"\",\"name\":\"\",\"agent\":\"\"}},"
+            f"\"reply_hint\":\"\",\"target_agent\":\"\",\"workflow_id\":\"\","
+            f"\"required_params\":[],\"permission_note\":\"\"}}")

@@ -749,6 +749,19 @@ def llm_final(state: StockAgentState) -> StockAgentState:
         detail = {**existing, **new_detail}
         repo.upsert_candidate(cand.stock_code, cand.stock_name, trade_date,
                               rank, [cand.reason], [cand.risk_notice], snapshot, detail)
+        try:
+            from app.services import knowledge_shadow
+            query = " ".join([
+                str(cand.reason or ""), str(cand.risk_notice or ""),
+                str(cand.focus_type or ""), str(cand.final_advice or ""),
+            ]).strip()
+            knowledge_shadow.record_shadow_hits(
+                agent="discover", stock_code=cand.stock_code, stock_name=cand.stock_name,
+                trade_date=trade_date, query=query,
+                scenario_tags=[cand.focus_type] if cand.focus_type else None,
+            )
+        except Exception as exc:  # noqa: BLE001 shadow 观测失败不阻塞正式候选落库
+            logger.warning("shadow 知识命中记录失败 discover %s: %s", cand.stock_code, exc)
     # 当日快照替换：删除当日不在本次执行结果中的残留候选，保证当日只保留最新一次执行产物。
     # 结果为空（LLM 无输出/数据源故障）时保留既有快照，防止误清空当日候选造成数据丢失
     if candidates:

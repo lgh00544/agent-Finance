@@ -241,7 +241,9 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
                 holding_info, _compact(quote_data), news_context),
             schema=MonitorOutput, ttl_seconds=3600, model_level=ModelLevel.DEEP,
             tools_allowlist=["get_quote", "get_daily_kline", "get_news",
-                             "get_fund_flow", "search_knowledge"],
+                             "get_fund_flow", "search_knowledge",
+                             "get_position_risk", "get_distribution_phase",
+                             "get_capital_view", "get_hot_money_context"],
             max_rounds=4, target_label=f"{name}({code})",
         )
         if _recheck_out is not None:  # 复核成功覆盖；失败(None)回退 LIGHT 结果，不中断

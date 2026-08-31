@@ -3,14 +3,17 @@ REST API：仅提供数据存取与手动触发任务（无任何二次判断逻
 面板等前端不内置研判，全部展示 LLM 输出结论与原始数据。
 """
 import difflib
+import concurrent.futures
 import logging
 import os
 import re
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.agents.review import llm_rethink_suggestion
@@ -20,9 +23,12 @@ from app.graph import router as graph_router
 from app.scheduler import jobs as scheduler_jobs
 from app.services import holding_view, market_view, ocr as ocr_service
 from app.services import status as status_service, task_queue
+from app.system_map import registry as system_map_registry
+from app.system_map import collaboration as collaboration_registry
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
+SYNC_RUN_TIMEOUT_SECONDS = 30
 
 
 # ================= 后台异步任务（耗时操作提交即返回，不阻塞页面） =================
@@ -32,8 +38,12 @@ def _task_batch_import_knowledge(items: list[dict]) -> dict:
     imported = 0
     for item in items:
         if item.get("title") and item.get("content"):
+            meta = {key: item[key] for key in (
+                "source_type", "methodology_type", "market_scope", "scenario_tags",
+                "evidence_level", "valid_from", "valid_to", "status", "risk_note",
+            ) if key in item}
             repo.add_knowledge(str(item["title"]).strip(), str(item["content"]).strip(),
-                               item.get("agent_tag") or "all")
+                               item.get("agent_tag") or "all", **meta)
             imported += 1
     return {"imported": imported}
 
@@ -136,38 +146,69 @@ def _task_sector_rotation() -> dict:
             "error": error}
 
 
-def _task_sector_forward(params: dict) -> dict:
+def _task_sector_forward(params: dict, progress: dict | None = None) -> dict:
     """手动触发：刷新快照 → C' 行情结构 → D' 板块前瞻，不依赖归因子 Agent。"""
     from app.services.sector_daily import refresh_sector_daily_snapshot
     from app.services.sector_forward_view import run_sector_forward
     from app.services.sector_regime import judge_regime
 
-    requested_date = str(params.get("trade_date") or "").strip() or None
-    target_date = requested_date
-    refresh = {"success": True, "trade_date": target_date, "rows": 0,
-               "error": None, "skipped": bool(target_date and repo.list_sector_daily_by_date(target_date))}
-    if not refresh["skipped"]:
-        refresh = refresh_sector_daily_snapshot(target_date)
-    if not refresh.get("success"):
-        return {"success": False, "trade_date": target_date or time.strftime("%Y-%m-%d"),
-                "refresh": refresh, "error": refresh.get("error")}
-    if not target_date:
-        dates = repo.list_sector_daily_dates(limit=1)
-        target_date = refresh.get("trade_date") or (dates[0] if dates else time.strftime("%Y-%m-%d"))
-    regime = judge_regime(target_date)
-    if not regime.get("success"):
-        return {"success": False, "trade_date": regime.get("trade_date"),
-                "refresh": refresh, "regime": regime, "error": regime.get("error")}
-    forward = run_sector_forward(regime.get("trade_date"))
-    return {"success": forward.get("success"), "trade_date": forward.get("trade_date"),
-            "refresh": refresh, "regime": regime, "forward": forward,
-            "error": forward.get("error")}
+    progress = progress if progress is not None else {}
+    try:
+        requested_date = str(params.get("trade_date") or "").strip() or None
+        target_date = requested_date
+        progress.update({"trade_date": target_date, "refresh_done": False,
+                         "snapshot_missing": False})
+        has_snapshot = bool(target_date and repo.list_sector_daily_by_date(target_date))
+        refresh = {"success": True, "trade_date": target_date, "rows": 0,
+                   "error": None, "skipped": has_snapshot}
+        if not refresh["skipped"]:
+            progress["snapshot_missing"] = True
+            refresh = refresh_sector_daily_snapshot(target_date)
+        progress.update({"refresh": refresh, "refresh_done": bool(refresh.get("success"))})
+        if not refresh.get("success"):
+            return {"success": False, "trade_date": target_date or time.strftime("%Y-%m-%d"),
+                    "refresh": refresh, "regime": None, "forward": None,
+                    "error": refresh.get("error")}
+        if not target_date:
+            dates = repo.list_sector_daily_dates(limit=1)
+            target_date = refresh.get("trade_date") or (dates[0] if dates else time.strftime("%Y-%m-%d"))
+            progress["trade_date"] = target_date
+        regime = judge_regime(target_date)
+        progress["regime"] = regime
+        if not regime.get("success"):
+            return {"success": False, "trade_date": regime.get("trade_date"),
+                    "refresh": refresh, "regime": regime, "forward": None,
+                    "error": regime.get("error")}
+        forward = run_sector_forward(regime.get("trade_date"))
+        progress["forward"] = forward
+        return {"success": forward.get("success"), "trade_date": forward.get("trade_date"),
+                "refresh": refresh, "regime": regime, "forward": forward,
+                "error": forward.get("error")}
+    except Exception as exc:  # noqa: BLE001 手动接口返回可诊断信息，不裸 500
+        trace = traceback.format_exc().splitlines()[:5]
+        progress["error_trace"] = trace
+        return {"success": False, "trade_date": progress.get("trade_date"),
+                "refresh": progress.get("refresh"), "regime": progress.get("regime"),
+                "forward": progress.get("forward"), "error": str(exc),
+                "error_trace": trace}
 
 
-def _task_sector_forecast_verify(params: dict) -> dict:
+def _task_sector_forecast_verify(params: dict, progress: dict | None = None) -> dict:
     """手动触发 E'-1 前瞻验证回填，不重新生成预测。"""
     from app.services.sector_forecast_verify import run_sector_forecast_verify
-    return run_sector_forecast_verify(params.get("forecast_date") or params.get("trade_date"))
+    progress = progress if progress is not None else {}
+    try:
+        forecast_date = params.get("forecast_date") or params.get("trade_date")
+        progress["forecast_date"] = forecast_date
+        result = run_sector_forecast_verify(forecast_date)
+        progress["verify"] = result
+        return result
+    except Exception as exc:  # noqa: BLE001 手动接口返回可诊断信息，不裸 500
+        trace = traceback.format_exc().splitlines()[:5]
+        progress["error_trace"] = trace
+        return {"success": False, "forecast_date": progress.get("forecast_date"),
+                "verify": progress.get("verify"), "error": str(exc),
+                "error_trace": trace}
 
 
 def _task_monitor_all() -> dict:
@@ -282,6 +323,74 @@ def _submit_task(kind: str, params: dict) -> dict:
     return {"task_id": tid, "label": label, "status": "pending"}
 
 
+def _sync_run_with_timeout(fn, params: dict, timeout_seconds: int = SYNC_RUN_TIMEOUT_SECONDS) -> dict:
+    """同步手动入口最多等待 timeout_seconds；超时返回 partial，后台线程继续收尾落库。"""
+    progress: dict = {}
+    start = time.time()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn, params, progress)
+    try:
+        result = future.result(timeout=timeout_seconds)
+        elapsed = int(time.time() - start)
+        if isinstance(result, dict):
+            return {**result, "status": "done" if result.get("success", True) else "failed",
+                    "elapsed_sec": elapsed}
+        return {"success": True, "status": "done", "elapsed_sec": elapsed, "result": result}
+    except concurrent.futures.TimeoutError:
+        elapsed = int(time.time() - start)
+        return {
+            "success": False,
+            "status": "running_partial",
+            "elapsed_sec": elapsed,
+            "trade_date": progress.get("trade_date"),
+            "forecast_date": progress.get("forecast_date"),
+            "refresh_done": bool(progress.get("refresh_done")),
+            "snapshot_missing": bool(progress.get("snapshot_missing")),
+            "refresh": progress.get("refresh"),
+            "regime": progress.get("regime"),
+            "forward": progress.get("forward"),
+            "verify": progress.get("verify"),
+            "error": "timeout",
+        }
+    except Exception as exc:  # noqa: BLE001 兜底：HTTP 不裸 500
+        elapsed = int(time.time() - start)
+        trace = traceback.format_exc().splitlines()[:5]
+        return {"success": False, "status": "failed", "elapsed_sec": elapsed,
+                "error": str(exc), "error_trace": trace}
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _table_latest_count(table: str, date_col: str = "trade_date") -> dict:
+    from sqlalchemy import text
+    from app.db.session import SessionLocal
+
+    try:
+        with SessionLocal() as db:
+            latest = db.execute(text(f"SELECT MAX({date_col}) FROM {table}")).scalar()
+            if not latest:
+                return {"latest_date": None, "row_count": 0}
+            count = db.execute(
+                text(f"SELECT COUNT(*) FROM {table} WHERE {date_col} = :d"),
+                {"d": latest},
+            ).scalar()
+            return {"latest_date": latest, "row_count": int(count or 0)}
+    except Exception as exc:  # noqa: BLE001 诊断接口不能因单表异常整体 500
+        return {"latest_date": None, "row_count": 0, "last_error": str(exc)[:500]}
+
+
+def _job_diag(job_key: str) -> dict:
+    from app.cache import cache
+
+    last_run_at = cache.get(f"job:last_{job_key}")
+    last_error = cache.get(f"job:last_{job_key}_error")
+    return {
+        "last_run_at": last_run_at,
+        "last_status": "failed" if last_error else "ok" if last_run_at else "unknown",
+        "last_error": (last_error or "")[:500],
+    }
+
+
 class TaskSubmitBody(BaseModel):
     kind: str = Field(description="任务类型")
     params: dict = Field(default_factory=dict, description="任务参数")
@@ -380,15 +489,46 @@ def run_sector_rotation_job():
 
 
 @router.post("/market/sector-forward/run")
-def run_sector_forward_job():
-    """手动触发行情结构 + 板块前瞻（刷新快照、C'、D'；异步提交）。"""
-    return _submit_task("sector_forward", {})
+def run_sector_forward_job(body: dict | None = Body(default=None)):
+    """手动触发行情结构 + 板块前瞻（刷新快照、C'、D'；同步等待最多 30s）。"""
+    return _sync_run_with_timeout(_task_sector_forward, body or {})
 
 
 @router.post("/market/sector-forecast-verify/run")
-def run_sector_forecast_verify_job(forecast_date: str | None = None):
-    """手动触发前瞻验证回填（异步提交 E'-1）。"""
-    return _submit_task("sector_forecast_verify", {"forecast_date": forecast_date})
+def run_sector_forecast_verify_job(forecast_date: str | None = None,
+                                   body: dict | None = Body(default=None)):
+    """手动触发前瞻验证回填（同步等待最多 30s）。"""
+    params = body or {}
+    if forecast_date and "forecast_date" not in params:
+        params = {**params, "forecast_date": forecast_date}
+    return _sync_run_with_timeout(_task_sector_forecast_verify, params)
+
+
+@router.get("/market/diagnostics")
+def get_market_diagnostics():
+    """市场研判模块诊断：关键表最新日期/行数 + 关键 job 最近状态。"""
+    tables = {
+        "sector_daily": _table_latest_count("sector_daily_snapshot"),
+        "sector_rotation": _table_latest_count("sector_daily_rank_log"),
+        "sector_launch_reason": _table_latest_count("sector_launch_reason"),
+        "sector_regime_forecast": _table_latest_count("sector_regime_forecast"),
+        "sector_forward_forecast": _table_latest_count("sector_forward_forecast"),
+        "sector_forecast_verify": _table_latest_count("sector_forecast_verify", "forecast_date"),
+        "sector_next_hot": _table_latest_count("sector_next_hot"),
+    }
+    jobs = {
+        "sector_daily": _job_diag("sector_daily"),
+        "sector_regime": _job_diag("sector_regime"),
+        "sector_forward": _job_diag("sector_forward"),
+        "sector_forecast_verify": _job_diag("sector_forecast_verify"),
+        "sector_next_hot": _job_diag("sector_next_hot"),
+    }
+    table_errors = [v.get("last_error") for v in tables.values() if v.get("last_error")]
+    has_any_table = any(v["latest_date"] for v in tables.values())
+    has_failed_job = any(v["last_status"] == "failed" for v in jobs.values())
+    status = "failed" if has_failed_job or table_errors else "ok" if has_any_table else "partial"
+    return {"status": status, "tables": tables, "jobs": jobs,
+            "sector_patterns_available": bool(tables["sector_daily"]["row_count"])}
 
 
 @router.get("/market/sector-patterns")
@@ -410,6 +550,14 @@ def get_sector_forward(date: str | None = None):
     """读取指定交易日 top10 板块 T+1/T+3/T+5 前瞻。"""
     d = date or time.strftime("%Y-%m-%d")
     return {"trade_date": d, "forecasts": repo.list_sector_forward_forecast(d)}
+
+
+@router.get("/market/sector-next-hot")
+def get_sector_next_hot(date: str | None = None, limit: int = 10):
+    """读取指定交易日下一个风口候选，作为旧轮动归因长跑的快速替代。"""
+    dates = repo.list_sector_daily_dates(limit=30)
+    d = date or (dates[0] if dates else time.strftime("%Y-%m-%d"))
+    return {"trade_date": d, "items": repo.list_sector_next_hot_by_date(d, limit)}
 
 
 @router.get("/market/regime-view")
@@ -441,6 +589,60 @@ def job_status():
 def system_status():
     """外部连接探活（数据源/LLM/数据库/向量库）+ 检测时间，供首页系统状态看板"""
     return status_service.system_status()
+
+
+@router.get("/system-map")
+def system_map():
+    """只读系统能力地图汇总。"""
+    return system_map_registry.get_system_map_summary()
+
+
+@router.get("/system-map/agents")
+def system_map_agents():
+    """只读 Agent 能力注册列表。"""
+    return system_map_registry.list_agents()
+
+
+@router.get("/system-map/agents/{agent_id}")
+def system_map_agent(agent_id: str):
+    """只读 Agent 能力注册详情。"""
+    agent = system_map_registry.get_agent(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    return agent
+
+
+@router.get("/system-map/tools")
+def system_map_tools():
+    """只读 ReAct 工具注册列表。"""
+    return system_map_registry.list_tools()
+
+
+@router.get("/system-map/workflows")
+def system_map_workflows():
+    """只读关键 workflow 注册列表。"""
+    return system_map_registry.list_workflows()
+
+
+@router.get("/system-map/collaboration")
+def system_map_collaboration():
+    """只读 Agent 协作矩阵。"""
+    return collaboration_registry.list_collaboration_rules()
+
+
+@router.get("/system-map/agents/{agent_id}/allowed-targets")
+def system_map_allowed_targets(agent_id: str):
+    """返回 Agent 的显式协作目标白名单。"""
+    return {
+        "agent_id": agent_id,
+        "allowed_targets": collaboration_registry.list_allowed_targets(agent_id),
+    }
+
+
+@router.get("/system-map/can-collaborate")
+def system_map_can_collaborate(requester: str, target: str, relation: str):
+    """查询单条协作关系；未注册关系稳定返回 forbidden。"""
+    return collaboration_registry.can_collaborate(requester, target, relation)
 
 
 @router.get("/feishu/status")
@@ -905,6 +1107,11 @@ class RejectSuggestionBody(BaseModel):
     reason: str = Field(default="", description="驳回原因（审核留痕，可空以兼容旧客户端）")
 
 
+class ApproveSuggestionBody(BaseModel):
+    override_audit: bool = Field(default=False, description="显式绕过未通过审核的建议")
+    override_reason: str = Field(default="", description="override 审核闸门的人工理由")
+
+
 @router.post("/reviews/{rid}/adopt")
 def adopt_review_suggestion(rid: int):
     """采纳复盘给出的交易偏好优化建议 → 更新 sys_trade_profile"""
@@ -920,7 +1127,9 @@ def adopt_review_suggestion(rid: int):
     content[suggestion["field"]] = suggestion["value"]
     version = repo.update_trade_profile(content)
     repo.update_review_suggestion_status(rid, "adopted")
-    return {"adopted": True, "field": suggestion["field"], "version": version}
+    return {"adopted": True, "field": suggestion["field"], "version": version,
+            "legacy_adopt": True,
+            "warning": "旧复盘入口不具备 agent_suggestion 审核链，请优先使用 /agent-suggestions/{sid}/approve"}
 
 
 @router.post("/reviews/{rid}/reject")
@@ -977,22 +1186,77 @@ class KnowledgeBody(BaseModel):
     content: str = Field(description="知识正文")
     agent_tag: str = Field(default="all",
                            description="适用 Agent：discover/score/position/monitor/sell/review/all")
+    source_type: str = Field(default="manual", description="来源：manual/import/feishu/review/agent_chat/external")
+    methodology_type: str = Field(default="general", description="类型：tactic/risk/position/sell/market/review/data/general")
+    market_scope: str = Field(default="all", description="市场范围：all/a_share/index/sector/stock/convertible/unknown")
+    scenario_tags: list[str] = Field(default_factory=list, description="场景标签")
+    evidence_level: str = Field(default="unverified", description="证据级别：unverified/observed/backtested/reviewed/audited")
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    status: str = Field(default="active", description="状态：active/shadow/archived/expired")
+    risk_note: str = Field(default="", description="风险说明")
 
 
 @router.get("/knowledge")
-def list_knowledge(agent_tag: Optional[str] = None):
+def list_knowledge(agent_tag: Optional[str] = None, status: Optional[str] = None,
+                   source_type: Optional[str] = None, methodology_type: Optional[str] = None,
+                   market_scope: Optional[str] = None, scenario_tag: Optional[str] = None):
     """私有交易经验/战法列表（全部或按 Agent 过滤）"""
-    rows = repo.list_knowledge(agent_tag)
+    rows = repo.list_knowledge(
+        agent_tag, status=status, source_type=source_type,
+        methodology_type=methodology_type, market_scope=market_scope,
+        scenario_tag=scenario_tag,
+    )
     return [{"id": r.id, "title": r.title, "content": r.content, "agent_tag": r.agent_tag,
              "hit_count": r.hit_count, "last_used_at": str(r.last_used_at) if r.last_used_at else None,
-             "created_at": str(r.created_at)} for r in rows]
+             "created_at": str(r.created_at), "source_type": r.source_type,
+             "methodology_type": r.methodology_type, "market_scope": r.market_scope,
+             "scenario_tags": r.scenario_tags or [], "evidence_level": r.evidence_level,
+             "valid_from": r.valid_from, "valid_to": r.valid_to,
+             "status": r.status, "risk_note": r.risk_note or ""} for r in rows]
+
+
+@router.get("/knowledge/shadow-hits")
+def list_knowledge_shadow_hits(knowledge_id: Optional[int] = None, agent: Optional[str] = None,
+                               stock_code: Optional[str] = None, trade_date: Optional[str] = None,
+                               verify_status: Optional[str] = None, limit: int = 200):
+    return repo.list_knowledge_shadow_hits(
+        knowledge_id=knowledge_id, agent=agent or "", stock_code=stock_code or "",
+        trade_date=trade_date or "", verify_status=verify_status or "", limit=limit)
+
+
+@router.post("/knowledge/shadow/refresh-outcomes")
+def refresh_knowledge_shadow_outcomes():
+    return repo.refresh_knowledge_shadow_outcomes()
 
 
 @router.post("/knowledge")
 def create_knowledge(body: KnowledgeBody):
     """新增知识条目（保存后自动进入对应 Agent 的检索注入，无需重启）"""
-    kid = repo.add_knowledge(body.title, body.content, body.agent_tag)
+    kid = repo.add_knowledge(
+        body.title, body.content, body.agent_tag,
+        source_type=body.source_type, methodology_type=body.methodology_type,
+        market_scope=body.market_scope, scenario_tags=body.scenario_tags,
+        evidence_level=body.evidence_level, valid_from=body.valid_from,
+        valid_to=body.valid_to, status=body.status, risk_note=body.risk_note,
+    )
     return {"id": kid}
+
+
+class KnowledgeStatusBody(BaseModel):
+    status: str = Field(description="状态：active/shadow/archived/expired")
+    reason: str = Field(default="", description="人工调整原因")
+
+
+@router.post("/knowledge/{kid}/status")
+def change_knowledge_status(kid: int, body: KnowledgeStatusBody):
+    try:
+        ok = repo.update_knowledge_status(kid, body.status, body.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not ok:
+        raise HTTPException(status_code=404, detail="知识条目不存在")
+    return {"updated": True, "id": kid, "status": body.status}
 
 
 @router.post("/knowledge/{kid}/delete")
@@ -1010,7 +1274,11 @@ class KnowledgeBatchBody(BaseModel):
 @router.post("/knowledge/batch-import")
 def batch_import_knowledge(body: KnowledgeBatchBody):
     """批量导入私有知识（异步提交：逐条落库，立即返回任务ID，不阻塞页面）"""
-    items = [{"title": it.title, "content": it.content, "agent_tag": it.agent_tag}
+    items = [{"title": it.title, "content": it.content, "agent_tag": it.agent_tag,
+              "source_type": it.source_type, "methodology_type": it.methodology_type,
+              "market_scope": it.market_scope, "scenario_tags": it.scenario_tags,
+              "evidence_level": it.evidence_level, "valid_from": it.valid_from,
+              "valid_to": it.valid_to, "status": it.status, "risk_note": it.risk_note}
              for it in body.items]
     return _submit_task("knowledge_import", {"items": items})
 
@@ -1069,7 +1337,7 @@ def _coerce_value(raw: str):
 
 
 @router.post("/agent-suggestions/{sid}/approve")
-def approve_agent_suggestion(sid: int):
+def approve_agent_suggestion(sid: int, body: ApproveSuggestionBody | None = None):
     """人工审核：采纳建议（⚠️ 仅人工触发；系统禁止自动、无监督修改任何策略参数）
     profile 类建议 → 直接写入个人交易偏好档案（版本号+1 全部 Agent 生效）；
     prompt/规则类建议 → 请走 POST /agent-suggestions/{sid}/adopt 一键采纳自动落地。"""
@@ -1082,6 +1350,11 @@ def approve_agent_suggestion(sid: int):
         raise HTTPException(
             status_code=400,
             detail="该建议为规则类（prompt），请走 /agent-suggestions/{sid}/adopt 一键采纳自动落地")
+    _require_agent_suggestion_audit(
+        suggestion,
+        override_audit=body.override_audit if body else False,
+        override_reason=body.override_reason if body else "",
+    )
 
     content = repo.get_trade_profile_content()
     content[suggestion.rule_name] = _coerce_value(suggestion.suggested_value)
@@ -1123,6 +1396,8 @@ _WEAKEN_VERBS = ("放宽", "允许", "取消", "豁免", "解除", "不设", "�
 
 class AdoptSuggestionBody(BaseModel):
     confirm: bool = Field(default=False, description="硬规则二次确认（rule_type=hard 时必须为 True）")
+    override_audit: bool = Field(default=False, description="显式绕过未通过审核的建议")
+    override_reason: str = Field(default="", description="override 审核闸门的人工理由")
 
 
 class RollbackRuleBody(BaseModel):
@@ -1132,6 +1407,32 @@ class RollbackRuleBody(BaseModel):
 def _normalize_rule(text: str) -> str:
     """规则文本归一化（空白折叠 + 去尾部标点），供去重/冲突比对"""
     return re.sub(r"\s+", "", str(text or "")).strip("。；;，,！!？? \t")
+
+
+def _require_agent_suggestion_audit(suggestion, *, override_audit: bool = False,
+                                    override_reason: str = "") -> None:
+    """采纳前审核闸门；只做状态判断和 override 留痕，不写 profile/rule_change。"""
+    if not settings.rule_adopt_require_audit:
+        return
+    verdict = (getattr(suggestion, "audit_verdict", None) or "pending").strip().lower()
+    if verdict == "pass":
+        return
+    if not override_audit:
+        raise HTTPException(
+            status_code=409,
+            detail=f"建议当前审核状态为 {verdict}，请先完成审核或显式 override_audit",
+        )
+    reason = (override_reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="override_audit=True 时必须填写 override_reason")
+    existing = (getattr(suggestion, "conflict_note", None) or "").strip()
+    marker = f"审核 override：{reason}"
+    conflict_note = f"{existing}\n{marker}".strip() if existing else marker
+    repo.update_agent_suggestion_notes(
+        suggestion.id,
+        conflict_note=conflict_note,
+        dedup_note=getattr(suggestion, "dedup_note", None) or "",
+    )
 
 
 def _validate_adopt(suggestion) -> tuple[bool, str, str]:
@@ -1179,7 +1480,7 @@ def adopt_agent_suggestion(sid: int, body: AdoptSuggestionBody | None = None):
     校验通过后写入 rule_change 表（status=active）→ agent_call 管道动态注入全部 Agent
     → 版本指纹入缓存键，LLM 缓存自动失效；硬规则需二次确认（confirm=True）。
     文件路径/插入位置仅作展示元数据，绝不写入源码文件。"""
-    confirm = (body.confirm if body else False)
+    confirm = body.confirm if body else False
     suggestion = repo.get_agent_suggestion(sid)
     if suggestion is None:
         raise HTTPException(status_code=404, detail="建议不存在")
@@ -1194,6 +1495,11 @@ def adopt_agent_suggestion(sid: int, body: AdoptSuggestionBody | None = None):
     if (suggestion.rule_type or "soft") == "hard" and not confirm:
         raise HTTPException(status_code=400,
                             detail="该规则为硬性规则（底层约束，全局生效），请确认后重试")
+    _require_agent_suggestion_audit(
+        suggestion,
+        override_audit=body.override_audit if body else False,
+        override_reason=body.override_reason if body else "",
+    )
 
     ok, conflict_note, dedup_note = _validate_adopt(suggestion)
     if not ok:

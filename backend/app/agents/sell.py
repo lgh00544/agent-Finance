@@ -216,7 +216,9 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
             target_label=f"{name}({code})",
             # 卖出判断看行情/消息/资金，不查财务 → 5工具 + 6 轮预算
             tools_allowlist=["get_quote", "get_daily_kline", "get_news",
-                             "get_fund_flow", "search_knowledge"],
+                             "get_fund_flow", "search_knowledge",
+                             "get_position_risk", "get_distribution_phase",
+                             "get_capital_view", "get_hot_money_context"],
             max_rounds=6,
         )
     else:

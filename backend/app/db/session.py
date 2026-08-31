@@ -195,12 +195,21 @@ def _ensure_review_result_columns(eng=None) -> None:
 
 
 def _ensure_knowledge_hit_columns(eng=None) -> None:
-    """幂等补齐 private_knowledge.hit_count/last_used_at 列（决策级归因·命中计量；
-    仅增量加列，不重建表不丢数据；旧数据 hit_count=0、last_used_at=NULL）"""
+    """幂等补齐 private_knowledge 命中计量与治理元数据列。
+    仅增量加列，不重建表不丢数据；历史知识默认 active。"""
     eng = eng or engine
     additions = {
         "hit_count": "INTEGER NOT NULL DEFAULT 0",
         "last_used_at": "DATETIME",
+        "source_type": "VARCHAR(16) NOT NULL DEFAULT 'manual'",
+        "methodology_type": "VARCHAR(16) NOT NULL DEFAULT 'general'",
+        "market_scope": "VARCHAR(16) NOT NULL DEFAULT 'all'",
+        "scenario_tags": "JSON",
+        "evidence_level": "VARCHAR(16) NOT NULL DEFAULT 'unverified'",
+        "valid_from": "DATETIME",
+        "valid_to": "DATETIME",
+        "status": "VARCHAR(16) NOT NULL DEFAULT 'active'",
+        "risk_note": "TEXT NOT NULL DEFAULT ''",
     }
     with eng.begin() as conn:
         if eng.dialect.name == "sqlite":

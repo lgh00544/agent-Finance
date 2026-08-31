@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import delete, inspect
 
+from app.agents import common
 from app.agents.common import HARD_RULES, dynamic_rules_section
 from app.api.routes import (AdoptSuggestionBody, RollbackRuleBody, _validate_adopt,
                              adopt_agent_suggestion, approve_agent_suggestion,
@@ -40,19 +41,23 @@ def _clean_tables():
 
 def _make_suggestion(rule_text: str, rule_type: str = "soft", target_kind: str = "prompt",
                      rule_name: str = "测试规则X", review_id: int | None = None,
-                     priority: str = "high") -> int:
+                     priority: str = "high", target_agent: str = "discover",
+                     audit_verdict: str = "pass") -> int:
     if review_id is None:
         review_id = repo.insert_review(
             "600601", "测试股601", 1, "2026-08-01", 10, 3.2,
             {"入场逻辑": "回踩企稳", "兑现程度": "兑现"}, "止盈应分批", {"偏好": "更保守"})
-    return repo.insert_agent_suggestion(
-        review_id=review_id, target_agent="discover", rule_name=rule_name,
+    sid = repo.insert_agent_suggestion(
+        review_id=review_id, target_agent=target_agent, rule_name=rule_name,
         current_value="当前值", suggested_value="建议值",
         reason="建议理由", evidence="事实依据", target_kind=target_kind,
         rule_type=rule_type, priority=priority,
         problem_desc="当前规则缺陷说明", rule_text=rule_text,
         expected_effect="预期胜率提升", risk_note="可能过滤掉部分机会",
         file_path="agent_prompts/discover.py", insert_position="第 2 段")
+    if audit_verdict != "pending":
+        repo.update_agent_suggestion_audit(sid, audit_verdict, 1, None)
+    return sid
 
 
 # ==================== 1. 迁移幂等 ====================
@@ -134,6 +139,52 @@ def test_dynamic_rules_section_empty_and_hard_soft():
     assert "复盘采纳规则·参考权重" in section
     assert "非死条件" in section and "动态调整须在输出中标注理由" in section
     assert "硬性注入规则" in section and "软性注入规则" in section
+
+
+def test_dynamic_rules_section_filters_by_agent_and_keeps_legacy_scope():
+    """指定 Agent 只看专属/all/空值规则；无参调用仍返回全部 active 规则。"""
+    rules = (
+        ("discover 专属规则", "discover"),
+        ("score 专属规则", "score"),
+        ("全局规则", "all"),
+        ("存量空值规则", ""),
+    )
+    for text, target_agent in rules:
+        repo.adopt_rule_suggestion(
+            _make_suggestion(text, rule_name=text, target_agent=target_agent)
+        )
+
+    discover_section = dynamic_rules_section("discover")
+    score_section = dynamic_rules_section("score")
+    all_section = dynamic_rules_section()
+
+    for text in ("discover 专属规则", "全局规则", "存量空值规则"):
+        assert text in discover_section
+    assert "score 专属规则" not in discover_section
+    for text in ("score 专属规则", "全局规则", "存量空值规则"):
+        assert text in score_section
+    assert "discover 专属规则" not in score_section
+    for text, _ in rules:
+        assert text in all_section
+
+
+def test_build_agent_context_passes_agent_to_dynamic_rules(monkeypatch):
+    """动态规则注入保持原段位，同时按当前 Agent 查询。"""
+    calls = []
+    monkeypatch.setattr("app.agents.common.dynamic_rules_section",
+                        lambda agent="": calls.append(agent) or "RULES")
+    monkeypatch.setattr("app.agents.common.global_base_prompt", lambda: "")
+    monkeypatch.setattr("app.agents.common.hard_rules_section", lambda: "")
+    monkeypatch.setattr("app.agents.common.experience_section", lambda agent: "")
+    monkeypatch.setattr("app.agents.common._agent_knowledge_text", lambda agent: "")
+    monkeypatch.setattr(repo, "get_latest_market_intel", lambda: None)
+
+    system_prompt, user_prompt = common.build_agent_context(
+        "score", "", "question", with_profile=False, with_knowledge=False,
+    )
+    assert calls == ["score"]
+    assert system_prompt == "RULES"
+    assert user_prompt == "question"
 
 
 # ==================== 4. 确定性校验拦截（双保险第二层） ====================

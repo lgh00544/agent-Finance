@@ -208,6 +208,10 @@ class Settings(BaseSettings):
     # 开启后 score 等节点走 run_agentic_judge 只读工具环，失败自动回退单发；关闭时主链零影响。
     agentic_enable: bool = False    # 总开关 AGENTIC_ENABLE（开启 agentic 通道）
 
+    # ---------- 建议采纳审核闸门 ----------
+    # 默认要求 agent_suggestion 先经 AuditAgent 通过；关闭可用于兼容迁移/应急回滚。
+    rule_adopt_require_audit: bool = True  # RULE_ADOPT_REQUIRE_AUDIT
+
     # ---------- 存储空间维护（低频自动清理，防无限堆积）----------
     news_retention_days: int = 90        # 新闻/公告保留周期（天），超期自动清理（关键分析数据不清理）
     db_maintenance_enabled: bool = True  # 定时空间维护总开关（SQLite VACUUM + 超期数据清理）

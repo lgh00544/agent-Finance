@@ -289,7 +289,10 @@ def llm_score(state: StockAgentState) -> StockAgentState:
             target_label=f"{name}({code})",
             # 决策瓶颈：全量6工具 + 8 轮预算（显式示例，等价默认 None）
             tools_allowlist=["get_quote", "get_daily_kline", "get_news",
-                             "get_financial", "get_fund_flow", "search_knowledge"],
+                             "get_financial", "get_fund_flow", "search_knowledge",
+                             "get_sector_regime", "get_factor_calibration",
+                             "get_distribution_phase", "get_capital_view",
+                             "get_hot_money_context"],
             max_rounds=8,
         )
     else:
@@ -353,6 +356,18 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         output.risk_list,
         thinking_summary=(summarize_agentic_trace(agentic_trace) if agentic_trace else None),
     )
+    try:
+        from app.services import knowledge_shadow
+        factor_query = " ".join(
+            f"{f.factor}{f.score}{f.signal}{f.reason}" for f in output.factors)
+        query = " ".join([
+            factor_query, " ".join(output.risk_list or []),
+            output.final_advice or "", state.get("discover_context") or "",
+        ]).strip()
+        knowledge_shadow.record_shadow_hits(
+            agent="score", stock_code=code, stock_name=name, trade_date=today, query=query)
+    except Exception as exc:  # noqa: BLE001 shadow 观测失败不阻塞正式评分
+        logger.warning("shadow 知识命中记录失败 score %s: %s", code, exc)
     state["score_result"] = output.model_dump()
     state["risk_notice"] = output.risk_list
     state["stage"] = "score"

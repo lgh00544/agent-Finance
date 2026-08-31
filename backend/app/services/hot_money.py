@@ -84,7 +84,7 @@ def _latest_lhb_date(stock_code: str, trade_date: str) -> str | None:
     return dates[-1] if dates else None
 
 
-def aggregate_for_stock(stock_code: str, stock_name: str, trade_date: str) -> dict | None:
+def aggregate_for_stock(stock_code: str, stock_name: str, trade_date: str, trace: bool = True) -> dict | None:
     """聚合单标的游资数据 → 注入 dict（无数据返回 None，LLM 保持"无游资席位数据标中性"）。
     字段名强制带口径后缀（lhb_1d_net_buy / lhb_3d_net_buy），LLM 只能调用带后缀字段。
     目标日期无流水时自动回退到 ≤ 目标日期的最近龙虎榜交易日（T+1 数据注入打通）。"""
@@ -141,15 +141,16 @@ def aggregate_for_stock(stock_code: str, stock_name: str, trade_date: str) -> di
         agg["tier"] = first["tier"]
         agg["seat_name"] = first["seat_code"]
 
-    # 留痕：命中游资或有流水时写 ai_reasoning_trace（source_module='hot_money'，跨模块联查）
-    try:
-        reasoning_trace.trace_hot_money(
-            stock_code, stock_name, trade_date,
-            flows=[{"seat": f.get("seat_name"), "type": f.get("lhb_type"),
-                    "net_buy": f.get("net_buy"), "source": f.get("source")} for f in flows],
-            agg=agg)
-    except Exception:  # noqa: BLE001 留痕失败不影响主链路
-        logger.warning("hot_money 留痕失败: %s/%s", stock_code, trade_date)
+    if trace:
+        # 留痕：命中游资或有流水时写 ai_reasoning_trace（source_module='hot_money'，跨模块联查）
+        try:
+            reasoning_trace.trace_hot_money(
+                stock_code, stock_name, trade_date,
+                flows=[{"seat": f.get("seat_name"), "type": f.get("lhb_type"),
+                        "net_buy": f.get("net_buy"), "source": f.get("source")} for f in flows],
+                agg=agg)
+        except Exception:  # noqa: BLE001 留痕失败不影响主链路
+            logger.warning("hot_money 留痕失败: %s/%s", stock_code, trade_date)
     return agg
 
 

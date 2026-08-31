@@ -22,7 +22,7 @@ from app.db.models import (
     CapitalActor, CapitalFlow, CapitalStats, DragonTiger,
     Experience, ExperienceConfig, ForwardViewHistory, Holding, HotMoneyProfile,
     LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
-    PositionPlan, PrivateKnowledge, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
+    PositionPlan, PrivateKnowledge, KnowledgeShadowHit, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
     SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
     SectorRegimeForecast, SectorForwardForecast, SectorForecastVerify, SectorNextHot,
     SellDecision, StockCandidate, StockScore, TradeProfile,
@@ -2024,21 +2024,46 @@ def knowledge_version() -> tuple[int, int]:
         return int(count), int(max_id)
 
 
-def add_knowledge(title: str, content: str, agent_tag: str = "all") -> int:
+def add_knowledge(title: str, content: str, agent_tag: str = "all", *,
+                  source_type: str = "manual", methodology_type: str = "general",
+                  market_scope: str = "all", scenario_tags: list[str] | None = None,
+                  evidence_level: str = "unverified", valid_from: datetime | None = None,
+                  valid_to: datetime | None = None, status: str = "active",
+                  risk_note: str = "") -> int:
     with SessionLocal() as db:
-        row = PrivateKnowledge(title=title, content=content, agent_tag=agent_tag)
+        row = PrivateKnowledge(
+            title=title, content=content, agent_tag=agent_tag,
+            source_type=source_type, methodology_type=methodology_type,
+            market_scope=market_scope, scenario_tags=scenario_tags or [],
+            evidence_level=evidence_level, valid_from=valid_from, valid_to=valid_to,
+            status=status, risk_note=risk_note,
+        )
         db.add(row)
         db.commit()
         db.refresh(row)
         return row.id
 
 
-def list_knowledge(agent_tag: str | None = None) -> list[PrivateKnowledge]:
+def list_knowledge(agent_tag: str | None = None, *, status: str | None = None,
+                   source_type: str | None = None, methodology_type: str | None = None,
+                   market_scope: str | None = None, scenario_tag: str | None = None
+                   ) -> list[PrivateKnowledge]:
     with SessionLocal() as db:
         stmt = select(PrivateKnowledge).order_by(PrivateKnowledge.id.desc())
         if agent_tag:
             stmt = stmt.where(PrivateKnowledge.agent_tag == agent_tag)
-        return list(db.execute(stmt).scalars().all())
+        if status:
+            stmt = stmt.where(PrivateKnowledge.status == status)
+        if source_type:
+            stmt = stmt.where(PrivateKnowledge.source_type == source_type)
+        if methodology_type:
+            stmt = stmt.where(PrivateKnowledge.methodology_type == methodology_type)
+        if market_scope:
+            stmt = stmt.where(PrivateKnowledge.market_scope == market_scope)
+        rows = list(db.execute(stmt).scalars().all())
+        if scenario_tag:
+            rows = [r for r in rows if scenario_tag in (r.scenario_tags or [])]
+        return rows
 
 
 def delete_knowledge(knowledge_id: int) -> bool:
@@ -2049,6 +2074,126 @@ def delete_knowledge(knowledge_id: int) -> bool:
         db.delete(row)
         db.commit()
         return True
+
+
+def update_knowledge_status(knowledge_id: int, status: str, reason: str = "") -> bool:
+    """人工调整知识生命周期；只改状态和留痕，不删除正文，不做自动升级。"""
+    allowed = {"active", "shadow", "archived", "expired"}
+    if status not in allowed:
+        raise ValueError(f"status must be one of {sorted(allowed)}")
+    with SessionLocal() as db:
+        row = db.get(PrivateKnowledge, knowledge_id)
+        if row is None:
+            return False
+        row.status = status
+        note = (reason or "").strip()
+        if note:
+            stamp = _now().strftime("%Y-%m-%d %H:%M")
+            entry = f"[{stamp} status->{status}] {note}"
+            row.risk_note = "\n".join([p for p in [row.risk_note or "", entry] if p])
+        db.commit()
+        _invalidate("knowledge")
+        return True
+
+
+def record_knowledge_shadow_hit(knowledge_id: int, agent: str, stock_code: str,
+                                stock_name: str, trade_date: str, query: str = "",
+                                scenario_tags: list[str] | None = None,
+                                shadow_bias: str = "unknown",
+                                shadow_summary: str = "") -> int:
+    """幂等记录 shadow 知识旁路命中；不写正式候选/评分/交易结果。"""
+    allowed_bias = {"boost", "reduce", "risk", "neutral", "unknown"}
+    if shadow_bias not in allowed_bias:
+        shadow_bias = "unknown"
+    with SessionLocal() as db:
+        row = db.execute(
+            select(KnowledgeShadowHit).where(
+                KnowledgeShadowHit.knowledge_id == int(knowledge_id),
+                KnowledgeShadowHit.agent == agent,
+                KnowledgeShadowHit.stock_code == stock_code,
+                KnowledgeShadowHit.trade_date == trade_date,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = KnowledgeShadowHit(
+                knowledge_id=int(knowledge_id), agent=agent, stock_code=stock_code,
+                stock_name=stock_name or "", trade_date=trade_date,
+            )
+            db.add(row)
+        row.query = query or ""
+        row.scenario_tags = scenario_tags or []
+        row.shadow_bias = shadow_bias
+        row.shadow_summary = shadow_summary or ""
+        row.updated_at = _now()
+        db.commit()
+        db.refresh(row)
+        _invalidate("knowledge_shadow_hit")
+        return row.id
+
+
+def list_knowledge_shadow_hits(knowledge_id: int | None = None, agent: str = "",
+                               stock_code: str = "", trade_date: str = "",
+                               verify_status: str = "", limit: int = 200) -> list[dict]:
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(KnowledgeShadowHit).order_by(
+                KnowledgeShadowHit.trade_date.desc(), KnowledgeShadowHit.id.desc())
+            if knowledge_id is not None:
+                stmt = stmt.where(KnowledgeShadowHit.knowledge_id == int(knowledge_id))
+            if agent:
+                stmt = stmt.where(KnowledgeShadowHit.agent == agent)
+            if stock_code:
+                stmt = stmt.where(KnowledgeShadowHit.stock_code == stock_code)
+            if trade_date:
+                stmt = stmt.where(KnowledgeShadowHit.trade_date == trade_date)
+            if verify_status:
+                stmt = stmt.where(KnowledgeShadowHit.verify_status == verify_status)
+            rows = db.execute(stmt.limit(min(max(int(limit), 1), 500))).scalars().all()
+            return [{
+                "id": r.id, "knowledge_id": r.knowledge_id, "agent": r.agent,
+                "stock_code": r.stock_code, "stock_name": r.stock_name,
+                "trade_date": r.trade_date, "query": r.query or "",
+                "scenario_tags": r.scenario_tags or [],
+                "shadow_bias": r.shadow_bias or "unknown",
+                "shadow_summary": r.shadow_summary or "",
+                "t3_pct": r.t3_pct, "t5_pct": r.t5_pct, "t10_pct": r.t10_pct,
+                "max_drawdown": r.max_drawdown,
+                "verify_status": r.verify_status or "pending",
+                "created_at": str(r.created_at), "updated_at": str(r.updated_at),
+            } for r in rows]
+
+    return _dbq("knowledge_shadow_hit",
+                {"kid": knowledge_id, "agent": agent, "code": stock_code,
+                 "date": trade_date, "status": verify_status, "limit": limit}, _load)
+
+
+def refresh_knowledge_shadow_outcomes() -> dict:
+    """从 CandidateTrackVerify 回填 shadow 命中的 T+N 后验表现，不改变 T+N 口径。"""
+    with SessionLocal() as db:
+        hits = db.execute(select(KnowledgeShadowHit)).scalars().all()
+        updated = 0
+        for hit in hits:
+            verify = db.execute(
+                select(CandidateTrackVerify).where(
+                    CandidateTrackVerify.stock_code == hit.stock_code,
+                    CandidateTrackVerify.select_date == hit.trade_date,
+                )
+            ).scalar_one_or_none()
+            if verify is None:
+                status = "pending"
+                values = (None, None, None, None)
+            else:
+                values = (verify.t3_pct, verify.t5_pct, verify.t10_pct, verify.max_drawdown)
+                has_any = any(v is not None for v in values)
+                status = "finished" if verify.is_finished == 1 or verify.t10_pct is not None else (
+                    "partial" if has_any else "pending")
+            hit.t3_pct, hit.t5_pct, hit.t10_pct, hit.max_drawdown = values
+            hit.verify_status = status
+            hit.updated_at = _now()
+            updated += 1
+        db.commit()
+        _invalidate("knowledge_shadow_hit")
+        return {"updated": updated, "total": len(hits)}
 
 
 def bump_knowledge_hits(knowledge_ids: list[int]) -> int:

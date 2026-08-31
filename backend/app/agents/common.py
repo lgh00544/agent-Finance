@@ -93,15 +93,20 @@ def hard_rules_section() -> str:
     )
 
 
-def dynamic_rules_section() -> str:
+def dynamic_rules_section(agent: str = "") -> str:
     """复盘采纳规则（一键采纳自动落地）→ prompt 注入文本：
     硬规则与 HARD_RULES 同等声明（无条件遵守），软规则为参考权重（非死条件）；
-    规则由 DB 动态注入（rule_change 表，绝不写源码文件）。无生效规则时返回空。"""
+    规则由 DB 动态注入（rule_change 表，绝不写源码文件）。无生效规则时返回空。
+    agent 为空时保持旧行为返回全部 active 规则；指定 Agent 时只返回其专属、all
+    及空 target_agent 的存量兼容规则。"""
     try:
         rules = repo.get_active_rules()
     except Exception as exc:  # noqa: BLE001 规则读取失败不阻塞主链路
         logger.warning("复盘采纳规则读取失败: %s", exc)
         return ""
+    if agent:
+        rules = [r for r in rules
+                 if (r.get("target_agent") or "") in ("", "all", agent)]
     if not rules:
         return ""
     hard = [r for r in rules if r.get("rule_type") == "hard"]
@@ -142,7 +147,9 @@ def profile_section() -> str:
     return "\n".join(lines) if lines else ""
 
 
-def knowledge_section(agent: str, docs: list | None = None) -> tuple[str, list]:
+def knowledge_section(agent: str, docs: list | None = None, query: str = "",
+                      scenario_tags: list[str] | None = None, methodology_type: str = "",
+                      market_scope: str = "") -> tuple[str, list]:
     """私有交易经验/战法知识库 → prompt 注入文本（统一运行机制：任务启动自动检索）。
 
     返回 (注入文本, docs)；docs=[{id, number, title}]（number=注入段中的 1..N，
@@ -151,14 +158,31 @@ def knowledge_section(agent: str, docs: list | None = None) -> tuple[str, list]:
     docs 由调用方预取传入时（agent_chat）直接拼文本，不再检索、不重复计量。"""
     from app.services.vector_store import get_vector_store
 
+    docs_prefetched = docs is not None
     if docs is None:
         try:
-            docs = get_vector_store().search_knowledge(agent, top_k=5)
+            search = get_vector_store().search_knowledge
+            if query or scenario_tags or methodology_type or market_scope:
+                docs = search(agent, top_k=5, query=query, scenario_tags=scenario_tags,
+                              methodology_type=methodology_type, market_scope=market_scope)
+            else:
+                docs = search(agent, top_k=5)
         except Exception as exc:  # noqa: BLE001 知识检索失败不阻塞主链路
             logger.warning("私有知识检索失败 %s: %s", agent, exc)
             return "", []
         if not docs:
             return "", []
+    # 预取 docs 也经过轻量生命周期防线；只有 active 能进入正式 prompt。
+    from datetime import datetime
+    now = datetime.now()
+    docs = [d for d in docs
+            if (d.get("status") or "active") == "active"
+            and (not d.get("valid_from") or d["valid_from"] <= now)
+            and (not d.get("valid_to") or d["valid_to"] > now)]
+    if not docs:
+        return "", []
+    if not docs_prefetched:
+        # 仅对实际可注入的文档计量；预取 docs 不重复计量。
         # 命中计量：批量一次 UPDATE（失败仅 warning，不阻塞主链路）
         try:
             repo.bump_knowledge_hits([d["id"] for d in docs])
@@ -274,7 +298,7 @@ def build_agent_context(agent: str, system_prompt: str, user_prompt: str,
     if rules_section:
         sections.append(rules_section)
     # 拼接位1.5 · 复盘采纳规则（一键采纳自动落地：DB 动态注入，绝不写源码文件）
-    adopted = dynamic_rules_section()
+    adopted = dynamic_rules_section(agent)
     if adopted:
         sections.append(adopted)
     # 拼接位2 · 个性化交易体系 = 个人交易偏好档案（动态配置）

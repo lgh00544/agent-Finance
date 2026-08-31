@@ -344,7 +344,45 @@ class PrivateKnowledge(Base):
     # 决策级归因·命中计量：检索注入 + 对话显式引用累计（只加不自减，便于看历史累计）；last_used_at 最近命中时间
     hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    source_type: Mapped[str] = mapped_column(String(16), default="manual")
+    methodology_type: Mapped[str] = mapped_column(String(16), default="general")
+    market_scope: Mapped[str] = mapped_column(String(16), default="all")
+    scenario_tags: Mapped[list] = mapped_column(SafeJSON, default=list)
+    evidence_level: Mapped[str] = mapped_column(String(16), default="unverified")
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), index=True, default="active")
+    risk_note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class KnowledgeShadowHit(Base):
+    """shadow 知识命中观察表；只记录旁路观测，不参与正式决策。"""
+    __tablename__ = "knowledge_shadow_hit"
+    __table_args__ = (
+        UniqueConstraint("knowledge_id", "agent", "stock_code", "trade_date",
+                         name="uq_knowledge_shadow_hit"),
+        Index("ix_shadow_hit_knowledge", "knowledge_id", "verify_status"),
+        Index("ix_shadow_hit_stock_date", "stock_code", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    knowledge_id: Mapped[int] = mapped_column(Integer, ForeignKey("private_knowledge.id"), index=True)
+    agent: Mapped[str] = mapped_column(String(32), index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    query: Mapped[str] = mapped_column(Text, default="")
+    scenario_tags: Mapped[list] = mapped_column(SafeJSON, default=list)
+    shadow_bias: Mapped[str] = mapped_column(String(16), default="unknown")
+    shadow_summary: Mapped[str] = mapped_column(Text, default="")
+    t3_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t5_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t10_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown: Mapped[float | None] = mapped_column(Float, nullable=True)
+    verify_status: Mapped[str] = mapped_column(String(16), index=True, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
 class SellDecision(Base):

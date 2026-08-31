@@ -6,6 +6,8 @@ import re
 from app.llm.structured import ModelLevel, llm_call_json
 from app.prompts.chat_router import INTENTS, SYSTEM_PROMPT, RouteIntent, user_prompt
 from app.services import chat_handlers
+from app.system_map import collaboration as collaboration_registry
+from app.system_map import registry as system_map_registry
 
 logger = logging.getLogger(__name__)
 
@@ -68,22 +70,95 @@ def _route_regex(text: str) -> tuple[str, dict] | None:
     return None
 
 
+def _system_map_hint() -> tuple[str, dict | None]:
+    """Build a compact route hint without putting the full map in the prompt."""
+    try:
+        summary = system_map_registry.get_system_map_summary()
+        agents = ",".join(item["agent_id"] for item in summary.get("agents", []))
+        workflows = ",".join(item["workflow_id"] for item in summary.get("workflows", []))
+        return f"已注册 Agent: {agents}; workflow: {workflows}。未知能力按 chat 处理。", summary
+    except Exception as exc:  # noqa: BLE001 map is advisory and must not break routing
+        logger.warning("系统能力地图读取失败，路由按兼容路径继续: %s", exc)
+        return "系统能力地图暂不可用，按已有意图兼容路由。", None
+
+
+def _route_metadata(intent: str, params: dict, hint: str) -> tuple[str, dict, str]:
+    """Annotate a route with map metadata while keeping dispatch-compatible params."""
+    target_agent = params.get("target_agent") or ""
+    workflow_id = params.get("workflow_id") or ""
+    if not target_agent:
+        target_agent = {
+            "score": "score",
+            "sell": "sell",
+            "discover": "discover",
+            "monitor": "monitor",
+            "review": "review",
+            "market": "market_intel",
+        }.get(intent, "")
+    if not workflow_id:
+        workflow_id = {
+            "score": "score",
+            "sell": "sell_decision",
+            "discover": "daily_pipeline",
+            "monitor": "monitor_all",
+            "market": "market_intel",
+        }.get(intent, "")
+    required_params = list(params.get("required_params") or [])
+    permission_note = params.get("permission_note") or ""
+    if target_agent:
+        permission = collaboration_registry.can_collaborate("chat_entry", target_agent, "call")
+        permission_note = permission["reason"] if permission["allowed"] else "未注册协作关系，已按兼容路径处理。"
+    metadata = {
+        "target_agent": target_agent,
+        "workflow_id": workflow_id,
+        "required_params": required_params,
+        "permission_note": permission_note,
+    }
+    enriched = {**params, **metadata}
+    if permission_note:
+        hint = f"{hint}\n权限：{permission_note}" if hint else f"权限：{permission_note}"
+    return intent, enriched, hint
+
+
+def _validate_route(intent: str, params: dict, hint: str, summary: dict | None) -> tuple[str, dict, str]:
+    """Fail closed for unknown map capabilities; preserve legacy behavior if map is unavailable."""
+    if summary is None:
+        return _route_metadata(intent, params, hint)
+    agent_ids = {item["agent_id"] for item in summary.get("agents", [])}
+    workflow_ids = {item["workflow_id"] for item in summary.get("workflows", [])}
+    target_agent = params.get("target_agent") or ""
+    workflow_id = params.get("workflow_id") or ""
+    if (target_agent and target_agent not in agent_ids) or (workflow_id and workflow_id not in workflow_ids):
+        logger.info("路由返回未注册能力 agent=%s workflow=%s，降级 chat", target_agent, workflow_id)
+        return "chat", {"code": params.get("code", ""), "name": params.get("name", ""),
+                         "agent": "", "target_agent": "", "workflow_id": "",
+                         "required_params": [],
+                         "permission_note": "未注册能力，已降级为 chat。"}, \
+            "未注册能力，已降级为 chat。"
+    return _route_metadata(intent, params, hint)
+
+
 def route(text: str, prev: str = "") -> tuple[str, dict, str]:
     """意图判定 → (intent, params, reply_hint)；失败/低置信回 chat"""
     m = _route_regex(text)
     if m:
-        return m[0], m[1], ""
+        return _validate_route(m[0], m[1], "", _system_map_hint()[1])
     try:
-        result = llm_call_json(SYSTEM_PROMPT, user_prompt(text, prev), RouteIntent,
+        system_hint, summary = _system_map_hint()
+        result = llm_call_json(SYSTEM_PROMPT, f"{system_hint}\n{user_prompt(text, prev)}", RouteIntent,
                                max_tokens=200, model_level=ModelLevel.LIGHT)
         params = {"code": result.params.code, "name": result.params.name,
-                  "agent": result.params.agent}
+                  "agent": result.params.agent, "target_agent": result.target_agent,
+                  "workflow_id": result.workflow_id,
+                  "required_params": result.required_params,
+                  "permission_note": result.permission_note}
         if result.intent in INTENTS:
-            return result.intent, params, result.reply_hint
+            return _validate_route(result.intent, params, result.reply_hint, summary)
         logger.info("意图路由 LLM 返回未知意图 %s → 回 chat", result.intent)
     except Exception as exc:  # noqa: BLE001 LLM 失败回退 chat，不抛
         logger.warning("意图路由 LLM 调用失败: %s", exc)
-    return "chat", {"code": "", "name": "", "agent": ""}, ""
+    return "chat", {"code": "", "name": "", "agent": "", "target_agent": "",
+                     "workflow_id": "", "required_params": [], "permission_note": ""}, ""
 
 
 def route_and_execute(text: str, prev: str, open_id: str) -> str:

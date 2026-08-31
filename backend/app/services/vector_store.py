@@ -190,25 +190,52 @@ class VectorStore:
 
 
     # ---------------- 私有知识库检索（统一调教接口·统一运行机制） ----------------
-    def search_knowledge(self, agent: str, top_k: int = 5) -> list[dict[str, Any]]:
+    def search_knowledge(self, agent: str, top_k: int = 5, query: str = "",
+                         scenario_tags: list[str] | None = None,
+                         methodology_type: str = "", market_scope: str = "",
+                         status: str = "active") -> list[dict[str, Any]]:
         """检索私有交易经验/战法资料（Agent 任务启动时自动注入）。
         知识条目为人工录入的少量高价值资料，按 agent_tag（含通用 all）精确匹配
-        + 关键词 LIKE，确定性检索 dev/prod 行为一致；失败不阻塞主链路。
+        + 轻过滤，确定性检索 dev/prod 行为一致；失败不阻塞主链路。
         """
         try:
             from sqlalchemy import or_
+            from datetime import datetime
 
             with SessionLocal() as db:
                 stmt = (
                     select(PrivateKnowledge)
                     .where(or_(PrivateKnowledge.agent_tag == agent,
-                               PrivateKnowledge.agent_tag == "all"))
+                               PrivateKnowledge.agent_tag == "all"),
+                           PrivateKnowledge.status == status)
                     .order_by(PrivateKnowledge.id.desc())
-                    .limit(top_k)
                 )
+                if methodology_type:
+                    stmt = stmt.where(PrivateKnowledge.methodology_type == methodology_type)
+                if market_scope:
+                    stmt = stmt.where(PrivateKnowledge.market_scope == market_scope)
+                now = datetime.now()
+                stmt = stmt.where(
+                    or_(PrivateKnowledge.valid_from.is_(None), PrivateKnowledge.valid_from <= now),
+                    or_(PrivateKnowledge.valid_to.is_(None), PrivateKnowledge.valid_to > now),
+                )
+                if query.strip():
+                    terms = [term for term in query.strip().split() if term]
+                    for term in terms[:5]:
+                        stmt = stmt.where(or_(PrivateKnowledge.title.contains(term),
+                                              PrivateKnowledge.content.contains(term)))
                 rows = db.execute(stmt).scalars().all()
+                if scenario_tags:
+                    wanted = set(scenario_tags)
+                    rows = [r for r in rows if wanted.intersection(r.scenario_tags or [])]
+                rows = rows[:max(0, int(top_k))]
                 # 返回带 id（决策级归因：命中计量 + 对话引用编号映射依赖 id 定位）
-                return [{"id": r.id, "title": r.title, "content": r.content} for r in rows]
+                return [{"id": r.id, "title": r.title, "content": r.content,
+                         "agent_tag": r.agent_tag, "source_type": r.source_type,
+                         "methodology_type": r.methodology_type, "market_scope": r.market_scope,
+                         "scenario_tags": r.scenario_tags or [], "evidence_level": r.evidence_level,
+                         "valid_from": r.valid_from, "valid_to": r.valid_to,
+                         "status": r.status, "risk_note": r.risk_note or ""} for r in rows]
         except Exception as exc:  # noqa: BLE001
             logger.warning("私有知识库检索失败: %s", exc)
             return []
