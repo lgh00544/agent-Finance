@@ -41,3 +41,9 @@ export const getAuditLog = (
   targetId: number,
 ): Promise<Record<string, unknown>> =>
   get('/audit-log', { target_type: targetType, target_id: targetId })
+
+export const getAuditLogFull = async (
+  targetType: string,
+  targetId: number,
+): Promise<Record<string, unknown>> =>
+  await get('/audit-log', { target_type: targetType, target_id: targetId })

@@ -1,8 +1,7 @@
-import { useState } from 'react'
-import { App, Button, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { App, Button, Descriptions, Popover, Space, Table, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { agentSuggestions, ruleChanges, rollbackRuleChange } from '@/api/suggestions'
-import { getAuditLog } from '@/api/audit'
+import { getAuditLogFull } from '@/api/audit'
 import { EmptyState, StatusBadge } from '@/components/common'
 
 const { Text } = Typography
@@ -24,6 +23,43 @@ const AUDIT_TONE: Record<string, { label: string; tone: string }> = {
   fail: { label: '驳回', tone: 'err' },
 }
 
+const val = (v: unknown) => String(v ?? '').trim() || '—'
+
+function AuditPopoverContent({ sid, sug }: { sid: number; sug: Record<string, unknown> }) {
+  const { data: log } = useQuery({ queryKey: ['audit-log', 'agent_suggestion', sid], queryFn: () => getAuditLogFull('agent_suggestion', sid), enabled: !!sid, staleTime: 30_000, retry: 0 })
+  const ruleText = val(sug.rule_text) === val(sug.suggested_value) ? '—' : val(sug.rule_text)
+  return (
+    <div style={{ width: 520, maxHeight: 480, overflow: 'auto' }}>
+      <Text strong>原建议</Text>
+      <Descriptions size="small" column={1}>
+        <Descriptions.Item label="规则名">{val(sug.rule_name)}</Descriptions.Item>
+        <Descriptions.Item label="当前值">{val(sug.current_value)}</Descriptions.Item>
+        <Descriptions.Item label="建议值">{val(sug.suggested_value)}</Descriptions.Item>
+        <Descriptions.Item label="原因">{val(sug.reason)}</Descriptions.Item>
+        <Descriptions.Item label="依据">{val(sug.evidence)}</Descriptions.Item>
+        <Descriptions.Item label="问题">{val(sug.problem_desc)}</Descriptions.Item>
+        <Descriptions.Item label="规则条文">{ruleText}</Descriptions.Item>
+        <Descriptions.Item label="风险">{val(sug.risk_note)}</Descriptions.Item>
+        <Descriptions.Item label="状态">{val(sug.status)} / {val(sug.reject_reason)} / {val(sug.created_at)}</Descriptions.Item>
+      </Descriptions>
+      <Text strong>AI 审核</Text>
+      {!log ? (
+        <Text type="secondary">未审核 — 等待 03:30 cron 或手动 audit_pending(cutoff_id=0)</Text>
+      ) : (
+        <Descriptions size="small" column={1}>
+          <Descriptions.Item label="结论">{val(log.verdict)} / 第{val(log.round)}轮 / {val(log.confidence)}</Descriptions.Item>
+          <Descriptions.Item label="支持">{val(log.support_view)}</Descriptions.Item>
+          <Descriptions.Item label="反对">{val(log.dissent_view)}</Descriptions.Item>
+          <Descriptions.Item label="边界">{val(log.boundary_cases)}</Descriptions.Item>
+          <Descriptions.Item label="证据">{Array.isArray(log.evidence_refs) ? log.evidence_refs.join(', ') : val(log.evidence_refs)}</Descriptions.Item>
+          <Descriptions.Item label="模型">{val(log.audit_model)} / {val(log.created_at)}</Descriptions.Item>
+          <Descriptions.Item label="原始JSON"><Typography.Paragraph ellipsis={{ rows: 3, expandable: true }}>{val(log.reasoning).slice(0, 300)}</Typography.Paragraph></Descriptions.Item>
+        </Descriptions>
+      )}
+    </div>
+  )
+}
+
 /** 规则变更记录页（Phase 4，最轻） */
 export function RuleChangesPage() {
   const { message, modal } = App.useApp()
@@ -35,15 +71,6 @@ export function RuleChangesPage() {
     staleTime: 60_000, refetchInterval: 60_000, retry: 0,
   })
   const sugById = new Map((sugRows ?? []).map((s) => [s.id, s]))
-  // hover 懒取该建议最新审核记录（dissent_view 摘要；未审核 404 → 降级行内 verdict/round）
-  const [hoverSid, setHoverSid] = useState<number | null>(null)
-  const { data: hoverLog } = useQuery({
-    queryKey: ['audit-log', hoverSid],
-    queryFn: () => getAuditLog('agent_suggestion', hoverSid as number),
-    enabled: hoverSid != null,
-    staleTime: 60_000, retry: 0,
-  })
-
   if (isError) return (
     <div>
       <Text type="danger">加载失败：{error?.message}</Text>
@@ -95,14 +122,10 @@ export function RuleChangesPage() {
         const v = String((sug as unknown as Record<string, unknown>).audit_verdict ?? '')
         const m = AUDIT_TONE[v]
         if (!m) return <Text type="secondary">—</Text>
-        const round = String((sug as unknown as Record<string, unknown>).audit_round ?? '')
-        const dissent = hoverSid === sid && hoverLog
-          ? `[${String(hoverLog.verdict ?? '')}] 第${String(hoverLog.round ?? round)}轮: ${String(hoverLog.dissent_view ?? '').slice(0, 40)}...`
-          : `[${m.label}] 第${round || '?'}轮`
         return (
-          <Tooltip onOpenChange={(o) => setHoverSid(o ? sid : null)} title={dissent}>
+          <Popover trigger="hover" content={<AuditPopoverContent sid={sid} sug={sug as unknown as Record<string, unknown>} />}>
             <StatusBadge text={m.label} tone={m.tone} />
-          </Tooltip>
+          </Popover>
         )
       },
     },
