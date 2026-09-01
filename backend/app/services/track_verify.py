@@ -626,7 +626,7 @@ def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
             hi_avg = hi.get("avg_pct")
             lo_avg = lo.get("avg_pct")
             out.append({
-                "target_agent": "discover", "target_kind": "prompt", "rule_type": "soft",
+                "target_agent": "discover", "target_kind": "prompt", "rule_type": "hard",
                 "priority": "high",
                 "rule_name": f"候选池评级正相关性校验（{pair} 倒挂）",
                 "current_value": "评级 A/B/C 默认代表选股质量优劣，未单独校验与后续涨幅的相关性",
@@ -636,12 +636,12 @@ def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
                            f"可能误导仓位分配"),
                 "evidence": (f"{low} 档 {lo.get('n')} 笔平均 {lo_avg}%，"
                              f"{high} 档 {hi.get('n')} 笔平均 {hi_avg}%"),
-                "rule_text": ("候选评级 A/B/C 应体现选股质量差异：低评级档平均 T+N 涨幅持续高于"
-                              "高评级档时，需人工复核评级维度权重并调整评分提示词；倒挂持续期间"
-                              "降低高评级档独占权重，以实际涨幅排序为准"),
+                "rule_text": ("候选评级 A/B/C 必须接受实战 T+N 结果校验：低评级档平均 T+N 涨幅"
+                              "持续高于高评级档时，判定评级正相关性倒挂；倒挂未解除前，禁止仅因"
+                              "高评级而提高建仓优先级，必须同步参考实际涨幅、回撤和市场环境"),
                 "problem_desc": "评级体系与后续表现相关性倒挂，可能误导仓位分配与关注优先级",
                 "expected_effect": "恢复评级与表现的正常相关性，倒挂期避免高评级标的重仓",
-                "risk_note": "小样本周期倒挂可能为噪声，需连续 2 个统计期确认后才调整",
+                "risk_note": "硬规则仅在人工二次确认后生效；小样本倒挂可能为噪声，采纳前需核对样本数与连续性",
                 "file_path": "agent_prompts/score_prompt.py", "insert_position": "评级维度权重段",
             })
         elif anom["type"] == "consecutive_decline":
@@ -665,8 +665,8 @@ def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
         elif anom["type"] == "win_rate_low":
             d = anom["data"]
             out.append({
-                "target_agent": "discover", "target_kind": "prompt", "rule_type": "soft",
-                "priority": "medium",
+                "target_agent": "discover", "target_kind": "prompt", "rule_type": "hard",
+                "priority": "high",
                 "rule_name": "候选池选股胜率下限复核",
                 "current_value": f"候选池{period_label}胜率 {d['win_rate']}%"
                                  f"（{d.get('wins', 0)}/{d['n']}）低于 {_WIN_LOW:.0f}%",
@@ -674,11 +674,12 @@ def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
                 "reason": "整体胜率过低说明选股标准可能过于激进或市场环境变化",
                 "evidence": (f"n={d['n']} 胜率 {d['win_rate']}% 平均涨幅 {d['avg_pct']}% "
                              f"（{period_label}周期）"),
-                "rule_text": ("候选池胜率低于 40% 且样本≥3 时，应触发选股标准复核：人工检查当前"
-                              "市场环境档位与候选筛选条件是否过松，必要时收紧候选条件"),
+                "rule_text": ("候选池 T+5 正收益胜率低于 40% 且样本≥3 时，必须触发实战校验红线："
+                              "下一轮选股不得扩大候选规模，必须提高风险过滤权重，并优先复核"
+                              "市场环境档位、评级倒挂和候选筛选条件是否过松"),
                 "problem_desc": "选股胜率持续偏低，候选池质量不足",
                 "expected_effect": "及时收敛候选标准，减少无效候选对注意力的消耗",
-                "risk_note": "仅提示复核，选股标准调整必须人工执行",
+                "risk_note": "硬规则仅在人工二次确认后生效；低胜率可能受极端市况影响，采纳前需结合市场背景",
                 "file_path": "agent_prompts/discover_prompt.py", "insert_position": "筛选条件段",
             })
     return out

@@ -134,3 +134,48 @@ def test_sector_forward_task_refreshes_missing_target_date(monkeypatch):
     assert result["success"] is True
     assert result["trade_date"] == "2026-08-28"
     assert seen == {"refresh_date": "2026-08-28", "regime_date": "2026-08-28"}
+
+
+def test_sync_run_with_timeout_returns_partial():
+    import time
+    from app.api import routes
+
+    def slow_task(params, progress):
+        progress.update({"trade_date": "2026-08-28", "refresh_done": True})
+        time.sleep(0.05)
+        return {"success": True}
+
+    result = routes._sync_run_with_timeout(slow_task, {}, timeout_seconds=0.001)
+
+    assert result["status"] == "running_partial"
+    assert result["trade_date"] == "2026-08-28"
+    assert result["refresh_done"] is True
+
+
+def test_market_diagnostics_returns_table_job_summary(monkeypatch):
+    from app.api import routes
+
+    monkeypatch.setattr(routes, "_table_latest_count",
+                        lambda table, date_col="trade_date": {"latest_date": "2026-08-28", "row_count": 1})
+    monkeypatch.setattr(routes, "_job_diag",
+                        lambda job_key: {"last_run_at": "2026-08-28 15:45:00",
+                                         "last_status": "ok", "last_error": ""})
+
+    result = routes.get_market_diagnostics()
+
+    assert result["status"] == "ok"
+    assert result["tables"]["sector_regime_forecast"]["latest_date"] == "2026-08-28"
+    assert result["jobs"]["sector_forward"]["last_status"] == "ok"
+
+
+def test_sector_next_hot_route_reads_repo(monkeypatch):
+    from app.api import routes
+
+    monkeypatch.setattr(routes.repo, "list_sector_daily_dates", lambda limit=30: ["2026-08-28"])
+    monkeypatch.setattr(routes.repo, "list_sector_next_hot_by_date",
+                        lambda d, limit: [{"trade_date": d, "sector_name": "A", "rank_no": 11}])
+
+    result = routes.get_sector_next_hot(limit=1)
+
+    assert result["trade_date"] == "2026-08-28"
+    assert result["items"][0]["sector_name"] == "A"
