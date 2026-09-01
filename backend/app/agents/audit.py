@@ -2,6 +2,7 @@
 collect_audit 读建议 → llm_audit 首审 / llm_re_audit 重审 → run_pending_audits 批量扫描入口"""
 import json
 import logging
+import concurrent.futures
 import time
 
 from app.agents.common import ModelLevel, agent_call
@@ -12,6 +13,7 @@ from agent_prompts import audit_prompt
 from app.db import repo
 
 logger = logging.getLogger(__name__)
+AUDIT_ITEM_TIMEOUT_SECONDS = 90
 
 
 def collect_audit(suggestion) -> dict:
@@ -57,35 +59,64 @@ def _persist(suggestion, audit_round: int, out: AuditOutput, duration_ms: int) -
     return log_id
 
 
+def _call_with_timeout(fn, timeout_seconds: int, *args):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn, *args)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(f"audit item timeout after {timeout_seconds}s") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def run_pending_audits(cutoff_id: int = 0, last_scanned_id: int | None = None,
                        limit: int = 50) -> dict:
     """批量扫描待审建议辩证审核（幂等：pass/round2-fail 不再自动重审）。
-    首审 fail → 调 llm_rethink_suggestion 重思考 + 游标不越过（下轮 round2 重审）；round2 仍 fail → 定格不再第 3 轮。"""
+    单条 fail/异常/超时隔离：不中断整批；round2 仍 fail → 定格不再第 3 轮。"""
     cursor = max(cutoff_id or 0, int(repo.get_config("audit_cursor.last_id") or 0),
                  last_scanned_id or 0)
     rows = repo.list_agent_suggestions_for_audit(cursor, limit)
-    audited, rethunk = 0, 0
+    audited, rethunk, failed = 0, 0, 0
+    errors: list[dict] = []
+    blocked_id: int | None = None
     for s in rows:
-        nxt = (s.audit_round or 0) + 1
-        prev_dissent = ""
-        if nxt >= 2 and s.last_audit_id:
-            prev_log = repo.get_audit_log(s.last_audit_id)
-            prev_dissent = prev_log.dissent_view if prev_log else ""
-        t0 = time.time()
-        out = llm_re_audit(s, prev_dissent) if nxt >= 2 else llm_audit(s)
-        dur = int((time.time() - t0) * 1000)
-        _persist(s, nxt, out, dur)
-        audited += 1
-        if out.verdict == "fail" and nxt == 1:
-            try:
-                llm_rethink_suggestion(s.review_id, out.dissent_view)  # 失败自动重思考（复用 review 链路）
-                rethunk += 1
-            except Exception as exc:  # noqa: BLE001 重思考失败不阻断审核状态落库
-                logger.warning("audit 触发 rethink 失败 review#%s: %s", s.review_id, exc)
-            break  # 游标不越过，下轮 round2 重审
-        cursor = max(cursor, s.id)
+        try:
+            nxt = (s.audit_round or 0) + 1
+            prev_dissent = ""
+            if nxt >= 2 and s.last_audit_id:
+                prev_log = repo.get_audit_log(s.last_audit_id)
+                prev_dissent = prev_log.dissent_view if prev_log else ""
+            t0 = time.time()
+            if nxt >= 2:
+                out = _call_with_timeout(_call_re_audit, AUDIT_ITEM_TIMEOUT_SECONDS, s, prev_dissent)
+            else:
+                out = _call_with_timeout(llm_audit, AUDIT_ITEM_TIMEOUT_SECONDS, s)
+            dur = int((time.time() - t0) * 1000)
+            _persist(s, nxt, out, dur)
+            audited += 1
+            if out.verdict == "fail" and nxt == 1:
+                blocked_id = s.id if blocked_id is None else min(blocked_id, s.id)
+                try:
+                    llm_rethink_suggestion(s.review_id, out.dissent_view)  # 失败自动重思考（复用 review 链路）
+                    rethunk += 1
+                except Exception as exc:  # noqa: BLE001 重思考失败不阻断审核状态落库
+                    logger.warning("audit 触发 rethink 失败 review#%s: %s", s.review_id, exc)
+            elif blocked_id is None:
+                cursor = max(cursor, s.id)
+                repo.set_config("audit_cursor.last_id", str(cursor))
+        except Exception as exc:  # noqa: BLE001 单条失败隔离，后续建议继续审核
+            failed += 1
+            blocked_id = s.id if blocked_id is None else min(blocked_id, s.id)
+            errors.append({"id": s.id, "error": str(exc)[:300]})
+            logger.exception("audit 单条审核失败 suggestion#%s: %s", s.id, exc)
     repo.set_config("audit_cursor.last_id", str(cursor))
-    return {"audited": audited, "rethunk": rethunk, "cursor": cursor}
+    return {"audited": audited, "rethunk": rethunk, "failed": failed,
+            "errors": errors, "cursor": cursor}
+
+
+def _call_re_audit(suggestion, dissent_view: str) -> AuditOutput:
+    return llm_re_audit(suggestion, dissent_view)
 
 
 def trigger_audit_for_suggestion(suggestion_id: int) -> dict:

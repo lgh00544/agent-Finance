@@ -25,6 +25,11 @@ logger = get_logger("scheduler")
 scheduler: BackgroundScheduler | None = None
 
 
+def _mark_sector_job(job_key: str, success: bool, error: str | None = None) -> None:
+    cache.set(f"job:last_{job_key}", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+    cache.set(f"job:last_{job_key}_error", "" if success else (error or "unknown")[:500], 86400)
+
+
 def _is_trading_day(today: str) -> bool:
     """今天是否交易日（akshare 交易日历为全量静态历 1990~年末，成员判定即可）"""
     try:
@@ -264,8 +269,7 @@ def sector_daily_job() -> None:
         from app.services.sector_daily import refresh_sector_daily_snapshot
         result = refresh_sector_daily_snapshot()
         if result.get("success"):
-            cache.set("job:last_sector_daily",
-                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            _mark_sector_job("sector_daily", True)
             logger.info("全板块日快照完成: %s 条", result.get("rows", 0))
             # cron 闭环：快照就绪后追加触发状态机判定+归因，失败不抛
             from app.graph.router import run_sector_rotation
@@ -273,8 +277,10 @@ def sector_daily_job() -> None:
             logger.info("板块轮动判定+归因完成: %s",
                         run_result.get("rotation_state") or run_result.get("error"))
         else:
+            _mark_sector_job("sector_daily", False, str(result.get("error")))
             logger.warning("全板块日快照失败: %s", result.get("error"))
     except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        _mark_sector_job("sector_daily", False, str(exc))
         logger.error("全板块日快照异常: %s", exc)
     finally:
         cache.release_lock("sector_daily")
@@ -289,13 +295,14 @@ def sector_regime_job() -> None:
         from app.services.sector_regime import judge_regime
         result = judge_regime()
         if result.get("success"):
-            cache.set("job:last_sector_regime",
-                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            _mark_sector_job("sector_regime", True)
             logger.info("行情结构识别完成: %s/%s",
                         result.get("current_regime"), result.get("regime_stage"))
         else:
+            _mark_sector_job("sector_regime", False, str(result.get("error")))
             logger.warning("行情结构识别失败: %s", result.get("error"))
     except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        _mark_sector_job("sector_regime", False, str(exc))
         logger.error("行情结构识别异常: %s", exc)
     finally:
         cache.release_lock("sector_regime")
@@ -310,12 +317,13 @@ def sector_forward_job() -> None:
         from app.services.sector_forward_view import run_sector_forward
         result = run_sector_forward()
         if result.get("success"):
-            cache.set("job:last_sector_forward",
-                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            _mark_sector_job("sector_forward", True)
             logger.info("板块前瞻完成: %s 条", result.get("count", 0))
         else:
+            _mark_sector_job("sector_forward", False, str(result.get("error")))
             logger.warning("板块前瞻失败: %s", result.get("error"))
     except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        _mark_sector_job("sector_forward", False, str(exc))
         logger.error("板块前瞻异常: %s", exc)
     finally:
         cache.release_lock("sector_forward")
@@ -330,12 +338,13 @@ def sector_forecast_verify_job() -> None:
         from app.services.sector_forecast_verify import run_sector_forecast_verify
         result = run_sector_forecast_verify()
         if result.get("success"):
-            cache.set("job:last_sector_forecast_verify",
-                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            _mark_sector_job("sector_forecast_verify", True)
             logger.info("前瞻验证回填完成: %s 条", result.get("count", 0))
         else:
+            _mark_sector_job("sector_forecast_verify", False, str(result.get("error")))
             logger.warning("前瞻验证回填失败: %s", result.get("error"))
     except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        _mark_sector_job("sector_forecast_verify", False, str(exc))
         logger.error("前瞻验证回填异常: %s", exc)
     finally:
         cache.release_lock("sector_forecast_verify")
@@ -350,12 +359,13 @@ def sector_next_hot_job() -> None:
         from app.services.sector_next_hot import judge_next_hot
         result = judge_next_hot()
         if result.get("success"):
-            cache.set("job:last_sector_next_hot",
-                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            _mark_sector_job("sector_next_hot", True)
             logger.info("下一个风口预测完成: %s 条", result.get("count", 0))
         else:
+            _mark_sector_job("sector_next_hot", False, str(result.get("error")))
             logger.warning("下一个风口预测失败: %s", result.get("error"))
     except Exception as exc:  # noqa: BLE001 调度入口吞异常
+        _mark_sector_job("sector_next_hot", False, str(exc))
         logger.error("下一个风口预测异常: %s", exc)
     finally:
         cache.release_lock("sector_next_hot")
@@ -515,8 +525,17 @@ def audit_pending_job() -> None:
     try:
         from app.agents.audit import run_pending_audits
         result = run_pending_audits(cutoff_id=0)
-        logger.info("建议辩证审核: %s", result)
+        errors = result.get("errors") or []
+        error_text = "; ".join([f"#{e.get('id')}: {e.get('error')}" for e in errors])[:500]
+        cache.set("job:last_audit_pending", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_audit_pending_error", error_text, 86400)
+        if error_text:
+            logger.warning("建议辩证审核部分失败: %s", result)
+        else:
+            logger.info("建议辩证审核: %s", result)
     except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
+        cache.set("job:last_audit_pending", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_audit_pending_error", str(exc)[:500], 86400)
         logger.error("建议辩证审核异常: %s", exc)
 
 
@@ -770,4 +789,6 @@ def job_status() -> list[dict]:
     out.append({"id": "last_distribution_phase", "name": "最近派发期判定", "next_run": cache.get("job:last_distribution_phase")})
     out.append({"id": "last_quote_snapshot_refresh", "name": "最近持仓价刷新", "next_run": cache.get("job:last_quote_snapshot_refresh")})
     out.append({"id": "last_sector_daily", "name": "最近板块轮动日快照", "next_run": cache.get("job:last_sector_daily")})
+    out.append({"id": "last_audit_pending", "name": "最近建议辩证审核", "next_run": cache.get("job:last_audit_pending"),
+                "error": cache.get("job:last_audit_pending_error")})
     return out

@@ -117,6 +117,41 @@ def test_round2_still_fail_no_round3(monkeypatch):
     assert r3["audited"] == 0  # 无第 3 轮
 
 
+def test_pending_scan_persists_cursor_after_each_success(monkeypatch):
+    """批处理半途异常时不中断；游标不越过阻塞项，后续成功项不重复。"""
+    first = _mk_suggestion()
+    second = _mk_suggestion()
+    third = _mk_suggestion()
+    calls = {"n": 0}
+
+    def fake_audit(s):
+        calls["n"] += 1
+        if s.id == second:
+            raise RuntimeError("llm timeout")
+        return _audit_out("pass")
+
+    monkeypatch.setattr("app.agents.audit.llm_audit", fake_audit)
+    repo.set_config("audit_cursor.last_id", str(first - 1))
+
+    result = run_pending_audits(cutoff_id=first - 1)
+
+    assert result["audited"] == 2 and result["failed"] == 1
+    assert repo.get_config("audit_cursor.last_id") == str(first)
+    assert repo.get_agent_suggestion(second).audit_verdict == "pending"
+    assert repo.get_agent_suggestion(third).audit_verdict == "pass"
+
+
+def test_audit_call_timeout_is_item_scoped():
+    import time
+    from app.agents import audit
+
+    def slow_call():
+        time.sleep(0.05)
+
+    with pytest.raises(TimeoutError):
+        audit._call_with_timeout(slow_call, 0.001)
+
+
 def test_get_latest_audit_log_by_target():
     """① repo 层：同目标多条取最新（created_at desc），无记录返回 None"""
     from app.db import repo as _r
