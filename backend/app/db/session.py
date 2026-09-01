@@ -78,6 +78,7 @@ def init_db() -> None:
     _ensure_distribution_phase_table()
     _ensure_capital_view_tables()
     _ensure_knowledge_hit_columns()
+    _ensure_experience_curator_columns()
 
 
 def _ensure_experience_fts() -> None:
@@ -222,6 +223,29 @@ def _ensure_knowledge_hit_columns(eng=None) -> None:
             for col, ddl in additions.items():
                 try:
                     conn.exec_driver_sql(f"ALTER TABLE private_knowledge ADD COLUMN {col} {ddl}")
+                except Exception:  # noqa: BLE001 列已存在
+                    pass
+
+
+def _ensure_experience_curator_columns(eng=None) -> None:
+    """幂等补齐 experience 命中计量与策展字段；只增量加列，不删除旧记忆。"""
+    eng = eng or engine
+    additions = {
+        "hit_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_used_at": "DATETIME",
+        "expires_at": "DATETIME",
+        "curator_note": "TEXT NOT NULL DEFAULT ''",
+    }
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(experience)")}
+            for col, ddl in additions.items():
+                if col not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE experience ADD COLUMN {col} {ddl}")
+        else:
+            for col, ddl in additions.items():
+                try:
+                    conn.exec_driver_sql(f"ALTER TABLE experience ADD COLUMN {col} {ddl}")
                 except Exception:  # noqa: BLE001 列已存在
                     pass
 

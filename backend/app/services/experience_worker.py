@@ -32,6 +32,11 @@ DEFAULTS = {
     "auto_merge_enabled": "1",         # 自动合并总开关（0 时全走 Digest/M3）
     "worker_sleep_sec": "3",           # 批间限流
     "digest_backlog_threshold": "50",  # 积压触发阈值
+    "memory_curator_enabled": "1",     # Memory Curator 总开关
+    "memory_retention_days": "90",     # 低置信旧记忆保留天数
+    "memory_low_confidence_threshold": "0.55",
+    "memory_stale_hit_threshold": "0",
+    "memory_duplicate_similarity": "0.86",
 }
 
 

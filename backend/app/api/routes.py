@@ -1955,6 +1955,18 @@ class ExperienceConfigBody(BaseModel):
     config: dict = Field(description="key-value 配置（key 须为 DEFAULTS 已知项）")
 
 
+class MemoryCuratorRunBody(BaseModel):
+    dry_run: bool = Field(default=True)
+    limit: int = Field(default=100, ge=1, le=500)
+    confirm: bool = Field(default=False)
+
+
+class ExperienceExpireBody(BaseModel):
+    expires_at: datetime | None = None
+    status: str | None = Field(default=None, description="expired/archived")
+    note: str = Field(default="", description="人工过期/归档原因")
+
+
 @router.get("/experience/pending")
 def experience_pending(status: str | None = None, stage: str | None = None, limit: int = 50):
     """M1 沉淀队列（只读看板；pending 灰·processing 蓝·done 绿，按阶段筛选）"""
@@ -1996,6 +2008,50 @@ def experience_config_set(body: ExperienceConfigBody):
     for k, v in body.config.items():
         repo.set_config(k, str(v))
     return {"ok": True, "config": {k: str(v) for k, v in body.config.items()}}
+
+
+@router.get("/experience/curator/candidates")
+def experience_curator_candidates(status: str = "active", stage: str | None = None,
+                                  older_than_days: int | None = None,
+                                  max_hit_count: int | None = None,
+                                  max_confidence: float | None = None,
+                                  limit: int = 100):
+    return repo.list_curator_candidates(
+        status=status, stage=stage or "", older_than_days=older_than_days,
+        max_hit_count=max_hit_count, max_confidence=max_confidence, limit=limit)
+
+
+@router.post("/experience/curator/run")
+def experience_curator_run(body: MemoryCuratorRunBody | None = None):
+    body = body or MemoryCuratorRunBody()
+    if not body.dry_run and not body.confirm:
+        raise HTTPException(status_code=400, detail="dry_run=False 时必须 confirm=True")
+    from app.services.memory_curator import run_curator
+    return run_curator(dry_run=body.dry_run, limit=body.limit)
+
+
+@router.post("/experience/{eid}/expire")
+def experience_expire(eid: int, body: ExperienceExpireBody):
+    item = repo.get_experience(eid)
+    if item is None:
+        raise HTTPException(status_code=404, detail="经验不存在")
+    if body.status:
+        if body.status not in ("expired", "archived"):
+            raise HTTPException(status_code=400, detail="status 仅支持 expired/archived")
+        action_status = body.status
+        try:
+            ok = repo.mark_experience_curated(eid, action_status, body.note or "人工策展")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not ok:
+            raise HTTPException(status_code=404, detail="经验不存在")
+        return {"id": eid, "status": action_status}
+    if body.expires_at is None:
+        raise HTTPException(status_code=400, detail="需提供 expires_at 或 status")
+    ok = repo.set_experience_expires_at(eid, body.expires_at, body.note or "人工设置过期时间")
+    if not ok:
+        raise HTTPException(status_code=404, detail="经验不存在")
+    return {"id": eid, "expires_at": body.expires_at}
 
 
 @router.get("/experience/{eid}")

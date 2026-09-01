@@ -726,6 +726,10 @@ class Experience(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending_review")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    curator_note: Mapped[str] = mapped_column(Text, default="")
 
 
 class ReviewLog(Base):

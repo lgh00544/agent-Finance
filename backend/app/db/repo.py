@@ -3050,7 +3050,93 @@ def _exp_row(r) -> dict:
                 impact=r.impact, confidence=r.confidence, auto_merged=r.auto_merged,
                 source_pending_id=r.source_pending_id, status=r.status,
                 created_at=str(r.created_at),
-                last_reviewed_at=str(r.last_reviewed_at) if r.last_reviewed_at else None)
+                last_reviewed_at=str(r.last_reviewed_at) if r.last_reviewed_at else None,
+                hit_count=int(getattr(r, "hit_count", 0) or 0),
+                last_used_at=str(r.last_used_at) if getattr(r, "last_used_at", None) else None,
+                expires_at=str(r.expires_at) if getattr(r, "expires_at", None) else None,
+                curator_note=getattr(r, "curator_note", "") or "")
+
+
+def bump_experience_hits(ids: list[int]) -> int:
+    """经验命中计量：hit_count+1 + last_used_at=now；失败由调用方降级。"""
+    exp_ids = [int(i) for i in ids if i]
+    if not exp_ids:
+        return 0
+    with SessionLocal() as db:
+        res = db.execute(
+            update(Experience)
+            .where(Experience.id.in_(exp_ids))
+            .values(hit_count=Experience.hit_count + 1, last_used_at=datetime.now())
+        )
+        db.commit()
+        _invalidate("experience")
+        return int(res.rowcount or 0)
+
+
+def list_curator_candidates(status: str = "active", stage: str = "",
+                            older_than_days: int | None = None,
+                            max_hit_count: int | None = None,
+                            max_confidence: float | None = None,
+                            limit: int = 100) -> list[dict]:
+    """只读列出 Memory Curator 候选；不改变任何状态。"""
+    with SessionLocal() as db:
+        stmt = select(Experience)
+        if status:
+            stmt = stmt.where(Experience.status == status)
+        if stage:
+            stmt = stmt.where(Experience.stage == stage)
+        if older_than_days is not None:
+            cutoff = datetime.now() - timedelta(days=int(older_than_days))
+            stmt = stmt.where(Experience.created_at <= cutoff)
+        if max_hit_count is not None:
+            stmt = stmt.where(Experience.hit_count <= int(max_hit_count))
+        if max_confidence is not None:
+            stmt = stmt.where(Experience.confidence <= float(max_confidence))
+        stmt = stmt.order_by(Experience.created_at, Experience.id).limit(min(max(int(limit), 1), 500))
+        return [_exp_row(r) for r in db.execute(stmt).scalars().all()]
+
+
+def mark_experience_curated(eid: int, status: str, note: str,
+                            reviewer: str = "auto") -> bool:
+    """策展状态流转；仅归档/过期/提议，写 review_log，不物理删除。"""
+    actions = {
+        "archived": "curator_archive",
+        "expired": "curator_expire",
+        "pending_review": "curator_propose",
+    }
+    if status not in actions:
+        raise ValueError("status must be archived/expired/pending_review")
+    with SessionLocal() as db:
+        row = db.get(Experience, int(eid))
+        if row is None:
+            return False
+        row.status = status
+        row.curator_note = note or ""
+        row.last_reviewed_at = _now()
+        db.add(ReviewLog(experience_id=row.id, action=actions[status],
+                         reviewer=reviewer, note=note or ""))
+        db.commit()
+        _invalidate("experience")
+        _invalidate("review_log")
+        return True
+
+
+def set_experience_expires_at(eid: int, expires_at: datetime,
+                              note: str = "", reviewer: str = "sir") -> bool:
+    """人工设置单条经验过期时间，保留正文并写 review_log。"""
+    with SessionLocal() as db:
+        row = db.get(Experience, int(eid))
+        if row is None:
+            return False
+        row.expires_at = expires_at
+        row.curator_note = note or row.curator_note or ""
+        row.last_reviewed_at = _now()
+        db.add(ReviewLog(experience_id=row.id, action="curator_set_expiry",
+                         reviewer=reviewer, note=note or str(expires_at)))
+        db.commit()
+        _invalidate("experience")
+        _invalidate("review_log")
+        return True
 
 
 def update_experience_status(id, status, reviewer=None, action=None, note=None) -> None:
@@ -3116,6 +3202,9 @@ def search_experience(stage=None, tags=None, query=None, k=5, status="active") -
         params: dict = {"status": status, "k": int(k)}
         sql = ("SELECT e.* FROM experience_fts f JOIN experience e ON e.id=f.rowid "
                "WHERE e.status=:status")
+        if status == "active":
+            sql += " AND (e.expires_at IS NULL OR e.expires_at > :now)"
+            params["now"] = datetime.now()
         if stage:
             sql += " AND e.stage=:stage"
             params["stage"] = stage
@@ -3135,6 +3224,9 @@ def _search_experience_like(stage=None, tags=None, query=None, k=5, status="acti
     """LIKE 兜底检索（FTS 不可用/未命中；MySQL 降级模式）"""
     with SessionLocal() as db:
         stmt = select(Experience).where(Experience.status == status)
+        if status == "active":
+            stmt = stmt.where(or_(Experience.expires_at.is_(None),
+                                  Experience.expires_at > datetime.now()))
         if stage:
             stmt = stmt.where(Experience.stage == stage)
         if tags:
@@ -3153,7 +3245,11 @@ def _exp_map_row(r) -> dict:
                 tags=r["tags"], impact=r["impact"], confidence=r["confidence"],
                 auto_merged=r["auto_merged"], source_pending_id=r["source_pending_id"],
                 status=r["status"], created_at=str(r["created_at"]),
-                last_reviewed_at=str(r["last_reviewed_at"]) if r["last_reviewed_at"] else None)
+                last_reviewed_at=str(r["last_reviewed_at"]) if r["last_reviewed_at"] else None,
+                hit_count=int(r["hit_count"] or 0),
+                last_used_at=str(r["last_used_at"]) if r["last_used_at"] else None,
+                expires_at=str(r["expires_at"]) if r["expires_at"] else None,
+                curator_note=r["curator_note"] or "")
 
 
 # ==================== 经验沉淀设置中心（key-value 热加载） ====================

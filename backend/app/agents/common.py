@@ -223,6 +223,10 @@ def experience_section(agent: str) -> str:
         return ""
     if not items:
         return ""
+    try:
+        repo.bump_experience_hits([int(it["id"]) for it in items if it.get("id")])
+    except Exception as exc:  # noqa: BLE001 经验计量失败不阻塞主链路
+        logger.warning("经验命中计量失败（降级跳过）: %s", exc)
     lines = []
     for it in items:
         tag = "·自动" if it.get("auto_merged") else ""
