@@ -1,12 +1,15 @@
-import { get } from './client'
+import { get, post } from './client'
 import type {
   HotSector,
   IndexItem,
+  MarketDiagnosticsInfo,
   MarketConditionInfo,
   MarketIntelInfo,
   RegimeViewInfo,
+  SectorNextHotInfo,
   SectorPattern,
   SectorRotationInfo,
+  SyncRunResult,
 } from '@/types'
 
 /** GET /api/market/indices（三大指数） */
@@ -43,3 +46,19 @@ export const sectorPatterns = (): Promise<{ patterns?: Record<string, SectorPatt
 /** GET /api/market/regime-view（行情结构主视图：C' + D' + E'） */
 export const sectorRegimeView = (date?: string): Promise<RegimeViewInfo> =>
   get('/market/regime-view', date ? { date } : undefined)
+
+/** GET /api/market/diagnostics（市场研判模块诊断） */
+export const marketDiagnostics = (): Promise<MarketDiagnosticsInfo> =>
+  get('/market/diagnostics')
+
+/** POST /api/market/sector-forward/run（同步等待最多 30s） */
+export const runSectorForward = (tradeDate?: string): Promise<SyncRunResult> =>
+  post('/market/sector-forward/run', tradeDate ? { trade_date: tradeDate } : {})
+
+/** POST /api/market/sector-forecast-verify/run（同步等待最多 30s） */
+export const runSectorForecastVerify = (forecastDate?: string): Promise<SyncRunResult> =>
+  post('/market/sector-forecast-verify/run', forecastDate ? { forecast_date: forecastDate } : {})
+
+/** GET /api/market/sector-next-hot（旧轮动归因长跑的快速替代） */
+export const sectorNextHot = (date?: string, limit = 10): Promise<SectorNextHotInfo> =>
+  get('/market/sector-next-hot', { ...(date ? { date } : {}), limit })

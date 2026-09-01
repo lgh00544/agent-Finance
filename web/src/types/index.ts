@@ -194,6 +194,43 @@ export interface RegimeViewInfo {
   verify?: SectorForecastVerify[]
   accuracy?: { windows?: SectorForecastAccuracyWindow[] }
 }
+export interface MarketDiagnosticsTable {
+  latest_date?: string | null
+  row_count?: number
+  last_error?: string
+}
+export interface MarketDiagnosticsJob {
+  last_run_at?: string | null
+  last_status?: 'ok' | 'failed' | 'unknown' | string
+  last_error?: string
+}
+export interface MarketDiagnosticsInfo {
+  status?: 'ok' | 'partial' | 'failed' | string
+  tables?: Record<string, MarketDiagnosticsTable>
+  jobs?: Record<string, MarketDiagnosticsJob>
+  sector_patterns_available?: boolean
+}
+export interface SyncRunResult {
+  success?: boolean
+  status?: 'done' | 'failed' | 'running_partial' | string
+  elapsed_sec?: number
+  error?: string | null
+  [k: string]: unknown
+}
+export interface SectorNextHotItem {
+  trade_date?: string
+  sector_name?: string
+  rank_no?: number
+  hot_score?: number | null
+  expected_horizon_days?: number | null
+  confidence?: number | null
+  trigger_evidence?: Record<string, unknown>
+  [k: string]: unknown
+}
+export interface SectorNextHotInfo {
+  trade_date?: string | null
+  items?: SectorNextHotItem[]
+}
 
 // ===== 账户 =====
 export interface AccountSummary {

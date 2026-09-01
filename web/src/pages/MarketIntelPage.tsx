@@ -1,10 +1,10 @@
 import { type CSSProperties, useEffect, useState } from 'react'
 import { App, Alert, Button, Card, Collapse, Descriptions, List, Progress, Select, Space, Tabs, Tag, Tooltip, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { marketIntel, marketIntelDates, sectorPatterns, sectorRegimeView, sectorRotation } from '@/api/market'
+import { marketDiagnostics, marketIntel, marketIntelDates, runSectorForecastVerify, runSectorForward, sectorNextHot, sectorPatterns, sectorRegimeView, sectorRotation } from '@/api/market'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard } from '@/components/common'
-import type { MarketIntelInfo, RegimeViewInfo, SectorForwardForecast } from '@/types'
+import type { MarketDiagnosticsInfo, MarketIntelInfo, RegimeViewInfo, SectorForwardForecast, SectorNextHotItem } from '@/types'
 
 const { Text } = Typography
 
@@ -129,10 +129,62 @@ function byHorizon(rows: SectorForwardForecast[] | undefined, h: string): Sector
   return (rows ?? []).filter((r) => r.forecast_horizon === h)
 }
 
-function RegimeStructureTab({ date }: { date?: string }) {
+function PendingEmpty({ text, actionLabel, onAction, loading }: { text: string; actionLabel?: string; onAction?: () => void; loading?: boolean }) {
+  return (
+    <Space size={8}>
+      <Tag color="blue">待生成</Tag>
+      <Text type="secondary">{text}</Text>
+      {onAction ? <Button size="small" loading={loading} onClick={onAction}>{actionLabel ?? '生成'}</Button> : null}
+    </Space>
+  )
+}
+
+function ModuleStatusBar() {
+  const { data } = useQuery({
+    queryKey: ['market-diagnostics'],
+    queryFn: () => marketDiagnostics(),
+    refetchInterval: 30_000,
+  })
+  const diag = data ?? ({} as MarketDiagnosticsInfo)
+  const tables = diag.tables ?? {}
+  const jobs = diag.jobs ?? {}
+  const latestJob = Object.entries(jobs)
+    .filter(([, v]) => v.last_run_at)
+    .sort((a, b) => String(b[1].last_run_at).localeCompare(String(a[1].last_run_at)))[0]
+  const firstError = Object.values(jobs).map((j) => j.last_error).find(Boolean)
+    ?? Object.values(tables).map((t) => t.last_error).find(Boolean)
+  const statusColor = diag.status === 'ok' ? 'green' : diag.status === 'failed' ? 'red' : 'orange'
+  const tableTag = (key: string, label: string) => (
+    <Tag>
+      {label} {tables[key]?.latest_date ?? '—'} · {tables[key]?.row_count ?? 0}
+    </Tag>
+  )
+
+  return (
+    <Alert
+      style={{ marginBottom: 10 }}
+      type={diag.status === 'failed' ? 'error' : diag.status === 'ok' ? 'success' : 'warning'}
+      showIcon
+      message={(
+        <Space size={[6, 6]} wrap>
+          {tableTag('sector_daily', 'daily')}
+          {tableTag('sector_regime_forecast', 'regime')}
+          {tableTag('sector_forward_forecast', 'forward')}
+          {tableTag('sector_forecast_verify', 'verify')}
+          <Tag>job {latestJob ? `${latestJob[0]} ${latestJob[1].last_run_at}` : '—'}</Tag>
+          <Tag color={statusColor}>{diag.status ?? 'unknown'}</Tag>
+        </Space>
+      )}
+      description={firstError ? `上次失败原因：${firstError}` : undefined}
+    />
+  )
+}
+
+function RegimeStructureTab({ date, onRun, running }: { date?: string; onRun?: () => void; running?: boolean }) {
   const { data, isError, error, refetch } = useQuery({
     queryKey: ['sector-regime-view', date],
     queryFn: () => sectorRegimeView(date),
+    enabled: !!date,
   })
   if (isError) return <ErrorCard title="行情结构加载失败" message={error?.message} onRetry={() => refetch()} />
   const view = data ?? ({} as RegimeViewInfo)
@@ -148,6 +200,15 @@ function RegimeStructureTab({ date }: { date?: string }) {
 
   return (
     <Space orientation="vertical" style={{ width: '100%' }} size={12}>
+      {!regime ? (
+        <Alert
+          type="info"
+          showIcon
+          message="行情结构待生成"
+          description="当前日期没有 C' 结构判定记录，可先刷新行情结构。"
+          action={onRun ? <Button size="small" type="primary" loading={running} onClick={onRun}>刷新行情结构</Button> : undefined}
+        />
+      ) : null}
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
         <div style={{ ...panelStyle, flex: '2 1 360px' }}>
           <Text type="secondary">当前行情结构 · {view.trade_date ?? '—'}</Text>
@@ -186,7 +247,7 @@ function RegimeStructureTab({ date }: { date?: string }) {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
         <div style={panelStyle}>
           <Text strong>最值得观察</Text>
-          <List size="small" dataSource={watch} locale={{ emptyText: '暂无板块前瞻' }} renderItem={(r) => (
+          <List size="small" dataSource={watch} locale={{ emptyText: <PendingEmpty text="暂无板块前瞻" actionLabel="刷新" onAction={onRun} loading={running} /> }} renderItem={(r) => (
             <List.Item style={{ paddingInline: 0 }}>
               <Space wrap>
                 <Tag>{r.rank_no}</Tag><Text strong>{r.sector_name}</Text><Tag color="blue">{biasLabel(r.forward_bias)}</Tag>
@@ -197,7 +258,7 @@ function RegimeStructureTab({ date }: { date?: string }) {
         </div>
         <div style={panelStyle}>
           <Text strong>高追风险</Text>
-          <List size="small" dataSource={highChase} locale={{ emptyText: '暂无显著高追风险' }} renderItem={(r) => (
+          <List size="small" dataSource={highChase} locale={{ emptyText: <PendingEmpty text="暂无显著高追风险" actionLabel="刷新" onAction={onRun} loading={running} /> }} renderItem={(r) => (
             <List.Item style={{ paddingInline: 0 }}>
               <Space wrap>
                 <Text strong>{r.sector_name}</Text><Tag color={riskColor(r.chase_risk)}>追高 {pct(r.chase_risk)}</Tag>
@@ -208,7 +269,7 @@ function RegimeStructureTab({ date }: { date?: string }) {
         </div>
         <div style={panelStyle}>
           <Text strong>潜在切换</Text>
-          <List size="small" dataSource={switches} locale={{ emptyText: '暂无切换候选' }} renderItem={(r) => (
+          <List size="small" dataSource={switches} locale={{ emptyText: <PendingEmpty text="暂无切换候选" actionLabel="刷新" onAction={onRun} loading={running} /> }} renderItem={(r) => (
             <List.Item style={{ paddingInline: 0 }}>
               <Space wrap>
                 <Text strong>{r.sector_name}</Text><Tag color="purple">{String(r.forecast_horizon).toUpperCase()}</Tag>
@@ -225,7 +286,7 @@ function RegimeStructureTab({ date }: { date?: string }) {
             <tr><th style={thStyle}>窗口</th><th style={thStyle}>板块</th><th style={thStyle}>倾向</th><th style={thStyle}>延续</th><th style={thStyle}>退潮</th><th style={thStyle}>追高</th><th style={thStyle}>切换</th></tr>
           </thead>
           <tbody>
-            {[...t1.slice(0, 5), ...t3.slice(0, 5), ...t5.slice(0, 5)].map((r, i) => (
+            {[...t1.slice(0, 5), ...t3.slice(0, 5), ...t5.slice(0, 5)].length ? [...t1.slice(0, 5), ...t3.slice(0, 5), ...t5.slice(0, 5)].map((r, i) => (
               <tr key={`${r.forecast_horizon}-${r.sector_name}-${i}`}>
                 <td style={tdStyle}>{String(r.forecast_horizon).toUpperCase()}</td>
                 <td style={tdStyle}>{r.sector_name}</td>
@@ -235,7 +296,13 @@ function RegimeStructureTab({ date }: { date?: string }) {
                 <td style={tdStyle}>{pct(r.chase_risk)}</td>
                 <td style={tdStyle}>{r.switch_candidate ? '是' : '否'}</td>
               </tr>
-            ))}
+            )) : (
+              <tr>
+                <td style={tdStyle} colSpan={7}>
+                  <PendingEmpty text="三窗口前瞻待生成" actionLabel="刷新" onAction={onRun} loading={running} />
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </Card>
@@ -280,12 +347,27 @@ function SectorRotationTab() {
   const { data: rot } = useQuery({
     queryKey: ['sector-rotation', curRDate],
     queryFn: () => sectorRotation(curRDate),
+    enabled: !!curRDate,
   })
   const { data: pats } = useQuery({ queryKey: ['sector-patterns'], queryFn: () => sectorPatterns() })
+  const { data: nextHot } = useQuery({
+    queryKey: ['sector-next-hot', curRDate],
+    queryFn: () => sectorNextHot(curRDate, 10),
+    enabled: !!curRDate,
+  })
+  const [rotStartedAt, setRotStartedAt] = useState<number | null>(null)
   const runRot = useTaskSubmit('sector_rotation', () => {
     message.success('板块轮动分析任务已提交后台')
     qc.invalidateQueries({ queryKey: ['sector-rotation'] })
+    qc.invalidateQueries({ queryKey: ['sector-next-hot'] })
+    qc.invalidateQueries({ queryKey: ['market-diagnostics'] })
   })
+  const rotStatus = runRot.poll.data?.status
+  const rotRunning = runRot.submit.isPending || rotStatus === 'pending' || rotStatus === 'running'
+  const elapsedSec = rotStartedAt && rotRunning ? Math.max(0, Math.round((Date.now() - rotStartedAt) / 1000)) : 0
+  useEffect(() => {
+    if (!rotRunning) setRotStartedAt(null)
+  }, [rotRunning])
   // 每条启动归因的"理由全文展开"状态（index → 是否展开），无条件在顶部声明（Hooks 纪律）
   const [expanded, setExpanded] = useState<Record<number, boolean>>({})
   const toggleExpand = (i: number) => setExpanded((prev) => ({ ...prev, [i]: !prev[i] }))
@@ -304,10 +386,11 @@ function SectorRotationTab() {
       <Space wrap>
         <Select placeholder="选择轮动日期" style={{ width: 160 }} value={curRDate} onChange={setRDate}
           options={(rDates ?? []).map((d) => ({ label: d, value: d }))} />
-        <Button type="primary" loading={runRot.submit.isPending} onClick={() => runRot.submit.mutate({})}>
-          立即分析（后台）
+        <Button type="primary" loading={rotRunning} onClick={() => { setRotStartedAt(Date.now()); runRot.submit.mutate({}) }}>
+          立即跑板块轮动归因（预计 5min）
         </Button>
       </Space>
+      {rotRunning ? <Progress percent={Math.min(99, Math.round((elapsedSec / 300) * 100))} size="small" status="active" format={() => `${elapsedSec}s`} /> : null}
 
       {/* 看板指标卡 */}
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
@@ -373,7 +456,31 @@ function SectorRotationTab() {
               }]} />
             ) : null}
           </Card>
-        )) : <Text type="secondary">（当日无启动归因）</Text>}
+        )) : (
+          <Space orientation="vertical" style={{ width: '100%' }} size={8}>
+            <Alert
+              type="info"
+              showIcon
+              message="旧轮动归因待生成"
+              description="sector_rotation 是长跑归因任务，预计约 5 分钟；下方先展示 sector_next_hot 快速替代结果。"
+            />
+            <List
+              size="small"
+              dataSource={(nextHot?.items ?? []) as SectorNextHotItem[]}
+              locale={{ emptyText: <PendingEmpty text="暂无下一个风口候选" /> }}
+              renderItem={(it) => (
+                <List.Item style={{ paddingInline: 0 }}>
+                  <Space wrap>
+                    <Tag>{it.rank_no ?? '—'}</Tag>
+                    <Text strong>{it.sector_name ?? '—'}</Text>
+                    <Tag color="blue">热度 {it.hot_score ?? '—'}</Tag>
+                    <Text type="secondary">预计 {it.expected_horizon_days ?? '—'} 天 / 置信 {pct(it.confidence)}</Text>
+                  </Space>
+                </List.Item>
+              )}
+            />
+          </Space>
+        )}
       </Card>
 
       {/* 多窗口规律 */}
@@ -428,6 +535,8 @@ export function MarketIntelPage() {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [date, setDate] = useState<string>()
+  const [regimeRunning, setRegimeRunning] = useState(false)
+  const [verifyRunning, setVerifyRunning] = useState(false)
 
   const { data: dates } = useQuery({ queryKey: ['mi-dates'], queryFn: () => marketIntelDates(30) })
   useEffect(() => {
@@ -446,15 +555,55 @@ export function MarketIntelPage() {
     message.success('市场研判任务已提交后台')
     qc.invalidateQueries({ queryKey: ['mi-dates'] })
     qc.invalidateQueries({ queryKey: ['market-intel'] })
+    qc.invalidateQueries({ queryKey: ['market-diagnostics'] })
   })
-  const runRegime = useTaskSubmit('sector_forward', () => {
-    message.success('行情结构前瞻已完成')
+
+  const refreshDiagnostics = () => {
+    qc.invalidateQueries({ queryKey: ['market-diagnostics'] })
     qc.invalidateQueries({ queryKey: ['sector-regime-view'] })
-  })
-  const runVerify = useTaskSubmit('sector_forecast_verify', () => {
-    message.success('前瞻验证回填已完成')
-    qc.invalidateQueries({ queryKey: ['sector-regime-view'] })
-  })
+  }
+
+  const handleRunRegime = async () => {
+    if (!selectedDate) return
+    setRegimeRunning(true)
+    try {
+      const result = await runSectorForward(selectedDate)
+      if (result.status === 'running_partial') {
+        message.warning('行情结构仍在后台收尾，快照已写库请稍后刷新')
+      } else if (result.success === false) {
+        message.error(`行情结构刷新失败：${result.error ?? '未知错误'}`)
+      } else {
+        message.success('行情结构前瞻已完成')
+      }
+      refreshDiagnostics()
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '行情结构刷新失败')
+      refreshDiagnostics()
+    } finally {
+      setRegimeRunning(false)
+    }
+  }
+
+  const handleRunVerify = async () => {
+    if (!selectedDate) return
+    setVerifyRunning(true)
+    try {
+      const result = await runSectorForecastVerify(selectedDate)
+      if (result.status === 'running_partial') {
+        message.warning('前瞻验证仍在后台收尾，请稍后刷新')
+      } else if (result.success === false) {
+        message.error(`前瞻验证失败：${result.error ?? '未知错误'}`)
+      } else {
+        message.success('前瞻验证回填已完成')
+      }
+      refreshDiagnostics()
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '前瞻验证失败')
+      refreshDiagnostics()
+    } finally {
+      setVerifyRunning(false)
+    }
+  }
 
   const appetite: Record<string, { label: string; color: string; 含义: string }> = {
     进取: { label: '进取', color: 'red', 含义: '资金转进攻，可增配主线强势方向' },
@@ -467,10 +616,10 @@ export function MarketIntelPage() {
       <Space style={{ marginBottom: 10 }} wrap>
         <Select placeholder="选择研判日期" style={{ width: 160 }} value={selectedDate} onChange={setDate}
           options={(dates ?? []).map((d) => ({ label: d, value: d }))} />
-        <Button type="primary" disabled={!selectedDate} loading={runRegime.submit.isPending} onClick={() => runRegime.submit.mutate({ trade_date: selectedDate })}>
+        <Button type="primary" disabled={!selectedDate} loading={regimeRunning} onClick={handleRunRegime}>
           刷新行情结构
         </Button>
-        <Button disabled={!selectedDate} loading={runVerify.submit.isPending} onClick={() => runVerify.submit.mutate({ forecast_date: selectedDate })}>
+        <Button disabled={!selectedDate} loading={verifyRunning} onClick={handleRunVerify}>
           回填验证
         </Button>
         <Button type="primary" loading={run.submit.isPending} onClick={() => run.submit.mutate({})}>
@@ -478,6 +627,7 @@ export function MarketIntelPage() {
         </Button>
         <Button onClick={() => refetch()}>刷新</Button>
       </Space>
+      <ModuleStatusBar />
 
       {mi?.phase ? (
         <Alert
@@ -493,7 +643,7 @@ export function MarketIntelPage() {
         items={[
           {
             key: 'regime', label: '行情结构',
-            children: <RegimeStructureTab date={selectedDate} />,
+            children: <RegimeStructureTab date={selectedDate} onRun={handleRunRegime} running={regimeRunning} />,
           },
           {
             key: 'basis', label: '市场判定依据',
@@ -544,7 +694,16 @@ export function MarketIntelPage() {
             key: 'volume', label: '板块量能信号',
             children: (() => {
               const vs = (mi?.volume_signal ?? {}) as Record<string, unknown>
-              if (!Object.keys(vs).length) return <Text type="secondary">（该轮未输出量能信号）</Text>
+              const raw = (mi?.raw ?? {}) as Record<string, unknown>
+              const boardVolumeUnavailable = vs.board_volume_ratio_available === false || raw.board_volume_ratio_available === false
+              if (!Object.keys(vs).length || boardVolumeUnavailable) {
+                return (
+                  <Space orientation="vertical" style={{ width: '100%' }} size={8}>
+                    <Alert type="warning" showIcon message="akshare 东财接口 board_volume_ratio_available=false，请等待数据源升级" />
+                    {Object.keys(vs).length ? <DictTab dict={vs} empty="（该轮未输出量能信号）" /> : null}
+                  </Space>
+                )
+              }
               return (
                 <Descriptions size="small" column={1} items={[
                   { key: 'fc', label: '放量板块', children: String(vs['放量板块'] ?? '（无/数据缺失）') },

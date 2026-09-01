@@ -23,13 +23,13 @@ import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { get } from '@/api/client'
 import { portfolioAttribution, reviews, stockCycleAttribution } from '@/api/reviews'
 import { candidateTradeable } from '@/api/candidates'
-import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion, reReviewSuggestion } from '@/api/suggestions'
-import { trackVerifyDates, trackVerifyList, trackVerifyStats, runTrackVerify, runTrackSuggest } from '@/api/track'
+import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion, reReviewSuggestion, ruleChanges } from '@/api/suggestions'
+import { trackVerifyDates, trackVerifyList, runTrackVerify, runTrackSuggest } from '@/api/track'
 import { traceDetail, traces } from '@/api/traces'
 import { ChartCard } from '@/components/charts/ChartCard'
 import type { EChartsOption } from 'echarts'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StatusBadge, StockLabel } from '@/components/common'
-import type { AgentSuggestion, ReviewInfo, TrackVerifyRow } from '@/types'
+import type { AgentSuggestion, ReviewInfo, RuleChange, TrackVerifyRow } from '@/types'
 
 const { Text } = Typography
 const SUG_STATUS: Record<string, { label: string; color: string }> = {
@@ -556,7 +556,7 @@ function WinRateTrend({ list }: { list: TrackVerifyRow[] }) {
       if (!d) continue
       const cur = g.get(d) ?? { win: 0, n: 0 }
       cur.n += 1
-      if (Number(r.t5_pct) >= 0) cur.win += 1
+      if (Number(r.t5_pct) > 0) cur.win += 1
       g.set(d, cur)
     }
     return Array.from(g).sort((a, b) => a[0].localeCompare(b[0]))
@@ -575,6 +575,27 @@ function WinRateTrend({ list }: { list: TrackVerifyRow[] }) {
       itemStyle: { color: '#10b981' }, areaStyle: { color: 'rgba(16,185,129,0.12)' } }],
   }
   return <ChartCard title="选股胜率趋势（按选中日 T+5 胜率）" option={option} height={220} />
+}
+
+function trackPct(r: TrackVerifyRow, k: 't3_pct' | 't5_pct' | 't10_pct'): number | null {
+  const v = r[k]
+  if (v == null) return null
+  const n = typeof v === 'number' ? v : Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+function calcTrackStats(list: TrackVerifyRow[], k: 't3_pct' | 't5_pct' | 't10_pct' = 't5_pct') {
+  const vals = list.map((r) => trackPct(r, k)).filter((v): v is number => v != null)
+  const wins = vals.filter((v) => v > 0).length
+  const gains = vals.filter((v) => v > 0).reduce((s, v) => s + v, 0)
+  const losses = vals.filter((v) => v < 0).reduce((s, v) => s + v, 0)
+  return {
+    n: vals.length,
+    wins,
+    winRate: vals.length ? wins / vals.length * 100 : null,
+    avgPct: vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : null,
+    plRatio: losses < 0 ? gains / Math.abs(losses) : null,
+  }
 }
 
 /** 选股准确率验证（track verify，直调） */
@@ -598,7 +619,16 @@ function TrackVerify() {
     },
     enabled: !!date || !!dates?.length,
   })
-  const { data: stats } = useQuery({ queryKey: ['tv-stats'], queryFn: () => trackVerifyStats('t5') })
+  const { data: trackSuggestions } = useQuery({
+    queryKey: ['agent-sug', 'track-verify'],
+    queryFn: () => agentSuggestions(),
+    staleTime: 60_000,
+  })
+  const { data: trackRules } = useQuery({
+    queryKey: ['rule-changes', 'track-verify'],
+    queryFn: () => ruleChanges('active'),
+    staleTime: 60_000,
+  })
 
   // —— 新增：按 select_date 批量跨查 candidate_tradeable，构建徽章索引 —— 只读
   const distinctDates = useMemo(() => {
@@ -670,11 +700,45 @@ function TrackVerify() {
     return arr
   }, [rows, sortKey])
 
-  const wr = stats?.win_rate
-  const avg = stats?.avg_pct
-  const runVerify = async () => { try { await runTrackVerify(false); message.success('T+N 验证已提交后台'); qc.invalidateQueries({ queryKey: ['tv-list'] }) } catch (e) { message.error(e instanceof Error ? e.message : '失败') } }
-  const runBackfill = async () => { try { await runTrackVerify(true); message.success('历史回填已提交后台，将逐日补算候选 T+N'); qc.invalidateQueries({ queryKey: ['tv-list'] }) } catch (e) { message.error(e instanceof Error ? e.message : '失败') } }
-  const runSuggest = async () => { try { await runTrackSuggest(); message.success('建议生成已提交后台') } catch (e) { message.error(e instanceof Error ? e.message : '失败') } }
+  const localStats = useMemo(() => calcTrackStats(rows ?? []), [rows])
+  const wr = localStats.winRate
+  const avg = localStats.avgPct
+  const reviewIdZero = (v: unknown) => v === 0 || v === '0'
+  const trackOnlySuggestions = useMemo(
+    () => (trackSuggestions ?? []).filter((s: AgentSuggestion) => reviewIdZero(s.review_id)),
+    [trackSuggestions],
+  )
+  const pendingTrackSuggestions = trackOnlySuggestions.filter((s) => s.status === 'pending')
+  const activeTrackRules = useMemo(
+    () => (trackRules ?? []).filter((r: RuleChange) => reviewIdZero(r.review_id)),
+    [trackRules],
+  )
+  const runVerify = async () => {
+    try {
+      await runTrackVerify(false)
+      message.success('T+N 验证已提交后台')
+      qc.invalidateQueries({ queryKey: ['tv-list'] })
+      qc.invalidateQueries({ queryKey: ['agent-sug'] })
+      qc.invalidateQueries({ queryKey: ['rule-changes'] })
+    } catch (e) { message.error(e instanceof Error ? e.message : '失败') }
+  }
+  const runBackfill = async () => {
+    try {
+      await runTrackVerify(true)
+      message.success('历史回填已提交后台，将逐日补算候选 T+N')
+      qc.invalidateQueries({ queryKey: ['tv-list'] })
+      qc.invalidateQueries({ queryKey: ['agent-sug'] })
+      qc.invalidateQueries({ queryKey: ['rule-changes'] })
+    } catch (e) { message.error(e instanceof Error ? e.message : '失败') }
+  }
+  const runSuggest = async () => {
+    try {
+      await runTrackSuggest()
+      message.success('建议生成已提交后台，请到本页「策略闭环建议」或「规则变更记录」审核/应用')
+      qc.invalidateQueries({ queryKey: ['agent-sug'] })
+      qc.invalidateQueries({ queryKey: ['rule-changes'] })
+    } catch (e) { message.error(e instanceof Error ? e.message : '失败') }
+  }
 
   const ratingDist = useMemo(() => {
     const m = new Map<string, number>()
@@ -731,11 +795,17 @@ function TrackVerify() {
       <StatCardGrid>
         <StatCard label="胜率" value={wr != null ? `${wr.toFixed(1)}%` : '无数据'}
           tone={wr != null ? (wr >= 50 ? 'ok' : wr < 40 ? 'err' : 'warn') : 'mute'}
-          sub={`盈利 ${stats?.wins ?? 0} 笔 / 共 ${stats?.n ?? 0} 笔`} />
+          sub={`上涨 ${localStats.wins} 笔 / 共 ${localStats.n} 笔`} />
         <StatCard label="平均涨幅" value={avg != null ? `${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%` : '无数据'}
           tone={avg != null ? (avg > 0 ? 'up' : avg < 0 ? 'down' : 'mute') : 'mute'} />
-        <StatCard label="盈亏比" value={stats?.pl_ratio != null ? stats.pl_ratio.toFixed(2) : '—'} tone="mute" />
-        <StatCard label="样本量" value={stats?.n ?? 0} tone="mute" sub="T+5 已到期" />
+        <StatCard label="盈亏比" value={localStats.plRatio != null ? localStats.plRatio.toFixed(2) : '—'} tone="mute" />
+        <StatCard label="样本量" value={localStats.n} tone="mute" sub="当前筛选内 T+5 已到期" />
+      </StatCardGrid>
+      <StatCardGrid>
+        <StatCard label="待审核建议" value={pendingTrackSuggestions.length} tone={pendingTrackSuggestions.length ? 'warn' : 'mute'} sub="生成建议后在此闭环" />
+        <StatCard label="已生效规则" value={activeTrackRules.length} tone={activeTrackRules.length ? 'ok' : 'mute'} sub="人工采纳后动态注入" />
+        <StatCard label="候选策略闭环" value="T+N" tone="info" sub="入选后上涨/回撤校验选股" />
+        <StatCard label="建仓计划闭环" value="复盘" tone="info" sub="建仓到离场校验持仓与止盈止损" />
       </StatCardGrid>
       <StatCardGrid>
         <StatCard label="T+3 平均" value={periodAvg.t3 != null ? `${periodAvg.t3 >= 0 ? '+' : ''}${periodAvg.t3.toFixed(2)}%` : '—'} tone="mute" sub="选中日 3 日后" />
@@ -744,20 +814,22 @@ function TrackVerify() {
         <StatCard label="已验证日期" value={dateRange.n} tone="mute" sub={`${dateRange.min} ~ ${dateRange.max}`} />
       </StatCardGrid>
       <Alert type="info" showIcon style={{ marginBottom: 10 }}
-        message={`验证口径：候选选中日 T+N 涨跌幅（相对选中日收盘 base_close_price），T+N 收益跑赢沪深300 = 胜。列表支持按时间范围（近 1/3/6/12 月）与精确日期过滤；「历史回填」逐日补算未追踪的历史候选。`} />
+        message="实战闭环分两条：候选 T+N 验证用于收敛 Discover/Score 的选股与评级规则；建仓计划执行后的真实盈亏由复盘/组合周期统计收敛持仓、止盈止损和仓位控制规则。大盘只做背景参考，不参与当前胜率判定。" />
+      <Alert type="warning" showIcon style={{ marginBottom: 10 }}
+        message="审核入口：生成建议后，到本页「策略闭环建议」页签审核；规则采纳生效后，到左侧「策略沉淀 → 规则变更记录」查看、重新审核或回滚。硬规则采纳需要二次确认。" />
       <WinRateTrend list={rows ?? []} />
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
         排序规则：默认「评级 A→C + 选中日」；T+3/T+5/T+10 仅显示已到期样本，未到期显示「—」；「建仓级别」徽章来自当日可建仓判定（只读展示）。
       </Text>
       <Card size="small" title="统计口径说明" style={{ background: 'var(--bg-input)', marginBottom: 10 }}>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          「生成建议」基于已到期样本的胜率/回撤做提示性建议（落 agent_suggestion 待审核），不会自动改动任何策略。
+          「生成建议」基于当前已到期样本的胜率、评级倒挂、回撤做实战规则建议（落 agent_suggestion 待审核），不会绕过人工确认自动改动策略。
         </Text>
         <Space direction="vertical" style={{ width: '100%' }} size={4}>
-          <Text type="secondary">• 胜率 = 跑赢沪深300 的信号占比（T+N 收益 &gt; 大盘收益 = 胜）</Text>
-          <Text type="secondary">• 平均涨幅 = 全部到期样本 T+5 涨跌幅均值（% 相对选中日收盘）</Text>
+          <Text type="secondary">• 候选胜率 = 当前筛选内 T+5 收益 &gt; 0 的信号占比；这是我们自己的选股命中率，大盘仅作市况背景参考</Text>
+          <Text type="secondary">• 平均涨幅 = 当前筛选内到期样本 T+5 涨跌幅均值（% 相对选中日收盘）</Text>
           <Text type="secondary">• 最大回撤 = 到期样本窗口内最低价到选中日的回撤幅度</Text>
-          <Text type="secondary">• 样本量 = T+5 已到期的追踪行数（未到期不计入胜率）</Text>
+          <Text type="secondary">• 样本量 = 当前筛选内 T+5 已到期的追踪行数（未到期不计入胜率）</Text>
           <Text type="secondary">• 数据来源：候选池选中日 base_close_price + 日 K 收盘（纯代码计算，零 LLM）</Text>
         </Space>
       </Card>
@@ -765,7 +837,7 @@ function TrackVerify() {
         数据截止：最近一次 T+N 验证运行结果；「历史回填」可逐日补算未追踪的历史候选，补算为后台任务不阻塞页面。
       </Text>
       <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
-        最近验证日期：{dates?.[0] ?? '—'}；「手动验证（T+N）」对最新候选补算已到期样本，「生成建议」产出提示性建议（待审核）。
+        最近验证日期：{dates?.[0] ?? '—'}；「手动验证（T+N）」补算已到期候选，「生成建议」产出待审核规则建议。
       </Text>
       <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
         追踪状态：追踪中 = 选中日 T+5 未到期；已到期 = 已补算 T+5 收益并可计胜率。
@@ -817,7 +889,7 @@ function TrackVerify() {
           {
             title: 'T+5 结果', key: 't5res', width: 80,
             render: (_: unknown, r: TrackVerifyRow) => r.t5_pct != null
-              ? <Tag color={Number(r.t5_pct) >= 0 ? 'green' : 'red'}>{Number(r.t5_pct) >= 0 ? '胜' : '负'}</Tag>
+              ? <Tag color={Number(r.t5_pct) > 0 ? 'green' : 'red'}>{Number(r.t5_pct) > 0 ? '上涨' : '未涨'}</Tag>
               : <Tag color="default">未到期</Tag>,
           },
           {
