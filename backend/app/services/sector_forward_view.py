@@ -62,6 +62,14 @@ def _causal_context(trade_date: str, sector_name: str) -> dict:
             "confidence": confidence,
             "reason_tags": current.get("reason_tags") or "",
             "evidence": evidence,
+            "falsification": evidence.get("falsification") or {},
+            "has_hard_evidence": any(
+                item.get("evidence_level") in {"L1", "L2"}
+                for item in (evidence.get("causal_chain") or [])
+                if isinstance(item, dict)
+            ),
+            "has_transmission": bool(evidence.get("industry_transmission")),
+            "has_capital_behavior": bool(evidence.get("capital_behavior")),
         }
 
     background = None
@@ -82,6 +90,7 @@ def _causal_context(trade_date: str, sector_name: str) -> dict:
         "confidence": None,
         "reason_tags": "",
         "evidence": (background[1].get("evidence") or {}) if background else {},
+        "falsification": (background[1].get("evidence") or {}).get("falsification") if background else {},
         "background_available": background is not None,
     }
 
@@ -97,6 +106,23 @@ def _apply_causal_adjustment(continuation, chase, causal):
     if confidence < 0.45:
         return _clamp(continuation - 0.05), _clamp(chase + 0.05), -0.05
     return continuation, chase, 0.0
+
+
+def _falsification_triggered(causal: dict | None) -> bool:
+    """仅接受证据中明确的布尔触发标记；不从自然语言反证条件臆测触发。"""
+    flags = (causal or {}).get("falsification") or {}
+    return any(flags.get(key) is True for key in (
+        "falsification_triggered", "triggered", "active",
+    ))
+
+
+def _downgrade_bias(bias: str) -> str:
+    """反证触发时撤销延续/新主线确认标签，其他状态保持原判断。"""
+    return {
+        "continue": "uncertain",
+        "mainline_confirm": "uncertain",
+        "new_mainline_switch": "switch",
+    }.get(bias, bias)
 
 
 def _score(row, hist, previous, boxes, regime, causal=None):
@@ -126,6 +152,11 @@ def _score(row, hist, previous, boxes, regime, causal=None):
     technical_continuation = continuation
     continuation, chase, causal_adjustment = _apply_causal_adjustment(
         continuation, chase, causal)
+    falsification_triggered = _falsification_triggered(causal)
+    if falsification_triggered:
+        continuation = _clamp((continuation or 0.0) - 0.05) if continuation is not None else None
+        exhaustion = _clamp(exhaustion + 0.05)
+        chase = _clamp(chase + 0.05)
     mainline = regime.get("current_regime") == "mainline"
     fading = regime.get("regime_stage") in ("diverge", "fade") and (
         not regime.get("evidence", {}).get("leader_streak_sector") or
@@ -160,7 +191,13 @@ def _score(row, hist, previous, boxes, regime, causal=None):
                      "causal_missing": bool(causal.get("causal_missing")) if causal else False,
                      "causal_adjustment": causal_adjustment,
                      "causal_confidence": causal.get("confidence") if causal else None,
-                     "causal_source_trade_date": causal.get("source_trade_date") if causal else None},
+                     "causal_source_trade_date": causal.get("source_trade_date") if causal else None,
+                     "causal_reason_tags": causal.get("reason_tags") if causal else "",
+                     "causal_falsification": causal.get("falsification") if causal else {},
+                     "falsification_triggered": falsification_triggered,
+                     "causal_has_hard_evidence": causal.get("has_hard_evidence") if causal else None,
+                     "causal_has_transmission": causal.get("has_transmission") if causal else None,
+                     "causal_has_capital_behavior": causal.get("has_capital_behavior") if causal else None},
         "mainline": mainline,
     }
 
@@ -218,6 +255,8 @@ def run_sector_forward(trade_date: str | None = None) -> dict:
                         "fade" if score["exhaustion_risk"] >= 0.6 else
                         "mainline_confirm" if bias == "continue" else
                         "invalid_rotation" if regime["current_regime"] == "rotation" else "uncertain")
+            if score["evidence"].get("falsification_triggered"):
+                bias = _downgrade_bias(bias)
             if emotion_only:
                 if score["sector_tag"] in {"mainline_seed", "low_buy"}:
                     score["sector_tag"] = "one_day_fly"

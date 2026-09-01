@@ -69,12 +69,58 @@ def _posterior_regime(days_rows: list[list[dict]]) -> str:
     return "chaos"
 
 
+def _causal_review(forecasts: list[dict], horizon: str, mainline: str | None,
+                   mainline_hit: bool | None) -> dict:
+    """保留预测时原因输入与市场后验，避免将事后结果伪装成原因事实。"""
+    same_horizon = [row for row in forecasts if row.get("forecast_horizon") == horizon]
+    target = next((row for row in same_horizon if row.get("sector_name") == mainline), None)
+    target = target or next((row for row in forecasts if row.get("sector_name") == mainline), None)
+    if target is None:
+        return {"status": "forecast_missing", "confidence_band": "missing",
+                "input_gaps": ["mainline_forecast_missing"]}
+    evidence = target.get("evidence") or {}
+    confidence = evidence.get("causal_confidence")
+    missing = bool(evidence.get("causal_missing")) or confidence is None
+    try:
+        confidence = max(0.0, min(1.0, float(confidence))) if confidence is not None else None
+    except (TypeError, ValueError):
+        confidence = None
+        missing = True
+    band = "missing" if missing else "high" if confidence >= 0.75 else "medium" if confidence >= 0.45 else "low"
+    input_gaps = []
+    if missing:
+        input_gaps.append("causal_attribution_missing")
+    else:
+        if not evidence.get("causal_has_hard_evidence"):
+            input_gaps.append("hard_evidence_missing")
+        if not evidence.get("causal_has_transmission"):
+            input_gaps.append("industry_transmission_missing")
+        if not evidence.get("causal_has_capital_behavior"):
+            input_gaps.append("capital_confirmation_missing")
+    status = ("causal_missing" if missing else "awaiting_market_verification" if mainline_hit is None
+              else "market_validated" if mainline_hit else "market_not_validated")
+    return {
+        "sector_name": target.get("sector_name"),
+        "confidence": confidence,
+        "confidence_band": band,
+        "source_trade_date": evidence.get("causal_source_trade_date"),
+        "reason_tags": evidence.get("causal_reason_tags") or "",
+        "falsification": evidence.get("causal_falsification") or {},
+        "input_gaps": input_gaps,
+        "status": status,
+        "market_validated": mainline_hit,
+        "note": ("市场结果不符合预测；这不自动证明消息、政策或产业因果为假。"
+                 if status == "market_not_validated" else ""),
+    }
+
+
 def evaluate_forecast(regime: dict | None, forecasts: list[dict],
                       rows_by_date: dict[str, list[dict]], horizon: str,
                       verify_date: str | None) -> dict:
     """按审核映射表计算单个 horizon 的命中结果。"""
     need_days = HORIZON_DAYS[horizon]
     if len(rows_by_date) < need_days:
+        mainline = _mainline_sector(regime, forecasts)
         return {
             "verify_date": verify_date,
             "regime_hit": None,
@@ -82,7 +128,8 @@ def evaluate_forecast(regime: dict | None, forecasts: list[dict],
             "mainline_hit": None,
             "regime_forecast": (regime or {}).get("current_regime"),
             "miss_reason": "data_insufficient",
-            "detail": {"required_days": need_days, "actual_days": len(rows_by_date)},
+            "detail": {"required_days": need_days, "actual_days": len(rows_by_date),
+                       "causal_review": _causal_review(forecasts, horizon, mainline, None)},
         }
     horizon_bias = {
         "t1": (regime or {}).get("forward_bias_t1"),
@@ -156,6 +203,7 @@ def evaluate_forecast(regime: dict | None, forecasts: list[dict],
             "switch_sector": switch_sector,
             "mainline_change_sum": mainline_sum,
             "switch_change_sum": switch_sum,
+            "causal_review": _causal_review(forecasts, horizon, mainline, hit),
         },
     }
 

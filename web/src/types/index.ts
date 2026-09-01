@@ -113,6 +113,14 @@ export interface SectorLaunchItem {
   confidence?: number | null
   [k: string]: unknown
 }
+export interface SectorCausalChainItem {
+  layer?: string
+  claim?: string
+  evidence_keys?: string[]
+  evidence_level?: string
+  time_alignment?: string
+  cause_label?: string
+}
 export interface SectorRotationInfo {
   trade_date?: string | null
   rotation_state?: string | null
@@ -180,12 +188,20 @@ export interface SectorForecastAccuracyGroup {
   top5_continue_rate?: number | null
   mainline_hit_rate?: number | null
 }
+export interface SectorForecastCausalGroup {
+  band?: string
+  sample_count?: number
+  regime_hit_rate?: number | null
+  top5_continue_rate?: number | null
+  mainline_hit_rate?: number | null
+}
 export interface SectorForecastAccuracyWindow {
   window_days?: number
   start_date?: string
   end_date?: string
   sample_count?: number
   groups?: SectorForecastAccuracyGroup[]
+  causal_groups?: SectorForecastCausalGroup[]
 }
 export interface RegimeViewInfo {
   trade_date?: string | null
@@ -733,12 +749,26 @@ export interface SystemMapSummary {
 
 export type SystemMapHealthStatus = 'healthy' | 'attention' | 'error' | 'unknown'
 
+export interface SystemMapMigrationSummary {
+  table?: string
+  added?: string[]
+  existing?: string[]
+  [k: string]: unknown
+}
+
 export interface SystemMapHealthModule {
   module: string
   status: SystemMapHealthStatus
   counts?: Record<string, number | null>
   updated_at?: string
   last_error?: string | null
+  initialized_at?: string | null
+  backend?: string | null
+  database?: string | null
+  sqlite_path_digest?: string | null
+  reason?: string
+  knowledge?: SystemMapMigrationSummary
+  experience?: SystemMapMigrationSummary
   [k: string]: unknown
 }
 

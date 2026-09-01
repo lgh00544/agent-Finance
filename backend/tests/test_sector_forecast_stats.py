@@ -6,13 +6,13 @@ def test_stats_group_by_regime_and_windows(monkeypatch):
     rows = [
         {"forecast_date": "2026-08-27", "regime_forecast": "mainline",
          "regime_hit": True, "top5_continue_rate": 1.0, "mainline_hit": True,
-         "miss_reason": ""},
+         "miss_reason": "", "detail": {"causal_review": {"confidence_band": "high"}}},
         {"forecast_date": "2026-08-26", "regime_forecast": "mainline",
          "regime_hit": False, "top5_continue_rate": 0.5, "mainline_hit": False,
-         "miss_reason": ""},
+         "miss_reason": "", "detail": {"causal_review": {"confidence_band": "low"}}},
         {"forecast_date": "2026-08-25", "regime_forecast": "rotation",
          "regime_hit": True, "top5_continue_rate": None, "mainline_hit": True,
-         "miss_reason": ""},
+         "miss_reason": "", "detail": {"causal_review": {"confidence_band": "missing"}}},
         {"forecast_date": "2026-08-24", "regime_forecast": "chaos",
          "regime_hit": None, "top5_continue_rate": None, "mainline_hit": None,
          "miss_reason": "data_insufficient"},
@@ -30,3 +30,7 @@ def test_stats_group_by_regime_and_windows(monkeypatch):
     assert groups["mainline"]["mainline_hit_rate"] == 0.5
     assert groups["rotation"]["regime_hit_rate"] == 1.0
     assert "chaos" not in groups
+    causal = {g["band"]: g for g in result["windows"][0]["causal_groups"]}
+    assert causal["high"]["mainline_hit_rate"] == 1.0
+    assert causal["low"]["mainline_hit_rate"] == 0.0
+    assert causal["missing"]["sample_count"] == 1

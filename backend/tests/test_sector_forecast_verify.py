@@ -71,3 +71,33 @@ def test_data_insufficient_marks_nulls(monkeypatch):
     assert t5["top5_continue_rate"] is None
     assert t5["mainline_hit"] is None
     assert t5["miss_reason"] == "data_insufficient"
+
+
+def test_verify_keeps_causal_snapshot_without_overclaiming_failure():
+    regime = {
+        "current_regime": "mainline", "forward_bias_t1": "continue",
+        "evidence": {"leader_streak_sector": "半导体"},
+    }
+    forecasts = [{
+        "sector_name": "半导体", "rank_no": 1, "forecast_horizon": "t1",
+        "evidence": {
+            "causal_confidence": 0.8,
+            "causal_missing": False,
+            "causal_source_trade_date": "2026-08-28",
+            "causal_reason_tags": "verified_cause",
+            "causal_falsification": {"t1_invalid_if": "龙头走弱"},
+            "causal_has_hard_evidence": True,
+            "causal_has_transmission": True,
+            "causal_has_capital_behavior": True,
+        },
+    }]
+    actual = {"2026-08-29": [_row("半导体", 8, -1.0), *_rows(["A", "B", "C", "D"])]}
+
+    result = sfv.evaluate_forecast(regime, forecasts, actual, "t1", "2026-08-29")
+    review = result["detail"]["causal_review"]
+
+    assert result["mainline_hit"] is False
+    assert review["confidence_band"] == "high"
+    assert review["status"] == "market_not_validated"
+    assert review["falsification"]["t1_invalid_if"] == "龙头走弱"
+    assert "不自动证明" in review["note"]

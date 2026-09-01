@@ -146,6 +146,46 @@ def test_emotion_only_attribution_blocks_continuation_labels(monkeypatch):
                for item in saved["items"] if item["forecast_horizon"] in {"t3", "t5"})
 
 
+def test_forward_evidence_preserves_causal_review_inputs(monkeypatch):
+    row = _row(pct=2.0, volume=2.0)
+    history = [_row(rank=8, pct=1.0, volume=1.0) for _ in range(10)]
+    regime = {"current_regime": "mainline", "regime_stage": "unknown"}
+    saved = _patch(monkeypatch, [row], history, regime, {"A": {"box60_pct": 50}})
+    monkeypatch.setattr(
+        sector_forward_view.repo, "list_sector_launch_by_date",
+        lambda d: [{"sector_name": "A", "confidence": 0.8, "reason_tags": "verified_cause",
+                    "evidence": {"causal_chain": [{"evidence_level": "L1"}],
+                                 "industry_transmission": ["上游传导"],
+                                 "capital_behavior": {"leader": "确认"},
+                                 "falsification": {"t1_invalid_if": "龙头走弱"}}}],
+    )
+    sector_forward_view.run_sector_forward("2026-08-28")
+    evidence = saved["items"][0]["evidence"]
+    assert evidence["causal_reason_tags"] == "verified_cause"
+    assert evidence["causal_has_hard_evidence"] is True
+    assert evidence["causal_has_transmission"] is True
+    assert evidence["causal_has_capital_behavior"] is True
+    assert evidence["causal_falsification"]["t1_invalid_if"] == "龙头走弱"
+
+
+def test_explicit_falsification_trigger_degrades_forecast(monkeypatch):
+    row = _row(pct=2.0, volume=2.0)
+    history = [_row(rank=8, pct=1.0, volume=1.0) for _ in range(10)]
+    regime = {"current_regime": "mainline", "regime_stage": "unknown"}
+    saved = _patch(monkeypatch, [row], history, regime, {"A": {"box60_pct": 50}})
+    monkeypatch.setattr(
+        sector_forward_view.repo, "list_sector_launch_by_date",
+        lambda d: [{"sector_name": "A", "confidence": 0.8, "reason_tags": "verified_cause",
+                    "evidence": {"falsification": {"falsification_triggered": True}}}],
+    )
+    sector_forward_view.run_sector_forward("2026-08-28")
+    item = saved["items"][0]
+    assert item["evidence"]["falsification_triggered"] is True
+    assert item["evidence"]["causal_adjustment"] == 0.05
+    assert item["exhaustion_risk"] > 0
+    assert item["forward_bias"] == "uncertain"
+
+
 def test_fetch_boxes_timeout_degrades_to_empty(monkeypatch):
     def slow_fetch(self, names):
         time.sleep(0.3)

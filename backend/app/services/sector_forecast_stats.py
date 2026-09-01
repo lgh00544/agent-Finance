@@ -24,6 +24,17 @@ def _parse_date(value: str | None) -> datetime:
     return datetime.now()
 
 
+def _group_metrics(items: list[dict], key: str, value: str) -> dict:
+    rows = [row for row in items if key(row) == value]
+    return {
+        "band": value,
+        "sample_count": len(rows),
+        "regime_hit_rate": _rate([row.get("regime_hit") for row in rows]),
+        "top5_continue_rate": _avg([row.get("top5_continue_rate") for row in rows]),
+        "mainline_hit_rate": _rate([row.get("mainline_hit") for row in rows]),
+    }
+
+
 def summarize_forecast_accuracy(end_date: str | None = None,
                                 windows: tuple[int, ...] = WINDOWS) -> dict:
     """按近 30/60/90 日与 regime 聚合命中率。"""
@@ -47,11 +58,18 @@ def summarize_forecast_accuracy(end_date: str | None = None,
                 "top5_continue_rate": _avg([r.get("top5_continue_rate") for r in items]),
                 "mainline_hit_rate": _rate([r.get("mainline_hit") for r in items]),
             })
+        def causal_band(row: dict) -> str:
+            review = (row.get("detail") or {}).get("causal_review") or {}
+            return review.get("confidence_band") or "missing"
+        causal_groups = [_group_metrics(win_rows, causal_band, band)
+                         for band in ("high", "medium", "low", "missing")
+                         if any(causal_band(row) == band for row in win_rows)]
         out.append({
             "window_days": days,
             "start_date": start_key,
             "end_date": end_key,
             "sample_count": len(win_rows),
             "groups": groups,
+            "causal_groups": causal_groups,
         })
     return {"windows": out}

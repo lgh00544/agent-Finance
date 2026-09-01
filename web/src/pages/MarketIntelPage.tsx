@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { marketDiagnostics, marketIntel, marketIntelDates, runSectorForecastVerify, runSectorForward, sectorNextHot, sectorPatterns, sectorRegimeView, sectorRotation } from '@/api/market'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard } from '@/components/common'
-import type { MarketDiagnosticsInfo, MarketIntelInfo, RegimeViewInfo, SectorForwardForecast, SectorNextHotItem } from '@/types'
+import type { MarketDiagnosticsInfo, MarketIntelInfo, RegimeViewInfo, SectorForwardForecast, SectorLaunchItem, SectorNextHotItem } from '@/types'
 
 const { Text } = Typography
 
@@ -164,6 +164,56 @@ function EvidenceCards({ chain }: { chain: unknown }) {
     const content = e.inference ?? e.content ?? e.value ?? e
     return <Card key={i} size="small" title={fmt(title)} extra={<Tag color="blue">{fmt(source)}</Tag>}><Text>{fmt(content)}</Text></Card>
   }) : <Text type="secondary">（证据链为空）</Text>}</Space>
+}
+
+function causalBand(confidence?: unknown, missing?: unknown): { label: string; color: string } {
+  if (missing || confidence == null || Number.isNaN(Number(confidence))) return { label: '原因缺失', color: 'default' }
+  const value = Number(confidence)
+  if (value >= 0.75) return { label: '高硬度', color: 'green' }
+  if (value >= 0.45) return { label: '中等', color: 'orange' }
+  return { label: '低硬度', color: 'red' }
+}
+
+function CausalLoop({ item }: { item: SectorLaunchItem }) {
+  const evidence = item.evidence ?? {}
+  const chain = Array.isArray(evidence.causal_chain) ? evidence.causal_chain as Array<Record<string, unknown>> : []
+  const transmission = Array.isArray(evidence.industry_transmission) ? evidence.industry_transmission : []
+  const capital = evidence.capital_behavior as Record<string, unknown> | undefined
+  const falsification = evidence.falsification as Record<string, unknown> | undefined
+  const band = causalBand(item.confidence, evidence.causal_missing)
+  const caps = evidence.confidence_caps as Record<string, unknown> | undefined
+  return (
+    <Collapse size="small" style={{ marginTop: 6 }} items={[{
+      key: 'causal',
+      label: <Space size={6}><span>板块因果闭环</span><Tag color={band.color}>原因硬度 {item.confidence == null ? '—' : pct(item.confidence)} · {band.label}</Tag></Space>,
+      children: (
+        <Space orientation="vertical" style={{ width: '100%' }} size={6}>
+          <Descriptions size="small" column={1} items={[
+            { key: 'caps', label: '置信度口径', children: fmt(caps?.cap_reason ?? '按证据链、时间匹配、产业传导、资金验证计算') },
+            { key: 'transmission', label: '产业传导', children: transmission.length ? fmt(transmission) : '（未提供）' },
+            { key: 'capital', label: '资金验证', children: capital && Object.keys(capital).length ? fmt(capital) : '（未提供）' },
+            { key: 'source', label: '证据状态', children: evidence.causal_missing ? '当日归因缺失，未参与前瞻修正' : `归因日期 ${fmt(evidence.causal_source_trade_date)}` },
+          ]} />
+          {chain.length ? (
+            <List size="small" header={<Text strong>催化分层与证据等级</Text>} dataSource={chain} renderItem={(part) => (
+              <List.Item style={{ paddingInline: 0 }}>
+                <Space wrap>
+                  <Tag>{fmt(part.layer)}</Tag>
+                  <Tag color="blue">{fmt(part.evidence_level)}</Tag>
+                  <Tag>{fmt(part.time_alignment)}</Tag>
+                  <Tag color={part.cause_label === 'post_move_explanation' ? 'orange' : part.cause_label === 'unusable_rumor' ? 'red' : 'default'}>{fmt(part.cause_label)}</Tag>
+                  <Text>{fmt(part.claim)}</Text>
+                </Space>
+              </List.Item>
+            )} />
+          ) : <Text type="secondary">（暂无可回指的完整因果链）</Text>}
+          <Descriptions size="small" column={1} title="反证条件" items={['t1_invalid_if', 't3_invalid_if', 't5_invalid_if'].map((key) => ({
+            key, label: key.replace('_invalid_if', '').toUpperCase(), children: fmt(falsification?.[key] ?? '（未提供）'),
+          }))} />
+        </Space>
+      ),
+    }]} />
+  )
 }
 
 function ModuleStatusBar() {
@@ -352,6 +402,27 @@ function RegimeStructureTab({ date, onRun, running }: { date?: string; onRun?: (
             ))}
           </tbody>
         </table>
+        {(acc30?.causal_groups ?? []).length ? (
+          <>
+            <Text strong style={{ display: 'block', marginTop: 10 }}>按原因硬度复盘</Text>
+            <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse', marginTop: 4 }}>
+              <thead>
+                <tr><th style={thStyle}>原因硬度</th><th style={thStyle}>样本</th><th style={thStyle}>结构命中</th><th style={thStyle}>Top5延续</th><th style={thStyle}>主线命中</th></tr>
+              </thead>
+              <tbody>
+                {(acc30?.causal_groups ?? []).map((g) => (
+                  <tr key={g.band}>
+                    <td style={tdStyle}>{g.band === 'high' ? '高' : g.band === 'medium' ? '中' : g.band === 'low' ? '低' : '缺失'}</td>
+                    <td style={tdStyle}>{g.sample_count ?? 0}</td>
+                    <td style={tdStyle}>{pct(g.regime_hit_rate)}</td>
+                    <td style={tdStyle}>{pct(g.top5_continue_rate)}</td>
+                    <td style={tdStyle}>{pct(g.mainline_hit_rate)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        ) : null}
       </Card>
 
       <Collapse size="small" items={[{
@@ -488,6 +559,7 @@ function SectorRotationTab() {
                 ),
               }]} />
             ) : null}
+            <CausalLoop item={lr} />
           </Card>
         )) : (
           <Space orientation="vertical" style={{ width: '100%' }} size={8}>
@@ -509,6 +581,19 @@ function SectorRotationTab() {
                     <Tag color="blue">热度 {it.hot_score ?? '—'}</Tag>
                     <Text type="secondary">预计 {it.expected_horizon_days ?? '—'} 天 / 置信 {pct(it.confidence)}</Text>
                   </Space>
+                  {it.trigger_evidence ? (
+                    <Collapse size="small" items={[{
+                      key: 'next-hot-causal',
+                      label: '因果迁移核验',
+                      children: <Descriptions size="small" column={1} items={[
+                        { key: 'missing', label: '状态', children: it.trigger_evidence?.causal_missing ? '原因或关系证据缺失，暂列观察池' : '已有归因输入，仍需验证迁移关系' },
+                        { key: 'parent', label: '父板块置信度', children: fmt(it.trigger_evidence?.parent_confidence) },
+                        { key: 'distance', label: '传导距离', children: fmt(it.trigger_evidence?.transmission_distance) },
+                        { key: 'logic', label: '迁移逻辑', children: fmt(it.trigger_evidence?.migration_logic) },
+                        { key: 'verify', label: '必须验证', children: fmt(it.trigger_evidence?.must_verify) },
+                      ]} />,
+                    }]} />
+                  ) : null}
                 </List.Item>
               )}
             />
