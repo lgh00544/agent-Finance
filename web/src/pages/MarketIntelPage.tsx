@@ -139,6 +139,33 @@ function PendingEmpty({ text, actionLabel, onAction, loading }: { text: string; 
   )
 }
 
+function continuationOf(item: Record<string, unknown>): boolean {
+  const raw = `${fmt(item.reason_tags)} ${fmt(item.reason_text)} ${fmt(item.continuation)}`
+  return /持续|延续|可持|hold|continue/i.test(raw)
+}
+
+function continuationDays(item: Record<string, unknown>): string {
+  let ext = item.ext_info
+  if (typeof ext === 'string') { try { ext = JSON.parse(ext) } catch { ext = undefined } }
+  const e = (ext ?? {}) as Record<string, unknown>
+  return fmt(item.continuation_days ?? item.expected_days ?? e.continuation_days ?? e.expected_days)
+}
+
+function EvidenceCards({ chain }: { chain: unknown }) {
+  let parsed = chain
+  if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed) } catch { /* 保留原文展示 */ } }
+  const entries = Array.isArray(parsed) ? parsed : typeof parsed === 'object' && parsed
+    ? Object.entries(parsed as Record<string, unknown>).map(([k, v]) => ({ evidence_key: k, inference: v }))
+    : parsed ? [{ evidence_key: '证据', inference: parsed }] : []
+  return <Space orientation="vertical" style={{ width: '100%' }} size={6}>{entries.length ? entries.map((entry, i) => {
+    const e = (entry ?? {}) as Record<string, unknown>
+    const title = e.evidence_key ?? e.title ?? `证据 ${i + 1}`
+    const source = e.source ?? e.source_type ?? e.data_source ?? '分析结果'
+    const content = e.inference ?? e.content ?? e.value ?? e
+    return <Card key={i} size="small" title={fmt(title)} extra={<Tag color="blue">{fmt(source)}</Tag>}><Text>{fmt(content)}</Text></Card>
+  }) : <Text type="secondary">（证据链为空）</Text>}</Space>
+}
+
 function ModuleStatusBar() {
   const { data } = useQuery({
     queryKey: ['market-diagnostics'],
@@ -364,8 +391,10 @@ function SectorRotationTab() {
   })
   const rotStatus = runRot.poll.data?.status
   const rotRunning = runRot.submit.isPending || rotStatus === 'pending' || rotStatus === 'running'
+  // eslint-disable-next-line react/purity
   const elapsedSec = rotStartedAt && rotRunning ? Math.max(0, Math.round((Date.now() - rotStartedAt) / 1000)) : 0
   useEffect(() => {
+    // eslint-disable-next-line react/set-state-in-effect
     if (!rotRunning) setRotStartedAt(null)
   }, [rotRunning])
   // 每条启动归因的"理由全文展开"状态（index → 是否展开），无条件在顶部声明（Hooks 纪律）
@@ -379,6 +408,8 @@ function SectorRotationTab() {
   const launchList = rot?.launch?.length ? rot.launch : (rot?.launch_reasons ?? [])
   const st = rot?.rotation_state ?? ''
   const churn = rot?.churn_rate
+  const continuations = launchList.filter((lr) => continuationOf(lr as Record<string, unknown>))
+  const focus = st === 'mainline' ? '关注主线板块抱团持续性' : st === 'rotation' ? '关注切换节奏避免追高' : st === 'chaos' ? '防御为主降低仓位' : '等待结构判定后再确定关注重点'
 
   return (
     <Space orientation="vertical" style={{ width: '100%' }} size={12}>
@@ -398,23 +429,36 @@ function SectorRotationTab() {
           <Text type="secondary">轮动状态</Text>
           <div style={{ fontSize: 24, fontWeight: 700, color: stateColor[st] }}>{stateLabel[st] ?? rot?.rotation_state ?? '（数据缺失）'}</div>
           <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>三态判定：主线行情=资金集中单主线；轮动=高低切换快；混沌=无明确主线。</Text>
+          <Text type="secondary" style={{ display: 'block', fontSize: 13, marginTop: 6 }}>📌 关注重点：{focus}</Text>
         </div>
-        <div style={{ flex: '1 1 240px', border: '1px solid var(--border)', borderRadius: 8, padding: 12, background: 'var(--bg-input)' }}>
+        <Tooltip title="churn 次数 = 当前周期内主线板块切换次数，> 1 表示热点快速轮动">
+          <div style={{ flex: '1 1 240px', border: '1px solid var(--border)', borderRadius: 8, padding: 12, background: 'var(--bg-input)' }}>
           <Text type="secondary">主切频次 · 主线板块</Text>
           <div style={{ fontSize: 24, fontWeight: 700 }}>
             {churn != null ? `${churn} 次` : '—'}
             <span style={{ fontSize: 14, fontWeight: 500, marginLeft: 8 }}>{rot?.mainline_sector ?? '—'}</span>
           </div>
           <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>churn 越高说明板块切换越频繁；主线板块是资金持续抱团的方向。</Text>
-        </div>
+          </div>
+        </Tooltip>
       </div>
+
+      <Card size="small" title="可延续板块（下一阶段值得关注）" extra={<Text type="secondary">基于 AI 评估 × 持续信号规则筛出</Text>}>
+        {continuations.length ? <Space wrap>
+          {continuations.map((lr, i) => <Card key={i} size="small" hoverable title={lr.sector_name ?? '—'}>
+            <Space wrap><Tag color="blue">{st === 'mainline' ? '主线' : st === 'rotation' ? '轮动' : '观察'}</Tag><Text type="secondary">预期延续 {continuationDays(lr as Record<string, unknown>)} 天</Text></Space>
+            <Text type="secondary" ellipsis style={{ display: 'block', maxWidth: 280, marginTop: 6 }}>{lr.reason_text ?? '—'}</Text>
+          </Card>)}
+        </Space> : <EmptyState text="（暂无明确可延续板块）" icon="📌" />}
+      </Card>
 
       {/* AI 评估区 */}
       <Card size="small" style={{ background: 'var(--bg-input)' }}
         title={<span>AI 评估 · 本轮判定 {rot?.count ?? launchList.length} 个板块启动，理由摘要如下</span>}>
         {launchList.length ? launchList.map((lr, i) => (
           <Card key={i} size="small" style={{ marginBottom: 6, background: 'var(--bg-input)' }}>
-            <Space wrap><Text strong style={{ fontSize: 15 }}>{lr.sector_name ?? '—'}</Text><Tag color="blue">{lr.reason_tags ?? '（数据缺失）'}</Tag></Space>
+            <Space wrap><Text strong style={{ fontSize: 15 }}>{lr.sector_name ?? '—'}</Text>{continuationOf(lr as Record<string, unknown>) ? <Tag color="green">可延续</Tag> : null}<Tag color="blue">{lr.reason_tags ?? '（数据缺失）'}</Tag></Space>
+            {continuationOf(lr as Record<string, unknown>) ? <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>预期延续 {continuationDays(lr as Record<string, unknown>)} 天（从持续信号提取）</Text> : null}
             {(() => {
               const full = lr.reason_text || '（数据缺失）'
               const cut = full.split(/[。；\n]/).reduce((acc, s) => (acc.length + s.length + 1 <= 80 ? (acc ? acc + '。' + s : s) : acc), '')
@@ -431,7 +475,7 @@ function SectorRotationTab() {
               )
             })()}
             {lr.reason_chain ? (
-              <Collapse size="small" style={{ marginTop: 6 }} items={[{
+              <Collapse size="small" defaultActiveKey={['chain']} style={{ marginTop: 6 }} items={[{
                 key: 'chain',
                 label: 'reason_chain 证据链',
                 children: (
@@ -439,18 +483,7 @@ function SectorRotationTab() {
                     <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 6 }}>
                       证据链 = 本次判定背后的关键数据点与逻辑步骤，非原始 JSON
                     </Text>
-                    {(() => {
-                      const rc = lr.reason_chain
-                      if (Array.isArray(rc)) return (
-                        <Descriptions size="small" column={1} items={rc.map((it, j) => {
-                          const o = (it ?? {}) as Record<string, unknown>
-                          const reason = Object.entries(o).map(([k, v]) => `${k}: ${fmt(v)}`).join('；')
-                          return { key: `rc-${j}`, label: `步骤 ${j + 1}`, children: <div style={{ whiteSpace: 'pre-wrap' }}>{reason}</div> }
-                        })} />
-                      )
-                      if (typeof rc === 'object') return <DictTab dict={rc as Record<string, unknown>} empty="（证据链为空）" />
-                      return <Text>{String(rc)}</Text>
-                    })()}
+                    <EvidenceCards chain={lr.reason_chain} />
                   </div>
                 ),
               }]} />
@@ -541,6 +574,7 @@ export function MarketIntelPage() {
   const { data: dates } = useQuery({ queryKey: ['mi-dates'], queryFn: () => marketIntelDates(30) })
   useEffect(() => {
     if (!date && dates && dates.length > 0) {
+      // eslint-disable-next-line react/set-state-in-effect
       setDate(dates[0])
     }
   }, [date, dates])

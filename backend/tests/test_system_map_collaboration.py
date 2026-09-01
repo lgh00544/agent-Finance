@@ -54,3 +54,17 @@ def test_api_can_collaborate_allowed_and_forbidden_are_stable():
     assert allowed.status_code == forbidden.status_code == 200
     assert allowed.json()["allowed"] is True
     assert forbidden.json()["allowed"] is False
+    assert forbidden.json()["default_denied"] is True
+
+
+def test_api_can_collaborate_unknown_agent_returns_runtime_fields():
+    client = TestClient(app)
+    resp = client.get(
+        "/api/system-map/can-collaborate",
+        params={"requester": "unknown_agent", "target": "score", "relation": "call"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["allowed"] is False
+    assert body["unknown_caller"] is True
+    assert body["unknown_target"] is False

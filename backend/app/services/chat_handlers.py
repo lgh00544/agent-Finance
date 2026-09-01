@@ -12,6 +12,7 @@ from app.graph import router as graph_router
 from app.llm.structured import ModelLevel
 from app.services import agent_chat, feishu_bridge, holding_view, market_view, status as status_service
 from app.services import task_queue, ths_pnl
+from app.system_map import collaboration as collaboration_registry
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +20,47 @@ _LONG = {"score", "sell", "discover", "trigger"}
 _LABEL = {"score": "飞书·单股评分", "sell": "飞书·卖出决策",
           "discover": "飞书·今日选股", "trigger": "飞书·手动选股"}
 _NOTE = "\n（仅参考建议，交易需人工执行）"
+_INTENT_TARGETS = {
+    "score": "score",
+    "sell": "sell",
+    "discover": "discover",
+    "monitor": "monitor",
+    "review": "review",
+    "market": "market_intel",
+    "trigger": "discover",
+}
+
+
+def _collaboration_rejection(intent: str, params: dict) -> dict | None:
+    caller = str(params.get("_caller_agent") or "").strip()
+    if not caller:
+        return None
+    target = str(params.get("_target_agent") or params.get("target_agent")
+                 or _INTENT_TARGETS.get(intent, "")).strip()
+    relation = str(params.get("_relation") or "call").strip()
+    result = collaboration_registry.check_collaboration(caller, target, relation)
+    if result["allowed"]:
+        return None
+    logger.warning("Agent 协作调用被拒绝 caller=%s target=%s relation=%s reason=%s",
+                   caller, target, relation, result.get("reason"))
+    return result
+
+
+def _format_collaboration_rejection(result: dict) -> str:
+    return (
+        "协作调用被拒绝："
+        f"caller={result.get('caller') or result.get('requester_agent') or ''} "
+        f"target={result.get('target') or result.get('target_agent') or ''} "
+        f"relation={result.get('relation') or 'call'}；"
+        f"reason={result.get('reason') or '未注册协作关系默认禁止'}"
+    )
 
 
 def dispatch(text: str, intent: str, params: dict, hint: str, open_id: str) -> str:
     """分发：长任务异步提交回执，其余同步 format；任何异常回处理失败不崩溃"""
+    rejection = _collaboration_rejection(intent, params or {})
+    if rejection is not None:
+        return _format_collaboration_rejection(rejection)
     if intent in _LONG:
         kind = f"feishu_{intent}"
         if not task_queue.has_active(kind):

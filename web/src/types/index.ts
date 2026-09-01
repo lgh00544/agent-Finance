@@ -645,3 +645,113 @@ export interface OcrResult {
   raw_text?: string
   [k: string]: unknown
 }
+
+// ===== 系统能力地图 =====
+export interface SystemMapAgent {
+  agent_id: string
+  name?: string
+  responsibility?: string
+  knowledge?: string
+  agent_type?: string
+  authority_level?: string
+  inputs_required?: unknown[]
+  inputs_optional?: unknown[]
+  outputs?: unknown[]
+  knowledge_scope?: string
+  can_reference?: unknown[]
+  can_call?: unknown[]
+  cannot_do?: unknown[]
+  human_gate_required?: boolean
+  [k: string]: unknown
+}
+
+export interface SystemMapTool {
+  tool_id: string
+  name?: string
+  description?: string
+  owner_module?: string
+  tool_type?: string
+  inputs?: Record<string, unknown>
+  outputs?: unknown
+  used_by?: unknown[]
+  cache_policy?: string
+  failure_policy?: string
+  cannot_do?: unknown[]
+  [k: string]: unknown
+}
+
+export interface SystemMapWorkflow {
+  workflow_id: string
+  name?: string
+  intent_examples?: unknown[]
+  steps?: unknown[]
+  required_inputs?: unknown[]
+  optional_inputs?: unknown[]
+  allowed_entry_agents?: unknown[]
+  audit_required?: boolean
+  human_confirm_required?: boolean
+  final_responder?: string
+  [k: string]: unknown
+}
+
+export interface SystemMapCollaborationRule {
+  requester_agent: string
+  target_agent: string
+  relation: string
+  allowed: boolean
+  max_depth?: number
+  conflict_policy?: string
+  audit_required?: boolean
+  reason?: string
+  [k: string]: unknown
+}
+
+export interface SystemMapCanCollaborateResult extends SystemMapCollaborationRule {
+  caller?: string
+  target?: string
+  unknown?: boolean
+  unknown_caller?: boolean
+  unknown_target?: boolean
+  default_denied?: boolean
+}
+
+export interface SystemMapAllowedTargets {
+  agent_id: string
+  allowed_targets: string[]
+  [k: string]: unknown
+}
+
+export interface SystemMapSummary {
+  agents_count?: number
+  tools_count?: number
+  workflows_count?: number
+  agents?: SystemMapAgent[]
+  tools?: SystemMapTool[]
+  workflows?: SystemMapWorkflow[]
+  [k: string]: unknown
+}
+
+export type SystemMapHealthStatus = 'healthy' | 'attention' | 'error' | 'unknown'
+
+export interface SystemMapHealthModule {
+  module: string
+  status: SystemMapHealthStatus
+  counts?: Record<string, number | null>
+  updated_at?: string
+  last_error?: string | null
+  [k: string]: unknown
+}
+
+export interface SystemMapHealth {
+  status: SystemMapHealthStatus
+  complete?: boolean
+  module_count?: number
+  healthy_modules?: number
+  attention_modules?: number
+  error_modules?: number
+  unknown_modules?: number
+  updated_at?: string
+  last_errors?: Array<{ module?: string; error?: string }>
+  modules?: Record<string, SystemMapHealthModule>
+  [k: string]: unknown
+}

@@ -254,13 +254,15 @@ def _task_track_verify(backfill: bool) -> dict:
 
 
 def _task_track_suggest() -> dict:
-    """选股验证建议生成（手动入口：基于已存统计生成/兜底建议）"""
+    """选股验证建议生成（手动入口：生成后立即跑 AI 审核，只审核不自动生效）"""
     from app.services import track_verify
 
     rows = repo.list_track_verify()
     stats = track_verify.compute_stats(rows, period="t5")
     anomalies = track_verify.detect_anomalies(stats)
-    return track_verify.generate_suggestions(stats, anomalies)
+    result = track_verify.generate_suggestions(stats, anomalies)
+    result["audit"] = track_verify.auto_audit_generated_suggestions(result)
+    return result
 
 
 def _task_chat_ask(params: dict) -> dict:
@@ -597,6 +599,14 @@ def system_map():
     return system_map_registry.get_system_map_summary()
 
 
+@router.get("/system-map/health")
+def system_map_health():
+    """只读治理运行状态聚合；不执行任务、不写数据库。"""
+    from app.system_map.health import get_governance_health
+
+    return get_governance_health()
+
+
 @router.get("/system-map/agents")
 def system_map_agents():
     """只读 Agent 能力注册列表。"""
@@ -642,7 +652,7 @@ def system_map_allowed_targets(agent_id: str):
 @router.get("/system-map/can-collaborate")
 def system_map_can_collaborate(requester: str, target: str, relation: str):
     """查询单条协作关系；未注册关系稳定返回 forbidden。"""
-    return collaboration_registry.can_collaborate(requester, target, relation)
+    return collaboration_registry.check_collaboration(requester, target, relation)
 
 
 @router.get("/feishu/status")

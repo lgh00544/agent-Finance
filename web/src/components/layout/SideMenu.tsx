@@ -10,6 +10,7 @@ import {
   HomeOutlined,
   LineChartOutlined,
   MessageOutlined,
+  PartitionOutlined,
   SafetyOutlined,
   StarOutlined,
   SyncOutlined,
@@ -55,6 +56,7 @@ const NAV_GROUPS: Array<{
       { path: '/rule-changes', label: '规则变更记录', icon: <FileTextOutlined /> },
       { path: '/experience', label: '经验沉淀', icon: <ExperimentOutlined /> },
       { path: '/profile', label: '个人交易偏好', icon: <UserOutlined /> },
+      { path: '/system-map', label: '系统治理', icon: <PartitionOutlined /> },
     ],
   },
 ]

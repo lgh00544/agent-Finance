@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type MouseEvent } from 'react'
 import {
   App,
   Alert,
@@ -6,6 +6,7 @@ import {
   Card,
   Col,
   Collapse,
+  Descriptions,
   Drawer,
   Input,
   List,
@@ -26,6 +27,7 @@ import { candidateTradeable } from '@/api/candidates'
 import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion, reReviewSuggestion, ruleChanges } from '@/api/suggestions'
 import { trackVerifyDates, trackVerifyList, runTrackVerify, runTrackSuggest } from '@/api/track'
 import { traceDetail, traces } from '@/api/traces'
+import { reAuditSuggestion as triggerAiAudit } from '@/api/audit'
 import { ChartCard } from '@/components/charts/ChartCard'
 import type { EChartsOption } from 'echarts'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StatusBadge, StockLabel } from '@/components/common'
@@ -34,9 +36,101 @@ import type { AgentSuggestion, ReviewInfo, RuleChange, TrackVerifyRow } from '@/
 const { Text } = Typography
 const SUG_STATUS: Record<string, { label: string; color: string }> = {
   pending: { label: '待审核', color: 'orange' },
-  approved: { label: '已采纳', color: 'green' },
+  approved: { label: '已生效', color: 'green' },
   adopted: { label: '已采纳', color: 'green' },
   rejected: { label: '已驳回', color: 'default' },
+}
+const SUG_STATUS_TIP: Record<string, string> = {
+  pending: '待审核 = 需人工处理',
+  approved: '已生效 = 已人工采纳并写入偏好/规则',
+  adopted: '已采纳 = 写入偏好档案并生效',
+  rejected: '已驳回 = 留痕不生效',
+}
+const textVal = (v: unknown, empty = '—') => String(v ?? '').trim() || empty
+
+function CompareBox({ title, value }: { title: string; value: unknown }) {
+  return (
+    <Card size="small" title={title} style={{ background: 'var(--bg-input)', height: '100%' }}>
+      <Typography.Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }} ellipsis={{ rows: 4, expandable: true }}>
+        {textVal(value)}
+      </Typography.Paragraph>
+    </Card>
+  )
+}
+
+function ReasonCell({ text }: { text: unknown }) {
+  const [open, setOpen] = useState(false)
+  const full = textVal(text, '（无）')
+  const brief = full.length > 80 ? `${full.slice(0, 80)}...` : full
+  return (
+    <Space orientation="vertical" size={4}>
+      <Text type="secondary">{open ? full : brief}</Text>
+      {full.length > 80 ? <Button size="small" type="link" style={{ padding: 0 }} onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>{open ? '收起全文' : '展开查看全文'}</Button> : null}
+    </Space>
+  )
+}
+
+function SuggestionDetail({
+  r, onAct, onReReview, onAiAudit, onClose,
+}: {
+  r: AgentSuggestion
+  onAct: (r: AgentSuggestion, action: 'approve' | 'adopt' | 'reject') => void
+  onReReview: (r: AgentSuggestion) => void
+  onAiAudit?: (r: AgentSuggestion) => void
+  onClose?: () => void
+}) {
+  const status = String(r.status ?? '')
+  const kind = String(r.target_kind ?? r.rule_type ?? '')
+  const audit = auditVerdictOf(r)
+  const impact = textVal(r.impact ?? r.priority ?? r.risk_level, '（无）')
+  const confidence = textVal(r.confidence ?? r.audit_confidence, '（无）')
+  const stop = (fn: () => void) => (e: MouseEvent) => { e.stopPropagation(); fn() }
+  return (
+    <Space orientation="vertical" style={{ width: '100%' }} size={12}>
+      <Card size="small" title="基础信息" style={{ background: 'var(--bg-input)' }}>
+        <Descriptions size="small" column={1} items={[
+          { label: 'Agent', children: MODULE_LABEL[String(r.target_agent)] ?? textVal(r.target_agent) },
+          { label: '复盘 ID', children: textVal(r.review_id) },
+          { label: '调整类型', children: kind === 'hard' ? '规则类（需两步确认）' : kind === 'profile' ? '偏好类（写偏好档案）' : textVal(kind) },
+          { label: '创建时间', children: textVal(r.created_at) },
+          { label: '复盘指标', children: `置信度 ${confidence} / 影响 ${impact}` },
+        ]} />
+      </Card>
+      <Row gutter={12}>
+        <Col span={12}><CompareBox title="调整前" value={r.current_value ?? r.review_text} /></Col>
+        <Col span={12}><CompareBox title="调整后" value={r.suggested_value ?? r.new_text} /></Col>
+      </Row>
+      <Card size="small" title="复盘原文" style={{ background: 'var(--bg-input)' }}>
+        <div style={{ whiteSpace: 'pre-wrap' }}>{textVal(r.reason ?? r.reason_text, '（无）')}</div>
+      </Card>
+      <Card size="small" title="处理记录" style={{ background: 'var(--bg-input)' }}>
+        <Descriptions size="small" column={1} items={[
+          { label: '当前状态', children: SUG_STATUS[status]?.label ?? textVal(status) },
+          { label: 'AI 审核', children: AUDIT_STATUS[audit]?.label ?? textVal(audit) },
+          { label: '采纳时间', children: textVal(r.adopted_at ?? r.approved_at, '（无）') },
+          { label: '采纳人', children: textVal(r.reviewer ?? r.adopted_by, '（无）') },
+          { label: '驳回时间', children: textVal(r.rejected_at, '（无）') },
+          { label: '驳回原因', children: textVal(r.reject_reason, '（无）') },
+        ]} />
+      </Card>
+      <Card size="small" title="操作" style={{ background: 'var(--bg-input)' }}>
+        <Space wrap>
+          {status === 'pending' && audit === 'pass' ? <Button size="small" type="primary" style={{ background: 'var(--up)', borderColor: 'var(--up)' }} onClick={stop(() => onAct(r, kind === 'profile' ? 'approve' : 'adopt'))}>采纳</Button> : null}
+          {status === 'pending' && audit !== 'pass' ? <Tooltip title={audit === 'fail' ? 'AI 未通过，可重新审核或驳回' : '等待 AI 审核通过后才能应用'}><Button size="small" disabled>待AI通过</Button></Tooltip> : null}
+          {status === 'pending' && onAiAudit && ['pending', 'fail'].includes(audit) ? <Button size="small" onClick={stop(() => onAiAudit(r))}>AI审核</Button> : null}
+          {status === 'approved' ? <Text type="success">已采纳生效</Text> : null}
+          {status === 'pending' ? <Button size="small" danger onClick={stop(() => onAct(r, 'reject'))}>驳回</Button> : null}
+          {status === 'rejected' ? <Button size="small" type="default" danger onClick={stop(() => onReReview(r))}>重新审核</Button> : null}
+          {onClose ? <Button size="small" onClick={onClose}>关闭</Button> : null}
+        </Space>
+      </Card>
+    </Space>
+  )
+}
+const AUDIT_STATUS: Record<string, { label: string; color: string }> = {
+  pending: { label: 'AI待审', color: 'default' },
+  pass: { label: 'AI通过', color: 'green' },
+  fail: { label: 'AI未通过', color: 'red' },
 }
 
 function openRejectConfirm(
@@ -300,7 +394,7 @@ function ReviewsList() {
     {
       title: '建议状态', dataIndex: 'suggest_status', width: 110,
       render: (v: string) => (
-        <Tooltip title={v === 'pending' ? '待人工审核' : v === 'adopted' ? '已采纳并生效' : v === 'approved' ? '已通过待应用' : v === 'rejected' ? '已驳回' : v}>
+        <Tooltip title={v === 'pending' ? '待人工审核' : v === 'adopted' ? '已采纳并生效' : v === 'approved' ? '已人工采纳并生效' : v === 'rejected' ? '已驳回' : v}>
           <Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? v}</Tag>
         </Tooltip>
       ),
@@ -326,7 +420,7 @@ function ReviewsList() {
       </StatCardGrid>
       {sugList.length ? (
         <Alert type="info" showIcon style={{ marginBottom: 10, marginTop: 10, cursor: 'pointer' }} onClick={() => setAutoOpen(true)}
-          message={`🤖 AI 自动决策：近 ${sugList.length} 条 · 通过 ${passed} · 采纳 ${adoptedCount} · 驳回 ${rejected} · 待审 ${pending}（点击查看）`} />
+      message={`🤖 AI 自动决策：近 ${sugList.length} 条 · 生效 ${passed + adoptedCount} · 驳回 ${rejected} · 待审 ${pending}（点击查看）`} />
       ) : null}
       <Table<ReviewInfo> rowKey="id" size="small" dataSource={list} columns={cols} pagination={{ pageSize: 20 }}
         onRow={(r) => ({ onClick: () => setDrawerR(r) })} />
@@ -598,6 +692,10 @@ function calcTrackStats(list: TrackVerifyRow[], k: 't3_pct' | 't5_pct' | 't10_pc
   }
 }
 
+function auditVerdictOf(r: AgentSuggestion): string {
+  return String((r as Record<string, unknown>).audit_verdict || 'pending')
+}
+
 /** 选股准确率验证（track verify，直调） */
 function TrackVerify() {
   const { message } = App.useApp()
@@ -734,7 +832,7 @@ function TrackVerify() {
   const runSuggest = async () => {
     try {
       await runTrackSuggest()
-      message.success('建议生成已提交后台，请到本页「策略闭环建议」或「规则变更记录」审核/应用')
+      message.success('建议生成已提交后台，并会自动进入 AI 审核；AI 通过后到「策略闭环建议」人工采纳生效')
       qc.invalidateQueries({ queryKey: ['agent-sug'] })
       qc.invalidateQueries({ queryKey: ['rule-changes'] })
     } catch (e) { message.error(e instanceof Error ? e.message : '失败') }
@@ -816,7 +914,7 @@ function TrackVerify() {
       <Alert type="info" showIcon style={{ marginBottom: 10 }}
         message="实战闭环分两条：候选 T+N 验证用于收敛 Discover/Score 的选股与评级规则；建仓计划执行后的真实盈亏由复盘/组合周期统计收敛持仓、止盈止损和仓位控制规则。大盘只做背景参考，不参与当前胜率判定。" />
       <Alert type="warning" showIcon style={{ marginBottom: 10 }}
-        message="审核入口：生成建议后，到本页「策略闭环建议」页签审核；规则采纳生效后，到左侧「策略沉淀 → 规则变更记录」查看、重新审核或回滚。硬规则采纳需要二次确认。" />
+        message="审核入口：生成建议后先由 AI 审核；AI 通过的，到本页「策略闭环建议」页签人工采纳生效；规则采纳生效后，到左侧「策略沉淀 → 规则变更记录」查看、重新审核或回滚。硬规则采纳需要二次确认。" />
       <WinRateTrend list={rows ?? []} />
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
         排序规则：默认「评级 A→C + 选中日」；T+3/T+5/T+10 仅显示已到期样本，未到期显示「—」；「建仓级别」徽章来自当日可建仓判定（只读展示）。
@@ -907,6 +1005,7 @@ function TrackVerify() {
 function Suggestions() {
   const { message, modal } = App.useApp()
   const qc = useQueryClient()
+  const [selectedSug, setSelectedSug] = useState<AgentSuggestion | null>(null)
   const { data: rows } = useQuery({ queryKey: ['agent-sug'], queryFn: () => agentSuggestions() })
   const list = rows ?? []
   const byAgent = (() => {
@@ -941,6 +1040,7 @@ function Suggestions() {
 
   const byStatus = (st: string) => list.filter((s) => s.status === st).length
   const hardCount = list.filter((s) => s.rule_type === 'hard').length
+  const auditCount = (v: string) => list.filter((s) => auditVerdictOf(s) === v).length
   const reReview = async (r: (typeof list)[number]) => {
     try {
       await reReviewSuggestion(r.id)
@@ -948,16 +1048,47 @@ function Suggestions() {
       qc.invalidateQueries({ queryKey: ['agent-sug'] })
     } catch (e) { message.error(e instanceof Error ? e.message : '重新审核失败') }
   }
+  const aiAudit = async (r: (typeof list)[number]) => {
+    try {
+      await triggerAiAudit(r.id)
+      message.success('已提交 AI 审核')
+      qc.invalidateQueries({ queryKey: ['agent-sug'] })
+    } catch (e) { message.error(e instanceof Error ? e.message : 'AI 审核提交失败') }
+  }
+  const renderOps = (r: AgentSuggestion) => {
+    const status = String(r.status ?? '')
+    const kind = String(r.target_kind ?? r.rule_type ?? '')
+    const audit = auditVerdictOf(r)
+    return (
+      <Space size={4} wrap onClick={(e) => e.stopPropagation()}>
+        {status === 'pending' && audit === 'pass' ? <Button size="small" type="primary" style={{ background: 'var(--up)', borderColor: 'var(--up)' }} onClick={() => act(r, kind === 'profile' ? 'approve' : 'adopt')}>采纳</Button> : null}
+        {status === 'pending' && audit !== 'pass' ? <Tooltip title={audit === 'fail' ? 'AI 未通过，可重新审核或驳回' : '等待 AI 审核通过后才能应用'}><Button size="small" disabled>待AI通过</Button></Tooltip> : null}
+        {status === 'pending' && ['pending', 'fail'].includes(audit) ? <Button size="small" onClick={() => aiAudit(r)}>AI审核</Button> : null}
+        {status === 'approved' ? <Button size="small" onClick={() => setSelectedSug(r)}>查看</Button> : null}
+        {status === 'pending' ? <Button size="small" danger onClick={() => act(r, 'reject')}>驳回</Button> : null}
+        {status === 'adopted' ? <Button size="small" onClick={() => setSelectedSug(r)}>查看</Button> : null}
+        {status === 'rejected' ? <Tooltip title={`驳回原因：${textVal(r.reject_reason, '（未录入原因）')}`}><Button size="small" onClick={() => setSelectedSug(r)}>驳回原因</Button></Tooltip> : null}
+        {status === 'rejected' ? <Button size="small" type="default" danger onClick={() => reReview(r)}>重新审核</Button> : null}
+      </Space>
+    )
+  }
 
   return (
     <>
       <Alert type="info" showIcon style={{ marginBottom: 10 }}
-        message="策略闭环：ReviewAgent 每次平仓后产出优化建议（偏好/规则），全部经人工审核确认后才生效；硬规则（HARD_RULES）采纳需二次确认。驳回会以「驳回 + 理由」留痕。" />
+        title="交易复盘 · ReviewAgent 全链路"
+        description="Agent 复盘后产出 review_log（Agent 调整建议 + 偏好优化建议），需经人工审核确认后才生效。包含两类建议：① 偏好类（写偏好档案）② 规则类（写生效规则表）；系统先做 AI 辩证审核，AI 通过后才开放人工采纳。" />
       <StatCardGrid>
         <StatCard label="待审建议" value={byStatus('pending')} tone={byStatus('pending') ? 'warn' : 'mute'} sub="需人工审核后生效" />
-        <StatCard label="已通过" value={byStatus('approved')} tone="ok" sub="待应用生效" />
+        <StatCard label="已生效" value={byStatus('approved') + byStatus('adopted')} tone="ok" sub="已写入偏好/规则" />
         <StatCard label="已采纳生效" value={byStatus('adopted')} tone="ok" sub="已写入偏好/规则" />
         <StatCard label="已驳回" value={byStatus('rejected')} tone="mute" sub="含驳回留痕" />
+      </StatCardGrid>
+      <StatCardGrid>
+        <StatCard label="AI待审" value={auditCount('pending')} tone={auditCount('pending') ? 'warn' : 'mute'} sub="等待自动/手动审核" />
+        <StatCard label="AI通过" value={auditCount('pass')} tone="ok" sub="可由你确认生效" />
+        <StatCard label="AI未通过" value={auditCount('fail')} tone={auditCount('fail') ? 'err' : 'mute'} sub="需重审或驳回" />
+        <StatCard label="硬规则候选" value={hardCount} tone={hardCount ? 'warn' : 'mute'} sub="二次确认后生效" />
       </StatCardGrid>
       <Space wrap style={{ margin: '10px 0' }}>
         <Text type="secondary">规则类型：</Text>
@@ -967,40 +1098,46 @@ function Suggestions() {
         {byAgent.map(([a, n]) => <Tag key={a}>{MODULE_LABEL[a] ?? a} {n}</Tag>)}
       </Space>
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
-        建议按目标 Agent 分布如上；全部需人工审核，「硬规则」采纳需二次确认。展开行可查看规则全文。
+        建议按目标 Agent 分布如上；AI 通过后才开放人工应用，「硬规则」采纳需二次确认。点击行可查看完整上下文，展开行可查看复盘原文。
       </Text>
       <Table size="small" rowKey="id" dataSource={list} pagination={{ pageSize: 10 }}
-        expandable={{ expandedRowRender: (r) => <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: 0 }}>{String(r.rule_text ?? '无规则全文')}</pre> }}
+        onRow={(r) => ({ onClick: () => setSelectedSug(r), style: { cursor: 'pointer' } })}
+        expandable={{ expandedRowRender: (r) => <SuggestionDetail r={r} onAct={act} onReReview={reReview} onAiAudit={aiAudit} /> }}
         columns={[
           { title: 'Agent', dataIndex: 'target_agent', width: 100, render: (v: string) => MODULE_LABEL[v] ?? v },
-          { title: '类型', dataIndex: 'target_kind', width: 90, render: (v: string) =>
-            <Tag color={v === 'hard' ? 'volcano' : v === 'profile' ? 'blue' : 'default'}>{v === 'hard' ? '硬规则' : v === 'profile' ? '偏好' : '提示词'}</Tag> },
-          { title: '规则', dataIndex: 'rule_name', ellipsis: true },
-          { title: '当前→建议', key: 'val', width: 160, render: (_: unknown, r: (typeof list)[number]) => <Text>{(r.current_value ?? '—')} → {r.suggested_value ?? '—'}</Text> },
+          { title: '类型', key: 'kind', width: 90, render: (_: unknown, r: (typeof list)[number]) => {
+            const v = String(r.target_kind ?? r.rule_type ?? '')
+            return <Tag color={v === 'hard' ? 'volcano' : v === 'profile' ? 'blue' : 'default'}>{v === 'hard' ? '规则类' : v === 'profile' ? '偏好类' : textVal(v, '提示词')}</Tag>
+          } },
+          { title: '规则名', dataIndex: 'rule_name', width: 150, ellipsis: true },
+          { title: '调整前', key: 'before', width: 180, render: (_: unknown, r: (typeof list)[number]) => <Text ellipsis>{textVal(r.current_value ?? r.review_text)}</Text> },
+          { title: '调整后', key: 'after', width: 180, render: (_: unknown, r: (typeof list)[number]) => <Text ellipsis>{textVal(r.suggested_value ?? r.new_text)}</Text> },
+          { title: '当前-重议', key: 'reason', width: 220, render: (_: unknown, r: (typeof list)[number]) => <ReasonCell text={r.reason ?? r.reason_text} /> },
+          { title: '置信度/影响', key: 'impact', width: 110, render: (_: unknown, r: (typeof list)[number]) => <Space orientation="vertical" size={2}><Tag>{textVal(r.confidence ?? r.audit_confidence, '置信度—')}</Tag><Tag color="blue">{textVal(r.impact ?? r.priority ?? r.risk_level, '影响—')}</Tag></Space> },
           { title: '时间', dataIndex: 'created_at', width: 130, render: (v: string) => String(v ?? '').slice(0, 16) },
-          { title: '状态', dataIndex: 'status', width: 150, render: (v: string, r: (typeof list)[number]) => (
-            <Space direction="vertical" size={0}>
-              <Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? v}</Tag>
+          { title: '状态', dataIndex: 'status', width: 110, render: (v: string, r: (typeof list)[number]) => (
+            <Space orientation="vertical" size={0}>
+              <Tooltip title={SUG_STATUS_TIP[v] ?? textVal(v)}><Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? textVal(v)}</Tag></Tooltip>
+              <Tag color={AUDIT_STATUS[auditVerdictOf(r)]?.color ?? 'default'}>
+                {AUDIT_STATUS[auditVerdictOf(r)]?.label ?? auditVerdictOf(r)}
+              </Tag>
               {v === 'rejected' ? <Text type="secondary" style={{ fontSize: 12 }}>驳回原因：{String(r.reject_reason || '（未录入原因）')}</Text> : null}
             </Space>
           ) },
+          { title: '处理建议', key: 'guide', width: 130, render: (_: unknown, r: (typeof list)[number]) => String(r.status) === 'pending'
+            ? <Text type="secondary">{auditVerdictOf(r) === 'pass' ? '可应用 / 驳回' : auditVerdictOf(r) === 'fail' ? '重审 / 驳回' : '等AI审核'}</Text>
+            : <Text type="secondary">{String(r.status) === 'rejected' ? '可重新审核' : '查看留痕'}</Text> },
           {
-            title: '操作', key: 'ops', width: 200,
-            render: (_: unknown, r: (typeof list)[number]) => (
-              <Space size={4}>
-                {r.status === 'pending' ? (r.target_kind === 'profile'
-                  ? <Button size="small" onClick={() => act(r, 'approve')}>采纳</Button>
-                  : <Button size="small" onClick={() => act(r, 'adopt')}>应用生效</Button>
-                ) : null}
-                {r.status === 'pending' ? <Button size="small" onClick={() => act(r, 'reject')}>驳回</Button> : null}
-                {r.status === 'rejected' ? <Button size="small" type="default" danger onClick={() => reReview(r)}>重新审核</Button> : null}
-              </Space>
-            ),
+            title: '操作', key: 'ops', width: 180,
+            render: (_: unknown, r: (typeof list)[number]) => renderOps(r),
           },
         ]} />
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-        操作指引：采纳 = 通过审核（偏好类写入档案；规则类进入待应用）；应用生效 = 硬规则需二次确认后落地；驳回 = 以「驳回 + 理由」留痕。全部需人工操作，系统绝不自动生效。
+        操作指引：生成建议 → AI 审核 → AI 通过后你点采纳；AI 未通过的建议由你选择重新 AI 审核或驳回。全部规则落地仍需人工操作，系统绝不自动生效。
       </Text>
+      <Drawer title="ReviewAgent 建议详情" open={!!selectedSug} size={720} onClose={() => setSelectedSug(null)} destroyOnHidden>
+        {selectedSug ? <SuggestionDetail r={selectedSug} onAct={act} onReReview={reReview} onAiAudit={aiAudit} onClose={() => setSelectedSug(null)} /> : null}
+      </Drawer>
     </>
   )
 }

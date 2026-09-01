@@ -6,6 +6,9 @@ does not intercept or change any existing workflow execution.
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _rule(
@@ -116,6 +119,19 @@ def _forbidden_rule(requester_agent: str, target_agent: str, relation: str) -> d
     }
 
 
+def _known_nodes() -> set[str]:
+    nodes = {"chat_entry", "feishu_gateway", "portfolio_sentinel", "market_intel", "agent_suggestion"}
+    for item in _COLLABORATION_RULES:
+        nodes.add(item["requester_agent"])
+        nodes.add(item["target_agent"])
+    try:
+        from app.system_map import registry
+        nodes.update(agent["agent_id"] for agent in registry.list_agents())
+    except Exception:  # noqa: BLE001 runtime guard must fail closed without registry
+        logger.warning("系统能力地图读取失败，协作运行时检查按矩阵节点降级")
+    return nodes
+
+
 def list_collaboration_rules() -> list[dict]:
     """Return the explicit collaboration allowlist without live side effects."""
     return deepcopy(_COLLABORATION_RULES)
@@ -131,6 +147,39 @@ def can_collaborate(requester_agent: str, target_agent: str, relation: str) -> d
     )
 
 
+def check_collaboration(caller: str, target: str, relation: str = "call") -> dict:
+    """Runtime collaboration guard result; unknown or undeclared relations fail closed."""
+    caller = (caller or "").strip()
+    target = (target or "").strip()
+    relation = (relation or "call").strip()
+    known = _known_nodes()
+    unknown_caller = not caller or caller not in known
+    unknown_target = not target or target not in known
+    if unknown_caller or unknown_target:
+        result = _forbidden_rule(caller, target, relation)
+        result.update({
+            "caller": caller,
+            "target": target,
+            "unknown": True,
+            "unknown_caller": unknown_caller,
+            "unknown_target": unknown_target,
+            "default_denied": True,
+            "reason": "未知 caller 或 target，运行时协作检查默认拒绝。",
+        })
+        return result
+    result = can_collaborate(caller, target, relation)
+    default_denied = not result["allowed"] and result.get("conflict_policy") == "deny_by_default"
+    result.update({
+        "caller": caller,
+        "target": target,
+        "unknown": False,
+        "unknown_caller": False,
+        "unknown_target": False,
+        "default_denied": default_denied,
+    })
+    return result
+
+
 def list_allowed_targets(agent_id: str) -> list[str]:
     """Return target IDs for all explicitly allowed relations of an Agent."""
     targets = {
@@ -139,4 +188,3 @@ def list_allowed_targets(agent_id: str) -> list[str]:
         if item["requester_agent"] == agent_id and item["allowed"]
     }
     return sorted(targets)
-

@@ -761,6 +761,35 @@ def generate_suggestions(stats: dict, anomalies: list[dict],
             "deduped": deduped, "summary_note": summary_note}
 
 
+def auto_audit_generated_suggestions(suggestions_result: dict) -> dict:
+    """对本次新生成的选股验证建议立即触发 AI 审核；只写 audit_log/audit_verdict，不采纳生效。"""
+    ids: list[int] = []
+    for key in ("suggestions", "fallbacks"):
+        for item in suggestions_result.get(key, []) or []:
+            sid = item.get("id") if isinstance(item, dict) else None
+            if sid:
+                ids.append(int(sid))
+    out = {"requested": len(ids), "pass": 0, "fail": 0, "errors": []}
+    if not ids:
+        return out
+    try:
+        from app.agents.audit import trigger_audit_for_suggestion
+    except Exception as exc:  # noqa: BLE001 审核模块不可用不影响建议落库
+        out["errors"].append({"stage": "import", "error": str(exc)[:300]})
+        return out
+    for sid in ids:
+        try:
+            res = trigger_audit_for_suggestion(sid)
+            verdict = str(res.get("verdict") or "")
+            if verdict == "pass":
+                out["pass"] += 1
+            elif verdict == "fail":
+                out["fail"] += 1
+        except Exception as exc:  # noqa: BLE001 单条审核失败隔离
+            out["errors"].append({"id": sid, "error": str(exc)[:300]})
+    return out
+
+
 # ==================== 主链路（cron 与手动入口共用，幂等） ====================
 
 def _default_price_lookup(stock_code: str, select_date: str):
@@ -880,12 +909,15 @@ def run_verify_chain(backfill: bool = False, price_lookup=None, llm_call=None) -
             result["anomalies"] = anomalies
             result["factor_correlation"] = correlation
             result["suggestions"] = generate_suggestions(stats, anomalies, llm_call=llm_call)
+            if llm_call is None:
+                result["audit"] = auto_audit_generated_suggestions(result["suggestions"])
             # 评级重做-C：因子校准建议（模板兜底，走人工审核闭环）
             cal_suggestions = _template_calibration_suggestions(correlation)
+            cal_inserted: list[dict] = []
             for tpl in cal_suggestions:
                 if repo.has_pending_suggestion(tpl["rule_name"], tpl["target_agent"]):
                     continue
-                repo.insert_agent_suggestion(
+                sid = repo.insert_agent_suggestion(
                     0, tpl["target_agent"], tpl["rule_name"],
                     tpl["current_value"], tpl["suggested_value"],
                     tpl["reason"], tpl["evidence"],
@@ -895,6 +927,11 @@ def run_verify_chain(backfill: bool = False, price_lookup=None, llm_call=None) -
                     expected_effect=tpl["expected_effect"], risk_note=tpl["risk_note"],
                     file_path=tpl["file_path"], insert_position=tpl["insert_position"],
                     suggestion_source="template")
+                cal_inserted.append({"id": sid, "rule_name": tpl["rule_name"],
+                                     "suggestion_source": "template"})
+            if llm_call is None and cal_inserted:
+                result["factor_audit"] = auto_audit_generated_suggestions(
+                    {"suggestions": cal_inserted, "fallbacks": []})
         logger.info("候选T+N验证完成: 初始化%s 更新%s 到期%s 错误%s",
                     initialized, updated, finished_new, len(errors))
         return result
