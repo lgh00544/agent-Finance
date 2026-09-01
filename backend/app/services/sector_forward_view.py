@@ -39,7 +39,67 @@ def _streak(hist):
     return count
 
 
-def _score(row, hist, previous, boxes, regime):
+def _causal_context(trade_date: str, sector_name: str) -> dict:
+    """读取已落库归因；旧日期只作背景，不能在缺失当日归因时修正评分。"""
+    current = next(
+        (item for item in repo.list_sector_launch_by_date(trade_date)
+         if item.get("sector_name") == sector_name),
+        None,
+    )
+    if current is not None:
+        evidence = current.get("evidence") or {}
+        caps = evidence.get("confidence_caps") or {}
+        confidence = current.get("confidence")
+        if confidence is None:
+            confidence = caps.get("final_confidence")
+        try:
+            confidence = _clamp(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        return {
+            "causal_missing": False,
+            "source_trade_date": trade_date,
+            "confidence": confidence,
+            "reason_tags": current.get("reason_tags") or "",
+            "evidence": evidence,
+        }
+
+    background = None
+    for date in repo.list_sector_daily_dates(limit=30):
+        if date == trade_date:
+            continue
+        candidate = next(
+            (item for item in repo.list_sector_launch_by_date(date)
+             if item.get("sector_name") == sector_name),
+            None,
+        )
+        if candidate is not None:
+            background = (date, candidate)
+            break
+    return {
+        "causal_missing": True,
+        "source_trade_date": background[0] if background else None,
+        "confidence": None,
+        "reason_tags": "",
+        "evidence": (background[1].get("evidence") or {}) if background else {},
+        "background_available": background is not None,
+    }
+
+
+def _apply_causal_adjustment(continuation, chase, causal):
+    if continuation is None or not causal or causal.get("causal_missing"):
+        return continuation, chase, None
+    confidence = causal.get("confidence")
+    if confidence is None:
+        return continuation, chase, None
+    if confidence >= 0.75:
+        return _clamp(continuation + 0.05), chase, 0.05
+    if confidence < 0.45:
+        return _clamp(continuation - 0.05), _clamp(chase + 0.05), -0.05
+    return continuation, chase, 0.0
+
+
+def _score(row, hist, previous, boxes, regime, causal=None):
     name = row["sector_name"]
     top10_freq = sum(1 for r in hist if r.get("rank_no", 99) <= 10) / 10
     streak = _streak(hist)
@@ -63,6 +123,9 @@ def _score(row, hist, previous, boxes, regime):
                         0.20 * volume_fade + 0.10 * rank_drop)
     surge = _clamp(float(row.get("change_pct") or 0) / 10)
     chase = _clamp(0.5 * surge + 0.3 * (1 - top10_freq) + 0.2 * high_box)
+    technical_continuation = continuation
+    continuation, chase, causal_adjustment = _apply_causal_adjustment(
+        continuation, chase, causal)
     mainline = regime.get("current_regime") == "mainline"
     fading = regime.get("regime_stage") in ("diverge", "fade") and (
         not regime.get("evidence", {}).get("leader_streak_sector") or
@@ -92,7 +155,12 @@ def _score(row, hist, previous, boxes, regime):
         "evidence": {"top10_freq_10d": top10_freq, "streak": streak,
                      "volume_ratio": volume, "box_position_60d": box,
                      "breadth_expansion": breadth, "mainline_fading": fading,
-                     "data_insufficient": len(hist) < 10 or not hist},
+                     "data_insufficient": len(hist) < 10 or not hist,
+                     "technical_continuation_prob": technical_continuation,
+                     "causal_missing": bool(causal.get("causal_missing")) if causal else False,
+                     "causal_adjustment": causal_adjustment,
+                     "causal_confidence": causal.get("confidence") if causal else None,
+                     "causal_source_trade_date": causal.get("source_trade_date") if causal else None},
         "mainline": mainline,
     }
 
@@ -136,7 +204,11 @@ def run_sector_forward(trade_date: str | None = None) -> dict:
     for row in rows:
         hist = _history(row["sector_name"], 10)
         previous = hist[-2] if len(hist) >= 2 else None
-        score = _score(row, hist, previous, boxes, regime)
+        causal = _causal_context(today, row["sector_name"])
+        score = _score(row, hist, previous, boxes, regime, causal)
+        emotion_only = "emotion_only" in {
+            tag.strip() for tag in str(causal.get("reason_tags") or "").split(",")
+        }
         for horizon in HORIZONS:
             bias = score["forward_bias"]
             if horizon == "t3":
@@ -146,6 +218,11 @@ def run_sector_forward(trade_date: str | None = None) -> dict:
                         "fade" if score["exhaustion_risk"] >= 0.6 else
                         "mainline_confirm" if bias == "continue" else
                         "invalid_rotation" if regime["current_regime"] == "rotation" else "uncertain")
+            if emotion_only:
+                if score["sector_tag"] in {"mainline_seed", "low_buy"}:
+                    score["sector_tag"] = "one_day_fly"
+                if horizon in {"t3", "t5"} and bias in {"continue", "mainline_confirm"}:
+                    bias = "uncertain"
             forecasts.append({**score, "trade_date": today, "forward_bias": bias,
                               "forecast_horizon": horizon})
     count = repo.upsert_sector_forward_forecast(forecasts)

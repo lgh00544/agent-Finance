@@ -17,6 +17,10 @@ def _patch(monkeypatch, rows, history, regime, boxes):
                         lambda name, days=10: history)
     monkeypatch.setattr(sector_forward_view.repo, "get_sector_regime_forecast",
                         lambda d: regime)
+    monkeypatch.setattr(sector_forward_view.repo, "list_sector_launch_by_date",
+                        lambda d: [])
+    monkeypatch.setattr(sector_forward_view.repo, "list_sector_daily_dates",
+                        lambda limit=30: [])
     saved = {}
     monkeypatch.setattr(sector_forward_view.repo, "upsert_sector_forward_forecast",
                         lambda items: saved.update({"items": items}) or len(items))
@@ -77,6 +81,69 @@ def test_sector_tag_written_to_forecast_payload(monkeypatch):
                    {"A": {"box60_pct": 80}})
     sector_forward_view.run_sector_forward("2026-08-28")
     assert saved["items"][0]["sector_tag"] == "fade_warn"
+
+
+def test_high_causal_confidence_raises_continuation(monkeypatch):
+    row = _row(pct=2.0, volume=2.0)
+    history = [_row(rank=8, pct=1.0, volume=1.0) for _ in range(10)]
+    regime = {"current_regime": "mainline", "regime_stage": "unknown"}
+    saved = _patch(monkeypatch, [row], history, regime, {"A": {"box60_pct": 50}})
+    monkeypatch.setattr(
+        sector_forward_view.repo, "list_sector_launch_by_date",
+        lambda d: [{"sector_name": "A", "confidence": 0.8, "reason_tags": "",
+                    "evidence": {"confidence_caps": {"final_confidence": 0.8}}}],
+    )
+    sector_forward_view.run_sector_forward("2026-08-28")
+    item = saved["items"][0]
+    technical = item["evidence"]["technical_continuation_prob"]
+    assert item["continuation_prob"] == technical + 0.05
+    assert item["evidence"]["causal_missing"] is False
+
+
+def test_low_causal_confidence_lowers_continuation_and_raises_chase(monkeypatch):
+    row = _row(pct=2.0, volume=2.0)
+    history = [_row(rank=8, pct=1.0, volume=1.0) for _ in range(10)]
+    regime = {"current_regime": "mainline", "regime_stage": "unknown"}
+    saved = _patch(monkeypatch, [row], history, regime, {"A": {"box60_pct": 50}})
+    monkeypatch.setattr(
+        sector_forward_view.repo, "list_sector_launch_by_date",
+        lambda d: [{"sector_name": "A", "confidence": 0.3, "reason_tags": "",
+                    "evidence": {"confidence_caps": {"final_confidence": 0.3}}}],
+    )
+    sector_forward_view.run_sector_forward("2026-08-28")
+    item = saved["items"][0]
+    technical = item["evidence"]["technical_continuation_prob"]
+    assert item["continuation_prob"] == technical - 0.05
+    assert item["chase_risk"] >= 0.05
+
+
+def test_missing_causal_attribution_does_not_change_technical_score(monkeypatch):
+    row = _row(pct=2.0, volume=2.0)
+    history = [_row(rank=8, pct=1.0, volume=1.0) for _ in range(10)]
+    regime = {"current_regime": "mainline", "regime_stage": "unknown"}
+    saved = _patch(monkeypatch, [row], history, regime, {"A": {"box60_pct": 50}})
+    sector_forward_view.run_sector_forward("2026-08-28")
+    item = saved["items"][0]
+    assert item["evidence"]["causal_missing"] is True
+    assert item["continuation_prob"] == item["evidence"]["technical_continuation_prob"]
+    assert item["evidence"]["causal_adjustment"] is None
+
+
+def test_emotion_only_attribution_blocks_continuation_labels(monkeypatch):
+    row = _row(pct=2.0, volume=2.0)
+    history = [_row(rank=8, pct=1.0, volume=1.0) for _ in range(10)]
+    regime = {"current_regime": "mainline", "regime_stage": "unknown"}
+    saved = _patch(monkeypatch, [row], history, regime, {"A": {"box60_pct": 50}})
+    monkeypatch.setattr(
+        sector_forward_view.repo, "list_sector_launch_by_date",
+        lambda d: [{"sector_name": "A", "confidence": 0.8,
+                    "reason_tags": "emotion_only",
+                    "evidence": {"confidence_caps": {"final_confidence": 0.8}}}],
+    )
+    sector_forward_view.run_sector_forward("2026-08-28")
+    assert {item["sector_tag"] for item in saved["items"]} <= {"none", "one_day_fly"}
+    assert all(item["forward_bias"] not in {"continue", "mainline_confirm"}
+               for item in saved["items"] if item["forecast_horizon"] in {"t3", "t5"})
 
 
 def test_fetch_boxes_timeout_degrades_to_empty(monkeypatch):

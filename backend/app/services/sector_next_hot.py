@@ -40,6 +40,42 @@ def _hot_score(score: dict, row: dict) -> float | None:
     return _clamp(raw)
 
 
+def _causal_evidence(score: dict, causal: dict | None) -> dict:
+    """只输出可回指的归因；没有关系证据时保留空值和待核验项。"""
+    causal = causal or {}
+    evidence = {
+        "causal_missing": bool(causal.get("causal_missing", True)),
+        "parent_confidence": None,
+        "transmission_distance": None,
+        "migration_logic": None,
+        "must_verify": [
+            "补齐当日板块启动归因",
+            "验证资金流向与领涨股持续性",
+            "验证产业或政策传导是否真实存在",
+        ],
+    }
+    if not evidence["causal_missing"]:
+        parent_confidence = causal.get("confidence")
+        causal_chain = (causal.get("evidence") or {}).get("causal_chain") or []
+        transmission = (causal.get("evidence") or {}).get("industry_transmission") or []
+        evidence.update({
+            "parent_confidence": parent_confidence,
+            "transmission_distance": len(transmission) if transmission else None,
+            "migration_logic": (
+                "；".join(str(item) for item in transmission)
+                if transmission else None
+            ),
+            "must_verify": [
+                "验证父板块与候选板块的产业或政策关联",
+                "验证资金是否从父板块扩散至候选板块",
+                "验证候选板块出现持续性盘面确认",
+            ],
+        })
+        if not causal_chain and evidence["migration_logic"] is None:
+            evidence["causal_missing"] = True
+    return evidence
+
+
 def judge_next_hot(trade_date: str | None = None) -> dict:
     """预测当前 top10 外、未来 1-3 日最可能进 top5 的前 5 板块。"""
     today = trade_date or time.strftime("%Y-%m-%d")
@@ -59,12 +95,14 @@ def judge_next_hot(trade_date: str | None = None) -> dict:
     for row in rows:
         hist = repo.list_sector_daily_history(row["sector_name"], 10)
         prev = hist[-2] if len(hist) >= 2 else None
-        score = sector_forward_view._score(row, hist, prev, boxes, regime)
+        causal = sector_forward_view._causal_context(today, row["sector_name"])
+        score = sector_forward_view._score(row, hist, prev, boxes, regime, causal)
         hot = _hot_score(score, row)
         evidence = {**(score.get("evidence") or {}),
                     "switch_candidate": score.get("switch_candidate"),
                     "current_rank": row.get("rank_no"),
-                    "sector_tag": score.get("sector_tag", "none")}
+                    "sector_tag": score.get("sector_tag", "none"),
+                    **_causal_evidence(score, causal)}
         if hot is None:
             evidence["data_insufficient"] = True
             continue

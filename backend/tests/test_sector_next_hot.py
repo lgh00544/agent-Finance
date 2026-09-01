@@ -37,6 +37,8 @@ def test_next_hot_candidates_sorted(monkeypatch):
     monkeypatch.setattr(sector_next_hot.repo, "list_sector_daily_by_date", lambda d: rows)
     monkeypatch.setattr(sector_next_hot.repo, "list_sector_daily_history",
                         lambda name, days=10: histories[name])
+    monkeypatch.setattr(sector_next_hot.repo, "list_sector_launch_by_date", lambda d: [])
+    monkeypatch.setattr(sector_next_hot.repo, "list_sector_daily_dates", lambda limit=30: [])
     monkeypatch.setattr(AkshareSource, "fetch_board_box_positions",
                         lambda self, names: {n: {"box60_pct": 50} for n in names})
     saved = {}
@@ -51,3 +53,32 @@ def test_expected_horizon_days_switch_and_high_freq():
     score = {"switch_candidate": True, "evidence": {"top10_freq_10d": 0.8}}
     days = sector_next_hot._expected_days(score, _row(rank=12), {"current_regime": "mainline"})
     assert days >= 3
+
+
+def test_next_hot_marks_missing_causal_relation_without_inventing_parent(monkeypatch):
+    rows = [_row("S1", rank=11, volume=2.0)]
+    regime = {"current_regime": "mainline", "regime_stage": "diverge",
+              "evidence": {"leader_streak_sector": "OLD"}}
+    histories = {"S1": [_row("S1", rank=8, volume=1.0),
+                        _row("S1", rank=8, volume=1.0)]}
+    monkeypatch.setattr(sector_next_hot.repo, "get_sector_regime_forecast", lambda d: regime)
+    monkeypatch.setattr(sector_next_hot.repo, "list_sector_daily_by_date", lambda d: rows)
+    monkeypatch.setattr(sector_next_hot.repo, "list_sector_daily_history",
+                        lambda name, days=10: histories[name])
+    monkeypatch.setattr(sector_next_hot.repo, "list_sector_launch_by_date", lambda d: [])
+    monkeypatch.setattr(sector_next_hot.repo, "list_sector_daily_dates", lambda limit=30: [])
+    monkeypatch.setattr(AkshareSource, "fetch_board_box_positions",
+                        lambda self, names: {"S1": {"box60_pct": 50}})
+    saved = {}
+    monkeypatch.setattr(sector_next_hot.repo, "upsert_sector_next_hot",
+                        lambda items, trade_date=None: saved.update({"items": items}) or len(items))
+
+    result = sector_next_hot.judge_next_hot("2026-08-28")
+
+    assert result["count"] == 1
+    evidence = saved["items"][0]["trigger_evidence"]
+    assert evidence["causal_missing"] is True
+    assert evidence["parent_confidence"] is None
+    assert evidence["transmission_distance"] is None
+    assert evidence["migration_logic"] is None
+    assert evidence["must_verify"]
