@@ -57,6 +57,38 @@ _COMMON_AGENT_DEFAULTS = {
     "human_gate_required": False,
 }
 
+_SYSTEM_AGENT_META = {
+    "market_intel": {
+        "name": "市场研判 Agent",
+        "responsibility": "聚合大盘、板块、情绪与结构事实，生成市场环境参考，不直接改变交易执行。",
+        "knowledge": "全局通用知识库基线 + 人工硬性规则 + 市场环境参考事实 + market_intel 研判缓存",
+        "agent_type": "research_decision",
+        "authority_level": "advisory",
+        "inputs_optional": ["trade_date"],
+        "outputs": ["phase", "core_conflict", "risk_appetite", "volume_signal",
+                    "operative_meaning", "next_day_watch", "summary"],
+        "can_reference": ["global_knowledge", "agent_knowledge", "hard_rules", "market_regime"],
+        "can_call": [],
+        "cannot_do": ["execute_trade", "place_order", "cancel_order", "change_prompt_injection"],
+        "knowledge_scope": "market",
+        "human_gate_required": False,
+    },
+    "portfolio_sentinel": {
+        "name": "组合哨兵 Agent",
+        "responsibility": "聚合组合与持仓风险事实，生成组合级巡检、告警与参考，不直接下单。",
+        "knowledge": "全局通用知识库基线 + 人工硬性规则 + 组合风险参考事实 + portfolio_sentinel 快照",
+        "agent_type": "research_decision",
+        "authority_level": "advisory",
+        "inputs_optional": ["trade_date"],
+        "outputs": ["portfolio_risk", "sector_alerts", "time_stop_alerts", "portfolio_alerts"],
+        "can_reference": ["global_knowledge", "agent_knowledge", "hard_rules", "portfolio_risk"],
+        "can_call": [],
+        "cannot_do": ["execute_trade", "place_order", "cancel_order", "change_prompt_injection"],
+        "knowledge_scope": "portfolio",
+        "human_gate_required": False,
+    },
+}
+
 _WORKFLOWS = [
     {
         "workflow_id": "daily_pipeline",
@@ -171,14 +203,15 @@ _WORKFLOWS = [
 
 def list_agents() -> list[dict]:
     agents = []
-    for agent_id, meta in AGENT_CHAT_META.items():
+    for agent_id, meta in {**AGENT_CHAT_META, **_SYSTEM_AGENT_META}.items():
         agent = {
             "agent_id": agent_id,
             "name": meta.get("name", agent_id),
-            "responsibility": meta.get("scope", ""),
+            "responsibility": meta.get("scope", meta.get("responsibility", "")),
             "knowledge": meta.get("knowledge", ""),
             **_COMMON_AGENT_DEFAULTS,
             **_AGENT_DEFAULTS.get(agent_id, {}),
+            **_SYSTEM_AGENT_META.get(agent_id, {}),
         }
         agents.append(deepcopy(agent))
     return agents
@@ -230,4 +263,3 @@ def get_system_map_summary() -> dict:
         "agents": agents,
         "workflows": workflows,
     }
-

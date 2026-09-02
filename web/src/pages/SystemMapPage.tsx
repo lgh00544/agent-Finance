@@ -19,6 +19,7 @@ import type {
   SystemMapCollaborationRule,
   SystemMapHealth,
   SystemMapHealthModule,
+  SystemMapMigrationSummary,
   SystemMapTool,
   SystemMapWorkflow,
 } from '@/types'
@@ -327,7 +328,105 @@ function HealthCounts({ counts }: { counts?: Record<string, number | null> }) {
   )
 }
 
+function MigrationColumns({ summary, label }: { summary?: SystemMapMigrationSummary; label: string }) {
+  const added = summary?.added ?? []
+  const existing = summary?.existing ?? []
+  return (
+    <Descriptions.Item label={label}>
+      <Space direction="vertical" size={2}>
+        <Text>新增 {added.length}，已存在 {existing.length}</Text>
+        {added.length ? <Text type="secondary">新增列：{added.join('、')}</Text> : null}
+        {existing.length ? <Text type="secondary">已存在列：{existing.join('、')}</Text> : null}
+        {!added.length && !existing.length ? <Text type="secondary">暂无迁移摘要</Text> : null}
+      </Space>
+    </Descriptions.Item>
+  )
+}
+
+function DatabaseMigrationDetails({ module }: { module: SystemMapHealthModule }) {
+  const unknown = module.status === 'unknown'
+  const message = unknown
+    ? (module.reason ?? '当前没有迁移快照，请重启服务后确认')
+    : module.status === 'error'
+      ? '迁移失败，请查看日志'
+      : '本进程已完成迁移'
+  return (
+    <Card size="small" style={{ background: 'var(--bg-input)' }}>
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Space wrap>
+          <Text strong>数据库迁移</Text>
+          <HealthStatus status={module.status} />
+          <Text type="secondary">{message}</Text>
+        </Space>
+        <Descriptions size="small" column={{ xs: 1, sm: 2, md: 3 }}>
+          <Descriptions.Item label="数据库后端">{text(module.backend, 'unknown')}</Descriptions.Item>
+          <Descriptions.Item label="数据库身份">
+            {text(module.database ?? module.sqlite_path_digest, 'unknown')}
+          </Descriptions.Item>
+          <Descriptions.Item label="最近初始化">{text(module.initialized_at, 'unknown')}</Descriptions.Item>
+          <MigrationColumns summary={module.knowledge} label="Knowledge 目标列" />
+          <MigrationColumns summary={module.experience} label="Experience 目标列" />
+        </Descriptions>
+        {module.last_error && module.status === 'error' ? (
+          <Alert type="error" showIcon message="迁移失败，请查看日志" description={module.last_error} />
+        ) : null}
+        {unknown ? <Alert type="warning" showIcon message={message} /> : null}
+      </Space>
+    </Card>
+  )
+}
+
+function RegistrationIntegrityDetails({ module }: { module: SystemMapHealthModule }) {
+  const issues = module.issues ?? []
+  const summary = module.summary ?? {}
+  const message = module.status === 'healthy'
+    ? '未发现登记不一致'
+    : module.status === 'unknown'
+      ? '当前无法确认'
+      : '发现需要处理的问题'
+  return (
+    <Card size="small" style={{ background: 'var(--bg-input)' }}>
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Space wrap>
+          <Text strong>System Map 注册完整性</Text>
+          <HealthStatus status={module.status} />
+          <Text type="secondary">{message}</Text>
+          {module.checked_at ? <Text type="secondary">检查于 {module.checked_at}</Text> : null}
+        </Space>
+        <Space size={[4, 4]} wrap>
+          <Tag>来源 {summary.source_count ?? 'unknown'}</Tag>
+          <Tag color={issues.length ? 'orange' : undefined}>问题 {summary.issue_count ?? issues.length}</Tag>
+          <Tag color={summary.error_count ? 'red' : undefined}>错误 {summary.error_count ?? 'unknown'}</Tag>
+          <Tag>需关注 {summary.attention_count ?? 'unknown'}</Tag>
+        </Space>
+        {module.sources?.length ? <Text type="secondary">事实来源：{module.sources.join('、')}</Text> : null}
+        {issues.length ? (
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            {issues.map((issue, index) => (
+              <Alert
+                key={`${issue.kind ?? 'issue'}-${issue.item ?? index}`}
+                type={issue.severity === 'error' ? 'error' : 'warning'}
+                showIcon
+                message={`${issue.kind ?? 'integrity_issue'}：${issue.item ?? 'unknown'}`}
+                description={(
+                  <Space direction="vertical" size={2}>
+                    <Text>{issue.message ?? '登记信息存在差异'}</Text>
+                    <Text type="secondary">来源：{text(issue.source, 'unknown')}</Text>
+                    <Text type="secondary">预期：{text(issue.expected, 'unknown')}；实际：{text(issue.actual, 'unknown')}</Text>
+                  </Space>
+                )}
+              />
+            ))}
+          </Space>
+        ) : <Text type="secondary">未发现登记不一致。</Text>}
+      </Space>
+    </Card>
+  )
+}
+
 function HealthModuleRow({ module }: { module: SystemMapHealthModule }) {
+  if (module.module === 'database_migration') return <DatabaseMigrationDetails module={module} />
+  if (module.module === 'registration_integrity') return <RegistrationIntegrityDetails module={module} />
   const semantic = module.semantics as Record<string, unknown> | undefined
   const runtimeStats = module.runtime_rejection_stats as Record<string, unknown> | undefined
   return (
@@ -359,10 +458,18 @@ function HealthTab({ query }: { query: ReturnType<typeof useQuery<SystemMapHealt
   const data = query.data
   if (!data) return <EmptyState text="健康度接口没有返回数据，当前状态未知。" />
   const modules = Object.values(data.modules ?? {})
+  const hasMigrationModule = !!data.modules?.database_migration
+  const displayStatus = hasMigrationModule ? data.status : 'unknown'
+  const displayComplete = hasMigrationModule && !!data.complete
+  const migration = data.modules?.database_migration ?? {
+    module: 'database_migration',
+    status: 'unknown' as const,
+    reason: '旧后端未提供迁移状态，请重启服务后确认',
+  }
   return (
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
       <StatCardGrid>
-        <StatCard label="总体状态" value={<HealthStatus status={data.status} />} sub={data.complete ? '数据完整' : '存在 unknown 或错误'} />
+        <StatCard label="总体状态" value={<HealthStatus status={displayStatus} />} sub={displayComplete ? '数据完整' : '存在 unknown 或错误'} />
         <StatCard label="已读取模块" value={`${data.healthy_modules ?? 0}/${data.module_count ?? modules.length}`} tone="info" sub="真实接口返回" />
         <StatCard label="需关注" value={data.attention_modules ?? 0} tone="warn" sub="有积压或失败数据" />
         <StatCard label="错误模块" value={data.error_modules ?? 0} tone="err" sub="读取异常" />
@@ -370,13 +477,14 @@ function HealthTab({ query }: { query: ReturnType<typeof useQuery<SystemMapHealt
         <StatCard label="最近刷新" value={text(data.updated_at)} tone="mute" />
       </StatCardGrid>
       <Alert
-        type={data.status === 'healthy' ? 'success' : data.status === 'error' ? 'error' : 'warning'}
+        type={displayStatus === 'healthy' ? 'success' : displayStatus === 'error' ? 'error' : 'warning'}
         showIcon
         message="健康度只观察已有数据，不修改任何状态。active Knowledge 才进入正式注入；Shadow、Memory/Experience 不进入正式 prompt 或硬规则。"
       />
       {data.last_errors?.length ? (
         <Alert type="error" showIcon message="最近错误摘要" description={<Space direction="vertical">{data.last_errors.map((item, index) => <Text key={`${item.module}-${index}`}>{item.module}: {item.error}</Text>)}</Space>} />
       ) : null}
+      {!data.modules?.database_migration ? <HealthModuleRow module={migration} /> : null}
       {!modules.length ? <EmptyState text="没有模块健康数据，当前状态未知。" /> : modules.map((module) => <HealthModuleRow key={module.module} module={module} />)}
     </Space>
   )

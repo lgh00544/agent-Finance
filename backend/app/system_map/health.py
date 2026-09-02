@@ -19,8 +19,8 @@ from app.db.models import (
     PrivateKnowledge,
     RuleChange,
 )
-from app.db.session import SessionLocal
-from app.system_map import collaboration, registry
+from app.db.session import SessionLocal, get_init_db_result
+from app.system_map import collaboration, integrity, registry
 
 
 def _now() -> str:
@@ -248,6 +248,69 @@ def _collaboration() -> dict:
     )
 
 
+def _database_migration() -> dict:
+    """Expose the in-process startup migration snapshot without doing DDL."""
+    snapshot = get_init_db_result()
+    raw_status = snapshot.get("status")
+    if raw_status == "ok":
+        status = "healthy"
+        reason = "本进程已完成启动迁移"
+    elif raw_status == "failed":
+        status = "error"
+        reason = "启动迁移失败，请查看日志"
+    else:
+        status = "unknown"
+        reason = "当前没有迁移快照，请重启服务后确认"
+
+    result = _module(
+        "database_migration",
+        status,
+        updated_at=snapshot.get("initialized_at"),
+        last_error=snapshot.get("error") if status == "error" else None,
+        reason=reason,
+        migration_status=raw_status or "unknown",
+        initialized_at=snapshot.get("initialized_at"),
+        backend=snapshot.get("backend"),
+        database=snapshot.get("database"),
+        sqlite_path_digest=snapshot.get("sqlite_path_digest"),
+        knowledge=snapshot.get("migrations", {}).get("knowledge", {}),
+        experience=snapshot.get("migrations", {}).get("experience", {}),
+        semantics={
+            "startup_only": True,
+            "health_endpoint_runs_ddl": False,
+            "requires_restart_to_confirm": status == "unknown",
+        },
+    )
+    if status == "unknown":
+        result["last_error"] = reason
+    return result
+
+
+def _registration_integrity() -> dict:
+    """Expose read-only System Map registration drift checks."""
+    result = integrity.check_system_map_integrity()
+    status = result.get("status", "unknown")
+    return _module(
+        "registration_integrity",
+        status,
+        updated_at=result.get("checked_at"),
+        last_error=(
+            "System Map 完整性检查发现需要处理的问题"
+            if status in {"error", "attention"} and result.get("issues")
+            else None
+        ),
+        checked_at=result.get("checked_at"),
+        summary=result.get("summary", {}),
+        issues=result.get("issues", []),
+        sources=result.get("sources", []),
+        reason=(
+            "未发现登记不一致" if status == "healthy"
+            else "发现需要处理的问题" if status in {"error", "attention"}
+            else "当前无法确认注册完整性"
+        ),
+    )
+
+
 def get_governance_health() -> dict:
     """Return module-level read-only governance health and observable gaps."""
     module_loaders = [
@@ -257,6 +320,8 @@ def get_governance_health() -> dict:
         ("experience_memory", _experience),
         ("rule_change_audit", _rules_audit),
         ("collaboration", _collaboration),
+        ("database_migration", _database_migration),
+        ("registration_integrity", _registration_integrity),
     ]
     modules = {
         name: _run_module(name, loader)

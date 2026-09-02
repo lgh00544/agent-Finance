@@ -756,6 +756,17 @@ export interface SystemMapMigrationSummary {
   [k: string]: unknown
 }
 
+export interface SystemMapIntegrityIssue {
+  kind?: string
+  severity?: string
+  source?: string
+  item?: string
+  message?: string
+  expected?: unknown
+  actual?: unknown
+  [k: string]: unknown
+}
+
 export interface SystemMapHealthModule {
   module: string
   status: SystemMapHealthStatus
@@ -769,6 +780,10 @@ export interface SystemMapHealthModule {
   reason?: string
   knowledge?: SystemMapMigrationSummary
   experience?: SystemMapMigrationSummary
+  summary?: Record<string, number | null>
+  issues?: SystemMapIntegrityIssue[]
+  sources?: string[]
+  checked_at?: string | null
   [k: string]: unknown
 }
 

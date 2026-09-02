@@ -8,7 +8,7 @@ from app.system_map import health
 def test_health_aggregates_real_modules_and_unknown_gaps():
     result = health.get_governance_health()
 
-    assert result["module_count"] == 6
+    assert result["module_count"] == 8
     assert set(result["modules"]) == {
         "system_map",
         "knowledge",
@@ -16,6 +16,8 @@ def test_health_aggregates_real_modules_and_unknown_gaps():
         "experience_memory",
         "rule_change_audit",
         "collaboration",
+        "database_migration",
+        "registration_integrity",
     }
     knowledge = result["modules"]["knowledge"]
     assert knowledge["status"] in {"healthy", "attention", "error", "unknown"}
@@ -30,7 +32,7 @@ def test_health_api_is_read_only_and_returns_module_statuses():
 
     assert response.status_code == 200
     assert response.json()["status"] in {"healthy", "attention", "error", "unknown"}
-    assert response.json()["module_count"] == 6
+    assert response.json()["module_count"] == 8
 
 
 def test_health_module_failure_is_error_and_not_healthy(monkeypatch):
@@ -46,7 +48,8 @@ def test_health_module_failure_is_error_and_not_healthy(monkeypatch):
 
 def test_health_empty_module_is_unknown_not_healthy(monkeypatch):
     monkeypatch.setattr(health, "_knowledge", lambda: health._module("knowledge", "unknown"))
-    for name in ("_system_map", "_shadow", "_experience", "_rules_audit", "_collaboration"):
+    for name in ("_system_map", "_shadow", "_experience", "_rules_audit", "_collaboration",
+                 "_registration_integrity"):
         monkeypatch.setattr(health, name, lambda name=name: health._module(name, "healthy"))
 
     result = health.get_governance_health()

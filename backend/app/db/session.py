@@ -2,6 +2,12 @@
 数据库会话管理：同一套 ORM 模型，默认 SQLite 单文件（data/dev.db，零外部依赖）；
 DB_BACKEND=mysql 时切换 MySQL8。业务代码一律通过 repo 网关访问，本模块只被网关使用。
 """
+import hashlib
+import logging
+import os
+import re
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine, event
@@ -9,6 +15,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 from app.db.models import Base
+
+logger = logging.getLogger(__name__)
+_LAST_INIT_DB_RESULT: dict = {"status": "not_run"}
 
 
 def _sqlite_pragmas(dbapi_connection, connection_record):
@@ -34,8 +43,6 @@ def _build_engine_url() -> str:
     # 默认：SQLite 单文件（SQLITE_PATH 便于测试隔离）
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    import os
-
     db_file = os.environ.get("SQLITE_PATH") or (data_dir / "dev.db")
     return f"sqlite:///{db_file}"
 
@@ -52,33 +59,140 @@ if settings.db_backend != "mysql":
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
-def init_db() -> None:
+def _database_identity(eng=engine) -> dict:
+    """Return non-sensitive database identity for startup diagnostics."""
+    if eng.dialect.name == "sqlite":
+        database = str(eng.url.database or "")
+        digest = hashlib.sha256(database.encode("utf-8")).hexdigest()[:12]
+        return {"backend": "sqlite", "sqlite_path_digest": digest}
+    return {"backend": eng.dialect.name, "database": str(eng.url.database or "")}
+
+
+def get_init_db_result() -> dict:
+    """Return a read-only copy of the latest startup migration result."""
+    return deepcopy(_LAST_INIT_DB_RESULT)
+
+
+def _safe_error(exc: BaseException) -> str:
+    """Keep startup diagnostics useful without exposing credentials."""
+    message = str(exc) or exc.__class__.__name__
+    message = re.sub(r"(?i)(mysql(?:\+\w+)?://)[^@\s]+@", r"\1<redacted>@", message)
+    message = re.sub(r"(?i)(password|passwd|pwd)=([^&\s]+)", r"\1=<redacted>", message)
+    return message
+
+
+def _is_duplicate_column_error(exc: BaseException) -> bool:
+    """Only classify an explicit duplicate-column error as an idempotent hit."""
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+        if len(chain) >= 5:
+            break
+    text = " ".join(str(item) for item in chain).lower()
+    if "duplicate column" in text or "duplicate column name" in text:
+        return True
+    return any("1060" in str(item) and "column" in str(item).lower() for item in chain)
+
+
+def _add_column(conn, table: str, column: str, ddl: str) -> str:
+    """Add one column and distinguish duplicate-column from real DB failures."""
+    statement = f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+    try:
+        conn.exec_driver_sql(statement)
+        return "added"
+    except Exception as exc:  # noqa: BLE001 preserve real migration failures
+        if _is_duplicate_column_error(exc):
+            logger.debug("数据库迁移列已存在 backend=%s table=%s column=%s",
+                         conn.engine.dialect.name, table, column)
+            return "existing"
+        logger.error("数据库迁移失败 backend=%s table=%s column=%s error=%s",
+                     conn.engine.dialect.name, table, column, _safe_error(exc))
+        raise
+
+
+def _add_columns(eng, table: str, additions: dict[str, str]) -> dict:
+    """Idempotently add columns and return a small diagnostic summary."""
+    result = {"table": table, "added": [], "existing": []}
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            existing = {
+                row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")
+            }
+            for column, ddl in additions.items():
+                if column in existing:
+                    result["existing"].append(column)
+                else:
+                    _add_column(conn, table, column, ddl)
+                    result["added"].append(column)
+        else:
+            for column, ddl in additions.items():
+                outcome = _add_column(conn, table, column, ddl)
+                result["added" if outcome == "added" else "existing"].append(column)
+    return result
+
+
+def init_db() -> dict:
     """建表（幂等）。prod 模式下容器初始化已有 DDL，此处 create_all 兜底保证结构一致。"""
     from app.db import models  # noqa: F401  确保模型注册
 
-    Base.metadata.create_all(bind=engine)
-    _ensure_experience_fts()
-    _ensure_review_result_columns()
-    _ensure_stock_candidate_detail()
-    _ensure_trade_record_columns()
-    _ensure_agent_suggestion_columns()
-    _ensure_position_plan_detail()
-    _ensure_position_plan_source()
-    _ensure_hot_money_profile_columns()
-    _ensure_holding_high_price()
-    _ensure_alert_log_source()
-    _ensure_lhb_multi_source_verified()
-    _ensure_forward_view_history()
-    _ensure_market_condition_next_day()
-    _add_factor_scores_column()
-    _ensure_sector_forward_tag()
-    _ensure_indexes()
-    _ensure_sector_snapshot_table()
-    _ensure_quote_snapshot_table()
-    _ensure_distribution_phase_table()
-    _ensure_capital_view_tables()
-    _ensure_knowledge_hit_columns()
-    _ensure_experience_curator_columns()
+    global _LAST_INIT_DB_RESULT
+    identity = _database_identity()
+    try:
+        Base.metadata.create_all(bind=engine)
+        _ensure_experience_fts()
+        _ensure_review_result_columns()
+        _ensure_stock_candidate_detail()
+        _ensure_trade_record_columns()
+        _ensure_agent_suggestion_columns()
+        _ensure_position_plan_detail()
+        _ensure_position_plan_source()
+        _ensure_hot_money_profile_columns()
+        _ensure_holding_high_price()
+        _ensure_alert_log_source()
+        _ensure_lhb_multi_source_verified()
+        _ensure_forward_view_history()
+        _ensure_market_condition_next_day()
+        _add_factor_scores_column()
+        _ensure_sector_forward_tag()
+        _ensure_indexes()
+        _ensure_sector_snapshot_table()
+        _ensure_quote_snapshot_table()
+        _ensure_distribution_phase_table()
+        _ensure_capital_view_tables()
+        knowledge = _ensure_knowledge_hit_columns()
+        experience = _ensure_experience_curator_columns()
+    except Exception as exc:  # noqa: BLE001 startup must expose migration failures
+        _LAST_INIT_DB_RESULT = {
+            "status": "failed",
+            **identity,
+            "initialized_at": datetime.now().isoformat(timespec="seconds"),
+            "error": _safe_error(exc),
+        }
+        logger.error(
+            "数据库初始化/迁移失败 identity=%s error=%s",
+            identity,
+            _safe_error(exc),
+        )
+        raise
+    _LAST_INIT_DB_RESULT = {
+        "status": "ok",
+        **identity,
+        "initialized_at": datetime.now().isoformat(timespec="seconds"),
+        "migrations": {"knowledge": knowledge, "experience": experience},
+    }
+    logger.info(
+        "数据库初始化/迁移完成 backend=%s database=%s knowledge_added=%s "
+        "knowledge_existing=%s experience_added=%s experience_existing=%s",
+        identity.get("backend"),
+        identity.get("database") or identity.get("sqlite_path_digest"),
+        len(knowledge["added"]),
+        len(knowledge["existing"]),
+        len(experience["added"]),
+        len(experience["existing"]),
+    )
+    return _LAST_INIT_DB_RESULT
 
 
 def _ensure_experience_fts() -> None:
@@ -159,16 +273,7 @@ def _ensure_capital_view_tables() -> None:
 def _ensure_stock_candidate_detail(eng=None) -> None:
     """幂等补齐 stock_candidate.detail 列（v2.0 输出详情；仅增量加列，不重建表不丢数据）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(stock_candidate)")}
-            if "detail" not in existing:
-                conn.exec_driver_sql("ALTER TABLE stock_candidate ADD COLUMN detail JSON")
-        else:
-            try:
-                conn.exec_driver_sql("ALTER TABLE stock_candidate ADD COLUMN detail JSON")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "stock_candidate", {"detail": "JSON"})
 
 
 def _ensure_review_result_columns(eng=None) -> None:
@@ -180,25 +285,14 @@ def _ensure_review_result_columns(eng=None) -> None:
         "suggest_iteration": "INTEGER DEFAULT 1",
         "suggest_history": "JSON",
     }
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(review_result)")}
-            for col, ddl in additions.items():
-                if col not in existing:
-                    conn.exec_driver_sql(f"ALTER TABLE review_result ADD COLUMN {col} {ddl}")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            for col, ddl in additions.items():
-                try:
-                    conn.exec_driver_sql(f"ALTER TABLE review_result ADD COLUMN {col} {ddl}")
-                except Exception:  # noqa: BLE001 列已存在
-                    pass
+    _add_columns(eng, "review_result", additions)
 
 
-def _ensure_knowledge_hit_columns(eng=None) -> None:
+def _ensure_knowledge_hit_columns(eng=None) -> dict:
     """幂等补齐 private_knowledge 命中计量与治理元数据列。
     仅增量加列，不重建表不丢数据；历史知识默认 active。"""
     eng = eng or engine
+    text_default = "TEXT NOT NULL DEFAULT ''" if eng.dialect.name == "sqlite" else "TEXT"
     additions = {
         "hit_count": "INTEGER NOT NULL DEFAULT 0",
         "last_used_at": "DATETIME",
@@ -210,44 +304,22 @@ def _ensure_knowledge_hit_columns(eng=None) -> None:
         "valid_from": "DATETIME",
         "valid_to": "DATETIME",
         "status": "VARCHAR(16) NOT NULL DEFAULT 'active'",
-        "risk_note": "TEXT NOT NULL DEFAULT ''",
+        "risk_note": text_default,
     }
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(private_knowledge)")}
-            for col, ddl in additions.items():
-                if col not in existing:
-                    conn.exec_driver_sql(f"ALTER TABLE private_knowledge ADD COLUMN {col} {ddl}")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            for col, ddl in additions.items():
-                try:
-                    conn.exec_driver_sql(f"ALTER TABLE private_knowledge ADD COLUMN {col} {ddl}")
-                except Exception:  # noqa: BLE001 列已存在
-                    pass
+    return _add_columns(eng, "private_knowledge", additions)
 
 
-def _ensure_experience_curator_columns(eng=None) -> None:
+def _ensure_experience_curator_columns(eng=None) -> dict:
     """幂等补齐 experience 命中计量与策展字段；只增量加列，不删除旧记忆。"""
     eng = eng or engine
+    text_default = "TEXT NOT NULL DEFAULT ''" if eng.dialect.name == "sqlite" else "TEXT"
     additions = {
         "hit_count": "INTEGER NOT NULL DEFAULT 0",
         "last_used_at": "DATETIME",
         "expires_at": "DATETIME",
-        "curator_note": "TEXT NOT NULL DEFAULT ''",
+        "curator_note": text_default,
     }
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(experience)")}
-            for col, ddl in additions.items():
-                if col not in existing:
-                    conn.exec_driver_sql(f"ALTER TABLE experience ADD COLUMN {col} {ddl}")
-        else:
-            for col, ddl in additions.items():
-                try:
-                    conn.exec_driver_sql(f"ALTER TABLE experience ADD COLUMN {col} {ddl}")
-                except Exception:  # noqa: BLE001 列已存在
-                    pass
+    return _add_columns(eng, "experience", additions)
 
 
 def _ensure_trade_record_columns(eng=None) -> None:
@@ -258,36 +330,14 @@ def _ensure_trade_record_columns(eng=None) -> None:
         "before_shares": "INTEGER",
         "after_shares": "INTEGER",
     }
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(trade_record)")}
-            for col, ddl in additions.items():
-                if col not in existing:
-                    conn.exec_driver_sql(f"ALTER TABLE trade_record ADD COLUMN {col} {ddl}")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            for col, ddl in additions.items():
-                try:
-                    conn.exec_driver_sql(f"ALTER TABLE trade_record ADD COLUMN {col} {ddl}")
-                except Exception:  # noqa: BLE001 列已存在
-                    pass
+    _add_columns(eng, "trade_record", additions)
 
 
 def _ensure_position_plan_source(eng=None) -> None:
     """幂等补齐 position_plan.source 列（计划来源标记 candidate/manual；
     仅增量加列，不重建表不丢数据；旧数据默认 manual）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(position_plan)")}
-            if "source" not in existing:
-                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN source VARCHAR(16) DEFAULT 'manual'")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            try:
-                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN source VARCHAR(16) DEFAULT 'manual'")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "position_plan", {"source": "VARCHAR(16) DEFAULT 'manual'"})
 
 
 def _ensure_agent_suggestion_columns(eng=None) -> None:
@@ -311,19 +361,7 @@ def _ensure_agent_suggestion_columns(eng=None) -> None:
         "audit_round": "INTEGER DEFAULT 0",
         "last_audit_id": "INTEGER NULL",
     }
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(agent_suggestion)")}
-            for col, ddl in additions.items():
-                if col not in existing:
-                    conn.exec_driver_sql(f"ALTER TABLE agent_suggestion ADD COLUMN {col} {ddl}")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            for col, ddl in additions.items():
-                try:
-                    conn.exec_driver_sql(f"ALTER TABLE agent_suggestion ADD COLUMN {col} {ddl}")
-                except Exception:  # noqa: BLE001 列已存在
-                    pass
+    _add_columns(eng, "agent_suggestion", additions)
 
 
 def _ensure_hot_money_profile_columns(eng=None) -> None:
@@ -334,88 +372,35 @@ def _ensure_hot_money_profile_columns(eng=None) -> None:
         "win_rate_5d": "FLOAT",
         "last_review_at": "VARCHAR(16) DEFAULT ''",
     }
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(hot_money_profile)")}
-            for col, ddl in additions.items():
-                if col not in existing:
-                    conn.exec_driver_sql(f"ALTER TABLE hot_money_profile ADD COLUMN {col} {ddl}")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            for col, ddl in additions.items():
-                try:
-                    conn.exec_driver_sql(f"ALTER TABLE hot_money_profile ADD COLUMN {col} {ddl}")
-                except Exception:  # noqa: BLE001 列已存在
-                    pass
+    _add_columns(eng, "hot_money_profile", additions)
 
 
 def _ensure_position_plan_detail(eng=None) -> None:
     """幂等补齐 position_plan.detail 列（v3.0 白盒扩展：dimensions/final_advice/market_regime；
     仅增量加列，不重建表不丢数据；旧数据为 NULL，展示层兼容）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(position_plan)")}
-            if "detail" not in existing:
-                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN detail JSON")
-        else:
-            try:
-                conn.exec_driver_sql("ALTER TABLE position_plan ADD COLUMN detail JSON")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "position_plan", {"detail": "JSON"})
 
 
 def _ensure_holding_high_price(eng=None) -> None:
     """幂等补齐 holding.high_price 列（移动止盈线基准；仅增量加列，不重建表不丢数据；
     旧数据为 NULL，MonitorAgent 首次取行情时降级以当前价为基准）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(holding)")}
-            if "high_price" not in existing:
-                conn.exec_driver_sql("ALTER TABLE holding ADD COLUMN high_price FLOAT")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            try:
-                conn.exec_driver_sql("ALTER TABLE holding ADD COLUMN high_price FLOAT")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "holding", {"high_price": "FLOAT"})
 
 
 def _ensure_alert_log_source(eng=None) -> None:
     """幂等补齐 alert_log.source 列（告警来源标记 monitor/portfolio_sentinel；
     仅增量加列，不重建表不丢数据；旧数据默认 monitor）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(alert_log)")}
-            if "source" not in existing:
-                conn.exec_driver_sql("ALTER TABLE alert_log ADD COLUMN source VARCHAR(16) DEFAULT 'monitor'")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            try:
-                conn.exec_driver_sql("ALTER TABLE alert_log ADD COLUMN source VARCHAR(16) DEFAULT 'monitor'")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "alert_log", {"source": "VARCHAR(16) DEFAULT 'monitor'"})
 
 
 def _ensure_lhb_multi_source_verified(eng=None) -> None:
     """幂等补齐 lhb_original_flow.multi_source_verified 列（第二源上榜确认采信标记；
     仅增量加列，不重建表不丢数据；旧数据默认 False）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(lhb_original_flow)")}
-            if "multi_source_verified" not in existing:
-                conn.exec_driver_sql(
-                    "ALTER TABLE lhb_original_flow ADD COLUMN multi_source_verified BOOLEAN DEFAULT 0")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            try:
-                conn.exec_driver_sql(
-                    "ALTER TABLE lhb_original_flow ADD COLUMN multi_source_verified BOOLEAN DEFAULT 0")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "lhb_original_flow", {"multi_source_verified": "BOOLEAN DEFAULT 0"})
 
 
 def _ensure_forward_view_history(eng=None) -> None:
@@ -431,51 +416,22 @@ def _ensure_market_condition_next_day(eng=None) -> None:
     """幂等补齐 market_condition.next_day_index_pct 列（市况次日指数回填，准确率闭环；
     仅增量加列，不重建表不丢数据；旧数据为 NULL=未回填）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(market_condition)")}
-            if "next_day_index_pct" not in existing:
-                conn.exec_driver_sql("ALTER TABLE market_condition ADD COLUMN next_day_index_pct FLOAT")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            try:
-                conn.exec_driver_sql("ALTER TABLE market_condition ADD COLUMN next_day_index_pct FLOAT")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "market_condition", {"next_day_index_pct": "FLOAT"})
 
 
 def _ensure_sector_forward_tag(eng=None) -> None:
     """幂等补齐 sector_forward_forecast.sector_tag 列（老数据默认 none）。"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(sector_forward_forecast)")}
-            if "sector_tag" not in existing:
-                conn.exec_driver_sql(
-                    "ALTER TABLE sector_forward_forecast ADD COLUMN sector_tag VARCHAR(16) NOT NULL DEFAULT 'none'")
-        else:
-            try:
-                conn.exec_driver_sql(
-                    "ALTER TABLE sector_forward_forecast ADD COLUMN sector_tag VARCHAR(16) NOT NULL DEFAULT 'none'")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "sector_forward_forecast", {
+        "sector_tag": "VARCHAR(16) NOT NULL DEFAULT 'none'",
+    })
 
 
 def _add_factor_scores_column(eng=None) -> None:
     """幂等补齐 candidate_track_verify.factor_scores 列（因子回测校准闭环；
     仅增量加列，不重建表不丢数据；旧数据为 NULL=无因子分诚实留空）"""
     eng = eng or engine
-    with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(candidate_track_verify)")}
-            if "factor_scores" not in existing:
-                conn.exec_driver_sql("ALTER TABLE candidate_track_verify ADD COLUMN factor_scores JSON")
-        else:
-            # MySQL 8 无 ADD COLUMN IF NOT EXISTS：已存在时报错，忽略即可
-            try:
-                conn.exec_driver_sql("ALTER TABLE candidate_track_verify ADD COLUMN factor_scores JSON")
-            except Exception:  # noqa: BLE001 列已存在
-                pass
+    _add_columns(eng, "candidate_track_verify", {"factor_scores": "JSON"})
 
 
 def get_session() -> Session:

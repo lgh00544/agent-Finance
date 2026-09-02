@@ -7,7 +7,17 @@ from app.system_map import registry
 
 def test_list_agents_contains_core_agents():
     agent_ids = {item["agent_id"] for item in registry.list_agents()}
-    assert {"discover", "score", "monitor", "sell", "review"} <= agent_ids
+    assert {"discover", "score", "monitor", "sell", "review", "market_intel", "portfolio_sentinel"} <= agent_ids
+
+
+def test_list_agents_includes_system_agents_with_real_metadata():
+    agents = {item["agent_id"]: item for item in registry.list_agents()}
+    market = agents["market_intel"]
+    portfolio = agents["portfolio_sentinel"]
+    assert market["agent_type"] == "research_decision"
+    assert portfolio["authority_level"] == "advisory"
+    assert "execute_trade" in market["cannot_do"]
+    assert "execute_trade" in portfolio["cannot_do"]
 
 
 def test_list_tools_contains_readonly_react_tools():
