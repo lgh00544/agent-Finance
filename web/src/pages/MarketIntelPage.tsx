@@ -481,6 +481,8 @@ function SectorRotationTab() {
   const churn = rot?.churn_rate
   const continuations = launchList.filter((lr) => continuationOf(lr as Record<string, unknown>))
   const focus = st === 'mainline' ? '关注主线板块抱团持续性' : st === 'rotation' ? '关注切换节奏避免追高' : st === 'chaos' ? '防御为主降低仓位' : '等待结构判定后再确定关注重点'
+  const [chainMode, setChainMode] = useState<'all' | 'none' | 'default'>('none')
+  const chainCount = launchList.filter((lr) => lr.reason_chain).length
 
   return (
     <Space orientation="vertical" style={{ width: '100%' }} size={12}>
@@ -500,7 +502,6 @@ function SectorRotationTab() {
           <Text type="secondary">轮动状态</Text>
           <div style={{ fontSize: 24, fontWeight: 700, color: stateColor[st] }}>{stateLabel[st] ?? rot?.rotation_state ?? '（数据缺失）'}</div>
           <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>三态判定：主线行情=资金集中单主线；轮动=高低切换快；混沌=无明确主线。</Text>
-          <Text type="secondary" style={{ display: 'block', fontSize: 13, marginTop: 6 }}>📌 关注重点：{focus}</Text>
         </div>
         <Tooltip title="churn 次数 = 当前周期内主线板块切换次数，> 1 表示热点快速轮动">
           <div style={{ flex: '1 1 240px', border: '1px solid var(--border)', borderRadius: 8, padding: 12, background: 'var(--bg-input)' }}>
@@ -516,9 +517,11 @@ function SectorRotationTab() {
 
       <Card size="small" title="可延续板块（下一阶段值得关注）" extra={<Text type="secondary">基于 AI 评估 × 持续信号规则筛出</Text>}>
         {continuations.length ? <Space wrap>
-          {continuations.map((lr, i) => <Card key={i} size="small" hoverable title={lr.sector_name ?? '—'}>
-            <Space wrap><Tag color="blue">{st === 'mainline' ? '主线' : st === 'rotation' ? '轮动' : '观察'}</Tag><Text type="secondary">预期延续 {continuationDays(lr as Record<string, unknown>)} 天</Text></Space>
-            <Text type="secondary" ellipsis style={{ display: 'block', maxWidth: 280, marginTop: 6 }}>{lr.reason_text ?? '—'}</Text>
+          {continuations.map((lr, i) => <Card key={i} size="small" hoverable title={<div style={{ wordBreak: 'break-word', whiteSpace: 'normal' }}>{lr.sector_name ?? '—'}</div>}>
+            <Space orientation="vertical" size={4}>
+              <Space wrap><Tag color="blue">{st === 'mainline' ? '主线' : st === 'rotation' ? '轮动' : '观察'}</Tag><Text type="secondary">预期延续 {continuationDays(lr as Record<string, unknown>)} 天</Text></Space>
+              <Text type="secondary" style={{ display: 'block', wordBreak: 'break-word' }}>{lr.reason_text ?? '—'}</Text>
+            </Space>
           </Card>)}
         </Space> : <EmptyState text="（暂无明确可延续板块）" icon="📌" />}
       </Card>
@@ -526,6 +529,12 @@ function SectorRotationTab() {
       {/* AI 评估区 */}
       <Card size="small" style={{ background: 'var(--bg-input)' }}
         title={<span>AI 评估 · 本轮判定 {rot?.count ?? launchList.length} 个板块启动，理由摘要如下</span>}>
+        <Space wrap style={{ marginBottom: 8 }}>
+          <Text type="secondary">共 {chainCount} 个板块的证据链</Text>
+          <Button size="small" onClick={() => setChainMode('all')}>全部展开</Button>
+          <Button size="small" onClick={() => setChainMode('none')}>全部折叠</Button>
+          <Button size="small" onClick={() => setChainMode('default')}>恢复默认</Button>
+        </Space>
         {launchList.length ? launchList.map((lr, i) => (
           <Card key={i} size="small" style={{ marginBottom: 6, background: 'var(--bg-input)' }}>
             <Space wrap><Text strong style={{ fontSize: 15 }}>{lr.sector_name ?? '—'}</Text>{continuationOf(lr as Record<string, unknown>) ? <Tag color="green">可延续</Tag> : null}<Tag color="blue">{lr.reason_tags ?? '（数据缺失）'}</Tag></Space>
@@ -546,7 +555,7 @@ function SectorRotationTab() {
               )
             })()}
             {lr.reason_chain ? (
-              <Collapse size="small" defaultActiveKey={['chain']} style={{ marginTop: 6 }} items={[{
+              <Collapse key={chainMode} size="small" defaultActiveKey={chainMode === 'all' ? ['chain'] : chainMode === 'default' ? (i === 0 ? ['chain'] : []) : []} style={{ marginTop: 6 }} items={[{
                 key: 'chain',
                 label: 'reason_chain 证据链',
                 children: (
@@ -644,6 +653,10 @@ function SectorRotationTab() {
           ))}
         </div>
       </Card>
+
+      <Space style={{ marginTop: 12 }}>
+        <Text style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>📌 关注重点：{focus}</Text>
+      </Space>
     </Space>
   )
 }
