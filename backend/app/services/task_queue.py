@@ -1,8 +1,9 @@
 """轻量后台任务队列：手动耗时任务异步化（提交即返回，不阻塞页面操作）。
 
 - 线程池串行执行（max_workers=1，防外部接口/LLM 限流，单人使用足够）；
-- 内存任务表：状态流转 pending → running → done/failed；
-  字段：task_id/kind/label/params/status/submitted_at/started_at/finished_at/error/result；
+- 内存任务表：状态流转 pending → running → done/failed/canceled；
+  字段：task_id/kind/label/params/status/attempt_id/cancel_requested/
+  submitted_at/started_at/finished_at/error/result；
 - 保留最近 _KEEP 条记录，超出自动裁剪；
 - failed 任务支持 retry（重置状态重新入队，复用原 task_id）；
 - 卡死终结：daily_pipeline / monitor_all 等长任务超时上限（_TIMEOUT_SECONDS），
@@ -79,6 +80,8 @@ def submit(kind: str, label: str, fn: Callable, params: dict | None = None) -> s
         task: dict[str, Any] = {
             "task_id": tid, "kind": kind, "label": label, "seq": _seq,
             "params": dict(params or {}), "status": "pending",
+            "attempt_id": uuid.uuid4().hex[:12], "cancel_requested": False,
+            "canceled_at": None,
             "submitted_at": _now(), "started_at": None, "finished_at": None,
             "error": None, "result": None, "_fn": fn,
         }
@@ -89,22 +92,43 @@ def submit(kind: str, label: str, fn: Callable, params: dict | None = None) -> s
 
 
 def _run(tid: str) -> None:
-    task = _tasks.get(tid)
-    if task is None:
-        return
-    task["status"] = "running"
-    task["started_at"] = _now()
-    task["_started_mono"] = time.monotonic()  # 超时终结基准（watchdog 用）
+    with _lock:
+        task = _tasks.get(tid)
+        if task is None or task["status"] != "pending" or task["cancel_requested"]:
+            return
+        task["status"] = "running"
+        task["started_at"] = _now()
+        task["_started_mono"] = time.monotonic()  # 超时终结基准（watchdog 用）
+        attempt_id = task["attempt_id"]
+        fn = task["_fn"]
+        params = task["params"]
     try:
-        result = task["_fn"](task["params"])  # 执行函数统一签名 fn(params: dict)
-        task["status"] = "done"
-        task["result"] = _safe_result(result)
+        result = fn(params)  # 执行函数统一签名 fn(params: dict)
+        with _lock:
+            current = _tasks.get(tid)
+            # 取消、超时或重试已经撤销本次 attempt 的发布资格，旧线程只能自然结束。
+            if (current is not task or current["attempt_id"] != attempt_id
+                    or current["status"] != "running"
+                    or current["cancel_requested"]):
+                return
+            current["status"] = "done"
+            current["result"] = _safe_result(result)
     except Exception as exc:  # noqa: BLE001 任务级整体容错，失败原因随任务返回供前端展示
-        task["status"] = "failed"
-        task["error"] = str(exc)
+        with _lock:
+            current = _tasks.get(tid)
+            if (current is task and current["attempt_id"] == attempt_id
+                    and current["status"] == "running"
+                    and not current["cancel_requested"]):
+                current["status"] = "failed"
+                current["error"] = str(exc)
         logger.error("后台任务 %s(%s) 失败: %s", task["kind"], tid, exc)
     finally:
-        task["finished_at"] = _now()
+        with _lock:
+            current = _tasks.get(tid)
+            if (current is task and current["attempt_id"] == attempt_id
+                    and current["finished_at"] is None
+                    and current["status"] in ("done", "failed", "canceled")):
+                current["finished_at"] = _now()
 
 
 def _safe_result(result: Any) -> Any:
@@ -141,6 +165,9 @@ def retry(tid: str) -> bool:
         if task is None or task["status"] != "failed":
             return False
         task["status"] = "pending"
+        task["attempt_id"] = uuid.uuid4().hex[:12]
+        task["cancel_requested"] = False
+        task["canceled_at"] = None
         task["error"] = None
         task["result"] = None
         task["started_at"] = None
@@ -158,15 +185,17 @@ def has_active(kind: str) -> bool:
 
 
 def cancel(tid: str) -> bool:
-    """手动取消卡死任务：仅 pending/running 可取消（failed/done 不可）。
+    """手动取消卡死任务：仅 pending/running 可取消（failed/done/canceled 不可）。
     取消后释放任务队列（正在执行的线程无法强杀，留在旧池后台耗，
-    但队列立即腾出，新任务可提交）"""
+    但队列立即腾出，新任务可提交；旧线程失去本次 attempt 的发布资格。"""
     with _lock:
         task = _tasks.get(tid)
         if task is None or task["status"] not in ("pending", "running"):
             return False
-        task["status"] = "failed"
+        task["status"] = "canceled"
+        task["cancel_requested"] = True
         task["error"] = "canceled by user"
+        task["canceled_at"] = _now()
         task["finished_at"] = _now()
         if task.get("_started_mono"):
             _replace_executor_locked()  # 正在执行：丢弃旧池，释放被占的单线程队列

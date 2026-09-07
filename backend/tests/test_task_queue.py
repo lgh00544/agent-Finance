@@ -1,4 +1,5 @@
 """后台任务队列测试：提交即返回 / 状态流转 / 失败与重试 / 保留上限裁剪"""
+import threading
 import time
 
 from app.services import task_queue
@@ -75,6 +76,60 @@ def test_retry_rejects_running_or_done():
     _wait_status(tid, "done")
     assert task_queue.retry(tid) is False  # done 不可重试
     assert task_queue.retry("not-exist-id") is False
+
+
+def test_cancel_running_task_cannot_publish_done():
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow(params):
+        started.set()
+        release.wait(5)
+        return "stale-result"
+
+    tid = task_queue.submit("test_cancel_running", "取消中的任务", _slow)
+    assert started.wait(2)
+    assert task_queue.cancel(tid) is True
+    release.set()
+
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        task = task_queue.get(tid)
+        if task and task["status"] == "canceled":
+            break
+        time.sleep(0.02)
+    task = task_queue.get(tid)
+    assert task["status"] == "canceled"
+    assert task["result"] is None
+    assert task["cancel_requested"] is True
+    assert task_queue.retry(tid) is False
+
+
+def test_cancel_pending_task_never_runs():
+    started = threading.Event()
+    release = threading.Event()
+    calls = {"pending": 0}
+
+    def _blocker(params):
+        started.set()
+        release.wait(5)
+        return "ok"
+
+    def _pending(params):
+        calls["pending"] += 1
+        return "must-not-run"
+
+    blocker = task_queue.submit("test_cancel_blocker", "阻塞任务", _blocker)
+    assert started.wait(2)
+    tid = task_queue.submit("test_cancel_pending", "待取消任务", _pending)
+    assert task_queue.cancel(tid) is True
+    release.set()
+    _wait_status(blocker, "done")
+
+    task = task_queue.get(tid)
+    assert task["status"] == "canceled"
+    assert task["result"] is None
+    assert calls["pending"] == 0
 
 
 def test_recent_tasks_ordered():

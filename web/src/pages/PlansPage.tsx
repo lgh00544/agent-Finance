@@ -34,6 +34,9 @@ const SOURCE_LABEL: Record<string, string> = { candidate: '每日候选池', man
 const FRESHNESS_LABEL: Record<string, { label: string; color: string }> = {
   realtime: { label: '实时数据', color: 'green' },
   cache30m: { label: '30分钟缓存', color: 'orange' },
+  same_day_as_of: { label: '当日数据截至', color: 'blue' },
+  prior_close: { label: '前收数据', color: 'default' },
+  unknown: { label: '数据时效未知', color: 'red' },
 }
 
 /** 触发信号：止盈已触发=涨=红(var--up) / 止损已触发=跌=绿(var--down) / 正常待评估=橙(var--warn) */
@@ -88,6 +91,7 @@ function PlanExpand({ p, scoreMap }: { p: PositionPlan; scoreMap: Record<string,
   const dims = (detail.dimensions as Array<Record<string, unknown>>) ?? []
   const grade = scoreMap[p.stock_code]?.grade ?? (detail.grade as string) ?? '—'
   const freshness = detail.freshness as string | undefined
+  const dataAsOf = detail.data_as_of as string | undefined
 
   const refresh = useTaskSubmit('position', () => {
     message.success('建仓方案重算任务已提交后台')
@@ -104,6 +108,7 @@ function PlanExpand({ p, scoreMap }: { p: PositionPlan; scoreMap: Record<string,
         {freshness ? (
           <Tag color={FRESHNESS_LABEL[freshness]?.color ?? 'default'}>{FRESHNESS_LABEL[freshness]?.label ?? freshness}</Tag>
         ) : null}
+        {dataAsOf ? <Text type="secondary">数据截至 {dataAsOf}</Text> : null}
       </Space>
 
       {quant.current_price != null ? (

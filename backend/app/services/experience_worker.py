@@ -154,7 +154,7 @@ def _conflict_check(draft: ExperienceDraft) -> dict:
     """两段式冲突判定：
     ① 代码层：同 stage 的 active 经验，tags 有交集的优先（候选过滤）；
     ② LLM 层：ROUTE_PROMPT 附候选列表，判定结论是否相反（代码不做语义判断）。
-    LLM 判定失败视为无冲突（auto_merged 项可回滚兜底），记录告警。"""
+    LLM 判定失败视为有冲突，转人工审核（fail-closed），记录告警。"""
     cands = repo.search_experience(stage=draft.stage, k=5)
     if not cands:
         return {"conflict": False, "reason": "无同阶段候选经验"}
@@ -173,9 +173,9 @@ def _conflict_check(draft: ExperienceDraft) -> dict:
         res = _llm_extract(experience_prompt.ROUTE_PROMPT, user, RouteConflict)
         return {"conflict": res.conflict, "conflicting_ids": res.conflicting_ids,
                 "reason": res.reason}
-    except Exception as exc:  # noqa: BLE001 冲突判定失败不阻断自动合并（可回滚兜底）
-        logger.warning("冲突判定 LLM 失败（视为无冲突）: %s", exc)
-        return {"conflict": False, "reason": "冲突判定失败，视为无冲突"}
+    except Exception as exc:  # noqa: BLE001 冲突判定失败不得自动放行
+        logger.warning("冲突判定 LLM 失败（转人工审核）: %s", exc)
+        return {"conflict": True, "reason": "冲突判定失败，转人工审核"}
 
 
 def _process_item(item: dict) -> None:

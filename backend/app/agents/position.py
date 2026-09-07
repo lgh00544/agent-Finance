@@ -4,6 +4,8 @@ PositionAgent 仓位规划 - LangGraph 节点
 【交由模型推理的业务逻辑】分批区间/资金配比/止损止盈/市场强弱（全部在 LLM）
 流转：collect_plan_input → llm_plan
 """
+import hashlib
+import json
 import logging
 import time
 
@@ -106,10 +108,14 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
     if regime_context:
         capital_constraints += f"\n{regime_context}"
     stock_data = _compact(info.get("indicators", {}))
+    input_fingerprint = _plan_input_fingerprint(
+        code, today, state.get("score_result"),
+        {**info, "score_info": score_info, "index_data": index_data,
+         "capital_constraints": capital_constraints, "stock_data": stock_data})
 
     output = agent_call(
         agent="position",
-        cache_key=f"{code}:{today}",
+        cache_key=f"{code}:{today}:input:{input_fingerprint}",
         system_prompt=position_prompt.SYSTEM_PROMPT,
         user_prompt=position_prompt.build_user_prompt(
             score_info, index_data, capital_constraints, stock_data),
@@ -118,9 +124,11 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
         model_level=ModelLevel.DEEP,
     )
 
-    # 分级缓存时效标签：A 级实时数据；B 级 30 分钟缓存（页面按此标注数据新鲜度）
+    # 新鲜度只描述事实数据，不再用评级推断“实时”。
     grade = (state.get("score_result") or {}).get("grade") or ""
-    freshness = "realtime" if grade == "A" else "cache30m"
+    data_as_of = str(indicators.get("latest_date") or "")
+    freshness = _data_freshness(data_as_of, today)
+    analysis_generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
     # 量化计算（纯计算零 LLM）：金额/股数（100 整数倍）/分级 C1 上限/盈亏比/资金缩减
     indicators = (info or {}).get("indicators") or {}
     quant = plan_quant.quantify(
@@ -138,6 +146,9 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
                 "final_advice": output.final_advice,
                 "market_regime": output.market_regime,
                 "freshness": freshness,
+                "data_as_of": data_as_of or None,
+                "analysis_generated_at": analysis_generated_at,
+                "input_fingerprint": input_fingerprint,
                 "quant": quant},
         source=state.get("plan_source") or "manual",
     )
@@ -147,6 +158,28 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
                       f"建仓方案完成: 总仓{output.total_pct}% 止损{output.stop_loss} 止盈{output.take_profit}"]
     logger.info("建仓方案完成 %s: plan_id=%s", code, plan_id)
     return state
+
+
+def _plan_input_fingerprint(code: str, trade_date: str,
+                            score_result: dict | None, basic_info: dict) -> str:
+    """动态输入指纹：行情/评分/资金约束变化时，Position LLM 缓存自动换键。"""
+    payload = {
+        "stock_code": code,
+        "trade_date": trade_date,
+        "score_result": score_result or {},
+        "basic_info": basic_info or {},
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _data_freshness(data_as_of: str, trade_date: str) -> str:
+    """返回事实数据状态；daily K 线不宣称盘中实时。"""
+    if not data_as_of:
+        return "unknown"
+    if data_as_of == trade_date:
+        return "same_day_as_of"
+    return "prior_close"
 
 
 def _compact(data) -> str:

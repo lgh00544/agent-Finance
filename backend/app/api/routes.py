@@ -434,7 +434,8 @@ def cancel_task(tid: str):
     if not task_queue.cancel(tid):
         raise HTTPException(status_code=400,
                             detail="任务不存在或当前状态不可取消（仅待执行/执行中可取消）")
-    return {"task_id": tid, "status": "failed", "canceled": True}
+    task = task_queue.get(tid) or {}
+    return {"task_id": tid, "status": task.get("status", "canceled"), "canceled": True}
 
 
 # ================= 任务触发 =================
