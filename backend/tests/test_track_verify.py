@@ -105,6 +105,34 @@ def test_tn_metrics_base_fallback():
     assert m["t3"]["pct"] == pytest.approx(15.0)  # 11.5/10-1
 
 
+def test_confirmed_kline_points_drops_intraday_today():
+    dates = ["2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03"]
+    closes = [10.0, 10.5, 11.0, 12.0]
+
+    intraday_dates, intraday_closes = tv.confirmed_kline_points(
+        dates, closes, datetime.datetime(2026, 9, 3, 9, 59))
+    close_dates, close_closes = tv.confirmed_kline_points(
+        dates, closes, datetime.datetime(2026, 9, 3, 16, 0))
+
+    assert intraday_dates == ["2026-08-31", "2026-09-01", "2026-09-02"]
+    assert intraday_closes == [10.0, 10.5, 11.0]
+    assert close_dates == dates
+    assert close_closes == closes
+
+
+def test_build_daily_path_from_selected_day_only_confirmed_facts():
+    dates = ["2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03"]
+    closes = [10.0, 9.7, 9.4, 9.8]
+
+    path = tv.build_daily_path(dates, closes, 10.0, "2026-08-31")
+
+    assert [p["day_n"] for p in path] == [0, 1, 2, 3]
+    assert path[0]["pct_from_base"] == pytest.approx(0.0)
+    assert path[1]["daily_pct"] == pytest.approx(-3.0)
+    assert "累计跌幅>=3%" in path[1]["attention_flags"]
+    assert "最大回撤>=5%" in path[2]["attention_flags"]
+
+
 def test_tn_metrics_drawdown_not_double_counted():
     """先涨后回撤不双计：回撤只相对基准最低收盘，与区间高点无关"""
     closes = [10, 11, 11.5, 11.2, 9.5, 9.8, 10.1]
@@ -209,11 +237,18 @@ def test_chain_init_due_and_idempotent():
     assert row["t10_pct"] == pytest.approx(25.0)    # 12.5/10-1
     assert row["verify_result"]["periods"]["t3"]["win"] is True
     assert row["verify_result"]["latest_date"] == "2026-08-14"  # 12 个交易日末位
+    assert row["verify_result"]["daily_path"][0]["day_n"] == 0
+    assert row["verify_result"]["daily_path"][-1]["day_n"] == 10
 
     r2 = tv.run_verify_chain(backfill=False, price_lookup=lookup, llm_call=_no_llm)
     assert r2["initialized"] == 0      # 幂等：不再初始化
     assert r2["updated"] == 0          # 已到期不再遍历
     assert repo.list_track_verify().__len__() == 1  # 无重复行
+
+    r3 = tv.run_verify_chain(backfill=True, price_lookup=lookup, llm_call=_no_llm)
+    assert r3["initialized"] == 0
+    assert r3["updated"] == 1          # 历史回填会刷新已完成行，补齐路径类字段
+    assert r3["finished_new"] == 0     # 已完成历史行不重复计入新增到期
 
 
 def test_chain_insufficient_keeps_tracking():

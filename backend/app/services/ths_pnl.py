@@ -10,12 +10,16 @@
 纯函数可单测（不触网路径全覆盖）；网络/解析异常一律转 error 返回，绝不抛给调用方。
 """
 import json
+import logging
 import re
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from app.cache import cache
 from app.core.config import settings
+from app.db import repo
 
 _API_BASE = "https://tzzb.10jqka.com.cn/caishen_httpserver"
 _PNL_URL = _API_BASE + "/tzzb/caishen_fund/pc/asset/v1/time_share"
@@ -26,6 +30,11 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 _REFERER = "https://tzzb.10jqka.com.cn/pc/index.html"
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _CST = timezone(timedelta(hours=8))
+_REFRESH_LOCK = "ths_pnl_refresh"
+_REFRESH_COOLDOWN_KEY = "ths_pnl:last_refresh"
+_REFRESH_COOLDOWN_SECONDS = 30
+_SNAPSHOT_STALE_SECONDS = 10 * 60
+logger = logging.getLogger(__name__)
 
 
 def _now_str() -> str:
@@ -192,3 +201,64 @@ def get_snapshot(cookie: str = "", user_id: str = "", fund_key: str = "") -> dic
     if sh_pct is None:
         return {**pnl, "sh_pct": None, "error": "指数获取失败"}
     return {**pnl, "sh_pct": sh_pct}
+
+
+def _snapshot_age_seconds(snapshot: dict | None) -> float | None:
+    """计算快照年龄；无法解析时返回 None，交给调用方按需刷新。"""
+    if not snapshot:
+        return None
+    raw = str(snapshot.get("updated_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        updated = datetime.fromisoformat(raw.replace(" ", "T"))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=_CST)
+        return max(0.0, (datetime.now(_CST) - updated).total_seconds())
+    except ValueError:
+        return None
+
+
+def refresh_snapshot_if_needed(force: bool = False) -> dict | None:
+    """按需实时读取凭证并落库，返回最新快照。
+
+    普通 GET 仅在无快照、快照超过 10 分钟或上次为 token 失效时触发；
+    手动刷新 force=True 可绕过年龄判断。30 秒冷却 + 锁避免页面轮询造成重复请求。
+    """
+    latest = repo.get_latest_account_pnl()
+    age = _snapshot_age_seconds(latest)
+    needs_refresh = (
+        force
+        or latest is None
+        or bool(latest.get("token_expired"))
+        or age is None
+        or age > _SNAPSHOT_STALE_SECONDS
+    )
+    if not needs_refresh:
+        return latest
+    if not force and cache.get(_REFRESH_COOLDOWN_KEY):
+        return latest
+    if not cache.acquire_lock(_REFRESH_LOCK, ttl_seconds=60):
+        return latest
+    try:
+        if not force and cache.get(_REFRESH_COOLDOWN_KEY):
+            return repo.get_latest_account_pnl()
+        snapshot = get_snapshot()
+        now = datetime.now(_CST)
+        repo.upsert_account_pnl_snapshot(
+            trade_date=now.strftime("%Y-%m-%d"),
+            ts=now.strftime("%H:%M:%S"),
+            pnl_yk=snapshot.get("pnl_yk"),
+            pnl_pct=snapshot.get("pnl_pct"),
+            sh_pct=snapshot.get("sh_pct"),
+            chart_data=snapshot.get("chart_data") or [],
+            error=snapshot.get("error") or "",
+            token_expired=snapshot.get("token_expired") or False,
+        )
+        cache.set(_REFRESH_COOLDOWN_KEY, str(time.time()), _REFRESH_COOLDOWN_SECONDS)
+        return repo.get_latest_account_pnl()
+    except Exception as exc:  # noqa: BLE001 页面刷新失败仍返回旧快照
+        logger.warning("同花顺实时刷新失败: %s", exc)
+        return latest
+    finally:
+        cache.release_lock(_REFRESH_LOCK)

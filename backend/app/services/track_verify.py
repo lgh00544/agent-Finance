@@ -10,6 +10,8 @@
 - max_drawdown = 相对 base_close_price 的区间最低收盘回撤
   max(0, (base_close − min(closes[t0:])) / base_close × 100)，记录最低收盘日期。
   用收盘价、与涨跌幅同一基准可比（先涨后回落不双计为高涨幅+大回撤）。
+- daily_path = 从选中日 t0 起逐交易日记录已确认收盘路径，供后续 Agent 做观察与归因；
+  不足 T+N 也会保留已发生事实，禁止使用未确认当天日K。
 
 【系统监管红线】
 - 建议全部落 agent_suggestion（status=pending），任何规则调整必须经人工审核
@@ -21,6 +23,7 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime
 
 from app.agents.schemas import TrackVerifyOutput
 from app.cache import cache
@@ -37,6 +40,7 @@ _MAX_ERRORS = 20             # 单次链路错误记录上限（防日志与响�
 _PERF_SUMMARY_TTL = 1800     # 选股表现摘要缓存（30 分钟，与组合哨兵同节奏）
 _PERF_SUMMARY_SAMPLE = 20    # 选股表现回顾样本数（近 20 只有到期数据的候选）
 _PERIOD_LABELS = {"t3": "T+3", "t5": "T+5", "t10": "T+10"}
+_CLOSE_CONFIRM_HOUR = 16     # 16:00 后才把当天日K视为收盘确认数据
 
 # ==================== 因子回测校准闭环（评级重做-C） ====================
 _FACTOR_NAMES = ("动量", "催化", "估值", "主线契合", "资金面", "基本面质量")
@@ -107,6 +111,59 @@ def compute_tn_metrics(dates: list[str], closes: list[float],
     return {"t3": periods["t3"], "t5": periods["t5"], "t10": periods["t10"],
             "max_drawdown": max_drawdown, "min_close_date": min_close_date,
             "due": due, "notes": notes}
+
+
+def confirmed_kline_points(dates: list[str], closes: list[float],
+                           now: datetime | None = None) -> tuple[list[str], list[float]]:
+    """过滤未确认日K：盘中数据源可能返回当天正在形成的日K，16:00 前不得用于 T+N。"""
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    include_today = now.hour >= _CLOSE_CONFIRM_HOUR
+    pairs = [
+        (d, c) for d, c in zip(dates, closes)
+        if d < today or (d == today and include_today)
+    ]
+    return [d for d, _ in pairs], [c for _, c in pairs]
+
+
+def build_daily_path(dates: list[str], closes: list[float],
+                     base_close: float, select_date: str,
+                     max_days: int = 10) -> list[dict]:
+    """选中日起逐交易日事实路径；调用方需先过滤未确认日K。
+
+    day_n=0 为选中日收盘基准；后续仅记录已经发生的交易日，最多到 T+10。
+    attention_flags 只是客观触发项，供归因 Agent 消费，不直接改变策略规则。"""
+    if select_date not in dates:
+        raise ValueError(f"选中日 {select_date} 不在日K数据中")
+    t0 = dates.index(select_date)
+    base = base_close if base_close and base_close > 0 else closes[t0]
+    end = min(len(dates), t0 + max_days + 1)
+    path: list[dict] = []
+    min_close = base
+    for i in range(t0, end):
+        day_n = i - t0
+        close = closes[i]
+        pct_from_base = round((close / base - 1) * 100, 2)
+        daily_pct = None if i == t0 else round((close / closes[i - 1] - 1) * 100, 2)
+        min_close = min(min_close, close)
+        drawdown_from_base = round(max(0.0, (base - min_close) / base * 100), 2)
+        flags: list[str] = []
+        if pct_from_base <= -3:
+            flags.append("累计跌幅>=3%")
+        if daily_pct is not None and daily_pct <= -3:
+            flags.append("单日跌幅>=3%")
+        if drawdown_from_base >= 5:
+            flags.append("最大回撤>=5%")
+        path.append({
+            "date": dates[i],
+            "day_n": day_n,
+            "close": round(close, 4),
+            "pct_from_base": pct_from_base,
+            "daily_pct": daily_pct,
+            "drawdown_from_base": drawdown_from_base,
+            "attention_flags": flags,
+        })
+    return path
 
 
 # ==================== 统计（纯函数，可单测） ====================
@@ -842,13 +899,14 @@ def backfill_factor_scores() -> dict:
     return {"filled": filled, "skipped": skipped, "no_score": no_score}
 
 
-def _verify_rows(price_lookup) -> tuple[int, int, list[str]]:
+def _verify_rows(price_lookup, include_finished: bool = False) -> tuple[int, int, list[str]]:
     """计算：遍历未到期行，拉日K计算 T+N；到期行收尾 is_finished=1。返回
     (updated, finished_new, errors)"""
     updated = finished_new = 0
     errors: list[str] = []
     lookup = price_lookup or _default_price_lookup
-    for row in repo.list_track_verify(is_finished=0):
+    rows = repo.list_track_verify(limit=500) if include_finished else repo.list_track_verify(is_finished=0)
+    for row in rows:
         try:
             kline = lookup(row["stock_code"], row["select_date"])
             norm = _norm_kline(kline)
@@ -856,6 +914,10 @@ def _verify_rows(price_lookup) -> tuple[int, int, list[str]]:
                 errors.append(f"{row['stock_code']} {row['select_date']} 行情为空")
                 continue
             dates, closes = norm
+            dates, closes = confirmed_kline_points(dates, closes)
+            if not dates:
+                errors.append(f"{row['stock_code']} {row['select_date']} 无已确认日K")
+                continue
             metrics = compute_tn_metrics(dates, closes,
                                          row["base_close_price"], row["select_date"])
         except Exception as exc:  # noqa: BLE001 单行失败跳过，下次自动重试（诚实降级）
@@ -872,6 +934,8 @@ def _verify_rows(price_lookup) -> tuple[int, int, list[str]]:
             "base_close": row["base_close_price"] or latest_close,
             "latest_close": latest_close,
             "latest_date": dates[-1],
+            "daily_path": build_daily_path(
+                dates, closes, row["base_close_price"], row["select_date"]),
             "periods": periods,
             "drawdown": {"max_pct": metrics["max_drawdown"],
                          "min_close_date": metrics["min_close_date"]},
@@ -882,7 +946,7 @@ def _verify_rows(price_lookup) -> tuple[int, int, list[str]]:
             t10_pct=metrics["t10"]["pct"], max_drawdown=metrics["max_drawdown"],
             verify_result=verify_result, is_finished=1 if metrics["due"] else 0)
         updated += 1
-        if metrics["due"]:
+        if metrics["due"] and not row.get("is_finished"):
             finished_new += 1
     return updated, finished_new, errors
 
@@ -895,7 +959,7 @@ def run_verify_chain(backfill: bool = False, price_lookup=None, llm_call=None) -
         return {"skipped": "track_verify 锁被占用（每日任务或手动验证正在执行）"}
     try:
         initialized = _init_candidates()
-        updated, finished_new, errors = _verify_rows(price_lookup)
+        updated, finished_new, errors = _verify_rows(price_lookup, include_finished=backfill)
         result: dict = {"initialized": initialized, "updated": updated,
                         "finished_new": finished_new,
                         "errors": errors[:_MAX_ERRORS], "stats": None, "suggestions": []}

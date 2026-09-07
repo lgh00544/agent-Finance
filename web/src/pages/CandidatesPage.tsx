@@ -27,6 +27,21 @@ import { applyBatchAdjust, batchMetaByAssistantId, chatHistory } from '@/api/cha
 import type { AuditDecision, BatchAskResult, BlockDetail, Candidate, MarketAudit } from '@/types'
 
 const { Text } = Typography
+const snapshotNumber = (r: Candidate, detailKeys: string[], snapshotKey: string) => {
+  const detail = (r.detail ?? {}) as Record<string, unknown>
+  const raw = [...detailKeys.map((key) => detail[key]), (r.snapshot ?? {})[snapshotKey]]
+    .find((value) => value !== undefined && value !== null && value !== '')
+  const value = Number(raw)
+  return Number.isFinite(value) ? value : null
+}
+const snapshotMetric = (r: Candidate, detailKeys: string[], snapshotKey: string, suffix = '') => {
+  const value = snapshotNumber(r, detailKeys, snapshotKey)
+  return value !== null ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}${suffix}` : '—'
+}
+const snapshotColor = (r: Candidate, detailKeys: string[], snapshotKey: string) => {
+  const value = snapshotNumber(r, detailKeys, snapshotKey)
+  return value !== null ? (value > 0 ? 'var(--up)' : value < 0 ? 'var(--down)' : 'var(--text-2)') : 'var(--text-2)'
+}
 
 const TIER_MAP: Record<string, string> = { 强烈推荐: 'A', 建议关注: 'B', 谨慎观察: 'C' }
 const TIER_DOT: Record<string, string> = { A: 'red', B: 'orange', C: 'blue' }
@@ -536,6 +551,7 @@ export function CandidatesPage() {
   // 默认查询当天的候选池（dates[0] 是最新一天；异步回填避免首帧空态/未选中）
   useEffect(() => {
     if (!date && dates && dates.length > 0) {
+      // eslint-disable-next-line react/set-state-in-effect
       setDate(dates[0])
     }
   }, [date, dates])
@@ -721,6 +737,21 @@ export function CandidatesPage() {
                 const t = TIER_MAP[String((r.detail ?? {}).confidence_tier ?? '')] ?? ''
                 return t ? <Tag color={TIER_DOT[t]}>{t}</Tag> : '—'
               },
+            },
+            {
+              title: '现价', key: 'snapshot-price', width: 80,
+              render: (_: unknown, r: Candidate) => {
+                const value = snapshotNumber(r, ['current_price_at_candidate', 'snapshot_price'], 'price')
+                return <Text style={{ whiteSpace: 'nowrap' }}>{value !== null ? value.toFixed(2) : '—'}</Text>
+              },
+            },
+            {
+              title: '涨跌', key: 'snapshot-change', width: 80,
+              render: (_: unknown, r: Candidate) => <Text style={{ color: snapshotColor(r, ['change_amount_at_candidate', 'snapshot_change_amount'], 'change_amount'), whiteSpace: 'nowrap' }}>{snapshotMetric(r, ['change_amount_at_candidate', 'snapshot_change_amount'], 'change_amount')}</Text>,
+            },
+            {
+              title: '涨跌幅', key: 'snapshot-change-pct', width: 80,
+              render: (_: unknown, r: Candidate) => <Text style={{ color: snapshotColor(r, ['change_pct_at_candidate', 'snapshot_change_pct'], 'change_pct'), whiteSpace: 'nowrap' }}>{snapshotMetric(r, ['change_pct_at_candidate', 'snapshot_change_pct'], 'change_pct', '%')}</Text>,
             },
             {
               title: '理由', key: 'reasons', ellipsis: true,

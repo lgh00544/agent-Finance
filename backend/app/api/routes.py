@@ -766,7 +766,21 @@ def account_pnl():
 
     if not ths_pnl_service.load_cookie():
         return {"configured": False}
-    return {"configured": True, "snapshot": repo.get_latest_account_pnl()}
+    return {"configured": True,
+            "snapshot": ths_pnl_service.refresh_snapshot_if_needed()}
+
+
+@router.post("/account/pnl/refresh")
+def account_pnl_refresh():
+    """重新读取当前 DSH 凭证并立即验证同花顺会话；不返回 Cookie。"""
+    if not settings.ths_pnl_enable:
+        return {"configured": False}
+    from app.services import ths_pnl as ths_pnl_service
+
+    if not ths_pnl_service.load_cookie():
+        return {"configured": False}
+    return {"configured": True,
+            "snapshot": ths_pnl_service.refresh_snapshot_if_needed(force=True)}
 
 
 class AccountBaselineBody(BaseModel):

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { DndContext, DragOverlay, PointerSensor, useDroppable, useSensor, useSensors, type DragEndEvent, type DragStartEvent } from '@dnd-kit/core'
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
-import { App, Button, Card, Col, Descriptions, Drawer, Input, Popover, Row, Select, Space, Tag, Typography } from 'antd'
+import { App, Button, Card, Col, Descriptions, Drawer, Input, Popover, Radio, Row, Select, Space, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { agentSuggestions, rejectSuggestion, reReviewSuggestion, ruleChanges, rollbackRuleChange } from '@/api/suggestions'
 import { getAuditLogFull, reAuditSuggestion } from '@/api/audit'
@@ -134,13 +134,16 @@ function RuleChangeCard({ rule, onAction, onOpen }: { rule: RuleRow; onAction: (
 function BoardColumn({ col, items, onAction, onOpen }: { col: (typeof COLUMNS)[number]; items: RuleRow[]; onAction: (a: string, r: RuleRow) => void; onOpen: (r: RuleRow) => void }) {
   const { setNodeRef, isOver } = useDroppable({ id: col.key, data: { column: col.key } })
   return (
-    <Col flex="1 1 0" style={{ minWidth: 230 }}>
-      <div ref={setNodeRef} style={{ minHeight: 540 }}>
+    <Col flex="1 1 0" style={{ minWidth: 230, height: '100%' }}>
+      <div ref={setNodeRef} style={{ height: '100%', minHeight: 0 }}>
         <Card size="small" title={`${col.title} ${items.length}`}
-          style={{ minHeight: 520, background: isOver ? 'rgba(24,144,255,0.12)' : 'var(--bg-card)', borderColor: isOver ? '#1677ff' : undefined, boxShadow: isOver ? '0 0 0 2px rgba(22,119,255,0.2)' : undefined }}>
-          <SortableContext items={items.map((r) => `rule:${r.id}`)} strategy={verticalListSortingStrategy}>
-            {items.length ? items.map((rule) => <RuleChangeCard key={rule.id} rule={rule} onAction={onAction} onOpen={onOpen} />) : <Text type="secondary">拖到这里</Text>}
-          </SortableContext>
+          style={{ height: '100%', display: 'flex', flexDirection: 'column', background: isOver ? 'rgba(24,144,255,0.12)' : 'var(--bg-card)', borderColor: isOver ? '#1677ff' : undefined, boxShadow: isOver ? '0 0 0 2px rgba(22,119,255,0.2)' : undefined }}
+          styles={{ body: { flex: 1, minHeight: 0, overflow: 'hidden', padding: 8 } }}>
+          <div style={{ height: '100%', overflowY: 'auto', paddingRight: 4 }}>
+            <SortableContext items={items.map((r) => `rule:${r.id}`)} strategy={verticalListSortingStrategy}>
+              {items.length ? items.map((rule) => <RuleChangeCard key={rule.id} rule={rule} onAction={onAction} onOpen={onOpen} />) : <Text type="secondary">拖到这里</Text>}
+            </SortableContext>
+          </div>
         </Card>
       </div>
     </Col>
@@ -154,6 +157,7 @@ export function RuleChangesPage() {
   const [keyword, setKeyword] = useState('')
   const [agents, setAgents] = useState<string[]>([])
   const [types, setTypes] = useState<string[]>([])
+  const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc')
   const [selected, setSelected] = useState<RuleRow | null>(null)
   const [activeRule, setActiveRule] = useState<RuleRow | null>(null)
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }))
@@ -177,6 +181,9 @@ export function RuleChangesPage() {
     const kw = keyword.trim().toLowerCase()
     const hit = !kw || [r.rule_name, r.reason, r._sug.reason].some((x) => String(x ?? '').toLowerCase().includes(kw))
     return hit && (!agents.length || agents.includes(String(r.target_agent))) && (!types.length || types.includes(String(r.rule_type)))
+  }).sort((a, b) => {
+    const result = String(b.created_at ?? '').localeCompare(String(a.created_at ?? ''))
+    return sortOrder === 'desc' ? result : -result
   })
   const grouped = Object.fromEntries(COLUMNS.map((c) => [c.key, rowsView.filter((r) => r._column === c.key)])) as Record<string, RuleRow[]>
   const agentOptions = Array.from(new Set(rowsView.map((r) => String(r.target_agent)).filter(Boolean))).map((value) => ({ value, label: value }))
@@ -272,14 +279,18 @@ export function RuleChangesPage() {
       <Space wrap style={{ marginBottom: 10 }}>
         <Text type="secondary">全部规则变更在此全量留痕，可回滚（原因必填）</Text>
         <Input.Search allowClear placeholder="搜索规则名/原因" style={{ width: 240 }} onChange={(e) => setKeyword(e.target.value)} />
-        <Select mode="multiple" allowClear placeholder="Agent" options={agentOptions} style={{ width: 180 }} value={agents} onChange={setAgents} />
+        <Select mode="multiple" allowClear placeholder="目标 Agent（多选）" options={agentOptions} style={{ width: 180 }} value={agents} onChange={setAgents} />
         <Select mode="multiple" allowClear placeholder="类型" style={{ width: 180 }} value={types} onChange={setTypes}
           options={[{ value: 'hard', label: '硬规则' }, { value: 'soft', label: '软性' }, { value: 'profile', label: '偏好' }]} />
+        <Radio.Group size="small" optionType="button" value={sortOrder} onChange={(e) => setSortOrder(e.target.value as 'desc' | 'asc')}
+          options={[{ label: '时间 ↓', value: 'desc' }, { label: '时间 ↑', value: 'asc' }]} />
       </Space>
       <DndContext sensors={sensors} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragCancel={onDragCancel}>
-        <Row gutter={12} wrap={false} style={{ overflowX: 'auto', paddingBottom: 8 }}>
+        <div style={{ height: 'calc(100vh - 220px)', minHeight: 360 }}>
+          <Row gutter={12} wrap={false} style={{ height: '100%', overflowX: 'auto', overflowY: 'hidden', paddingBottom: 8 }}>
           {COLUMNS.map((col) => <BoardColumn key={col.key} col={col} items={grouped[col.key]} onAction={onAction} onOpen={setSelected} />)}
-        </Row>
+          </Row>
+        </div>
         <DragOverlay>{activeRule ? <div style={{ width: 260, boxShadow: '0 18px 40px rgba(0,0,0,0.35)', transform: 'rotate(1deg)', borderRadius: 8 }}><RuleCardBody rule={activeRule} onAction={onAction} onOpen={setSelected} /></div> : null}</DragOverlay>
       </DndContext>
       <Drawer title={selected ? val(selected.rule_name) : '规则详情'} open={!!selected} onClose={() => setSelected(null)} size="large" styles={{ wrapper: { width: 720 } }} destroyOnHidden>

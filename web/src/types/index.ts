@@ -460,10 +460,13 @@ export interface TrackVerifyRow {
   stock_code?: string
   stock_name?: string
   select_date?: string
+  select_rating?: string
+  base_close_price?: number | null
   t3_pct?: number | null
   t5_pct?: number | null
   t10_pct?: number | null
   max_drawdown?: number | null
+  verify_result?: Record<string, unknown>
   is_finished?: number
   [k: string]: unknown
 }

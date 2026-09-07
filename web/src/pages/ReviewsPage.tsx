@@ -11,6 +11,7 @@ import {
   Input,
   List,
   Row,
+  Segmented,
   Select,
   Space,
   Statistic,
@@ -678,6 +679,63 @@ function trackPct(r: TrackVerifyRow, k: 't3_pct' | 't5_pct' | 't10_pct'): number
   return Number.isFinite(n) ? n : null
 }
 
+function renderTrackPct(v: unknown, pendingText = '—') {
+  if (v == null) return pendingText
+  const n = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(n)) return pendingText
+  return <Text style={{ color: n >= 0 ? 'var(--up)' : 'var(--down)', whiteSpace: 'nowrap' }}>{n >= 0 ? '+' : ''}{n}%</Text>
+}
+
+type DailyPathPoint = {
+  date?: string
+  day_n?: number
+  close?: number
+  pct_from_base?: number
+  daily_pct?: number | null
+  drawdown_from_base?: number
+  attention_flags?: string[]
+}
+
+function dailyPathOf(r: TrackVerifyRow): DailyPathPoint[] {
+  const raw = r.verify_result?.daily_path
+  return Array.isArray(raw) ? raw as DailyPathPoint[] : []
+}
+
+function renderDailyPath(r: TrackVerifyRow) {
+  const path = dailyPathOf(r)
+  if (!path.length) {
+    return <EmptyState text="暂无逐日观察路径；点击「历史回填」后会按已确认收盘补齐。" />
+  }
+  return (
+    <div style={{ padding: '4px 12px 12px 12px' }}>
+      <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+        逐日观察路径：只使用选中日之后已确认收盘数据；盘中当天不纳入。
+      </Text>
+      <Table
+        size="small"
+        rowKey={(p) => `${p.date}-${p.day_n}`}
+        dataSource={path}
+        pagination={false}
+        columns={[
+          { title: '交易日', dataIndex: 'date', width: 110 },
+          { title: 'Day', dataIndex: 'day_n', width: 70, render: (v: unknown) => `T+${Number(v) || 0}` },
+          { title: '收盘', dataIndex: 'close', width: 80 },
+          { title: '累计', dataIndex: 'pct_from_base', width: 80, render: (v: unknown) => renderTrackPct(v) },
+          { title: '单日', dataIndex: 'daily_pct', width: 80, render: (v: unknown) => renderTrackPct(v) },
+          { title: '回撤', dataIndex: 'drawdown_from_base', width: 80, render: (v: unknown) => renderTrackPct(v) },
+          {
+            title: '关注触发',
+            key: 'flags',
+            render: (_: unknown, p: DailyPathPoint) => (p.attention_flags?.length
+              ? <Space wrap size={4}>{p.attention_flags.map((f) => <Tag key={f} color="orange">{f}</Tag>)}</Space>
+              : <Text type="secondary">—</Text>),
+          },
+        ]}
+      />
+    </div>
+  )
+}
+
 function calcTrackStats(list: TrackVerifyRow[], k: 't3_pct' | 't5_pct' | 't10_pct' = 't5_pct') {
   const vals = list.map((r) => trackPct(r, k)).filter((v): v is number => v != null)
   const wins = vals.filter((v) => v > 0).length
@@ -703,6 +761,7 @@ function TrackVerify() {
   const [date, setDate] = useState<string>()
   const [period, setPeriod] = useState<string>('all')
   const [sortKey, setSortKey] = useState<string>('rating-date')
+  const [gainFilter, setGainFilter] = useState<'all' | 'up' | 'down'>('all')
   const range = useMemo(() => periodToRange(period), [period])
 
   const { data: dates } = useQuery({ queryKey: ['tv-dates'], queryFn: () => trackVerifyDates() })
@@ -797,6 +856,13 @@ function TrackVerify() {
     }
     return arr
   }, [rows, sortKey])
+
+  const filteredRows = useMemo(() => sortedRows.filter((r) => {
+    const t5 = trackPct(r, 't5_pct')
+    if (gainFilter === 'all') return true
+    if (t5 == null) return false
+    return gainFilter === 'up' ? t5 > 0 : t5 < 0
+  }), [gainFilter, sortedRows])
 
   const localStats = useMemo(() => calcTrackStats(rows ?? []), [rows])
   const wr = localStats.winRate
@@ -950,27 +1016,40 @@ function TrackVerify() {
       </Space>
       <Row gutter={16} style={{ marginBottom: 10 }}>
         <Col span={12}>
-          <Card size="small" title="T+5 表现最佳（top 3）" style={{ background: 'var(--bg-input)' }}>
+          <Card size="small" title={<Space direction="vertical" size={0}>T+5 表现最佳（top 3）<Text type="secondary" style={{ fontSize: 12 }}>📈 仅展示 T+5 到期（已补算 T+5 收益的样本）</Text></Space>} style={{ background: 'var(--bg-input)' }}>
             {bestT5.length ? <List size="small" dataSource={bestT5} renderItem={(r) => (
               <List.Item>
                 <StockLabel code={String(r.stock_code ?? '')} name={String(r.stock_name ?? '')} />
-                <Text style={{ color: (r.t5_pct ?? 0) >= 0 ? 'var(--up)' : 'var(--down)' }}>{r.t5_pct}%</Text>
+                {renderTrackPct(r.t5_pct)}
               </List.Item>
             )} /> : <EmptyState text="暂无 T+5 到期数据。" icon="📭" />}
           </Card>
         </Col>
         <Col span={12}>
-          <Card size="small" title="T+5 表现最差（top 3）" style={{ background: 'var(--bg-input)' }}>
+          <Card size="small" title={<Space direction="vertical" size={0}>T+5 表现最差（top 3）<Text type="secondary" style={{ fontSize: 12 }}>📈 仅展示 T+5 到期（已补算 T+5 收益的样本）</Text></Space>} style={{ background: 'var(--bg-input)' }}>
             {worstT5.length ? <List size="small" dataSource={worstT5} renderItem={(r) => (
               <List.Item>
                 <StockLabel code={String(r.stock_code ?? '')} name={String(r.stock_name ?? '')} />
-                <Text style={{ color: (r.t5_pct ?? 0) >= 0 ? 'var(--up)' : 'var(--down)' }}>{r.t5_pct}%</Text>
+                {renderTrackPct(r.t5_pct)}
               </List.Item>
             )} /> : <EmptyState text="暂无 T+5 到期数据。" icon="📭" />}
           </Card>
         </Col>
       </Row>
-      <Table size="small" rowKey="id" dataSource={sortedRows} pagination={{ pageSize: 10 }}
+      <Space wrap style={{ marginBottom: 10 }}>
+        <Text type="secondary">按 T+5 涨跌筛选：</Text>
+        <Segmented
+          size="small"
+          options={[{ label: '全部', value: 'all' }, { label: '仅上涨', value: 'up' }, { label: '仅下跌', value: 'down' }]}
+          value={gainFilter}
+          onChange={(v) => setGainFilter(v as 'all' | 'up' | 'down')}
+        />
+      </Space>
+      <Table size="small" rowKey="id" dataSource={filteredRows} pagination={{ pageSize: 10 }}
+        expandable={{
+          expandedRowRender: renderDailyPath,
+          rowExpandable: (r) => dailyPathOf(r).length > 0,
+        }}
         columns={[
           { title: '股票', key: 'stock', render: (_: unknown, r: TrackVerifyRow) => <StockLabel code={String(r.stock_code ?? '')} name={String(r.stock_name ?? '')} /> },
           { title: '评级', dataIndex: 'select_rating', width: 70, render: (v: unknown) => String(v ?? '').trim() || '—' },
@@ -981,22 +1060,22 @@ function TrackVerify() {
             render: (_: unknown, r: TrackVerifyRow) =>
               <Tooltip title="当日可建仓判定（严格度门槛 + 买点/利空硬条件）；只读展示"> {renderBadge(String(r.select_date ?? ''), String(r.stock_code ?? ''))} </Tooltip>,
           },
-          { title: '选中日', dataIndex: 'select_date', width: 100 },
-          { title: 'T+3', dataIndex: 't3_pct', width: 70, render: (v: unknown) => v != null ? `${v}%` : '—' },
-          { title: 'T+5', dataIndex: 't5_pct', width: 70, render: (v: unknown) => v != null ? `${v}%` : '—' },
+          { title: '选中日', dataIndex: 'select_date', width: 100, sorter: (a: TrackVerifyRow, b: TrackVerifyRow) => String(a.select_date ?? '').localeCompare(String(b.select_date ?? '')) },
+          { title: 'T+3', dataIndex: 't3_pct', width: 70, sorter: (a: TrackVerifyRow, b: TrackVerifyRow) => (trackPct(a, 't3_pct') ?? -999) - (trackPct(b, 't3_pct') ?? -999), render: (v: unknown) => renderTrackPct(v) },
+          { title: 'T+5', dataIndex: 't5_pct', width: 70, sorter: (a: TrackVerifyRow, b: TrackVerifyRow) => (trackPct(a, 't5_pct') ?? -999) - (trackPct(b, 't5_pct') ?? -999), render: (v: unknown) => renderTrackPct(v) },
           {
             title: 'T+5 结果', key: 't5res', width: 80,
             render: (_: unknown, r: TrackVerifyRow) => r.t5_pct != null
-              ? <Tag color={Number(r.t5_pct) > 0 ? 'green' : 'red'}>{Number(r.t5_pct) > 0 ? '上涨' : '未涨'}</Tag>
+              ? <Tag style={{ color: Number(r.t5_pct) > 0 ? 'var(--up)' : 'var(--down)', borderColor: Number(r.t5_pct) > 0 ? 'var(--up)' : 'var(--down)', background: 'transparent' }}>{Number(r.t5_pct) > 0 ? '上涨' : '未涨'}</Tag>
               : <Tag color="default">未到期</Tag>,
           },
           {
             title: '追踪', dataIndex: 'is_finished', width: 70,
             render: (v: unknown) => v ? <Tag color="green">已到期</Tag> : <Tag color="blue">追踪中</Tag>,
           },
-          { title: 'T+10', dataIndex: 't10_pct', width: 80, render: (v: unknown) => v != null ? `${v}%` : '—' },
+          { title: 'T+10', dataIndex: 't10_pct', width: 80, sorter: (a: TrackVerifyRow, b: TrackVerifyRow) => (trackPct(a, 't10_pct') ?? -999) - (trackPct(b, 't10_pct') ?? -999), render: (v: unknown) => renderTrackPct(v) },
           { title: '最大回撤%', dataIndex: 'max_drawdown', width: 90, render: (v: unknown) => v ?? '—' },
-        ]} locale={{ emptyText: '当前筛选无追踪数据：切换时间范围、选择精确日期，或点「历史回填」逐日补算未追踪候选。' }} />
+        ]} locale={{ emptyText: gainFilter === 'all' ? '当前筛选无追踪数据：切换时间范围、选择精确日期，或点「历史回填」逐日补算未追踪候选。' : <EmptyState text="无符合筛选条件的样本（仅上涨/仅下跌需要 T+5 已到期）" icon="📭" /> }} />
     </div>
   )
 }

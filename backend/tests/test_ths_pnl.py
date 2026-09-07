@@ -231,6 +231,30 @@ def test_get_snapshot_full_success(monkeypatch):
     assert r["sh_pct"] == 0.33
 
 
+def test_refresh_snapshot_force_persists_live_result(monkeypatch):
+    monkeypatch.setattr(ths_pnl, "get_snapshot", lambda: {
+        "pnl_yk": 12.0, "pnl_pct": 0.04, "sh_pct": -0.2,
+        "chart_data": [{"t": 1, "v": 0.04}], "error": "",
+        "token_expired": False,
+    })
+    stored = {}
+    monkeypatch.setattr(ths_pnl.repo, "get_latest_account_pnl",
+                        lambda: stored.get("row"))
+    monkeypatch.setattr(
+        ths_pnl.repo, "upsert_account_pnl_snapshot",
+        lambda **kwargs: stored.update(row={
+            "pnl_yk": kwargs["pnl_yk"],
+            "pnl_pct": kwargs["pnl_pct"],
+            "token_expired": kwargs["token_expired"],
+        }) or 1,
+    )
+    ths_pnl.cache.delete(ths_pnl._REFRESH_COOLDOWN_KEY)
+    refreshed = ths_pnl.refresh_snapshot_if_needed(force=True)
+    assert refreshed["pnl_yk"] == 12.0
+    assert refreshed["token_expired"] is False
+    assert stored["row"]["pnl_pct"] == 0.04
+
+
 # ---------------- repo 落库闭环 ----------------
 
 def test_repo_upsert_get_latest_history_roundtrip():

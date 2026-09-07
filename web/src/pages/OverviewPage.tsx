@@ -1,10 +1,11 @@
+import { useState } from 'react'
 import { Alert, App, Button, Card, Col, Row, Space, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { dashboard, jobStatus, llmStats as fetchLlm, datasourceStats as fetchDs } from '@/api/system'
 import { recentTasks, retryTask } from '@/api/tasks'
 import { hotSectors, marketCondition, marketIndices } from '@/api/market'
 import { holdingQuotes, redLineCheck, takeProfitPlan } from '@/api/holdings'
-import { accountPnl } from '@/api/account'
+import { accountPnl, refreshAccountPnl } from '@/api/account'
 import { getAuditStats } from '@/api/audit'
 import { useNavigate } from 'react-router-dom'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
@@ -30,7 +31,11 @@ function strictColor(s: string): string {
 }
 
 /** 今日真实盈亏（同花顺）cell：三态诚实展示（未接入/有值/过期错误），绝不出假正数 */
-function PnlCell({ pnl }: { pnl?: AccountPnl }) {
+function PnlCell({ pnl, onRefresh, refreshing }: {
+  pnl?: AccountPnl
+  onRefresh?: () => void
+  refreshing?: boolean
+}) {
   if (!pnl?.configured) {
     return (
       <div>
@@ -68,7 +73,8 @@ function PnlCell({ pnl }: { pnl?: AccountPnl }) {
           description={
             <>
               <a href="https://tzzb.10jqka.com.cn/pc/index.html" target="_blank" rel="noreferrer">同花顺账本 · 重新登录</a>
-              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>重新登录后无需重启，页面会自动恢复正常</div>
+              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>请在 DSH 插件中完成“自动获取并保存”，再点击刷新验证</div>
+              {onRefresh ? <Button size="small" style={{ marginTop: 6 }} loading={refreshing} onClick={onRefresh}>刷新验证</Button> : null}
             </>
           } />
       ) : null}
@@ -177,6 +183,19 @@ export function OverviewPage() {
   const { data: mcStrict } = useQuery({ queryKey: ['market-cond-strict'], queryFn: marketCondition })
   // 同花顺真实今日盈亏（只读展示；默认关返回 {configured:false} → PnlCell 灰态）
   const { data: pnl } = useQuery({ queryKey: ['account-pnl'], queryFn: accountPnl, refetchInterval: 60_000 })
+  const [refreshingPnl, setRefreshingPnl] = useState(false)
+  const refreshPnl = async () => {
+    setRefreshingPnl(true)
+    try {
+      await refreshAccountPnl()
+      await qc.invalidateQueries({ queryKey: ['account-pnl'] })
+      message.success('同花顺凭证已重新验证')
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '同花顺刷新失败')
+    } finally {
+      setRefreshingPnl(false)
+    }
+  }
   // AI 审核待审统计（60s 节流；无数据灰态，点击跳规则变更页）
   const navigate = useNavigate()
   const { data: auditStat } = useQuery({
@@ -288,7 +307,7 @@ export function OverviewPage() {
               </Space>
             </div>
           </div>
-          <div><PnlCell pnl={pnl} /></div>
+          <div><PnlCell pnl={pnl} onRefresh={refreshPnl} refreshing={refreshingPnl} /></div>
         </div>
         <div style={{ marginTop: 8, fontSize: 13 }}><Text type="secondary">{String(marketCond.summary ?? '—')}</Text></div>
       </Card>

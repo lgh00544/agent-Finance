@@ -7,6 +7,9 @@ export const accountSummary = (): Promise<AccountSummary> => get('/account/summa
 /** GET /api/account/pnl（同花顺真实今日盈亏；未开启返回 {configured:false}） */
 export const accountPnl = (): Promise<AccountPnl> => get<AccountPnl>('/account/pnl')
 
+/** POST /api/account/pnl/refresh（重新读取 DSH 凭证并即时验证） */
+export const refreshAccountPnl = (): Promise<AccountPnl> => post<AccountPnl>('/account/pnl/refresh')
+
 /** POST /api/account/baseline（保存账户基准） */
 export const saveAccountBaseline = (body: Record<string, unknown>): Promise<AccountSummary> =>
   post('/account/baseline', body)

@@ -537,12 +537,74 @@ _NEG_RISK_TERMS = ("派发", "跌停", "退市", "ST", "爆雷", "利空", "减�
 _TIER_ORDER = {"强烈推荐": 2, "建议关注": 1, "谨慎观察": 0}
 
 
+def _audit_num(data: dict | None, key: str) -> float | None:
+    if not data:
+        return None
+    try:
+        v = data.get(key)
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:  # noqa: BLE001 展示审计不因脏值中断主链路
+        return None
+
+
+def _audit_metric_line(data: dict | None) -> str:
+    vals = [
+        ("距52高", _audit_num(data, "dist_52w_high_pct")),
+        ("区间位置", _audit_num(data, "pos_52w")),
+        ("MA20", _audit_num(data, "ma20_pos_pct")),
+        ("MA60", _audit_num(data, "ma60_pos_pct")),
+        ("量能5/20", _audit_num(data, "vol_5_20")),
+        ("5日", _audit_num(data, "pct_change_5d")),
+    ]
+    parts = [f"{name}{v:.2f}" for name, v in vals if v is not None]
+    return "；".join(parts) if parts else "结构列缺失"
+
+
+def _wyckoff_position_audit(cand: DiscoverCandidate,
+                            evidence_data: dict | None) -> dict:
+    """威科夫位置审计：不替代 LLM 阶段输出，只标注证据是否足够支撑该标签。"""
+    label = cand.stock_type
+    if any(t in label for t in ("派发", "下跌", "拉升中段")):
+        return {"passed": False, "evidence": f"威科夫定位 {label}；{_audit_metric_line(evidence_data)}"}
+    if "吸筹末期" not in label or evidence_data is None:
+        return {"passed": True, "evidence": f"威科夫定位 {label}；{_audit_metric_line(evidence_data)}"}
+
+    text = " ".join([
+        cand.reason or "", cand.tech_view or "", cand.volume_analysis or "",
+        cand.final_advice or "", cand.price_levels or "", cand.position_hint or "",
+        " ".join(cand.rule_refs or []),
+    ])
+    has_lps_basis = ("LPS" in text) or ("最后支撑点" in text) \
+        or ("缩量" in text and ("回踩" in text or "不破" in text))
+    vol = _audit_num(evidence_data, "vol_5_20")
+    ma20 = _audit_num(evidence_data, "ma20_pos_pct")
+    pct5 = _audit_num(evidence_data, "pct_change_5d")
+    pos = _audit_num(evidence_data, "pos_52w")
+    checks = [
+        ("量能未放大", vol is not None and vol <= 1.10),
+        ("贴近MA20", ma20 is not None and -2.0 <= ma20 <= 3.0),
+        ("非追涨段", pct5 is not None and pct5 <= 4.0),
+        ("中低位", pos is not None and 10.0 <= pos <= 55.0),
+        ("LPS/缩量回踩文字证据", has_lps_basis),
+    ]
+    ok = [name for name, passed in checks if passed]
+    passed = len(ok) >= 4
+    status = "证据充分" if passed else "证据不足，需按观察/突破复核"
+    return {
+        "passed": passed,
+        "evidence": f"威科夫定位 {label}；{status}；通过 {'/'.join(ok) or '无'}；{_audit_metric_line(evidence_data)}",
+    }
+
+
 def _build_candidate_audit(cand: DiscoverCandidate, market: dict | None,
-                           trade_date: str) -> dict:
+                           trade_date: str, evidence_data: dict | None = None) -> dict:
     """构造候选审计底稿（A 层，展示性判定：只读已字段/已有判定，不二次重算）。
     6 项 passed/evidence 供前端逐条复核；verdict 默认 = confidence_tier，
     极严市况且未全项通过（<5/6）→ 降一档并记 note。"""
     mc = market or {}
+    wyckoff_audit = _wyckoff_position_audit(cand, evidence_data)
     decisions = [
         {"key": "market_gate", "label": "市况门槛",
          "passed": bool(mc and (mc.get("cap") or 0) > 0),
@@ -560,8 +622,8 @@ def _build_candidate_audit(cand: DiscoverCandidate, market: dict | None,
          "passed": not any(t in (r or "") for r in cand.risks for t in _NEG_RISK_TERMS),
          "evidence": "；".join(cand.risks[:2]) or "无"},
         {"key": "pool_position", "label": "位置(距52高)",
-         "passed": not any(t in cand.stock_type for t in ("派发", "下跌", "拉升中段")),
-         "evidence": f"威科夫定位 {cand.stock_type}"},
+         "passed": wyckoff_audit["passed"],
+         "evidence": wyckoff_audit["evidence"]},
     ]
     passed_ratio = sum(1 for d in decisions if d["passed"])
     verdict = cand.confidence_tier
@@ -736,7 +798,9 @@ def llm_final(state: StockAgentState) -> StockAgentState:
             "position_hint": cand.position_hint,
             "rule_refs": cand.rule_refs,
             # 审计底稿（A 层，展示性判定：市况/档位/止损/盈亏/利空/位置 6 项 + 证据）
-            "audit": _build_candidate_audit(cand, market, trade_date),
+            "audit": _build_candidate_audit(
+                cand, market, trade_date,
+                {**snapshot, **(data_enrichment.get(cand.stock_code) or {})}),
             # 前瞻兑现三态（第 5 子 Agent 收口；缺则用 schema 默认，禁止静默丢键）
             "horizon_bias": cand.horizon_bias,
             "horizon_clarity": cand.horizon_clarity,

@@ -53,6 +53,32 @@ def test_audit_poseverity_bottom_not_crash():
     assert a["decisions"][4]["passed"] is False  # 重大利空命中
 
 
+def test_audit_accumulation_late_requires_lps_basis():
+    cand = _mk(
+        reason="低位反弹，站上均线，5日上涨明显",
+        tech_view="威科夫阶段定位为吸筹末期，但仅见均线转强",
+        volume_analysis="量能温和放大",
+    )
+    evidence = {"pos_52w": 36.0, "ma20_pos_pct": 4.8, "ma60_pos_pct": 7.9,
+                "vol_5_20": 1.24, "pct_change_5d": 7.8, "dist_52w_high_pct": -22.5}
+    a = _build_candidate_audit(cand, _MKT, "2026-08-24", evidence)
+    assert a["decisions"][5]["passed"] is False
+    assert "证据不足" in a["decisions"][5]["evidence"]
+
+
+def test_audit_accumulation_late_passes_with_lps_basis():
+    cand = _mk(
+        reason="箱体低位回踩后重新企稳",
+        tech_view="威科夫 LPS 缩量回踩，不破前低，供应减少",
+        volume_analysis="回踩阶段缩量，反弹未异常爆量",
+    )
+    evidence = {"pos_52w": 32.0, "ma20_pos_pct": 1.2, "ma60_pos_pct": 3.0,
+                "vol_5_20": 0.86, "pct_change_5d": 1.8, "dist_52w_high_pct": -28.0}
+    a = _build_candidate_audit(cand, _MKT, "2026-08-24", evidence)
+    assert a["decisions"][5]["passed"] is True
+    assert "证据充分" in a["decisions"][5]["evidence"]
+
+
 def test_audit_market_missing_degrade_base():
     a = _build_candidate_audit(_mk(), None, "2026-08-24")
     # 市况缺失 → market_gate 不过，但其余照常，verdict 不因市况缺失而降（strictness 判空）
