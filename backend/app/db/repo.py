@@ -1607,6 +1607,27 @@ def list_trace_history(code: str | None = None, date: str | None = None,
                 {"code": code, "date": date, "module": module, "limit": limit}, _load)
 
 
+def get_trace_history(history_id: int) -> dict | None:
+    """读取单条推理留痕历史全文；只读，不影响当前投影。"""
+    def _load() -> dict | None:
+        with SessionLocal() as db:
+            r = db.get(AiReasoningTraceHistory, history_id)
+            if r is None:
+                return None
+            return {"history_id": r.history_id, "stock_code": r.stock_code,
+                    "stock_name": r.stock_name, "source_module": r.source_module,
+                    "generate_date": r.generate_date, "fact_basis": r.fact_basis,
+                    "technical_reasoning": r.technical_reasoning,
+                    "capital_reasoning": r.capital_reasoning,
+                    "fundamental_reasoning": r.fundamental_reasoning,
+                    "risk_reasoning": r.risk_reasoning, "rule_refs": r.rule_refs,
+                    "final_conclusion": r.final_conclusion, "confidence": r.confidence,
+                    "data_source": r.data_source, "create_time": r.create_time,
+                    "ext_info": r.ext_info, "recorded_at": str(r.recorded_at)}
+
+    return _dbq("trace_history", {"id": history_id}, _load)
+
+
 def list_candidate_dates(limit: int = 30) -> list[str]:
     """候选池可选日期（去重降序，默认最新在前）：页面只加载最新一天，
     切换历史日期时再按需查询，避免初始化全量加载"""

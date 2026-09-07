@@ -180,6 +180,9 @@ def test_same_key_latest_wins_atomic():
     assert len(history) == 2
     assert "第一版" in history[0].technical_reasoning
     assert "第二版" in history[1].technical_reasoning
+    detail = repo.get_trace_history(history[0].history_id)
+    assert detail and "第一版" in detail["technical_reasoning"]
+    assert repo.get_trace_history(99999999) is None
 
 
 def test_repo_landing_writes_trace():

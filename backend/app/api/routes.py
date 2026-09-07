@@ -872,6 +872,15 @@ def list_trace_history(code: Optional[str] = None, date: Optional[str] = None,
     return repo.list_trace_history(code, date, module, limit)
 
 
+@router.get("/traces/history/{history_id}")
+def get_trace_history(history_id: int):
+    """推理留痕历史完整详情（只读）。"""
+    trace = repo.get_trace_history(history_id)
+    if trace is None:
+        raise HTTPException(status_code=404, detail="历史留痕记录不存在")
+    return trace
+
+
 @router.get("/traces/{trace_id}")
 def get_trace(trace_id: int):
     """推理留痕完整详情（结论卡 + 分层推理全文）"""
