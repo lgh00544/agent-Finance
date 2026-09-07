@@ -263,16 +263,16 @@ def market_band_info(score: float) -> tuple[int, str, str, str]:
 
 
 # ---------- 市况严格度（决策可信度增强） ----------
-# 严格度 → 可建仓门槛（tier_allowed）+ 额外硬校验（extra_checks）+ LLM prompt 措辞。
-# 宽松/标准硬门槛一致（A/B 建仓、C 观察），差异体现于选股措辞；严格/极严叠加胜率/净流入关卡。
+# 严格度 → 可建仓门槛（tier_allowed）+ LLM prompt 措辞。
+# 胜率/净流入等统计事实只作为模型证据，不作为程序硬阈值拦截。
 strictness_policy: dict[str, dict] = {
-    "宽松": {"tier_allowed": ["A", "B"], "extra_checks": [],
+    "宽松": {"tier_allowed": ["A", "B"],
             "prompt_phrase": "宽松选股·宽松门槛"},
-    "标准": {"tier_allowed": ["A", "B"], "extra_checks": [],
+    "标准": {"tier_allowed": ["A", "B"],
             "prompt_phrase": "标准选股·常规门槛"},
-    "严格": {"tier_allowed": ["A"], "extra_checks": ["win_rate_5d>=40"],
+    "严格": {"tier_allowed": ["A"],
             "prompt_phrase": "严格选股·从严门槛"},
-    "极严": {"tier_allowed": ["A"], "extra_checks": ["win_rate_5d>=50", "main_net_5d>=1e8"],
+    "极严": {"tier_allowed": ["A"],
             "prompt_phrase": "只保留最强信号·极严门槛"},
 }
 

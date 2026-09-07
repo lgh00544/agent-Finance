@@ -1738,7 +1738,7 @@ def portfolio_attribution(days: int = 30):
 @router.get("/stock_cycle_attribution/{stock_code}")
 def stock_cycle_attribution(stock_code: str):
     """单股周期复利（纯计算，零 LLM）：历史多次操作的汇总（总盈亏/平均持仓/最佳最差周期/胜率拖累率）。
-    无持仓记录 → has_history=False；供 Score 历史胜率加分/扣分 + 复盘页周期表。"""
+    无持仓记录 → has_history=False；供 Score 作为历史表现证据 + 复盘页周期表。"""
     from app.services.track_verify import build_stock_cycle_attribution
     return build_stock_cycle_attribution(stock_code)
 

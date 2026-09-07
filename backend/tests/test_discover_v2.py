@@ -45,8 +45,8 @@ def test_strictness_policy_shape():
     assert strictness_policy["宽松"]["tier_allowed"] == ["A", "B"]
     assert strictness_policy["标准"]["tier_allowed"] == ["A", "B"]
     assert strictness_policy["严格"]["tier_allowed"] == ["A"]
-    assert strictness_policy["严格"]["extra_checks"] == ["win_rate_5d>=40"]
-    assert strictness_policy["极严"]["extra_checks"] == ["win_rate_5d>=50", "main_net_5d>=1e8"]
+    assert "extra_checks" not in strictness_policy["严格"]
+    assert "extra_checks" not in strictness_policy["极严"]
     assert all(p["prompt_phrase"] for p in strictness_policy.values())
 
 

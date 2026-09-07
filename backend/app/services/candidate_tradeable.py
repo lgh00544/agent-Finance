@@ -114,9 +114,9 @@ def judge_tradeable(cand: dict, tier_effective: str, plan: dict | None,
         _block("重大利空排查", False, "候选风险含重大利空类表述")
     else:
         _block("重大利空排查", True, "无重大利空类表述")
-    cond_win, cond_inflow = _strictness_extra_checks(cand, strictness, win_rate_5d, reasons, block_details)
+    _strictness_evidence(cand, strictness, win_rate_5d, block_details)
 
-    is_tradeable = 1 if (cond_grade and cond_price and cond_risk and cond_win and cond_inflow) else 0
+    is_tradeable = 1 if (cond_grade and cond_price and cond_risk) else 0
     if is_tradeable:
         label = "可建仓"
     elif tier_effective in ("A", "B"):
@@ -130,45 +130,20 @@ def judge_tradeable(cand: dict, tier_effective: str, plan: dict | None,
             "plan_exists": plan_exists, "price_zone": price_zone, "current_price": current_price}
 
 
-def _strictness_extra_checks(cand: dict, strictness: str, win_rate_5d: float | None,
-                             reasons: list, block_details: list) -> tuple[int, int]:
-    """严格度额外硬校验（extra_checks）：返回 (cond_win, cond_inflow)；逐项构造 block_details"""
-    policy = strictness_policy.get(strictness, strictness_policy["标准"])
-    cond_win, cond_inflow = 1, 1
-    win_thr = None
-    inflow_thr = None
-    for chk in policy["extra_checks"]:
-        if chk.startswith("win_rate_5d>="):
-            win_thr = max(win_thr or 0.0, float(chk.split(">=")[1]))
-        elif chk.startswith("main_net_5d>="):
-            inflow_thr = float(chk.split(">=")[1])
-    if win_thr is None and inflow_thr is None:
-        block_details.append({"rule": "严格度门槛", "passed": True,
-                              "evidence": f"{strictness}市况无额外硬校验"})
-        return cond_win, cond_inflow
-    if win_thr is not None:
-        if win_rate_5d is not None and win_rate_5d >= win_thr:
-            block_details.append({"rule": "严格度门槛", "passed": True,
-                                  "evidence": f"历史 T+5 胜率 {win_rate_5d:.0f}% ≥ {win_thr:.0f}%（{strictness}市况）"})
-        else:
-            cond_win = 0
-            msg = f"历史 T+5 胜率不足 {win_thr:.0f}%（{strictness}市况）"
-            reasons.append(msg)
-            block_details.append({"rule": "严格度门槛", "passed": False, "evidence": msg})
-    if inflow_thr is not None:
-        try:
-            main5 = float((cand.get("detail") or {}).get("main_net_5d") or 0)
-        except (TypeError, ValueError):
-            main5 = 0
-        if main5 >= inflow_thr:
-            block_details.append({"rule": "严格度门槛", "passed": True,
-                                  "evidence": f"主力净流入 {main5 / 1e8:.2f} 亿 ≥ {inflow_thr / 1e8:.0f} 亿（{strictness}市况）"})
-        else:
-            cond_inflow = 0
-            msg = f"主力净流入不足 {inflow_thr / 1e8:.0f} 亿（{strictness}市况）"
-            reasons.append(msg)
-            block_details.append({"rule": "严格度门槛", "passed": False, "evidence": msg})
-    return cond_win, cond_inflow
+def _strictness_evidence(cand: dict, strictness: str, win_rate_5d: float | None,
+                         block_details: list) -> None:
+    """记录市况严格度相关事实；不把历史胜率/净流入写成程序硬否决。"""
+    try:
+        main5 = float((cand.get("detail") or {}).get("main_net_5d"))
+    except (TypeError, ValueError):
+        main5 = None
+    win_txt = "缺失" if win_rate_5d is None else f"{win_rate_5d:.0f}%"
+    inflow_txt = "缺失" if main5 is None else f"{main5 / 1e8:.2f} 亿"
+    block_details.append({
+        "rule": "严格度证据",
+        "passed": True,
+        "evidence": f"{strictness}市况参考事实：历史 T+5 胜率 {win_txt}；主力5日净流入 {inflow_txt}（不作硬阈值否决）",
+    })
 
 
 def _effective_tier(cand: dict, adjusts: dict, trade_date: str) -> str | None:

@@ -1,5 +1,5 @@
 """评级重做-A：六因子透明评分体系测试
-覆盖：ScoreFactor/ScoreOutput schema 解析、potential_flag 代码层推导覆写、
+覆盖：ScoreFactor/ScoreOutput schema 解析、potential_flag 模型输出保留、
 factors 六项强校验、交叉验证字段、cache_key v4 失效、collect_data 候选上下文注入、
 旧数据向后兼容、reasoning_trace v4 格式留痕。
 """
@@ -166,10 +166,10 @@ def test_trace_score_old_format_compat():
     reasoning_trace.flush()
 
 
-# ---- potential_flag 代码层推导（P1-1 审核增强）----
+# ---- potential_flag 模型判断保留（主观研判不由代码硬阈值覆盖）----
 
-def test_potential_flag_derived_from_factors(monkeypatch):
-    """代码层按催化>=7 且 动量<=4 覆写 potential_flag（不信任 LLM 自报）"""
+def test_potential_flag_preserves_model_judgment(monkeypatch):
+    """potential_flag 由模型综合判断，代码层不按固定因子阈值覆写。"""
     from app.agents import score as score_mod
     from app.agents.schemas import ScoreFactor, ScoreOutput
 
@@ -186,7 +186,7 @@ def test_potential_flag_derived_from_factors(monkeypatch):
         monkeypatch.setattr(score_mod.repo, "hot_money_fingerprint", lambda: "fp")
         monkeypatch.setattr(score_mod.repo, "upsert_score", lambda *a, **k: None)
 
-    # LLM 自报 True 但因子不满足（催化5<7）→ 强制 False
+    # 模型自报 True，即使单项因子不满足旧阈值，也应保留。
     out = ScoreOutput(stock_code="600000", stock_name="测试", score=60, grade="C",
                       factors=[
                           ScoreFactor(factor="催化", score=5, reason="x", signal="中性"),
@@ -199,9 +199,9 @@ def test_potential_flag_derived_from_factors(monkeypatch):
                       potential_flag=True, risk_list=[])
     _setup(monkeypatch, out)
     score_mod.llm_score(_state())
-    assert out.potential_flag is False          # 自报 True 被覆写为 False
+    assert out.potential_flag is True
 
-    # 因子满足（催化8≥7 且 动量4≤4）→ 强制 True
+    # 模型自报 False，即使单项因子满足旧阈值，也应保留。
     out2 = ScoreOutput(stock_code="600000", stock_name="测试", score=60, grade="C",
                        factors=[
                            ScoreFactor(factor="动量", score=4, reason="x", signal="中性"),
@@ -214,7 +214,7 @@ def test_potential_flag_derived_from_factors(monkeypatch):
                        potential_flag=False, risk_list=[])
     monkeypatch.setattr(score_mod, "agent_call", lambda **kw: out2)
     score_mod.llm_score(_state())
-    assert out2.potential_flag is True          # 因子满足 → 强制 True
+    assert out2.potential_flag is False
 
 
 def test_llm_score_detail_stores_factors(monkeypatch):
@@ -233,6 +233,7 @@ def test_llm_score_detail_stores_factors(monkeypatch):
     ]
     out = ScoreOutput(stock_code="600000", stock_name="测试", score=55, grade="C",
                       factors=factors, risk_list=["风险1"],
+                      potential_flag=True,
                       cross_validation_note="交叉验证结论", final_advice="综合评估：0/6 因子看多")
 
     def _upsert(code, name, today, score, grade, detail, risk_list, **k):
@@ -253,6 +254,6 @@ def test_llm_score_detail_stores_factors(monkeypatch):
     d = captured["detail"]
     assert "factors" in d and len(d["factors"]) == 6
     assert d["factors"][0]["factor"] == "催化"
-    assert d["potential_flag"] is False          # 催化4<7 → 代码层覆写为 False
+    assert d["potential_flag"] is True
     assert d["cross_validation_note"] == "交叉验证结论"
     assert d["final_advice"] == "综合评估：0/6 因子看多"

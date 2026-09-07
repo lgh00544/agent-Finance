@@ -178,7 +178,7 @@ def test_collect_injects_distribution_phase(monkeypatch):
                                   "trade_date": "2026-08-24", "trace": []})
     assert (st2["distribution_phase_context"] or {}).get("phase") == 3
 
-    # ---- Score：llm_score data_pack 带上 + phase≥2 评分上限压至 90 + 风险提示 ----
+    # ---- Score：llm_score data_pack 带上；phase 风险由模型综合判断，代码不再硬性封顶 ----
     factors = [ScoreFactor(factor=n, score=i, reason=f"测试{n}", signal="中性")
                for i, n in enumerate(["动量", "催化", "估值", "主线契合", "资金面", "基本面质量"], 1)]
     out = ScoreOutput(stock_code="600036", stock_name="招商银行", score=95, grade="A",
@@ -190,5 +190,5 @@ def test_collect_injects_distribution_phase(monkeypatch):
 
     score_mod.llm_score(st2)
     assert "distribution_phase_context" in cap["prompt"] and "砸盘期" in cap["prompt"]
-    assert st2["score_result"]["score"] == 90  # 95 → 上限 90（不单独占一维）
-    assert any("派发期判定" in n for n in st2["risk_notice"])
+    assert st2["score_result"]["score"] == 95
+    assert st2["risk_notice"] == []

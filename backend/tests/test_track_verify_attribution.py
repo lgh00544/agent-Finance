@@ -104,8 +104,8 @@ def test_score_inject_cycle_attribution():
     src_collect = inspect.getsource(score_mod.collect_data)
     assert "build_stock_cycle_attribution" in src_collect and "cycle_attribution" in src_collect
     src_score = inspect.getsource(score_mod.llm_score)
-    assert "历史胜率" in src_score and "+ 5" in src_score and "- 10" in src_score
-    # 缺历史（win_rate/drag_rate None）→ 加分/扣分条件不触发（不伪造 0）
+    assert "cycle_attribution" in src_score and "二次改分" in src_score
+    # 缺历史（win_rate/drag_rate None）→ 统计事实不伪造 0
     cyc = tv.build_stock_cycle_attribution("RLH9002")
     assert cyc.get("win_rate") is None or cyc["win_rate"] < 60.0
     assert cyc.get("drag_rate") is None or cyc["drag_rate"] < 30.0
