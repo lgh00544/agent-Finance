@@ -395,6 +395,10 @@ export interface AiTrace {
   data_source?: string
   [k: string]: unknown
 }
+export interface AiTraceHistory extends AiTrace {
+  history_id: number
+  recorded_at?: string
+}
 export interface AlertInfo {
   id: number
   stock_code: string

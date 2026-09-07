@@ -20,7 +20,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { candidateConcentration, candidateDates, candidateTradeable, candidates, stockNames } from '@/api/candidates'
 import { marketCondition } from '@/api/market'
 import { trackVerifyStats } from '@/api/track'
-import { traces, traceDetail } from '@/api/traces'
+import { traceHistoryDetail, traces, tracesHistory, traceDetail } from '@/api/traces'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, StatCard, StatCardGrid, StockLabel } from '@/components/common'
 import { applyBatchAdjust, batchMetaByAssistantId, chatHistory } from '@/api/chat'
@@ -255,30 +255,54 @@ function TraceModal({ code, date, open, onClose }: { code: string; date: string;
     queryFn: () => traces(code, date),
     enabled: open,
   })
+  const { data: historyRows } = useQuery({
+    queryKey: ['traces-history', code, date],
+    queryFn: () => tracesHistory(code, date),
+    enabled: open,
+  })
   const [detail, setDetail] = useState<Record<string, unknown> | null>(null)
+  const [detailKind, setDetailKind] = useState<'current' | 'history'>('current')
   const openDetail = (id: number) => traceDetail(id).then(setDetail)
+  const openHistoryDetail = (id: number) => traceHistoryDetail(id).then(setDetail)
+  const closeDetail = () => setDetail(null)
+  const list = (items: Array<Record<string, unknown>>, kind: 'current' | 'history') => items.length ? (
+    items.map((t) => (
+      <Card key={String(t.trace_id ?? t.history_id)} size="small" style={{ marginBottom: 8, background: 'var(--bg-input)' }}>
+        <Space wrap>
+          <Tag color={kind === 'history' ? 'gold' : 'blue'}>{String(t.source_module ?? '—')}</Tag>
+          <Text type="secondary">{String(t.recorded_at ?? t.create_time ?? '').slice(0, 19)}</Text>
+          <Button size="small" onClick={() => {
+            setDetailKind(kind)
+            if (kind === 'history') openHistoryDetail(Number(t.history_id))
+            else openDetail(Number(t.trace_id))
+          }}>查看详情</Button>
+        </Space>
+        <div style={{ fontSize: 13, marginTop: 4 }}>{String(t.final_conclusion ?? '').slice(0, 120)}</div>
+      </Card>
+    ))
+  ) : (
+    <EmptyState
+      text={kind === 'history' ? '暂无追加历史记录。' : '该标的本交易日暂无留痕记录。'}
+      icon={kind === 'history' ? '🕘' : '🔍'}
+    />
+  )
   return (
     <Modal title={`AI 研判留痕：${code}`} open={open} onCancel={() => { setDetail(null); onClose() }} footer={null} width={640}>
       {detail ? (
         <div>
-          <Button size="small" onClick={() => setDetail(null)}>← 返回列表</Button>
+          <Button size="small" onClick={closeDetail}>← 返回{detailKind === 'history' ? '历史' : '当前'}列表</Button>
           <pre style={{ background: 'var(--bg-input)', padding: 12, borderRadius: 6, whiteSpace: 'pre-wrap', fontSize: 12, marginTop: 8 }}>
             {JSON.stringify(detail, null, 2)}
           </pre>
         </div>
-      ) : rows?.length ? (
-        rows.map((t) => (
-          <Card key={t.trace_id} size="small" style={{ marginBottom: 8, background: 'var(--bg-input)' }}>
-            <Space wrap>
-              <Tag color="blue">{String(t.source_module ?? '—')}</Tag>
-              <Text type="secondary">{String(t.create_time ?? '').slice(0, 16)}</Text>
-              <Button size="small" onClick={() => openDetail(t.trace_id)}>查看详情</Button>
-            </Space>
-            <div style={{ fontSize: 13, marginTop: 4 }}>{String(t.final_conclusion ?? '').slice(0, 120)}</div>
-          </Card>
-        ))
       ) : (
-        <EmptyState text="该标的本交易日暂无留痕记录。" icon="🔍" />
+        <Tabs
+          size="small"
+          items={[
+            { key: 'current', label: `当前版本（${rows?.length ?? 0}）`, children: list((rows ?? []) as Array<Record<string, unknown>>, 'current') },
+            { key: 'history', label: `历史版本（${historyRows?.length ?? 0}）`, children: list((historyRows ?? []) as Array<Record<string, unknown>>, 'history') },
+          ]}
+        />
       )}
     </Modal>
   )
