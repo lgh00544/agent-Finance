@@ -17,7 +17,8 @@ from app.db.session import SessionLocal, init_db
 from app.services.candidate_tradeable import (_effective_tier, _zone_bounds,
                                               ensure_if_missing, ensure_tradeable,
                                               judge_tradeable, plan_candidate_count,
-                                              tier_of, tradeable_view)
+                                              tier_of, tradeable_view,
+                                              TRADEABLE_DECISION_VERSION)
 
 DATE = "2026-08-10"
 
@@ -298,6 +299,24 @@ def test_ensure_tradeable_and_lazy():
     assert len(repo.list_candidate_tradeable(DATE)) == 3
     # ensure_if_missing：已有记录 → 0
     assert ensure_if_missing(DATE) == 0
+
+
+def test_ensure_if_missing_recomputes_stale_decision_version():
+    _seed_candidates()
+    _seed_plan()
+    assert ensure_tradeable(DATE) == 3
+    with SessionLocal() as db:
+        row = db.query(CandidateTradeable).filter(
+            CandidateTradeable.stock_code == "600001",
+            CandidateTradeable.trade_date == DATE,
+        ).one()
+        row.detail = {"block_details": [], "decision_version": "legacy-hard-threshold"}
+        db.commit()
+    repo._invalidate("tradeable")
+
+    assert ensure_if_missing(DATE) == 3
+    refreshed = {r["stock_code"]: r for r in repo.list_candidate_tradeable(DATE)}
+    assert refreshed["600001"]["detail"]["decision_version"] == TRADEABLE_DECISION_VERSION
 
 
 def test_ensure_tradeable_plan_applied():

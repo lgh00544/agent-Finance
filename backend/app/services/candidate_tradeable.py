@@ -20,6 +20,9 @@ from app.db import repo
 
 logger = logging.getLogger(__name__)
 
+# 判定口径版本：模型主导主观判断后，旧版硬阈值快照必须自动重算。
+TRADEABLE_DECISION_VERSION = "model-led-v2"
+
 # 置信档位 → 展示评级（与候选池页 TIER_MAP 同款映射，纯展示层）
 TIER_MAP = {"强烈推荐": "A", "建议关注": "B", "谨慎观察": "C"}
 # 重大利空类表述命中即判 c3 不满足（候选生成时 LLM 已产出 risks/risk_notice 文本）
@@ -235,6 +238,7 @@ def ensure_tradeable(trade_date: str) -> int:
             res["price_zone"], res["current_price"],
             res["cond_grade"], res["cond_price"], res["cond_risk"],
             res["block_reason"], {"effective_tier": tier,
+                                  "decision_version": TRADEABLE_DECISION_VERSION,
                                   "confidence_tier": (cand.get("detail") or {}).get("confidence_tier"),
                                   "plan_date": _plan_date(plan),
                                   "block_details": res["block_details"]})
@@ -247,8 +251,10 @@ def _plan_date(plan: dict | None) -> str:
 
 
 def ensure_if_missing(trade_date: str) -> int:
-    """当日缺判定记录时懒补算（幂等）；已有记录直接返回 0 表示无需补算"""
-    if repo.has_tradeable_rows(trade_date):
+    """当日缺判定或判定口径过期时懒补算（幂等）。"""
+    rows = repo.list_candidate_tradeable(trade_date, limit=300)
+    if rows and all((r.get("detail") or {}).get("decision_version") == TRADEABLE_DECISION_VERSION
+                    for r in rows):
         return 0
     return ensure_tradeable(trade_date)
 
