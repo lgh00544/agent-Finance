@@ -108,7 +108,7 @@ export function TaskDrawer() {
     enabled: !!retryTid,
     refetchInterval: (q) => {
       const st = q.state.data?.status
-      return st === 'done' || st === 'failed' ? false : 2000
+      return st === 'done' || st === 'failed' || st === 'canceled' ? false : 2000
     },
   })
   useEffect(() => {
@@ -118,9 +118,10 @@ export function TaskDrawer() {
       status: t.status,
       error: t.error ?? null,
       result: t.result,
-      finished_at: (t.status === 'done' || t.status === 'failed') ? Date.now() : undefined,
+      finished_at: (t.status === 'done' || t.status === 'failed' || t.status === 'canceled')
+        ? Date.now() : undefined,
     })
-    if (t.status === 'done' || t.status === 'failed') setRetryTid(null)
+    if (t.status === 'done' || t.status === 'failed' || t.status === 'canceled') setRetryTid(null)
   }, [retryTid, retry.data, updateTask])
   useEffect(() => {
     if (retryTid && retry.error) setRetryTid(null)
@@ -138,31 +139,30 @@ export function TaskDrawer() {
   }
 
   const doRemove = (entry: TaskEntry) => {
-    // 仅 done/failed 可移除（store 内部也强校验）
+    // 仅终态可移除（store 内部也强校验）
     removeTask(entry.task_id)
   }
 
   const doCancel = (entry: TaskEntry) => {
     modal.confirm({
       title: '取消任务',
-      content: `确认取消【${kindLabel(entry.kind)} #${shortId(entry.task_id)}】？取消后该任务标记为失败。`,
+      content: `确认取消【${kindLabel(entry.kind)} #${shortId(entry.task_id)}】？取消后该任务不会发布结果。`,
       okText: '确认取消',
       cancelText: '继续执行',
       okButtonProps: { danger: true },
       onOk: () =>
         cancelTask(entry.task_id)
           .then((r) => {
-            // 后端 cancel 后把 status 置 failed + canceled=true
-            // store 走 updateTask 走"正常失败"流程，触发既有 isHidden(30s) 与重试按钮
+            // 后端返回明确的 canceled 终态；取消任务不可重试。
             updateTask(r.task_id, {
-              status: 'failed',
+              status: 'canceled',
               error: '已手动取消',
               finished_at: Date.now(),
             })
             message.success(`已取消：${kindLabel(entry.kind)} #${shortId(r.task_id)}`)
           })
           .catch((e: Error) => {
-            // 后端 400 = 任务已终态（done/failed），cancel 不可用
+            // 后端 400 = 任务已终态，cancel 不可用
             // toast 提示 + 立即拉一次真实状态刷新 store，消除"运行中"假象
             message.error(`取消失败：${e.message}`)
             taskDetail(entry.task_id)
@@ -171,7 +171,8 @@ export function TaskDrawer() {
                   status: t.status,
                   error: t.error ?? null,
                   result: t.result,
-                  finished_at: (t.status === 'done' || t.status === 'failed') ? Date.now() : undefined,
+                  finished_at: (t.status === 'done' || t.status === 'failed' || t.status === 'canceled')
+                    ? Date.now() : undefined,
                 }),
               )
               .catch(() => {})
@@ -244,8 +245,8 @@ export function TaskDrawer() {
                     <CloseCircleOutlined style={{ color: 'var(--err)' }} />}
                   <Text strong>{kindLabel(t.kind)}</Text>
                   <Text code style={{ fontSize: 11 }}>#{shortId(t.task_id)}</Text>
-                  <Tag color={t.status === 'done' ? 'green' : t.status === 'failed' ? 'red' : t.status === 'running' ? 'blue' : 'default'}>
-                    {t.status === 'pending' ? '排队中' : t.status === 'running' ? '运行中' : t.status === 'done' ? '已完成' : '失败'}
+                  <Tag color={t.status === 'done' ? 'green' : t.status === 'failed' ? 'red' : t.status === 'canceled' ? 'default' : t.status === 'running' ? 'blue' : 'default'}>
+                    {t.status === 'pending' ? '排队中' : t.status === 'running' ? '运行中' : t.status === 'done' ? '已完成' : t.status === 'canceled' ? '已取消' : '失败'}
                   </Tag>
                   <Text type="secondary" style={{ marginLeft: 'auto', fontSize: 12 }}>
                     {runningNow ? `${fmtElapsed(elapsed)}` : fmtElapsed(elapsed)}
@@ -272,7 +273,7 @@ export function TaskDrawer() {
                   <Alert
                     type="error"
                     showIcon
-                    message={t.status === 'failed' && t.error === '已手动取消' ? '已手动取消' : '执行失败'}
+                    message={t.status === 'canceled' ? '已手动取消' : '执行失败'}
                     description={
                       <div style={{ maxHeight: 120, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                         {t.error}

@@ -31,7 +31,7 @@ export interface TaskInfo {
   task_id: string
   kind: string
   label: string
-  status: 'pending' | 'running' | 'done' | 'failed'
+  status: 'pending' | 'running' | 'done' | 'failed' | 'canceled'
   error?: string | null
   result?: unknown
   submitted_at?: string

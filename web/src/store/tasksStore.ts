@@ -4,7 +4,7 @@ import { create } from 'zustand'
  * useTaskSubmit 透明写入：提交入队 → 轮询更新 → 失败标记。
  * 已完成任务 30s 后从视图隐藏（不真删，按 task_id 仍可查）。 */
 
-export type TaskStatus = 'pending' | 'running' | 'done' | 'failed'
+export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'canceled'
 
 export interface TaskEntry {
   task_id: string
@@ -41,16 +41,16 @@ export const useTasksStore = create<TasksState>((set) => ({
       const cur = s.tasks[task_id]
       if (!cur) return s
       const nextStatus = patch.status ?? cur.status
-      // 任务进入终态（done/failed）时刷新 lastViewedAt，开启 30s 隐藏计时
-      const terminal = nextStatus === 'done' || nextStatus === 'failed'
+      // 任务进入终态时刷新 lastViewedAt，开启 30s 隐藏计时
+      const terminal = nextStatus === 'done' || nextStatus === 'failed' || nextStatus === 'canceled'
       const lastViewedAt = (terminal && cur.status !== nextStatus) ? Date.now() : cur.lastViewedAt
       return { tasks: { ...s.tasks, [task_id]: { ...cur, ...patch, task_id, lastViewedAt } } }
     }),
   removeTask: (task_id) =>
     set((s) => {
       const cur = s.tasks[task_id]
-      // 仅允许删除 done/failed
-      if (!cur || (cur.status !== 'done' && cur.status !== 'failed')) return s
+      // 仅允许删除终态任务
+      if (!cur || !['done', 'failed', 'canceled'].includes(cur.status)) return s
       const next = { ...s.tasks }
       delete next[task_id]
       return { tasks: next }
@@ -59,7 +59,7 @@ export const useTasksStore = create<TasksState>((set) => ({
     set((s) => {
       const next: Record<string, TaskEntry> = {}
       for (const [id, t] of Object.entries(s.tasks)) {
-        if (t.status === 'done' || t.status === 'failed') continue
+        if (t.status === 'done' || t.status === 'failed' || t.status === 'canceled') continue
         next[id] = t
       }
       return { tasks: next }
@@ -68,7 +68,8 @@ export const useTasksStore = create<TasksState>((set) => ({
 
 /** 触达过视图（viewedAt）后若已完成超 30s 则视为可隐藏 */
 function isHidden(t: TaskEntry, now: number): boolean {
-  if ((t.status === 'done' || t.status === 'failed') && now - t.lastViewedAt > HIDE_AFTER_MS) {
+  if ((t.status === 'done' || t.status === 'failed' || t.status === 'canceled')
+      && now - t.lastViewedAt > HIDE_AFTER_MS) {
     return true
   }
   return false
