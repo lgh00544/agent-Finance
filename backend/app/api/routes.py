@@ -865,6 +865,13 @@ def list_traces(code: Optional[str] = None, date: Optional[str] = None,
     return repo.list_traces(code, date, module, limit)
 
 
+@router.get("/traces/history")
+def list_trace_history(code: Optional[str] = None, date: Optional[str] = None,
+                       module: Optional[str] = None, limit: int = 100):
+    """推理留痕追加历史（轻量列表；现有 /traces 仍为当前版本投影）。"""
+    return repo.list_trace_history(code, date, module, limit)
+
+
 @router.get("/traces/{trace_id}")
 def get_trace(trace_id: int):
     """推理留痕完整详情（结论卡 + 分层推理全文）"""

@@ -16,7 +16,8 @@ from sqlalchemy import and_, delete, func, or_, select, text, update
 from app.cache import cache
 from app.core.config import settings
 from app.db.models import (
-    AccountBaseline, AccountPnlSnapshot, AgentPreference, AgentSuggestion, AiReasoningTrace, AlertLog,
+    AccountBaseline, AccountPnlSnapshot, AgentPreference, AgentSuggestion, AiReasoningTrace,
+    AiReasoningTraceHistory, AlertLog,
     AuditLog,
     BatchAdjust, CandidateAdjust, CandidateTrackVerify, CandidateTradeable,
     CapitalActor, CapitalFlow, CapitalStats, DragonTiger,
@@ -1579,6 +1580,31 @@ def get_trace(trace_id: int) -> dict | None:
                     "ext_info": r.ext_info}
 
     return _dbq("trace", {"id": trace_id}, _load)
+
+
+def list_trace_history(code: str | None = None, date: str | None = None,
+                       module: str | None = None, limit: int = 100) -> list[dict]:
+    """推理留痕追加历史轻量列表；当前 /traces 投影接口保持最新版本语义。"""
+    def _load() -> list[dict]:
+        with SessionLocal() as db:
+            stmt = select(AiReasoningTraceHistory).order_by(
+                AiReasoningTraceHistory.generate_date.desc(),
+                AiReasoningTraceHistory.history_id.desc())
+            if code:
+                stmt = stmt.where(AiReasoningTraceHistory.stock_code == code)
+            if date:
+                stmt = stmt.where(AiReasoningTraceHistory.generate_date == date)
+            if module:
+                stmt = stmt.where(AiReasoningTraceHistory.source_module == module)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
+            return [{"history_id": r.history_id, "stock_code": r.stock_code,
+                     "stock_name": r.stock_name, "source_module": r.source_module,
+                     "generate_date": r.generate_date, "confidence": r.confidence,
+                     "data_source": r.data_source, "create_time": r.create_time,
+                     "recorded_at": str(r.recorded_at)} for r in rows]
+
+    return _dbq("trace_history",
+                {"code": code, "date": date, "module": module, "limit": limit}, _load)
 
 
 def list_candidate_dates(limit: int = 30) -> list[str]:

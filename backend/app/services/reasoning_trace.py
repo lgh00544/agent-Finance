@@ -2,7 +2,8 @@
 
 一次生成、结构化入库、多端复用。写入完全脱离主研判同步流程：
 后台单写线程攒批（满 5 条或间隔 1s）批量提交，失败重试 3 次，最终一致；
-同 code+generate_date+source_module 保留最新（upsert 覆盖）。
+当前表同 code+generate_date+source_module 保留最新（upsert 投影），
+历史表对每次生成追加留痕，不覆盖旧版本。
 写入失败绝不影响主业务流程（fire-and-forget + 失败仅日志）。
 
 字段组装（从各模块现有落库参数映射，零 LLM 调用）：
@@ -16,7 +17,7 @@ import threading
 import time
 
 from app.cache import cache
-from app.db.models import AiReasoningTrace, _now
+from app.db.models import AiReasoningTrace, AiReasoningTraceHistory, _now
 from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ def _flush(batch: list[dict]) -> None:
         try:
             with SessionLocal() as db:
                 for p in batch:
+                    _append_history(db, p)
                     _upsert_one(db, p)
                 db.commit()
             cache.delete_prefix("dbq:trace:")  # 写后失效 L1 读缓存
@@ -106,6 +108,13 @@ def _upsert_one(db, payload: dict) -> None:
         stmt = insert(AiReasoningTrace).values(**values)
         db.execute(stmt.on_duplicate_key_update(
             **{k: getattr(stmt.inserted, k) for k in _UP_COLS}))
+
+
+def _append_history(db, payload: dict) -> None:
+    """追加一次完整生成快照；与当前投影在同一事务中提交。"""
+    values = {k: payload.get(k) for k in _UP_COLS}
+    values["create_time"] = _now_str()
+    db.add(AiReasoningTraceHistory(**values))
 
 
 def _worker() -> None:

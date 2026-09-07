@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 
 from app.agents.schemas import DiscoverCandidate
 from app.db import repo
-from app.db.models import AiReasoningTrace
+from app.db.models import AiReasoningTrace, AiReasoningTraceHistory
 from app.db.session import SessionLocal, init_db
 from app.services import reasoning_trace
 
@@ -161,7 +161,7 @@ def test_plan_alert_review_sell_mapping():
 
 
 def test_same_key_latest_wins_atomic():
-    """同键（code+date+module）多次写入只保留最新：单批内重复与跨批重复均安全（原子 upsert）"""
+    """当前投影保留最新，追加历史保留同键的每次生成。"""
     reasoning_trace.trace_score("600106", "测试股106", "2026-08-05",
                                 80.0, "B", {"技术趋势": {"comment": "第一版"}}, [])
     reasoning_trace.trace_score("600106", "测试股106", "2026-08-05",
@@ -172,6 +172,14 @@ def test_same_key_latest_wins_atomic():
     assert len(rows) == 1
     assert "第二版" in rows[0].technical_reasoning
     assert "新风险" in rows[0].risk_reasoning
+    with SessionLocal() as db:
+        history = list(db.execute(select(AiReasoningTraceHistory).where(
+            AiReasoningTraceHistory.stock_code == "600106",
+            AiReasoningTraceHistory.source_module == "score",
+        ).order_by(AiReasoningTraceHistory.history_id)).scalars().all())
+    assert len(history) == 2
+    assert "第一版" in history[0].technical_reasoning
+    assert "第二版" in history[1].technical_reasoning
 
 
 def test_repo_landing_writes_trace():
@@ -215,7 +223,7 @@ def test_schema_rule_refs_field():
 
 
 def test_indexes_exist():
-    """建表索引与唯一约束存在（联合唯一 + module_date 覆盖索引 + 单列索引）"""
+    """当前投影保留唯一约束，历史表提供追加查询索引。"""
     from sqlalchemy import inspect
     from app.db.session import engine
 
@@ -224,3 +232,5 @@ def test_indexes_exist():
     assert "ix_trace_module_date" in idx
     uniq = {u["name"]: u for u in insp.get_unique_constraints("ai_reasoning_trace")}
     assert "uq_trace_code_date_module" in uniq
+    history_indexes = {i["name"] for i in insp.get_indexes("ai_reasoning_trace_history")}
+    assert "ix_trace_history_code_date_module" in history_indexes

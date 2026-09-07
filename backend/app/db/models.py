@@ -294,6 +294,38 @@ class AiReasoningTrace(Base):
     ext_info: Mapped[str] = mapped_column(Text, default="")         # 各模块特有数据（JSON 字符串）
 
 
+class AiReasoningTraceHistory(Base):
+    """推理留痕追加历史。
+
+    AiReasoningTrace 保留当前版本投影和联合唯一约束，供现有页面快速读取；
+    本表每次生成追加一行，不依赖删除旧约束，兼容 SQLite/MySQL 存量库迁移。
+    """
+    __tablename__ = "ai_reasoning_trace_history"
+    __table_args__ = (
+        Index("ix_trace_history_code_date_module", "stock_code", "generate_date",
+              "source_module"),
+        Index("ix_trace_history_recorded_at", "recorded_at"),
+    )
+
+    history_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64))
+    source_module: Mapped[str] = mapped_column(String(16), index=True)
+    generate_date: Mapped[str] = mapped_column(String(10), index=True)
+    fact_basis: Mapped[str] = mapped_column(Text, default="")
+    technical_reasoning: Mapped[str] = mapped_column(Text, default="")
+    capital_reasoning: Mapped[str] = mapped_column(Text, default="")
+    fundamental_reasoning: Mapped[str] = mapped_column(Text, default="")
+    risk_reasoning: Mapped[str] = mapped_column(Text, default="")
+    rule_refs: Mapped[str] = mapped_column(Text, default="")
+    final_conclusion: Mapped[str] = mapped_column(Text, default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    data_source: Mapped[str] = mapped_column(String(64), default="")
+    create_time: Mapped[str] = mapped_column(String(16), default="")
+    ext_info: Mapped[str] = mapped_column(Text, default="")
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class NewsArticle(Base):
     """新闻/公告原始文本（真源数据；Qdrant 仅做其向量索引，dev 模式 SQL LIKE 检索）"""
     __tablename__ = "news_article"
