@@ -29,7 +29,7 @@ from app.db.models import (
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
 from app.db.session import SessionLocal
-from app.services import reasoning_trace
+from app.services import reasoning_trace, task_queue
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: in
         if detail is not None:
             row.detail = detail
         row.created_at = _now()  # 覆盖更新：同日同股以最新执行时间为准（前端去重取最大）
-        db.commit()
+        task_queue.guarded_commit(db)
         _invalidate("candidate")
         # 推理留痕（异步批量写，零阻塞）：discover 结论=候选理由+风险初判+detail 结构字段
         reasoning_trace.trace_candidate(stock_code, stock_name, trade_date, reasons,
@@ -116,7 +116,7 @@ def replace_day_candidates(codes: set[str], trade_date: str) -> int:
                 db.delete(row)
                 removed += 1
         if removed:
-            db.commit()
+            task_queue.guarded_commit(db)
             _invalidate("candidate")
         return removed
 
@@ -782,7 +782,7 @@ def upsert_candidate_tradeable(stock_code: str, stock_name: str, trade_date: str
         row.plan_exists, row.price_zone, row.current_price = plan_exists, price_zone, current_price
         row.cond_grade, row.cond_price, row.cond_risk = cond_grade, cond_price, cond_risk
         row.block_reason, row.detail = block_reason, detail
-        db.commit()
+        task_queue.guarded_commit(db)
         _invalidate("tradeable")
 
 
@@ -940,7 +940,7 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
             row = StockScore(stock_code=stock_code, stock_name=stock_name, trade_date=trade_date)
             db.add(row)
         row.score, row.grade, row.detail, row.risk_list = score, grade, detail, risk_list
-        db.commit()
+        task_queue.guarded_commit(db)
         _invalidate("score")
         # 推理留痕：score 五维分项研判（dimensions[].comment 按维度归入技术/资金/基本面）
         # thinking 仅注入 trace 副本，绝不进业务表 detail
@@ -972,7 +972,7 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
                            source=source if source in ("candidate", "manual") else "manual",
                            supersedes_id=previous_id)
         db.add(row)
-        db.commit()
+        task_queue.guarded_commit(db)
         db.refresh(row)
         _invalidate("plan")
         # 推理留痕：position 分批区间/止损止盈/总仓 + 建仓逻辑说明 + v3.0 维度归因
@@ -992,7 +992,7 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
                        severity=severity, message=message, action=action, signal=signal,
                        pushed=pushed, source=source)
         db.add(row)
-        db.commit()
+        task_queue.guarded_commit(db)
         db.refresh(row)
         _invalidate("alert")
         # 推理留痕仅 monitor 信号（LLM 研判）：pre_market/market_shift 等代码级检测
@@ -1012,7 +1012,7 @@ def insert_review(stock_code: str, stock_name: str, holding_id: int, exit_date: 
                            exit_date=exit_date, hold_days=hold_days, pnl_pct=pnl_pct,
                            plan_vs_actual=plan_vs_actual, lesson=lesson, feedback=feedback)
         db.add(row)
-        db.commit()
+        task_queue.guarded_commit(db)
         db.refresh(row)
         _invalidate("review")
         # 推理留痕：review 计划兑现对比 + 经验教训 + 反馈偏好
@@ -2245,7 +2245,7 @@ def insert_sell_decision(holding_id: int, stock_code: str, stock_name: str, deci
         row = SellDecision(holding_id=holding_id, stock_code=stock_code,
                            stock_name=stock_name, decision=decision)
         db.add(row)
-        db.commit()
+        task_queue.guarded_commit(db)
         db.refresh(row)
         # 推理留痕：sell 卖出决策依据/离场区间/检查清单
         reasoning_trace.trace_sell(stock_code, stock_name, _now().strftime("%Y-%m-%d"), decision)

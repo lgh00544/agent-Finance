@@ -18,6 +18,7 @@ import logging
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -29,8 +30,46 @@ _TIMEOUT_SECONDS = 35 * 60  # 超时上限 35 分钟（方案 B：30~40 分钟�
 
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bg-task")
 _lock = threading.Lock()
+_publish_fence = threading.Lock()
 _tasks: dict[str, dict] = {}
 _seq = 0  # 提交序号（秒级时间戳相同场景下保证顺序稳定）
+_current_attempt: ContextVar[tuple[str, str] | None] = ContextVar(
+    "task_queue_current_attempt", default=None)
+
+
+class AttemptInvalidated(RuntimeError):
+    """当前后台任务 attempt 已取消、超时或被重试，禁止继续发布业务结果。"""
+
+
+def _attempt_active(attempt: tuple[str, str] | None) -> bool:
+    if attempt is None:
+        return True
+    tid, attempt_id = attempt
+    with _lock:
+        task = _tasks.get(tid)
+        return bool(task and task["attempt_id"] == attempt_id
+                    and task["status"] == "running"
+                    and not task["cancel_requested"])
+
+
+def ensure_attempt_active() -> None:
+    """任务上下文存在时确认本次 attempt 仍有业务发布资格。
+
+    同步调用没有 attempt 上下文，保持原有 repo 直调行为。
+    """
+    if not _attempt_active(_current_attempt.get()):
+        raise AttemptInvalidated("后台任务 attempt 已失效，放弃业务写入")
+
+
+def guarded_commit(db) -> None:
+    """在取消/超时栅栏内提交，确保取消返回后不再产生核心业务写入。"""
+    with _publish_fence:
+        try:
+            ensure_attempt_active()
+            db.commit()
+        except AttemptInvalidated:
+            db.rollback()
+            raise
 
 
 def _watchdog_loop() -> None:
@@ -39,18 +78,20 @@ def _watchdog_loop() -> None:
     其最终跑完写库不影响（候选池落库是好事），但不再阻塞新任务。"""
     while True:
         time.sleep(30)
-        with _lock:
-            now = time.monotonic()
-            for task in list(_tasks.values()):
-                started = task.get("_started_mono")
-                if (task["status"] == "running" and task["kind"] in _TIMEOUT_KINDS
-                        and started and now - started > _TIMEOUT_SECONDS):
-                    logger.warning("后台任务 %s(%s) 超时 %d 分钟，强制终结并释放任务队列",
-                                   task["kind"], task["task_id"], _TIMEOUT_SECONDS // 60)
-                    task["status"] = "failed"
-                    task["error"] = f"timeout after {_TIMEOUT_SECONDS // 60} minutes"
-                    task["finished_at"] = _now()
-                    _replace_executor_locked()
+        with _publish_fence:
+            with _lock:
+                now = time.monotonic()
+                for task in list(_tasks.values()):
+                    started = task.get("_started_mono")
+                    if (task["status"] == "running" and task["kind"] in _TIMEOUT_KINDS
+                            and started and now - started > _TIMEOUT_SECONDS):
+                        logger.warning("后台任务 %s(%s) 超时 %d 分钟，强制终结并释放任务队列",
+                                       task["kind"], task["task_id"], _TIMEOUT_SECONDS // 60)
+                        task["status"] = "failed"
+                        task["cancel_requested"] = True
+                        task["error"] = f"timeout after {_TIMEOUT_SECONDS // 60} minutes"
+                        task["finished_at"] = _now()
+                        _replace_executor_locked()
 
 
 threading.Thread(target=_watchdog_loop, name="bg-task-watchdog", daemon=True).start()
@@ -102,6 +143,7 @@ def _run(tid: str) -> None:
         attempt_id = task["attempt_id"]
         fn = task["_fn"]
         params = task["params"]
+    token = _current_attempt.set((tid, attempt_id))
     try:
         result = fn(params)  # 执行函数统一签名 fn(params: dict)
         with _lock:
@@ -113,6 +155,9 @@ def _run(tid: str) -> None:
                 return
             current["status"] = "done"
             current["result"] = _safe_result(result)
+    except AttemptInvalidated as exc:
+        logger.warning("后台任务 %s(%s) attempt 已失效，放弃发布结果: %s",
+                       task["kind"], tid, exc)
     except Exception as exc:  # noqa: BLE001 任务级整体容错，失败原因随任务返回供前端展示
         with _lock:
             current = _tasks.get(tid)
@@ -123,6 +168,7 @@ def _run(tid: str) -> None:
                 current["error"] = str(exc)
         logger.error("后台任务 %s(%s) 失败: %s", task["kind"], tid, exc)
     finally:
+        _current_attempt.reset(token)
         with _lock:
             current = _tasks.get(tid)
             if (current is task and current["attempt_id"] == attempt_id
@@ -188,17 +234,18 @@ def cancel(tid: str) -> bool:
     """手动取消卡死任务：仅 pending/running 可取消（failed/done/canceled 不可）。
     取消后释放任务队列（正在执行的线程无法强杀，留在旧池后台耗，
     但队列立即腾出，新任务可提交；旧线程失去本次 attempt 的发布资格。"""
-    with _lock:
-        task = _tasks.get(tid)
-        if task is None or task["status"] not in ("pending", "running"):
-            return False
-        task["status"] = "canceled"
-        task["cancel_requested"] = True
-        task["error"] = "canceled by user"
-        task["canceled_at"] = _now()
-        task["finished_at"] = _now()
-        if task.get("_started_mono"):
-            _replace_executor_locked()  # 正在执行：丢弃旧池，释放被占的单线程队列
+    with _publish_fence:
+        with _lock:
+            task = _tasks.get(tid)
+            if task is None or task["status"] not in ("pending", "running"):
+                return False
+            task["status"] = "canceled"
+            task["cancel_requested"] = True
+            task["error"] = "canceled by user"
+            task["canceled_at"] = _now()
+            task["finished_at"] = _now()
+            if task.get("_started_mono"):
+                _replace_executor_locked()  # 正在执行：丢弃旧池，释放被占的单线程队列
     logger.warning("后台任务 %s(%s) 已被手动取消", task["kind"], tid)
     return True
 

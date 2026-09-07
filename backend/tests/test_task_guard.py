@@ -1,4 +1,5 @@
 """手动挖掘链路修复配套测试：重复触发防护 / 强制刷新缓存 / 候选日期按需查询 / 缓存防穿透"""
+import threading
 import time
 
 import pytest
@@ -191,3 +192,45 @@ def test_dbq_none_not_cached():
     out = repo._dbq("probe", {"k": 1}, _load_none)
     assert out is None and len(calls) == 2
     cache.delete_prefix("dbq:")
+
+
+def test_cancel_running_task_cannot_write_business_row():
+    """取消在业务函数提交前发生时，核心业务表不得留下旧 attempt 的写入。"""
+    from sqlalchemy import select
+
+    from app.db import repo
+    from app.db.models import AlertLog
+    from app.db.session import SessionLocal
+    from app.services import task_queue
+
+    code = "ZZCANCEL"
+    started = threading.Event()
+    release = threading.Event()
+
+    def _write_after_release(_params):
+        started.set()
+        release.wait(5)
+        repo.insert_alert(code, "取消测试", "cancel_probe", "info",
+                          "不应落库", "review", {}, False)
+        return "unexpected"
+
+    tid = task_queue.submit("test_cancel_business_write", "取消业务写入",
+                            _write_after_release)
+    assert started.wait(2)
+    assert task_queue.cancel(tid) is True
+    release.set()
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        task = task_queue.get(tid)
+        if task and task["status"] == "canceled":
+            break
+        time.sleep(0.02)
+    task = task_queue.get(tid)
+    assert task["status"] == "canceled"
+    assert task["result"] is None
+
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(AlertLog).where(AlertLog.stock_code == code)
+        ).scalars().all()
+    assert rows == []
