@@ -148,6 +148,7 @@ def init_db() -> dict:
         _ensure_agent_suggestion_columns()
         _ensure_position_plan_detail()
         _ensure_position_plan_source()
+        _ensure_position_plan_history()
         _ensure_hot_money_profile_columns()
         _ensure_holding_high_price()
         _ensure_alert_log_source()
@@ -338,6 +339,12 @@ def _ensure_position_plan_source(eng=None) -> None:
     仅增量加列，不重建表不丢数据；旧数据默认 manual）"""
     eng = eng or engine
     _add_columns(eng, "position_plan", {"source": "VARCHAR(16) DEFAULT 'manual'"})
+
+
+def _ensure_position_plan_history(eng=None) -> None:
+    """幂等补齐 position_plan 替代链字段，不删除既有计划。"""
+    eng = eng or engine
+    _add_columns(eng, "position_plan", {"supersedes_id": "INTEGER"})
 
 
 def _ensure_agent_suggestion_columns(eng=None) -> None:

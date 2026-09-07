@@ -49,7 +49,10 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
                    for s in signals]
 
     # 建仓计划原始记录（入场逻辑与止损止盈参考）
-    plan = repo.get_latest_plan(code)
+    plan = repo.get_plan(getattr(holding, "plan_id", None))
+    plan_binding = "holding.plan_id" if plan is not None else "missing"
+    if plan is None and not getattr(holding, "plan_id", None):
+        plan, plan_binding = repo.get_plan_for_entry(code, holding.entry_date)
 
     # 盈亏客观数值（现价基于最近收盘）
     last_close = float(kline["close"].iloc[-1]) if not kline.empty else 0.0
@@ -135,7 +138,9 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
                     "shares": holding.shares, "stop_loss": holding.stop_loss,
                     "take_profit": holding.take_profit, "target_pct": holding.target_pct,
                     "note": holding.note, "latest_close": last_close, "pnl_pct": pnl_pct},
-        "plan": {"rationale": plan.rationale if plan else "",
+        "plan": {"plan_id": plan.id if plan else None,
+                 "binding": plan_binding,
+                 "rationale": plan.rationale if plan else "",
                  "batches": plan.batches if plan else [],
                  "stop_loss": plan.stop_loss if plan else 0,
                  "take_profit": plan.take_profit if plan else 0},

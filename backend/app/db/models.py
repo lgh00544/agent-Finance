@@ -168,7 +168,7 @@ class PositionPlan(Base):
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
     stock_name: Mapped[str] = mapped_column(String(64))
     plan_date: Mapped[str] = mapped_column(String(10), index=True)
-    status: Mapped[str] = mapped_column(String(16), default="proposed")  # proposed/accepted/expired
+    status: Mapped[str] = mapped_column(String(16), default="proposed")  # proposed/accepted/expired/superseded
     total_pct: Mapped[float] = mapped_column(Float, default=0.0)     # 总仓位上限 %（LLM 输出）
     batches: Mapped[list] = mapped_column(SafeJSON, default=list)        # 分批明细（LLM 输出）
     stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（LLM 输出）
@@ -176,6 +176,7 @@ class PositionPlan(Base):
     rationale: Mapped[str] = mapped_column(Text, default="")         # 建仓逻辑（LLM 输出）
     detail: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # v3.0 白盒扩展（dimensions/final_advice/market_regime/quant）
     source: Mapped[str] = mapped_column(String(16), default="manual", index=True)  # candidate/manual（来源标记）
+    supersedes_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)  # 替代的上一版本
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

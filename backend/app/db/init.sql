@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS position_plan (
     stop_loss FLOAT NOT NULL DEFAULT 0,
     take_profit FLOAT NOT NULL DEFAULT 0,
     rationale TEXT NULL,
+    supersedes_id INT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_plan_code (stock_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -115,8 +115,8 @@ def test_a_grade_always_realtime(monkeypatch):
     assert state["position_plan"]["plan_id"] == 66
 
 
-def test_insert_plan_same_day_dedupe():
-    """同日去重：同一标的同一交易日重复生成 → 仅保留最新一份"""
+def test_insert_plan_same_day_keeps_history():
+    """同日重算追加版本：旧计划保留并标记 superseded，新计划指向旧版本"""
     first = repo.insert_plan("600001", "测试A", "2026-08-09", 50.0,
                              [{"tranche": 1, "price_zone": "10~10.5", "ratio_pct": 30.0}],
                              9.2, 12.0, "第一版逻辑")
@@ -126,9 +126,11 @@ def test_insert_plan_same_day_dedupe():
     rows = repo.list_plans(limit=50)
     same_day = [r for r in rows if r["stock_code"] == "600001"
                 and r["plan_date"] == "2026-08-09"]
-    assert len(same_day) == 1, "同日同标的不应保留多份计划"
-    assert same_day[0]["id"] == second and second > first
-    assert same_day[0]["total_pct"] == 40.0, "应保留最新版计划"
+    assert len(same_day) == 2, "同日重算应保留历史版本"
+    by_id = {row["id"]: row for row in same_day}
+    assert by_id[first]["status"] == "superseded"
+    assert by_id[second]["supersedes_id"] == first
+    assert by_id[second]["total_pct"] == 40.0, "最新计划应保留最新版内容"
 
 
 def test_daily_pipeline_auto_plans_for_b_plus(monkeypatch):

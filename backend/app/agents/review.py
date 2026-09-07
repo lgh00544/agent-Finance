@@ -56,7 +56,10 @@ def collect_review(state: StockAgentState) -> StockAgentState:
                 pnl_pct = round((sell_amount - buy_amount) / buy_amount * 100, 2)
                 pnl_caliber = "（cost 缺失，回退 Σ卖−Σ买 口径）"
 
-    plan = repo.get_latest_plan(code)
+    plan = repo.get_plan(getattr(holding, "plan_id", None))
+    plan_binding = "holding.plan_id" if plan is not None else "missing"
+    if plan is None and not getattr(holding, "plan_id", None):
+        plan, plan_binding = repo.get_plan_for_entry(code, holding.entry_date)
     score_row = repo.get_latest_score(code)
 
     # 全链路落地表现聚合：持仓期间监控信号历史 + 卖出决策记录（各 Agent 输出方案的客观记录）
@@ -111,7 +114,9 @@ def collect_review(state: StockAgentState) -> StockAgentState:
                     "take_profit": holding.take_profit, "note": holding.note},
         "trades": [{"side": t.side, "price": t.price, "shares": t.shares,
                     "amount": t.amount, "trade_date": t.trade_date} for t in trades],
-        "plan": {"rationale": plan.rationale if plan else "",
+        "plan": {"plan_id": plan.id if plan else None,
+                 "binding": plan_binding,
+                 "rationale": plan.rationale if plan else "",
                  "batches": plan.batches if plan else [],
                  "stop_loss": plan.stop_loss if plan else 0,
                  "take_profit": plan.take_profit if plan else 0},

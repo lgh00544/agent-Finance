@@ -28,6 +28,7 @@ const STATUS_MAP: Record<string, { label: string; color: string }> = {
   proposed: { label: '待评估', color: 'orange' },
   accepted: { label: '已采纳', color: 'green' },
   abandoned: { label: '已放弃', color: 'default' },
+  superseded: { label: '已被新版本替代', color: 'default' },
 }
 const GRADE_TONE: Record<string, string> = { A: 'red', B: 'orange', C: 'blue' }
 const SOURCE_LABEL: Record<string, string> = { candidate: '每日候选池', manual: '手动生成' }

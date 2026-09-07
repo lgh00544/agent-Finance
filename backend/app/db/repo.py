@@ -955,18 +955,22 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
                 batches: list, stop_loss: float, take_profit: float, rationale: str,
                 detail: dict | None = None, source: str = "manual") -> int:
     """detail: v3.0 白盒扩展（dimensions/final_advice/market_regime/freshness/quant），可选；
-    旧调用零影响。去重规则：同一标的同一交易日仅保留最新一份（旧记录删除，
-    新记录 id 保持最新），杜绝列表重复冗余。source: candidate=每日候选池联动 / manual=手动生成。"""
+    旧调用零影响。同一标的同一交易日追加新版本，旧的 proposed 版本标记 superseded；
+    已采纳版本保留原状态。source: candidate=每日候选池联动 / manual=手动生成。"""
     with SessionLocal() as db:
-        stale = db.execute(select(PositionPlan).where(
+        stmt = (select(PositionPlan).where(
             PositionPlan.stock_code == stock_code, PositionPlan.plan_date == plan_date)
-        ).scalars().all()
-        for s in stale:
-            db.delete(s)
+                .order_by(PositionPlan.id.desc()))
+        previous = db.execute(stmt).scalars().all()
+        previous_id = previous[0].id if previous else None
+        for old in previous:
+            if old.status == "proposed":
+                old.status = "superseded"
         row = PositionPlan(stock_code=stock_code, stock_name=stock_name, plan_date=plan_date,
                            total_pct=total_pct, batches=batches, stop_loss=stop_loss,
                            take_profit=take_profit, rationale=rationale, detail=detail,
-                           source=source if source in ("candidate", "manual") else "manual")
+                           source=source if source in ("candidate", "manual") else "manual",
+                           supersedes_id=previous_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -1493,6 +1497,26 @@ def get_latest_plan(code: str) -> PositionPlan | None:
             .order_by(PositionPlan.id.desc()).limit(1)).scalar_one_or_none()
 
 
+def get_plan(plan_id: int | None) -> PositionPlan | None:
+    """按明确版本读取建仓计划。"""
+    if not plan_id:
+        return None
+    with SessionLocal() as db:
+        return db.get(PositionPlan, plan_id)
+
+
+def get_plan_for_entry(stock_code: str, entry_date: str) -> tuple[PositionPlan | None, str]:
+    """按入场日前最近版本推断旧持仓关联，并返回关联来源。"""
+    with SessionLocal() as db:
+        plan = db.execute(
+            select(PositionPlan).where(
+                PositionPlan.stock_code == stock_code,
+                PositionPlan.plan_date <= entry_date,
+            ).order_by(PositionPlan.plan_date.desc(), PositionPlan.id.desc()).limit(1)
+        ).scalar_one_or_none()
+        return (plan, "inferred_before_entry") if plan else (None, "missing")
+
+
 # ==================== 面板读取（API 层统一经此网关，禁止直连会话） ====================
 
 def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
@@ -1934,6 +1958,7 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "rationale": r.rationale,
                                            "detail": r.detail or {},
                                            "source": r.source or "manual",
+                                           "supersedes_id": r.supersedes_id,
                                            "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("plan", {"code": code, "limit": limit}, _load)
