@@ -1336,6 +1336,16 @@ def get_holding(holding_id: int) -> Holding | None:
         return db.get(Holding, holding_id)
 
 
+def get_active_holding_by_code(stock_code: str) -> Holding | None:
+    """读取同代码当前唯一有效持仓，防止人工/OCR重复建仓污染生命周期口径。"""
+    with SessionLocal() as db:
+        return db.execute(
+            select(Holding).where(Holding.stock_code == stock_code,
+                                  Holding.status == "holding")
+            .order_by(Holding.id.desc()).limit(1)
+        ).scalar_one_or_none()
+
+
 def insert_holding(stock_code: str, stock_name: str, entry_date: str, entry_price: float,
                    shares: int, cost: float, stop_loss: float = 0.0, take_profit: float = 0.0,
                    target_pct: float = 0.0, plan_id: int | None = None, note: str = "") -> int:
@@ -2073,6 +2083,16 @@ def list_reviews(code: str | None = None, limit: int = 50) -> list[dict]:
 def get_review(review_id: int) -> ReviewResult | None:
     with SessionLocal() as db:
         return db.get(ReviewResult, review_id)
+
+
+def get_review_for_holding_exit(holding_id: int, exit_date: str) -> ReviewResult | None:
+    """按持仓周期和离场日读取已有复盘，供复盘任务幂等保护使用。"""
+    with SessionLocal() as db:
+        return db.execute(
+            select(ReviewResult).where(ReviewResult.holding_id == holding_id,
+                                       ReviewResult.exit_date == exit_date)
+            .order_by(ReviewResult.id.desc()).limit(1)
+        ).scalar_one_or_none()
 
 
 def list_sell_decisions(holding_id: int, limit: int = 10) -> list[dict]:

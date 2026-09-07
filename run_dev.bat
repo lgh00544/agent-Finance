@@ -11,7 +11,7 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set PY=D:\space\self\self\.venv\Scripts\python.exe
+set PY=%~dp0.venv\Scripts\python.exe
 rem set ST=D:\space\self\self\.venv\Scripts\streamlit.exe   (Streamlit 已退役，不再启动)
 
 if not exist "%PY%" (

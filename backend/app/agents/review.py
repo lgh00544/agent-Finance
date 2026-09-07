@@ -194,6 +194,14 @@ def llm_review(state: StockAgentState) -> StockAgentState:
     name = state.get("stock_name") or code
     today = state.get("trade_date") or time.strftime("%Y-%m-%d")
 
+    existing = repo.get_review_for_holding_exit(state["holding_id"], today)
+    if existing is not None:
+        state["stage"] = "exit_review"
+        state["review_id"] = existing.id
+        state["trace"] = [*state.get("trace", []),
+                          f"复盘已存在: review_id={existing.id}，跳过重复生成"]
+        return state
+
     import json
 
     # 历史驳回记录注入：反映用户真实偏好，避免再次提出同类建议

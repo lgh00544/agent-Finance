@@ -17,6 +17,7 @@ import {
   Tag,
   Tooltip,
   Typography,
+  Select,
 } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -35,6 +36,7 @@ import { alerts } from '@/api/alerts'
 import { marketIndices } from '@/api/market'
 import { ocrHolding, ocrStatus } from '@/api/ocr'
 import { saveAccountBaseline } from '@/api/account'
+import { plans } from '@/api/positions'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard, StockLabel } from '@/components/common'
 import { moneySigned } from '@/utils/format'
@@ -747,6 +749,13 @@ function AddHoldingModal({ open, onClose }: { open: boolean; onClose: () => void
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [form] = Form.useForm()
+  const stockCode = Form.useWatch('stock_code', form) as string | undefined
+  const normalizedCode = String(stockCode ?? '').trim()
+  const { data: planRows, isFetching: plansLoading } = useQuery({
+    queryKey: ['holding-plans', normalizedCode],
+    queryFn: () => plans(normalizedCode, 50),
+    enabled: /^\d{6}$/.test(normalizedCode),
+  })
   const add = useMutation({
     mutationFn: (v: Record<string, unknown>) => addHolding(v),
     onSuccess: (r) => {
@@ -773,6 +782,17 @@ function AddHoldingModal({ open, onClose }: { open: boolean; onClose: () => void
         </Form.Item>
         <Form.Item name="shares" label="股数 *（100 整数倍）" rules={[{ required: true, message: '必填' }]}>
           <InputNumber min={100} step={100} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item name="plan_id" label="入场建仓计划（建议绑定）">
+          <Select
+            allowClear
+            loading={plansLoading}
+            placeholder={normalizedCode.length === 6 ? '选择该股票的计划版本' : '先输入 6 位股票代码'}
+            options={(planRows ?? []).map((p) => ({
+              value: p.id,
+              label: `${p.plan_date ?? '未知日期'} · ${p.status ?? '—'} · 计划 #${p.id}`,
+            }))}
+          />
         </Form.Item>
         <Space wrap>
           <Form.Item name="stop_loss" label="止损参考价"><InputNumber min={0} step={0.01} /></Form.Item>

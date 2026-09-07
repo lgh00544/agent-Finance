@@ -348,6 +348,8 @@ export interface Holding {
   pnl_amount?: number | null
   pnl_pct?: number | null
   status?: string
+  /** 新建持仓时绑定的入场建仓计划版本 */
+  plan_id?: number | null
   /** 前端去重合并标记：当前有效 / 重复录入（已自动忽略） / 历史买入 */
   _dedupe_status?: string
   created_at?: string

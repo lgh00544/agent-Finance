@@ -970,11 +970,29 @@ def holding_quotes():
 @router.post("/holdings")
 def add_holding(body: HoldingBody):
     """新增持仓（人工建仓后录入，触发创建后建议手动跑 monitor）"""
-    hid = repo.insert_holding(body.stock_code, body.stock_name, body.entry_date,
+    code = body.stock_code.strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="股票代码不能为空")
+    active = repo.get_active_holding_by_code(code)
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{code} 已有有效持仓（holding_id={active.id}），请使用加仓/成本修正，不要重复录入",
+        )
+    if body.plan_id is not None:
+        plan = repo.get_plan(body.plan_id)
+        if plan is None:
+            raise HTTPException(status_code=400, detail=f"建仓计划不存在: {body.plan_id}")
+        if plan.stock_code != code:
+            raise HTTPException(
+                status_code=400,
+                detail=f"建仓计划 {body.plan_id} 不属于股票 {code}，请重新选择对应计划",
+            )
+    hid = repo.insert_holding(code, body.stock_name, body.entry_date,
                               body.entry_price, body.shares, body.cost or body.entry_price * body.shares,
                               body.stop_loss, body.take_profit, body.target_pct,
                               body.plan_id, body.note)
-    return {"id": hid}
+    return {"id": hid, "plan_id": body.plan_id}
 
 
 @router.post("/holdings/{hid}/exit")
