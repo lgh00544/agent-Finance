@@ -394,8 +394,10 @@ def _submit_task(kind: str, params: dict) -> dict:
                                    f"请等待其完成后重试")
     label, fn = _TASK_KINDS[kind]
     task_params = dict(params or {})
-    task_params.setdefault("user_id", _request_user_id())
-    task_params.setdefault("user_role", current_user_role())
+    # 授权上下文必须由服务端覆盖，不能接受请求参数中的 user_id/user_role。
+    # 否则 /tasks/submit 可伪造其他用户身份执行私有任务。
+    task_params["user_id"] = _request_user_id()
+    task_params["user_role"] = current_user_role()
     tid = task_queue.submit(kind, label, fn, task_params)
     return {"task_id": tid, "label": label, "status": "pending"}
 
@@ -483,12 +485,14 @@ def submit_task(body: TaskSubmitBody):
 @router.get("/tasks/recent")
 def recent_tasks(limit: int = 10):
     """最近后台任务（最新在前，含状态/提交时间/失败原因）"""
-    return task_queue.recent_tasks(limit)
+    return task_queue.recent_tasks(limit, _request_user_id(),
+                                   is_admin=current_user_role() == "admin")
 
 
 @router.get("/tasks/{tid}")
 def task_detail(tid: str):
-    task = task_queue.get(tid)
+    task = task_queue.get(tid, _request_user_id(),
+                          is_admin=current_user_role() == "admin")
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return task
@@ -497,7 +501,8 @@ def task_detail(tid: str):
 @router.post("/tasks/{tid}/retry")
 def retry_task(tid: str):
     """失败任务一键重试（仅 failed 状态可重试，复用原任务ID）"""
-    if not task_queue.retry(tid):
+    if not task_queue.retry(tid, _request_user_id(),
+                            is_admin=current_user_role() == "admin"):
         raise HTTPException(status_code=400, detail="任务不存在或当前状态不可重试（仅失败任务可重试）")
     return {"task_id": tid, "status": "pending"}
 
@@ -506,10 +511,12 @@ def retry_task(tid: str):
 def cancel_task(tid: str):
     """手动取消卡死任务（仅待执行/执行中可取消；取消后立即释放任务队列，
     新任务可提交，无需重启后端）"""
-    if not task_queue.cancel(tid):
+    if not task_queue.cancel(tid, _request_user_id(),
+                             is_admin=current_user_role() == "admin"):
         raise HTTPException(status_code=400,
                             detail="任务不存在或当前状态不可取消（仅待执行/执行中可取消）")
-    task = task_queue.get(tid) or {}
+    task = task_queue.get(tid, _request_user_id(),
+                          is_admin=current_user_role() == "admin") or {}
     return {"task_id": tid, "status": task.get("status", "canceled"), "canceled": True}
 
 

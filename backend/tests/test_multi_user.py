@@ -6,7 +6,7 @@ import pytest
 from app import cache as cache_module
 from app.core import auth
 from app.db import repo
-from app.db.models import PaperAccount, TradeProfile, User
+from app.db.models import Holding, PaperAccount, TradeProfile, User
 from app.db.session import SessionLocal, init_db
 
 
@@ -107,3 +107,51 @@ def test_redis_namespace_is_applied_to_backend_keys(monkeypatch):
     backend.acquire_lock("job", 10)
     assert fake.calls[0][1][0] == "test-namespace:sample"
     assert fake.calls[1][1][0] == "test-namespace:lock:job"
+
+
+def test_private_query_cache_is_scoped_to_user():
+    owner = repo.create_user("cache-owner", "secret", "researcher")
+    other = repo.create_user("cache-other", "secret", "researcher")
+    owner_code, other_code = "600901", "600902"
+    repo.insert_holding(owner_code, "缓存甲", "2026-09-09", 10, 100,
+                        1000, user_id=owner["id"])
+    repo.insert_holding(other_code, "缓存乙", "2026-09-09", 10, 100,
+                        1000, user_id=other["id"])
+    try:
+        owner_tokens = auth.set_user_context(owner["id"], owner["role"])
+        try:
+            owner_rows = repo.list_holdings(user_id=owner["id"])
+        finally:
+            auth.reset_user_context(owner_tokens)
+        other_tokens = auth.set_user_context(other["id"], other["role"])
+        try:
+            other_rows = repo.list_holdings(user_id=other["id"])
+        finally:
+            auth.reset_user_context(other_tokens)
+        assert {r["stock_code"] for r in owner_rows} == {owner_code}
+        assert {r["stock_code"] for r in other_rows} == {other_code}
+    finally:
+        with SessionLocal() as db:
+            db.query(Holding).filter(Holding.stock_code.in_([owner_code, other_code])).delete(
+                synchronize_session=False)
+            db.commit()
+
+
+def test_task_owner_context_cannot_be_overridden(monkeypatch):
+    from app.api import routes
+
+    captured = {}
+
+    def fake_submit(kind, label, fn, params):
+        captured.update(params)
+        return "task-test"
+
+    monkeypatch.setattr(routes.task_queue, "submit", fake_submit)
+    tokens = auth.set_user_context(42, "researcher")
+    try:
+        routes._submit_task("score", {"stock_code": "600000", "user_id": 999,
+                                      "user_role": "admin"})
+    finally:
+        auth.reset_user_context(tokens)
+    assert captured["user_id"] == 42
+    assert captured["user_role"] == "researcher"

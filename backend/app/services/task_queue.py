@@ -22,6 +22,8 @@ from contextvars import ContextVar, copy_context
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 _KEEP = 30  # 保留最近任务条数
@@ -211,25 +213,37 @@ def _safe_result(result: Any) -> Any:
     return str(result)[:200]
 
 
-def get(tid: str) -> dict | None:
+def _visible(task: dict, user_id: int | None, is_admin: bool) -> bool:
+    """多人模式下只允许任务所有者或管理员访问任务记录。"""
+    if not settings.multi_user_enabled:
+        return True
+    if is_admin:
+        return True
+    owner_id = (task.get("params") or {}).get("user_id")
+    return user_id is not None and owner_id == user_id
+
+
+def get(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """任务详情（去掉内部 _fn 引用）"""
     with _lock:
         task = _tasks.get(tid)
-        return _public(task) if task else None
+        return _public(task) if task and _visible(task, user_id, is_admin) else None
 
 
-def recent_tasks(limit: int = 10) -> list[dict]:
+def recent_tasks(limit: int = 10, user_id: int | None = None,
+                 *, is_admin: bool = False) -> list[dict]:
     """最近任务（提交序号倒序 = 最新在前，供页面顶部任务状态区轮询）"""
     with _lock:
-        items = [t for t in sorted(_tasks.values(), key=lambda t: t["seq"], reverse=True)[:limit]]
+        items = [t for t in sorted(_tasks.values(), key=lambda t: t["seq"], reverse=True)
+                 if _visible(t, user_id, is_admin)][:limit]
         return [_public(t) for t in items]
 
 
-def retry(tid: str) -> bool:
+def retry(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> bool:
     """失败任务重试：重置状态重新入队（复用原 task_id 与执行函数）"""
     with _lock:
         task = _tasks.get(tid)
-        if task is None or task["status"] != "failed":
+        if task is None or not _visible(task, user_id, is_admin) or task["status"] != "failed":
             return False
         task["status"] = "pending"
         task["attempt_id"] = uuid.uuid4().hex[:12]
@@ -251,14 +265,15 @@ def has_active(kind: str) -> bool:
                    for t in _tasks.values())
 
 
-def cancel(tid: str) -> bool:
+def cancel(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> bool:
     """手动取消卡死任务：仅 pending/running 可取消（failed/done/canceled 不可）。
     取消后释放任务队列（正在执行的线程无法强杀，留在旧池后台耗，
     但队列立即腾出，新任务可提交；旧线程失去本次 attempt 的发布资格。"""
     with _publish_fence:
         with _lock:
             task = _tasks.get(tid)
-            if task is None or task["status"] not in ("pending", "running"):
+            if (task is None or not _visible(task, user_id, is_admin)
+                    or task["status"] not in ("pending", "running")):
                 return False
             task["status"] = "canceled"
             task["cancel_requested"] = True

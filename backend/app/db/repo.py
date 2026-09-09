@@ -2565,7 +2565,8 @@ def list_holdings(status: str | None = None, user_id: int | None = None,
                                            "audit_status": "not_required",
                                            "created_at": str(r.created_at)} for r in rows])
 
-    return _dbq("holding", {"status": status}, _load)
+    return _dbq("holding", {"status": status, "user_id": user_id,
+                              "is_admin": is_admin}, _load)
 
 
 def list_alerts(limit: int = 100, user_id: int | None = None,
@@ -2584,7 +2585,8 @@ def list_alerts(limit: int = 100, user_id: int | None = None,
                                            "source": r.source,
                                            "created_at": str(r.created_at)} for r in rows])
 
-    return _dbq("alert", {"limit": limit}, _load)
+    return _dbq("alert", {"limit": limit, "user_id": user_id,
+                            "is_admin": is_admin}, _load)
 
 
 def list_reviews(code: str | None = None, limit: int = 50, user_id: int | None = None,
@@ -2613,7 +2615,8 @@ def list_reviews(code: str | None = None, limit: int = 50, user_id: int | None =
                                            "created_at": str(r.created_at)}
                                           for r in rows])
 
-    return _dbq("review", {"code": code, "limit": limit}, _load)
+    return _dbq("review", {"code": code, "limit": limit, "user_id": user_id,
+                             "is_admin": is_admin}, _load)
 
 
 # ==================== 独立 AI 模拟账本（严禁写入 Holding/TradeRecord） ====================
