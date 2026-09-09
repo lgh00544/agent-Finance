@@ -184,6 +184,14 @@ def _invalidate(table: str) -> None:
         cache.delete_prefix(f"dbq:{table}:")
 
 
+def _context_user_id(default: int | None = None) -> int | None:
+    try:
+        from app.core.auth import current_user_id
+        return current_user_id() or default
+    except Exception:
+        return default
+
+
 def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: int,
                      reasons: list, risk_notice: list, snapshot: dict,
                      detail: dict | None = None) -> None:
@@ -1485,11 +1493,7 @@ def get_review_reject_history(code: str | None = None, limit: int = 10) -> list[
 
 def get_latest_preference(user_id: int | None = None) -> dict | None:
     if user_id is None:
-        try:
-            from app.core.auth import current_user_id
-            user_id = current_user_id()
-        except Exception:
-            user_id = None
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
     with SessionLocal() as db:
         stmt = select(AgentPreference).where(
             (AgentPreference.status == "active") | AgentPreference.status.is_(None))
@@ -1813,11 +1817,8 @@ def get_holding(holding_id: int) -> Holding | None:
 
 
 def get_holding_for_user(holding_id: int, user_id: int, *, is_admin: bool = False) -> Holding | None:
-    try:
-        from app.core.auth import current_user_id
-        user_id = current_user_id() or 1
-    except Exception:
-        user_id = 1
+    if user_id is None:
+        user_id = _context_user_id(1)
     with SessionLocal() as db:
         stmt = select(Holding).where(Holding.id == holding_id)
         if not is_admin:
@@ -2977,6 +2978,14 @@ def create_paper_review(account_id: int, stock_code: str, stock_name: str,
         return row.id
 
 
+def get_paper_review_for_user(review_id: int, user_id: int, *, is_admin: bool = False) -> PaperReview | None:
+    with SessionLocal() as db:
+        stmt = select(PaperReview).where(PaperReview.id == review_id)
+        if not is_admin:
+            stmt = stmt.where(PaperReview.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
 def list_paper_reviews(account_id: int | None = None, limit: int = 100,
                        user_id: int | None = None, *, is_admin: bool = False) -> list[dict]:
     with SessionLocal() as db:
@@ -3031,6 +3040,14 @@ def get_review(review_id: int) -> ReviewResult | None:
         return db.get(ReviewResult, review_id)
 
 
+def get_review_for_user(review_id: int, user_id: int, *, is_admin: bool = False) -> ReviewResult | None:
+    with SessionLocal() as db:
+        stmt = select(ReviewResult).where(ReviewResult.id == review_id)
+        if not is_admin:
+            stmt = stmt.where(ReviewResult.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
 def get_review_for_holding_exit(holding_id: int, exit_date: str) -> ReviewResult | None:
     """按持仓周期和离场日读取已有复盘，供复盘任务幂等保护使用。"""
     with SessionLocal() as db:
@@ -3041,25 +3058,32 @@ def get_review_for_holding_exit(holding_id: int, exit_date: str) -> ReviewResult
         ).scalar_one_or_none()
 
 
-def list_sell_decisions(holding_id: int, limit: int = 10) -> list[dict]:
+def list_sell_decisions(holding_id: int, limit: int = 10, user_id: int | None = None,
+                        *, is_admin: bool = False) -> list[dict]:
     with SessionLocal() as db:
-        rows = db.execute(
-            select(SellDecision).where(SellDecision.holding_id == holding_id)
-            .order_by(SellDecision.id.desc()).limit(limit)).scalars().all()
+        stmt = select(SellDecision).where(SellDecision.holding_id == holding_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(SellDecision.user_id == user_id)
+        rows = db.execute(stmt.order_by(SellDecision.id.desc()).limit(limit)).scalars().all()
         return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
-                                       "stock_name": r.stock_name,
-                                       "decision": r.decision,
+                                        "stock_name": r.stock_name,
+                                        "decision": r.decision,
                                        "created_at": str(r.created_at)} for r in rows])
 
 
 # ==================== 私有知识库（人工录入，Agent 启动自动检索注入） ====================
 
-def knowledge_version() -> tuple[int, int]:
+def knowledge_version(user_id: int | None = None) -> tuple[int, int]:
     """知识库变更感知（数量 + 最大ID），供 LLM 缓存键使用"""
+    if user_id is None:
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
     with SessionLocal() as db:
-        count = db.scalar(select(func.count()).select_from(PrivateKnowledge)) or 0
-        max_id = db.scalar(select(func.max(PrivateKnowledge.id))) or 0
-        return int(count), int(max_id)
+        stmt = select(func.count(), func.max(PrivateKnowledge.id)).select_from(PrivateKnowledge)
+        if user_id is not None:
+            stmt = stmt.where((PrivateKnowledge.user_id == user_id) |
+                              PrivateKnowledge.user_id.is_(None))
+        count, max_id = db.execute(stmt).one()
+        return int(count or 0), int(max_id or 0)
 
 
 def add_knowledge(title: str, content: str, agent_tag: str = "all", *,
@@ -3067,14 +3091,16 @@ def add_knowledge(title: str, content: str, agent_tag: str = "all", *,
                   market_scope: str = "all", scenario_tags: list[str] | None = None,
                   evidence_level: str = "unverified", valid_from: datetime | None = None,
                   valid_to: datetime | None = None, status: str = "active",
-                  risk_note: str = "") -> int:
+                  risk_note: str = "", user_id: int | None = None) -> int:
+    if user_id is None:
+        user_id = _context_user_id(1)
     with SessionLocal() as db:
         row = PrivateKnowledge(
             title=title, content=content, agent_tag=agent_tag,
             source_type=source_type, methodology_type=methodology_type,
             market_scope=market_scope, scenario_tags=scenario_tags or [],
             evidence_level=evidence_level, valid_from=valid_from, valid_to=valid_to,
-            status=status, risk_note=risk_note,
+            status=status, risk_note=risk_note, user_id=user_id,
         )
         db.add(row)
         db.commit()
@@ -3084,10 +3110,13 @@ def add_knowledge(title: str, content: str, agent_tag: str = "all", *,
 
 def list_knowledge(agent_tag: str | None = None, *, status: str | None = None,
                    source_type: str | None = None, methodology_type: str | None = None,
-                   market_scope: str | None = None, scenario_tag: str | None = None
+                   market_scope: str | None = None, scenario_tag: str | None = None,
+                   user_id: int | None = None, is_admin: bool = False
                    ) -> list[PrivateKnowledge]:
     with SessionLocal() as db:
         stmt = select(PrivateKnowledge).order_by(PrivateKnowledge.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PrivateKnowledge.user_id == user_id)
         if agent_tag:
             stmt = stmt.where(PrivateKnowledge.agent_tag == agent_tag)
         if status:
@@ -3104,9 +3133,13 @@ def list_knowledge(agent_tag: str | None = None, *, status: str | None = None,
         return rows
 
 
-def delete_knowledge(knowledge_id: int) -> bool:
+def delete_knowledge(knowledge_id: int, user_id: int | None = None,
+                     *, is_admin: bool = False) -> bool:
     with SessionLocal() as db:
-        row = db.get(PrivateKnowledge, knowledge_id)
+        stmt = select(PrivateKnowledge).where(PrivateKnowledge.id == knowledge_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PrivateKnowledge.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return False
         db.delete(row)
@@ -3114,13 +3147,17 @@ def delete_knowledge(knowledge_id: int) -> bool:
         return True
 
 
-def update_knowledge_status(knowledge_id: int, status: str, reason: str = "") -> bool:
+def update_knowledge_status(knowledge_id: int, status: str, reason: str = "",
+                            user_id: int | None = None, *, is_admin: bool = False) -> bool:
     """人工调整知识生命周期；只改状态和留痕，不删除正文，不做自动升级。"""
     allowed = {"active", "shadow", "archived", "expired"}
     if status not in allowed:
         raise ValueError(f"status must be one of {sorted(allowed)}")
     with SessionLocal() as db:
-        row = db.get(PrivateKnowledge, knowledge_id)
+        stmt = select(PrivateKnowledge).where(PrivateKnowledge.id == knowledge_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PrivateKnowledge.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return False
         row.status = status
@@ -3306,17 +3343,24 @@ def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
                             problem_desc: str = "", rule_text: str = "",
                             expected_effect: str = "", risk_note: str = "",
                             file_path: str = "", insert_position: str = "",
-                            suggestion_source: str = "llm") -> int:
+                            suggestion_source: str = "llm",
+                            user_id: int | None = None) -> int:
+    if user_id is None:
+        user_id = _context_user_id(1)
     with SessionLocal() as db:
+        if review_id:
+            review = db.get(ReviewResult, review_id)
+            if review and review.user_id is not None:
+                user_id = review.user_id
         row = AgentSuggestion(review_id=review_id, target_agent=target_agent, rule_name=rule_name,
                               current_value=current_value, suggested_value=suggested_value,
                               reason=reason, evidence=evidence,
                               target_kind=target_kind, status="pending",
                               rule_type=rule_type, priority=priority,
                               problem_desc=problem_desc, rule_text=rule_text,
-                              expected_effect=expected_effect, risk_note=risk_note,
-                              file_path=file_path, insert_position=insert_position,
-                              suggestion_source=suggestion_source)
+                               expected_effect=expected_effect, risk_note=risk_note,
+                               file_path=file_path, insert_position=insert_position,
+                               suggestion_source=suggestion_source, user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -3404,10 +3448,23 @@ def get_agent_suggestion(suggestion_id: int) -> AgentSuggestion | None:
         return db.get(AgentSuggestion, suggestion_id)
 
 
+def get_agent_suggestion_for_user(suggestion_id: int, user_id: int,
+                                  *, is_admin: bool = False) -> AgentSuggestion | None:
+    with SessionLocal() as db:
+        stmt = select(AgentSuggestion).where(AgentSuggestion.id == suggestion_id)
+        if not is_admin:
+            stmt = stmt.where(AgentSuggestion.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
 def get_agent_suggestions(review_id: int | None = None,
-                          status: str | None = None) -> list[AgentSuggestion]:
+                          status: str | None = None,
+                          user_id: int | None = None,
+                          *, is_admin: bool = False) -> list[AgentSuggestion]:
     with SessionLocal() as db:
         stmt = select(AgentSuggestion).order_by(AgentSuggestion.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AgentSuggestion.user_id == user_id)
         if review_id is not None:
             stmt = stmt.where(AgentSuggestion.review_id == review_id)
         if status:
@@ -3470,40 +3527,52 @@ def update_agent_suggestion_notes(suggestion_id: int, conflict_note: str = "",
 
 # ==================== 复盘采纳规则（一键采纳自动落地：规则存库 + agent_call 动态注入） ====================
 
-def get_active_rules() -> list[dict]:
+def get_active_rules(user_id: int | None = None) -> list[dict]:
     """生效中规则列表（agent_call 注入数据源；采纳/回滚后 _invalidate 失效）"""
+    if user_id is None:
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
-            rows = db.execute(
-                select(RuleChange).where(RuleChange.status == "active")
-                .order_by(RuleChange.id)).scalars().all()
+            stmt = select(RuleChange).where(RuleChange.status == "active")
+            if user_id is not None:
+                stmt = stmt.where((RuleChange.user_id == user_id) | RuleChange.user_id.is_(None))
+            rows = db.execute(stmt.order_by(RuleChange.id)).scalars().all()
             return [{"id": r.id, "target_agent": r.target_agent, "rule_type": r.rule_type,
-                     "rule_name": r.rule_name, "rule_text": r.rule_text} for r in rows]
+                      "rule_name": r.rule_name, "rule_text": r.rule_text} for r in rows]
 
-    return _dbq("rule_change", {"active": 1}, _load)
+    return _dbq("rule_change", {"active": 1, "user_id": user_id}, _load)
 
 
-def rule_version() -> str:
+def rule_version(user_id: int | None = None) -> str:
     """生效规则内容指纹（count+max_id）→ 入 LLM 缓存键：
     采纳/回滚后指纹变化，当日 LLM 缓存自动失效（同 _knowledge_version 语义）"""
+    if user_id is None:
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
+
     def _load() -> list:
         with SessionLocal() as db:
-            cnt = db.execute(select(func.count()).select_from(RuleChange)
-                             .where(RuleChange.status == "active")).scalar() or 0
-            max_id = db.execute(select(func.max(RuleChange.id))).scalar() or 0
+            stmt = select(func.count(), func.max(RuleChange.id)).select_from(RuleChange).where(
+                RuleChange.status == "active")
+            if user_id is not None:
+                stmt = stmt.where((RuleChange.user_id == user_id) | RuleChange.user_id.is_(None))
+            cnt, max_id = db.execute(stmt).one()
             return [{"count": int(cnt), "max_id": int(max_id or 0)}]
 
-    rows = _dbq("rule_change", {"ver": 1}, _load)
+    rows = _dbq("rule_change", {"ver": 1, "user_id": user_id}, _load)
     row = rows[0] if rows else {}
     return f"{row.get('count', 0)}:{row.get('max_id', 0)}"
 
 
 def list_rule_changes(status: str | None = None, target_agent: str | None = None,
-                      suggestion_id: int | None = None, limit: int = 50) -> list[dict]:
+                      suggestion_id: int | None = None, limit: int = 50,
+                      user_id: int | None = None, *, is_admin: bool = False) -> list[dict]:
     """规则变更记录轻量列表（记录页数据源，不含长文本；详情按需单查）"""
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(RuleChange).order_by(RuleChange.id.desc()).limit(limit)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(RuleChange.user_id == user_id)
             if status:
                 stmt = stmt.where(RuleChange.status == status)
             if target_agent:
@@ -3517,19 +3586,24 @@ def list_rule_changes(status: str | None = None, target_agent: str | None = None
                      "rule_type": r.rule_type, "rule_name": r.rule_name,
                      "rule_text": r.rule_text, "priority": r.priority,
                      "status": r.status, "operator": r.operator,
+                     "user_id": r.user_id,
                      "created_at": str(r.created_at),
                      "rollback_time": r.rollback_time} for r in rows]
 
     return _dbq("rule_change", {"status": status, "agent": target_agent,
-                                "suggestion_id": suggestion_id, "limit": limit}, _load)
+                                "suggestion_id": suggestion_id, "limit": limit,
+                                "user_id": user_id, "admin": is_admin}, _load)
 
 
-def get_rule_change(rule_change_id: int) -> dict | None:
+def get_rule_change(rule_change_id: int, user_id: int | None = None,
+                    *, is_admin: bool = False) -> dict | None:
     """规则变更完整详情（变更前后对比/回滚原因/落地元数据，供记录页展开）"""
     def _load() -> list:
         with SessionLocal() as db:
             r = db.get(RuleChange, rule_change_id)
             if r is None:
+                return []
+            if user_id is not None and not is_admin and r.user_id != user_id:
                 return []
             return [{"id": r.id, "source_suggestion_id": r.source_suggestion_id,
                      "review_id": r.review_id, "stock_code": r.stock_code,
@@ -3540,11 +3614,13 @@ def get_rule_change(rule_change_id: int) -> dict | None:
                      "reason": r.reason, "evidence": r.evidence,
                      "expected_effect": r.expected_effect, "risk_note": r.risk_note,
                      "file_path": r.file_path, "insert_position": r.insert_position,
-                     "status": r.status, "rollback_reason": r.rollback_reason,
-                     "rollback_time": r.rollback_time, "operator": r.operator,
-                     "created_at": str(r.created_at)}]
+                      "status": r.status, "rollback_reason": r.rollback_reason,
+                      "rollback_time": r.rollback_time, "operator": r.operator,
+                      "user_id": r.user_id,
+                      "created_at": str(r.created_at)}]
 
-    rows = _dbq("rule_change", {"detail": rule_change_id}, _load)
+    rows = _dbq("rule_change", {"detail": rule_change_id, "user_id": user_id,
+                                "admin": is_admin}, _load)
     return rows[0] if rows else None
 
 
@@ -3575,6 +3651,7 @@ def adopt_rule_suggestion(suggestion_id: int, operator: str = "") -> int:
             file_path=sug.file_path,
             insert_position=sug.insert_position,
             operator=operator,
+            user_id=sug.user_id or (review.user_id if review else None),
         )
         db.add(change)
         sug.status = "approved"
@@ -3584,10 +3661,14 @@ def adopt_rule_suggestion(suggestion_id: int, operator: str = "") -> int:
         return change.id
 
 
-def rollback_rule_change(rule_change_id: int, reason: str) -> bool:
+def rollback_rule_change(rule_change_id: int, reason: str, user_id: int | None = None,
+                         *, is_admin: bool = False) -> bool:
     """一键回滚：status=active → rolled_back + 原因/时间留痕；返回是否成功"""
     with SessionLocal() as db:
-        row = db.get(RuleChange, rule_change_id)
+        stmt = select(RuleChange).where(RuleChange.id == rule_change_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(RuleChange.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None or row.status != "active":
             return False
         row.status = "rolled_back"

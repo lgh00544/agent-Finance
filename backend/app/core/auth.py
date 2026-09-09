@@ -28,6 +28,10 @@ def current_user_role() -> str | None:
     return _current_user_role.get()
 
 
+def current_user_is_admin() -> bool:
+    return current_user_role() == "admin"
+
+
 def set_user_context(user_id: int | None, role: str | None = None):
     """为后台线程显式设置请求等价的用户上下文，返回可用于 reset 的 token。"""
     return _current_user_id.set(user_id), _current_user_role.set(role)
@@ -78,9 +82,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
         reset_id = _current_user_id.set(user_id)
         reset_role = _current_user_role.set(role)
         try:
-            public = request.url.path in {"/api/auth/login", "/api/health", "/health"}
+            public = request.url.path in {
+                "/api/auth/login", "/api/auth/status", "/api/health", "/health",
+            }
             if settings.multi_user_enabled and not public and user is None:
                 return JSONResponse(status_code=401, content={"detail": "需要有效的 Bearer 会话令牌"})
+            if (settings.multi_user_enabled and role == "viewer"
+                    and request.method.upper() not in {"GET", "HEAD", "OPTIONS"}):
+                return JSONResponse(status_code=403, content={"detail": "viewer 仅允许只读访问"})
             response = await call_next(request)
             return response
         finally:
@@ -96,3 +105,10 @@ def require_user() -> int:
     if settings.multi_user_enabled:
         raise HTTPException(status_code=401, detail="未认证")
     return repo.ensure_default_user()
+
+
+def require_write_access() -> None:
+    """写操作授权入口；多人模式下 viewer 只能读。"""
+    require_user()
+    if settings.multi_user_enabled and current_user_role() == "viewer":
+        raise HTTPException(status_code=403, detail="viewer 仅允许只读访问")

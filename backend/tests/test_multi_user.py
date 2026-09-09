@@ -109,6 +109,90 @@ def test_redis_namespace_is_applied_to_backend_keys(monkeypatch):
     assert fake.calls[1][1][0] == "test-namespace:lock:job"
 
 
+def test_lock_owner_renew_and_release():
+    backend = cache_module.MemoryCache()
+    assert backend.acquire_lock_owner("leader", "a", ttl_seconds=10) is True
+    assert backend.get_lock_owner("leader") == "a"
+    assert backend.acquire_lock_owner("leader", "b", ttl_seconds=10) is False
+    assert backend.renew_lock_owner("leader", "b", ttl_seconds=10) is False
+    assert backend.renew_lock_owner("leader", "a", ttl_seconds=10) is True
+    backend.release_lock_owner("leader", "b")
+    assert backend.get_lock_owner("leader") == "a"
+    backend.release_lock_owner("leader", "a")
+    assert backend.get_lock_owner("leader") is None
+
+
+def test_scheduler_uses_owner_lease(monkeypatch):
+    from app.scheduler import jobs
+
+    class FakeCache:
+        def __init__(self):
+            self.owner = None
+            self.calls = []
+
+        def acquire_lock_owner(self, name, owner, ttl_seconds):
+            self.calls.append(("acquire", name, owner, ttl_seconds))
+            if self.owner is not None:
+                return False
+            self.owner = owner
+            return True
+
+        def renew_lock_owner(self, name, owner, ttl_seconds):
+            self.calls.append(("renew", name, owner, ttl_seconds))
+            return self.owner == owner
+
+        def release_lock_owner(self, name, owner):
+            self.calls.append(("release", name, owner))
+            if self.owner == owner:
+                self.owner = None
+
+        def get_lock_owner(self, name):
+            return self.owner
+
+        def acquire_lock(self, *args, **kwargs):
+            return True
+
+        def release_lock(self, *args, **kwargs):
+            return None
+
+        def set(self, *args, **kwargs):
+            return None
+
+        def get(self, *args, **kwargs):
+            return None
+
+    class FakeScheduler:
+        def __init__(self, **kwargs):
+            self.started = False
+
+        def add_job(self, *args, **kwargs):
+            return None
+
+        def start(self):
+            self.started = True
+
+        def shutdown(self, **kwargs):
+            self.started = False
+
+        def get_jobs(self):
+            return []
+
+    fake = FakeCache()
+    monkeypatch.setattr(jobs, "cache", fake)
+    monkeypatch.setattr(jobs, "BackgroundScheduler", FakeScheduler)
+    monkeypatch.setattr(jobs.settings, "multi_user_enabled", True)
+    monkeypatch.setattr(jobs.settings, "cache_backend", "redis")
+    jobs.stop_scheduler()
+    jobs.start_scheduler()
+    try:
+        assert jobs._leader_acquired is True
+        assert fake.calls[0][0] == "acquire"
+        assert fake.owner == jobs._leader_owner
+    finally:
+        jobs.stop_scheduler()
+    assert fake.owner is None
+
+
 def test_private_query_cache_is_scoped_to_user():
     owner = repo.create_user("cache-owner", "secret", "researcher")
     other = repo.create_user("cache-other", "secret", "researcher")
@@ -182,3 +266,90 @@ def test_position_plan_is_scoped_and_owned():
             db.query(PositionPlan).filter(PositionPlan.id.in_([owner_id, other_id])).delete(
                 synchronize_session=False)
             db.commit()
+
+
+def test_viewer_is_read_only(monkeypatch):
+    from app.api import routes
+    from fastapi import HTTPException
+
+    viewer = repo.create_user(f"viewer-{datetime.now().timestamp()}", "secret", "viewer")
+    monkeypatch.setattr(routes.settings, "multi_user_enabled", True)
+    tokens = auth.set_user_context(viewer["id"], "viewer")
+    try:
+        with pytest.raises(HTTPException) as exc:
+            routes.auth_user_create(routes.UserCreateBody(username="x", password="x"))
+        assert exc.value.status_code == 403
+        with pytest.raises(HTTPException) as exc:
+            routes.add_holding(routes.HoldingBody(
+                stock_code="600000", stock_name="x", entry_date="2026-09-09",
+                entry_price=1, shares=100))
+        assert exc.value.status_code == 403
+    finally:
+        auth.reset_user_context(tokens)
+
+
+def test_http_auth_login_and_viewer_guard(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    viewer = repo.create_user(f"http-viewer-{datetime.now().timestamp()}", "secret", "viewer")
+    monkeypatch.setattr("app.core.config.settings.multi_user_enabled", True)
+    monkeypatch.setattr("app.api.routes.settings.multi_user_enabled", True)
+    with TestClient(app) as client:
+        status = client.get("/api/auth/status")
+        assert status.status_code == 200
+        assert status.json()["multi_user_enabled"] is True
+        login = client.post("/api/auth/login", json={"username": viewer["username"], "password": "secret"})
+        assert login.status_code == 200
+        token = login.json()["access_token"]
+        denied = client.post("/api/public-facts", headers={"Authorization": f"Bearer {token}"},
+                             json={"fact_type": "quote", "source": "test", "symbol": "600000",
+                                   "fact_as_of": "2026-09-09", "payload": {"price": 1}})
+        assert denied.status_code == 403
+
+
+def test_private_knowledge_and_suggestion_are_object_scoped():
+    owner = repo.create_user(f"knowledge-owner-{datetime.now().timestamp()}", "secret", "researcher")
+    other = repo.create_user(f"knowledge-other-{datetime.now().timestamp()}", "secret", "researcher")
+    owner_tokens = auth.set_user_context(owner["id"], owner["role"])
+    try:
+        kid = repo.add_knowledge("甲方私有", "只属于甲方", user_id=owner["id"])
+        review_id = repo.insert_review("600922", "复盘甲", 0, "2026-09-09", 1, 1, {}, "", {},
+                                       user_id=owner["id"])
+        sid = repo.insert_agent_suggestion(review_id, "score", "k", "1", "2", "r", "e")
+    finally:
+        auth.reset_user_context(owner_tokens)
+    other_tokens = auth.set_user_context(other["id"], other["role"])
+    try:
+        assert repo.list_knowledge(user_id=other["id"]) == []
+        assert repo.delete_knowledge(kid, user_id=other["id"]) is False
+        assert repo.get_agent_suggestion_for_user(sid, other["id"]) is None
+    finally:
+        auth.reset_user_context(other_tokens)
+def test_shared_task_state_is_mirrored_when_redis_enabled(monkeypatch):
+    from app.services import task_queue
+
+    class FakeCache:
+        def __init__(self):
+            self.data = {}
+
+        def set(self, key, value, ttl):
+            self.data[key] = value
+
+        def get(self, key):
+            return self.data.get(key)
+
+    fake = FakeCache()
+    monkeypatch.setattr(task_queue, "cache", fake)
+    monkeypatch.setattr(task_queue.settings, "multi_user_enabled", True)
+    monkeypatch.setattr(task_queue.settings, "cache_backend", "redis")
+    owner = repo.create_user(f"task-owner-{datetime.now().timestamp()}", "secret", "researcher")
+    tid = task_queue.submit("shared_probe", "共享状态", lambda p: "ok",
+                            {"user_id": owner["id"], "user_role": owner["role"]})
+    deadline = datetime.now() + timedelta(seconds=3)
+    while datetime.now() < deadline:
+        row = task_queue.get(tid, owner["id"])
+        if row and row["status"] == "done":
+            break
+    shared = task_queue._load_shared_task(tid)
+    assert shared and shared["status"] == "done"

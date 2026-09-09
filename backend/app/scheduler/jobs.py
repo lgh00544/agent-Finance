@@ -7,6 +7,9 @@ APScheduler 定时任务（Asia/Shanghai）
 【刚性代码逻辑】只做调度，不包含任何市场判断。
 """
 import logging
+import os
+import socket
+import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -24,6 +27,47 @@ logger = get_logger("scheduler")
 
 scheduler: BackgroundScheduler | None = None
 _leader_acquired = False
+_leader_owner = f"{socket.gethostname()}:{os.getpid()}"
+_leader_stop = threading.Event()
+_leader_thread: threading.Thread | None = None
+
+
+def _leader_ttl_seconds() -> int:
+    return max(30, int(settings.scheduler_leader_ttl_seconds))
+
+
+def _leader_renew_seconds() -> int:
+    return max(5, min(int(settings.scheduler_leader_renew_seconds), _leader_ttl_seconds() // 2))
+
+
+def _leader_renew_loop() -> None:
+    global scheduler, _leader_acquired
+    while not _leader_stop.wait(_leader_renew_seconds()):
+        if not _leader_acquired:
+            return
+        try:
+            ok = cache.renew_lock_owner("scheduler:leader", _leader_owner, _leader_ttl_seconds())
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            logger.error("调度 leader 租约续期失败: %s", exc)
+        if not ok:
+            logger.error("调度 leader 租约丢失，停止本实例 APScheduler")
+            if scheduler is not None:
+                try:
+                    scheduler.shutdown(wait=False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("停止失租调度器失败: %s", exc)
+                scheduler = None
+            _leader_acquired = False
+            return
+
+
+def _start_leader_renewal() -> None:
+    global _leader_thread
+    _leader_stop.clear()
+    _leader_thread = threading.Thread(
+        target=_leader_renew_loop, name="scheduler-leader-renew", daemon=True)
+    _leader_thread.start()
 
 
 def _mark_sector_job(job_key: str, success: bool, error: str | None = None) -> None:
@@ -723,10 +767,11 @@ def start_scheduler() -> None:
         if settings.cache_backend != "redis":
             logger.error("多人模式拒绝启动调度：必须配置共享 Redis")
             return
-        if not cache.acquire_lock("scheduler:leader", ttl_seconds=86400):
+        if not cache.acquire_lock_owner("scheduler:leader", _leader_owner, _leader_ttl_seconds()):
             logger.warning("多人模式当前实例不是调度 leader，跳过 APScheduler")
             return
         _leader_acquired = True
+        _start_leader_renewal()
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     # 工作日 16:00 候选池 T+N 验证（16:10 每日挖掘之前，验证前一日候选）
     scheduler.add_job(track_verify_job, "cron",
@@ -898,7 +943,8 @@ def stop_scheduler() -> None:
         scheduler.shutdown(wait=False)
         scheduler = None
     if _leader_acquired:
-        cache.release_lock("scheduler:leader")
+        _leader_stop.set()
+        cache.release_lock_owner("scheduler:leader", _leader_owner)
         _leader_acquired = False
 
 
@@ -925,4 +971,6 @@ def job_status() -> list[dict]:
     out.append({"id": "last_sector_daily", "name": "最近板块轮动日快照", "next_run": cache.get("job:last_sector_daily")})
     out.append({"id": "last_audit_pending", "name": "最近建议辩证审核", "next_run": cache.get("job:last_audit_pending"),
                 "error": cache.get("job:last_audit_pending_error")})
+    out.append({"id": "scheduler_leader", "name": "调度 leader",
+                "next_run": cache.get_lock_owner("scheduler:leader") or ""})
     return out

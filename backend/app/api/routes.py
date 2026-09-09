@@ -18,7 +18,13 @@ from pydantic import BaseModel, Field
 
 from app.agents.review import llm_rethink_suggestion
 from app.core.config import settings
-from app.core.auth import current_user_role, require_user, issue_token
+from app.core.auth import (
+    current_user_is_admin,
+    current_user_role,
+    issue_token,
+    require_user,
+    require_write_access,
+)
 from app.db import repo
 from app.graph import router as graph_router
 from app.scheduler import jobs as scheduler_jobs
@@ -36,9 +42,41 @@ def _request_user_id() -> int:
     return require_user()
 
 
+def _is_admin() -> bool:
+    return current_user_is_admin()
+
+
+def _require_owned_holding(hid: int, *, active_only: bool = False):
+    holding = repo.get_holding_for_user(hid, _request_user_id(), is_admin=_is_admin())
+    if holding is None or (active_only and holding.status != "holding"):
+        raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
+    return holding
+
+
+def _require_owned_review(rid: int):
+    review = repo.get_review_for_user(rid, _request_user_id(), is_admin=_is_admin())
+    if review is None:
+        raise HTTPException(status_code=404, detail="复盘记录不存在")
+    return review
+
+
+def _require_owned_agent_suggestion(sid: int):
+    suggestion = repo.get_agent_suggestion_for_user(sid, _request_user_id(), is_admin=_is_admin())
+    if suggestion is None:
+        raise HTTPException(status_code=404, detail="建议不存在")
+    return suggestion
+
+
+def _require_owned_paper_review(review_id: int):
+    review = repo.get_paper_review_for_user(review_id, _request_user_id(), is_admin=_is_admin())
+    if review is None:
+        raise HTTPException(status_code=404, detail="模拟复盘不存在")
+    return review
+
+
 def _paper_account_for_request(account_id: int):
     row = repo.get_paper_account_for_user(
-        account_id, _request_user_id(), is_admin=current_user_role() == "admin")
+        account_id, _request_user_id(), is_admin=_is_admin())
     if row is None:
         raise HTTPException(status_code=404, detail="模拟账户不存在")
     return row
@@ -81,6 +119,7 @@ def auth_login(body: LoginBody):
 
 @router.post("/auth/users")
 def auth_user_create(body: UserCreateBody):
+    require_write_access()
     if current_user_role() not in (None, "admin") and settings.multi_user_enabled:
         raise HTTPException(status_code=403, detail="仅管理员可创建用户")
     try:
@@ -96,6 +135,7 @@ def public_facts(symbol: str | None = None, fact_type: str | None = None, limit:
 
 @router.post("/public-facts")
 def public_fact_upsert(body: PublicFactBody):
+    require_write_access()
     forbidden = {"user_id", "account_id", "preference", "portfolio", "holding", "private"}
     if forbidden.intersection(body.payload):
         raise HTTPException(status_code=400, detail="公共事实不得包含用户私有字段")
@@ -388,7 +428,21 @@ def _task_batch_ask(params: dict) -> dict:
 def _submit_task(kind: str, params: dict) -> dict:
     """提交后台任务：立即返回任务ID，页面可自由切换；
     同类型任务正在执行/排队时拒绝（重复触发防护，防脏数据与资源浪费）"""
-    if task_queue.has_active(kind):
+    require_write_access()
+    if kind == "sell_decision" and params.get("holding_id") is not None:
+        _require_owned_holding(int(params["holding_id"]), active_only=True)
+    if kind == "review" and params.get("holding_id") is not None:
+        _require_owned_holding(int(params["holding_id"]))
+    if kind == "review_rethink" and params.get("review_id") is not None:
+        _require_owned_review(int(params["review_id"]))
+    if kind == "audit_one" and params.get("suggestion_id") is not None:
+        _require_owned_agent_suggestion(int(params["suggestion_id"]))
+    try:
+        active = task_queue.has_active(kind, _request_user_id(), is_admin=_is_admin())
+    except TypeError:
+        # 兼容旧测试/插件替换的单参数 has_active。
+        active = task_queue.has_active(kind)
+    if active:
         raise HTTPException(status_code=409,
                             detail=f"已有同类任务（{_TASK_KINDS[kind][0]}）正在执行，"
                                    f"请等待其完成后重试")
@@ -1117,6 +1171,8 @@ def paper_review_create(account_id: int, body: PaperReviewBody):
 @router.post("/paper/reviews/{review_id}/ai-audit")
 def paper_review_ai_audit(review_id: int):
     """调用现有 Review LLM 通道做模拟复盘审核；审核通过才可进入 paper shadow。"""
+    require_write_access()
+    _require_owned_paper_review(review_id)
     try:
         from app.agents.paper_review import audit_review
         result = audit_review(review_id)
@@ -1133,6 +1189,8 @@ def paper_review_ai_audit(review_id: int):
 
 @router.post("/paper/reviews/{review_id}/shadow")
 def paper_review_shadow(review_id: int):
+    require_write_access()
+    _require_owned_paper_review(review_id)
     try:
         result = repo.mark_paper_shadow(review_id)
     except ValueError as exc:
@@ -1278,6 +1336,7 @@ class PlanStatusBody(BaseModel):
 @router.post("/positions/{plan_id}/status")
 def update_plan_status(plan_id: int, body: PlanStatusBody):
     """人工确认建仓方案状态；只更新方案生命周期，不自动下单、不自动转持仓。"""
+    require_write_access()
     status = body.status.strip()
     if status not in {"accepted", "abandoned"}:
         raise HTTPException(status_code=400, detail="计划状态只能为 accepted/abandoned")
@@ -1327,6 +1386,7 @@ def holding_quotes():
 @router.post("/holdings")
 def add_holding(body: HoldingBody):
     """新增持仓（人工建仓后录入，触发创建后建议手动跑 monitor）"""
+    require_write_access()
     code = body.stock_code.strip()
     if not code:
         raise HTTPException(status_code=400, detail="股票代码不能为空")
@@ -1359,6 +1419,7 @@ def add_holding(body: HoldingBody):
 def exit_holding(hid: int, body: ExitBody):
     """记录卖出：股数清零则标记 exited 并自动触发 ReviewAgent 复盘。
     流水与持仓更新单事务写入（K223 留痕与事实一致）。"""
+    require_write_access()
     holding = repo.get_holding_for_user(hid, _request_user_id(),
                                         is_admin=current_user_role() == "admin")
     if holding is None or holding.status != "holding":
@@ -1402,6 +1463,7 @@ class CostAdjustBody(BaseModel):
 def add_shares(hid: int, body: AddSharesBody):
     """手动加仓：加权成本重算 + C3 止损（成本×0.92，知识库红线）联动 + buy 流水留痕。
     流水与持仓更新单事务写入。"""
+    require_write_access()
     holding = repo.get_holding_for_user(hid, _request_user_id(),
                                         is_admin=current_user_role() == "admin")
     if holding is None or holding.status != "holding":
@@ -1429,6 +1491,7 @@ def add_shares(hid: int, body: AddSharesBody):
 def adjust_cost(hid: int, body: CostAdjustBody):
     """手动成本修正：成本联动 C3 止损重算，adjust 流水留痕（原因必填）。
     流水与持仓更新单事务写入。"""
+    require_write_access()
     holding = repo.get_holding_for_user(hid, _request_user_id(),
                                         is_admin=current_user_role() == "admin")
     if holding is None or holding.status != "holding":
@@ -1468,9 +1531,8 @@ def holding_trades(hid: int):
 @router.post("/holdings/{hid}/monitor")
 def trigger_monitor(hid: int):
     """立即执行一次持仓监控（仅限当前有效持仓；已清仓标的不再监控）"""
-    holding = repo.get_holding(hid)
-    if holding is None or holding.status != "holding":
-        raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
+    require_write_access()
+    holding = _require_owned_holding(hid, active_only=True)
     try:
         result = graph_router.run_monitor(hid)
     except Exception as exc:  # noqa: BLE001
@@ -1482,13 +1544,16 @@ def trigger_monitor(hid: int):
 @router.post("/holdings/{hid}/sell-decision")
 def trigger_sell_decision(hid: int):
     """生成一次卖出决策（SellAgent；异步提交，决策仅供参考，卖出由人工执行）"""
+    _require_owned_holding(hid, active_only=True)
     return _submit_task("sell_decision", {"holding_id": hid})
 
 
 @router.get("/holdings/{hid}/sell-decisions")
 def list_sell_decisions(hid: int, limit: int = 10):
     """读取该持仓的历史卖出决策记录（仅供参考）"""
-    return repo.list_sell_decisions(hid, limit)
+    holding = _require_owned_holding(hid)
+    return repo.list_sell_decisions(hid, limit, user_id=holding.user_id,
+                                    is_admin=_is_admin())
 
 
 # ================= OCR 持仓截图识别 =================
@@ -1549,9 +1614,8 @@ def adopt_review_suggestion(rid: int):
     有 profile_suggestion 时更新个人偏好档案；只有通用 feedback 时，仅激活
     对应 AgentPreference 版本作为评分参考。两条路径都必须由人工显式触发。
     """
-    review = repo.get_review(rid)
-    if review is None:
-        raise HTTPException(status_code=404, detail="复盘记录不存在")
+    require_write_access()
+    review = _require_owned_review(rid)
     suggestion = (review.feedback or {}).get("profile_suggestion")
 
     version = None
@@ -1577,9 +1641,8 @@ def reject_review_suggestion(rid: int, body: RejectReviewBody):
     reason = body.reason.strip()
     if not reason:
         raise HTTPException(status_code=400, detail="驳回原因不能为空")
-    review = repo.get_review(rid)
-    if review is None:
-        raise HTTPException(status_code=404, detail="复盘记录不存在")
+    require_write_access()
+    review = _require_owned_review(rid)
     if review.suggest_status == "adopted":
         raise HTTPException(status_code=400, detail="该建议已采纳，不能再驳回")
     task = _submit_task("review_rethink", {"review_id": rid, "reason": reason})
@@ -1597,6 +1660,7 @@ def get_profile():
 @router.put("/profile")
 def put_profile(body: dict):
     """整体更新偏好档案（保存立即生效，无需重启）"""
+    require_write_access()
     if not isinstance(body, dict) or "content" not in body:
         raise HTTPException(status_code=400, detail="body 需包含 content 对象")
     version = repo.update_trade_profile(body["content"])
@@ -1606,6 +1670,7 @@ def put_profile(body: dict):
 @router.post("/profile/import")
 def import_profile(body: dict):
     """导入偏好 JSON（跨环境迁移）"""
+    require_write_access()
     if not isinstance(body, dict) or "content" not in body:
         raise HTTPException(status_code=400, detail="body 需包含 content 对象")
     version = repo.update_trade_profile(body["content"])
@@ -1644,7 +1709,7 @@ def list_knowledge(agent_tag: Optional[str] = None, status: Optional[str] = None
     rows = repo.list_knowledge(
         agent_tag, status=status, source_type=source_type,
         methodology_type=methodology_type, market_scope=market_scope,
-        scenario_tag=scenario_tag,
+        scenario_tag=scenario_tag, user_id=_request_user_id(), is_admin=_is_admin(),
     )
     return [{"id": r.id, "title": r.title, "content": r.content, "agent_tag": r.agent_tag,
              "hit_count": r.hit_count, "last_used_at": str(r.last_used_at) if r.last_used_at else None,
@@ -1666,18 +1731,21 @@ def list_knowledge_shadow_hits(knowledge_id: Optional[int] = None, agent: Option
 
 @router.post("/knowledge/shadow/refresh-outcomes")
 def refresh_knowledge_shadow_outcomes():
+    require_write_access()
     return repo.refresh_knowledge_shadow_outcomes()
 
 
 @router.post("/knowledge")
 def create_knowledge(body: KnowledgeBody):
     """新增知识条目（保存后自动进入对应 Agent 的检索注入，无需重启）"""
+    require_write_access()
     kid = repo.add_knowledge(
         body.title, body.content, body.agent_tag,
         source_type=body.source_type, methodology_type=body.methodology_type,
         market_scope=body.market_scope, scenario_tags=body.scenario_tags,
         evidence_level=body.evidence_level, valid_from=body.valid_from,
         valid_to=body.valid_to, status=body.status, risk_note=body.risk_note,
+        user_id=_request_user_id(),
     )
     return {"id": kid}
 
@@ -1689,8 +1757,10 @@ class KnowledgeStatusBody(BaseModel):
 
 @router.post("/knowledge/{kid}/status")
 def change_knowledge_status(kid: int, body: KnowledgeStatusBody):
+    require_write_access()
     try:
-        ok = repo.update_knowledge_status(kid, body.status, body.reason)
+        ok = repo.update_knowledge_status(kid, body.status, body.reason,
+                                          user_id=_request_user_id(), is_admin=_is_admin())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not ok:
@@ -1700,7 +1770,8 @@ def change_knowledge_status(kid: int, body: KnowledgeStatusBody):
 
 @router.post("/knowledge/{kid}/delete")
 def remove_knowledge(kid: int):
-    ok = repo.delete_knowledge(kid)
+    require_write_access()
+    ok = repo.delete_knowledge(kid, user_id=_request_user_id(), is_admin=_is_admin())
     if not ok:
         raise HTTPException(status_code=404, detail="知识条目不存在")
     return {"deleted": True}
@@ -1726,7 +1797,8 @@ def batch_import_knowledge(body: KnowledgeBatchBody):
 @router.get("/agent-suggestions")
 def list_agent_suggestions(status: Optional[str] = None, target_agent: Optional[str] = None):
     """复盘进化Agent 提出的各 Agent 规则/参数优化建议（默认全部；可过滤）"""
-    suggestions = repo.get_agent_suggestions(status=status)
+    suggestions = repo.get_agent_suggestions(
+        status=status, user_id=_request_user_id(), is_admin=_is_admin())
     if target_agent:
         suggestions = [s for s in suggestions if s.target_agent == target_agent]
     return [{"id": s.id, "review_id": s.review_id, "target_agent": s.target_agent,
@@ -1749,6 +1821,8 @@ def list_agent_suggestions(status: Optional[str] = None, target_agent: Optional[
 @router.get("/audit-log")
 def get_audit_log_detail(target_type: str, target_id: int):
     """通用审核 Agent：最新一条审核记录（含 dissent_view 完整字段）；无 → 404"""
+    if target_type == "agent_suggestion":
+        _require_owned_agent_suggestion(target_id)
     row = repo.get_latest_audit_log_by_target(target_type, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
@@ -1758,8 +1832,7 @@ def get_audit_log_detail(target_type: str, target_id: int):
 @router.post("/audit/re_audit/{suggestion_id}")
 def re_audit_suggestion(suggestion_id: int):
     """手动触发单条建议 AI 审核；提交后台任务，不在 HTTP 请求里等待 LLM。"""
-    if repo.get_agent_suggestion(suggestion_id) is None:
-        raise HTTPException(status_code=404, detail="建议不存在")
+    _require_owned_agent_suggestion(suggestion_id)
     return _submit_task("audit_one", {"suggestion_id": suggestion_id})
 
 
@@ -1780,9 +1853,8 @@ def approve_agent_suggestion(sid: int, body: ApproveSuggestionBody | None = None
     """人工审核：采纳建议（⚠️ 仅人工触发；系统禁止自动、无监督修改任何策略参数）
     profile 类建议 → 直接写入个人交易偏好档案（版本号+1 全部 Agent 生效）；
     prompt/规则类建议 → 请走 POST /agent-suggestions/{sid}/adopt 一键采纳自动落地。"""
-    suggestion = repo.get_agent_suggestion(sid)
-    if suggestion is None:
-        raise HTTPException(status_code=404, detail="建议不存在")
+    require_write_access()
+    suggestion = _require_owned_agent_suggestion(sid)
     if suggestion.status != "pending":
         raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
     if suggestion.target_kind != "profile":
@@ -1806,9 +1878,8 @@ def approve_agent_suggestion(sid: int, body: ApproveSuggestionBody | None = None
 @router.post("/agent-suggestions/{sid}/reject")
 def reject_agent_suggestion(sid: int, body: RejectSuggestionBody | None = None):
     """人工审核：驳回建议（不修改任何配置）；reason 为驳回原因，落库留痕（审核可追溯）"""
-    suggestion = repo.get_agent_suggestion(sid)
-    if suggestion is None:
-        raise HTTPException(status_code=404, detail="建议不存在")
+    require_write_access()
+    suggestion = _require_owned_agent_suggestion(sid)
     if suggestion.status != "pending":
         raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
     reason = (body.reason if body else "") or ""
@@ -1819,9 +1890,8 @@ def reject_agent_suggestion(sid: int, body: RejectSuggestionBody | None = None):
 @router.post("/agent-suggestions/{sid}/re_review")
 def re_review_agent_suggestion(sid: int):
     """重新审核：仅允许已驳回建议回到待审核，并清空驳回原因。"""
-    suggestion = repo.get_agent_suggestion(sid)
-    if suggestion is None:
-        raise HTTPException(status_code=404, detail="建议不存在")
+    require_write_access()
+    suggestion = _require_owned_agent_suggestion(sid)
     if suggestion.status != "rejected":
         raise HTTPException(status_code=400, detail=f"仅已驳回建议可重新审核（{suggestion.status}）")
     row = repo.reset_agent_suggestion_to_pending(sid)
@@ -1920,9 +1990,8 @@ def adopt_agent_suggestion(sid: int, body: AdoptSuggestionBody | None = None):
     → 版本指纹入缓存键，LLM 缓存自动失效；硬规则需二次确认（confirm=True）。
     文件路径/插入位置仅作展示元数据，绝不写入源码文件。"""
     confirm = body.confirm if body else False
-    suggestion = repo.get_agent_suggestion(sid)
-    if suggestion is None:
-        raise HTTPException(status_code=404, detail="建议不存在")
+    require_write_access()
+    suggestion = _require_owned_agent_suggestion(sid)
     if suggestion.status != "pending":
         raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
     if suggestion.target_kind == "profile":
@@ -1960,9 +2029,11 @@ def list_rule_changes(status: Optional[str] = None, target_agent: Optional[str] 
                       suggestion_id: Optional[int] = None, limit: int = 50):
     """规则变更记录（一键采纳/回滚全量留痕，时间倒序；记录页数据源；
     suggestion_id 过滤供复盘页回显某条建议的生效记录）"""
-    rows = repo.list_rule_changes(status, target_agent, suggestion_id, limit)
+    rows = repo.list_rule_changes(status, target_agent, suggestion_id, limit,
+                                  user_id=_request_user_id(), is_admin=_is_admin())
     for row in rows:
-        sug = repo.get_agent_suggestion(row.get("source_suggestion_id") or 0)
+        sug = repo.get_agent_suggestion_for_user(
+            row.get("source_suggestion_id") or 0, _request_user_id(), is_admin=_is_admin())
         row["audit_verdict"] = getattr(sug, "audit_verdict", None) or "pending"
         row["audit_round"] = getattr(sug, "audit_round", 0) or 0
         row["last_audit_id"] = getattr(sug, "last_audit_id", None)
@@ -1972,7 +2043,7 @@ def list_rule_changes(status: Optional[str] = None, target_agent: Optional[str] 
 @router.get("/rule-changes/{rid}")
 def get_rule_change_detail(rid: int):
     """规则变更完整详情（变更前后对比/落地元数据/回滚原因）"""
-    row = repo.get_rule_change(rid)
+    row = repo.get_rule_change(rid, user_id=_request_user_id(), is_admin=_is_admin())
     if row is None:
         raise HTTPException(status_code=404, detail="规则变更记录不存在")
     return row
@@ -1981,10 +2052,11 @@ def get_rule_change_detail(rid: int):
 @router.post("/rule-changes/{rid}/rollback")
 def rollback_rule_change(rid: int, body: RollbackRuleBody):
     """一键回滚：恢复变更前状态（status → rolled_back，原因/时间留痕，全程可追溯）"""
+    require_write_access()
     reason = body.reason.strip()
     if not reason:
         raise HTTPException(status_code=400, detail="回滚原因不能为空")
-    ok = repo.rollback_rule_change(rid, reason)
+    ok = repo.rollback_rule_change(rid, reason, user_id=_request_user_id(), is_admin=_is_admin())
     if not ok:
         raise HTTPException(status_code=404, detail="规则变更记录不存在或已回滚")
     return {"rolled_back": True, "rule_change_id": rid, "reason": reason}

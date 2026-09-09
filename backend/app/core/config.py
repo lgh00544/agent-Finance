@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     auth_default_username: str = "legacy"
     auth_default_password: str = ""
     redis_namespace: str = "stock-agent"
+    scheduler_leader_ttl_seconds: int = 90
+    scheduler_leader_renew_seconds: int = 30
     server_port: int = 8100
     sqlite_path: str = ""
     qdrant_local_path: str = ""
