@@ -23,6 +23,7 @@ from app.graph import router as graph_router
 logger = get_logger("scheduler")
 
 scheduler: BackgroundScheduler | None = None
+_leader_acquired = False
 
 
 def _mark_sector_job(job_key: str, success: bool, error: str | None = None) -> None:
@@ -190,7 +191,12 @@ def paper_execution_job() -> None:
         for review in repo.list_paper_reviews(limit=200):
             if review.get("audit_status") == "pending":
                 try:
-                    audit_review(review["id"])
+                    from app.core.auth import reset_user_context, set_user_context
+                    tokens = set_user_context(review.get("user_id") or 1, "admin")
+                    try:
+                        audit_review(review["id"])
+                    finally:
+                        reset_user_context(tokens)
                 except Exception as exc:  # noqa: BLE001 审核失败不伪造通过
                     logger.warning("模拟复盘 AI 审核失败 review#%s: %s", review.get("id"), exc)
         cache.set("job:last_paper_execution", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
@@ -217,11 +223,20 @@ def paper_monitor_job() -> None:
         from app.services import paper_execution, paper_monitor
         for account in repo.list_paper_accounts(status="active"):
             try:
-                paper_execution.run(account["id"], today)
+                from app.core.auth import reset_user_context, set_user_context
+                tokens = set_user_context(account.get("user_id") or 1, "admin")
+                try:
+                    paper_execution.run(account["id"], today)
+                finally:
+                    reset_user_context(tokens)
             except Exception as exc:
                 logger.warning("模拟账户 %s 盘中建仓执行失败: %s", account.get("id"), exc)
             try:
-                paper_monitor.run(account["id"], today)
+                tokens = set_user_context(account.get("user_id") or 1, "admin")
+                try:
+                    paper_monitor.run(account["id"], today)
+                finally:
+                    reset_user_context(tokens)
             except Exception as exc:
                 logger.warning("模拟账户 %s 盘中监控失败: %s", account.get("id"), exc)
         cache.set("job:last_paper_monitor", now.strftime("%Y-%m-%d %H:%M:%S"), 86400)
@@ -701,9 +716,17 @@ def feishu_daily_report_job() -> None:
 
 
 def start_scheduler() -> None:
-    global scheduler
+    global scheduler, _leader_acquired
     if scheduler is not None:
         return
+    if settings.multi_user_enabled:
+        if settings.cache_backend != "redis":
+            logger.error("多人模式拒绝启动调度：必须配置共享 Redis")
+            return
+        if not cache.acquire_lock("scheduler:leader", ttl_seconds=86400):
+            logger.warning("多人模式当前实例不是调度 leader，跳过 APScheduler")
+            return
+        _leader_acquired = True
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     # 工作日 16:00 候选池 T+N 验证（16:10 每日挖掘之前，验证前一日候选）
     scheduler.add_job(track_verify_job, "cron",
@@ -870,10 +893,13 @@ def start_scheduler() -> None:
 
 
 def stop_scheduler() -> None:
-    global scheduler
+    global scheduler, _leader_acquired
     if scheduler is not None:
         scheduler.shutdown(wait=False)
         scheduler = None
+    if _leader_acquired:
+        cache.release_lock("scheduler:leader")
+        _leader_acquired = False
 
 
 def job_status() -> list[dict]:

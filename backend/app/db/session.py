@@ -43,7 +43,7 @@ def _build_engine_url() -> str:
     # 默认：SQLite 单文件（SQLITE_PATH 便于测试隔离）
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    db_file = os.environ.get("SQLITE_PATH") or (data_dir / "dev.db")
+    db_file = os.environ.get("SQLITE_PATH") or settings.sqlite_path or (data_dir / "dev.db")
     return f"sqlite:///{db_file}"
 
 
@@ -164,6 +164,8 @@ def init_db() -> dict:
         _ensure_quote_snapshot_table()
         _ensure_distribution_phase_table()
         _ensure_capital_view_tables()
+        _ensure_identity_tables()
+        _ensure_user_columns()
         knowledge = _ensure_knowledge_hit_columns()
         experience = _ensure_experience_curator_columns()
     except Exception as exc:  # noqa: BLE001 startup must expose migration failures
@@ -196,6 +198,45 @@ def init_db() -> dict:
         len(experience["existing"]),
     )
     return _LAST_INIT_DB_RESULT
+
+
+def _ensure_identity_tables() -> None:
+    """创建用户/会话/公共事实表并为历史单用户数据准备默认主体。"""
+    from app.db.models import PublicFactSnapshot, User, UserSession
+    Base.metadata.create_all(bind=engine, tables=[
+        User.__table__, UserSession.__table__, PublicFactSnapshot.__table__,
+    ])
+    from app.db import repo
+    default_id = repo.ensure_default_user()
+    _ = default_id
+
+
+def _ensure_user_columns() -> None:
+    """给既有私有表增加可空归属列，并把旧数据归档到默认用户。"""
+    from app.db import repo
+    default_id = repo.ensure_default_user()
+    tables = (
+        "position_plan", "holding", "trade_record", "alert_log", "review_result",
+        "agent_preference", "sys_trade_profile", "private_knowledge", "sell_decision",
+        "account_baseline", "account_pnl_snapshot", "agent_suggestion", "rule_change",
+        "agent_chat_message", "paper_account", "paper_position", "paper_execution",
+        "paper_review", "paper_quote_snapshot", "paper_context", "paper_web_evidence",
+        "paper_alert",
+    )
+    with engine.begin() as conn:
+        for table in tables:
+            existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")} \
+                if engine.dialect.name == "sqlite" else set()
+            if "user_id" not in existing:
+                try:
+                    _add_column(conn, table, "user_id", "INTEGER NULL")
+                except Exception:
+                    if engine.dialect.name != "sqlite":
+                        raise
+            conn.exec_driver_sql(
+                f"UPDATE {table} SET user_id = :user_id WHERE user_id IS NULL",
+                {"user_id": default_id},
+            )
 
 
 def _ensure_experience_fts() -> None:

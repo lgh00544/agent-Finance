@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router as api_router
 from app.core.logging import setup_logging
+from app.core.auth import AuthMiddleware
 from app.db import repo
 from app.db.session import init_db
 from app.scheduler.jobs import start_scheduler, stop_scheduler
@@ -55,6 +56,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Stock Agent Decision System", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuthMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

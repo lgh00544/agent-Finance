@@ -157,7 +157,12 @@ def _run(tid: str) -> None:
         fn = task["_fn"]
         params = task["params"]
     token = _current_attempt.set((tid, attempt_id))
+    user_tokens = None
     try:
+        user_id = params.get("user_id") if isinstance(params, dict) else None
+        if user_id is not None:
+            from app.core.auth import set_user_context
+            user_tokens = set_user_context(user_id, params.get("user_role"))
         result = fn(params)  # 执行函数统一签名 fn(params: dict)
         with _lock:
             current = _tasks.get(tid)
@@ -181,6 +186,9 @@ def _run(tid: str) -> None:
                 current["error"] = str(exc)
         logger.error("后台任务 %s(%s) 失败: %s", task["kind"], tid, exc)
     finally:
+        if user_tokens is not None:
+            from app.core.auth import reset_user_context
+            reset_user_context(user_tokens)
         _current_attempt.reset(token)
         with _lock:
             current = _tasks.get(tid)

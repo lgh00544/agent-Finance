@@ -110,29 +110,34 @@ class RedisCache(CacheBackend):
     def __init__(self) -> None:
         self._client = redis_lib.from_url(settings.redis_url, decode_responses=True)
 
+    @staticmethod
+    def _key(key: str) -> str:
+        return f"{settings.redis_namespace}:{key}"
+
     def get(self, key: str) -> str | None:
-        return self._client.get(key)
+        return self._client.get(self._key(key))
 
     def set(self, key: str, value: str, ttl_seconds: int) -> None:
-        self._client.set(key, value, ex=ttl_seconds)
+        self._client.set(self._key(key), value, ex=ttl_seconds)
 
     def delete(self, key: str) -> None:
-        self._client.delete(key)
+        self._client.delete(self._key(key))
 
     def delete_prefix(self, prefix: str) -> None:
         cursor = 0
         while True:
-            cursor, keys = self._client.scan(cursor, match=f"{prefix}*", count=200)
+            cursor, keys = self._client.scan(cursor, match=f"{self._key(prefix)}*", count=200)
             if keys:
                 self._client.delete(*keys)
             if cursor == 0:
                 break
 
     def acquire_lock(self, lock_name: str, ttl_seconds: int = 3600) -> bool:
-        return bool(self._client.set(f"lock:{lock_name}", "1", nx=True, ex=ttl_seconds))
+        return bool(self._client.set(self._key(f"lock:{lock_name}"), "1",
+                                     nx=True, ex=ttl_seconds))
 
     def release_lock(self, lock_name: str) -> None:
-        self._client.delete(f"lock:{lock_name}")
+        self._client.delete(self._key(f"lock:{lock_name}"))
 
 
 def get_cache() -> CacheBackend:

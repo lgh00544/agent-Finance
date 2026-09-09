@@ -31,7 +31,8 @@ from app.db.models import (
     SectorNewsAIInterpret, SectorNewsArticle, SectorNewsFeedback, SectorNewsShadowVerify,
     SectorRegimeForecast,
     SellDecision, StockCandidate, StockScore, TradeProfile,
-    TradeRecord, WorkerRun, _now, DistributionPhaseLog,
+    TradeRecord, WorkerRun, _now, DistributionPhaseLog, User, UserSession,
+    PublicFactSnapshot,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace, task_queue
@@ -41,6 +42,115 @@ logger = logging.getLogger(__name__)
 
 def _json(value: Any) -> Any:
     return value if value is not None else None
+
+
+# ==================== 多人身份与公共事实 ====================
+
+def ensure_default_user() -> int:
+    """幂等创建旧单用户兼容主体并回填其 id。"""
+    from app.core.auth import hash_password
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(User.id == 1)).scalar_one_or_none()
+        if row is None:
+            row = User(id=1, username=settings.auth_default_username,
+                       password_hash=hash_password(settings.auth_default_password or "legacy"),
+                       role="admin")
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        return row.id
+
+
+def create_user(username: str, password: str, role: str = "researcher") -> dict:
+    if role not in {"admin", "researcher", "viewer"}:
+        raise ValueError("角色仅支持 admin/researcher/viewer")
+    from app.core.auth import hash_password
+    with SessionLocal() as db:
+        if db.execute(select(User).where(User.username == username)).scalar_one_or_none():
+            raise ValueError("用户名已存在")
+        row = User(username=username.strip(), password_hash=hash_password(password),
+                   role=role, is_active=True)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"id": row.id, "username": row.username, "role": row.role,
+                "is_active": row.is_active}
+
+
+def get_user_by_credentials(username: str, password: str) -> dict | None:
+    from app.core.auth import verify_password
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(User.username == username.strip(),
+                                             User.is_active.is_(True))).scalar_one_or_none()
+        if row is None or not verify_password(password, row.password_hash):
+            return None
+        return {"id": row.id, "username": row.username, "role": row.role,
+                "is_active": row.is_active}
+
+
+def create_user_session(user_id: int, token: str, expires_at: datetime) -> int:
+    with SessionLocal() as db:
+        row = UserSession(user_id=user_id,
+                          token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                          expires_at=expires_at)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def get_user_by_token(token: str) -> dict | None:
+    if not token:
+        return None
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with SessionLocal() as db:
+        row = db.execute(
+            select(User, UserSession).join(UserSession, UserSession.user_id == User.id).where(
+                UserSession.token_hash == digest, UserSession.revoked_at.is_(None),
+                UserSession.expires_at > _now(), User.is_active.is_(True))
+        ).first()
+        if row is None:
+            return None
+        user, _session = row
+        return {"id": user.id, "username": user.username, "role": user.role,
+                "is_active": user.is_active}
+
+
+def upsert_public_fact(fact_type: str, source: str, symbol: str, fact_as_of: str,
+                       payload: dict, content_hash: str | None = None) -> dict:
+    digest = content_hash or hashlib.sha256(
+        json.dumps(payload or {}, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+    with SessionLocal() as db:
+        row = db.execute(select(PublicFactSnapshot).where(
+            PublicFactSnapshot.source == source, PublicFactSnapshot.symbol == symbol,
+            PublicFactSnapshot.fact_as_of == fact_as_of,
+            PublicFactSnapshot.content_hash == digest)).scalar_one_or_none()
+        if row is None:
+            row = PublicFactSnapshot(fact_type=fact_type, source=source, symbol=symbol,
+                                     fact_as_of=fact_as_of, content_hash=digest,
+                                     payload=payload or {})
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        return {"id": row.id, "fact_type": row.fact_type, "source": row.source,
+                "symbol": row.symbol, "fact_as_of": row.fact_as_of,
+                "content_hash": row.content_hash, "payload": row.payload or {}}
+
+
+def list_public_facts(symbol: str | None = None, fact_type: str | None = None,
+                      limit: int = 100) -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(PublicFactSnapshot).order_by(PublicFactSnapshot.id.desc())
+        if symbol:
+            stmt = stmt.where(PublicFactSnapshot.symbol == symbol)
+        if fact_type:
+            stmt = stmt.where(PublicFactSnapshot.fact_type == fact_type)
+        rows = db.execute(stmt.limit(max(1, min(limit, 1000)))).scalars().all()
+        return [{"id": r.id, "fact_type": r.fact_type, "source": r.source,
+                 "symbol": r.symbol, "fact_as_of": r.fact_as_of,
+                 "content_hash": r.content_hash, "payload": r.payload or {},
+                 "created_at": str(r.created_at)} for r in rows]
 
 
 # ==================== 高频读结果缓存（TTL 短缓存，写操作自动失效） ====================
@@ -905,6 +1015,14 @@ def upsert_quote_snapshot(rows: list[dict]) -> int:
                 updated_at=_parse_ts(r.get("updated_at")),
             ))
         db.commit()
+    for r in rows:
+        upsert_public_fact(
+            "quote", str(r.get("source") or "quote_snapshot"),
+            str(r.get("stock_code") or ""), str(r.get("updated_at") or _now()),
+            {"stock_code": r.get("stock_code"), "name": r.get("name", ""),
+             "price": r.get("price", 0.0), "change_pct": r.get("change_pct"),
+             "source": r.get("source", "")},
+        )
     return len(rows)
 
 
@@ -1242,13 +1360,14 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
 
 def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: str,
                  message: str, action: str, signal: dict, pushed: bool,
-                 source: str = "monitor", extra: dict | None = None) -> int:
+                 source: str = "monitor", extra: dict | None = None,
+                 user_id: int | None = None) -> int:
     """写告警日志；source 标记来源（monitor/portfolio_sentinel）。extra=thinking 摘要，仅进 trace_alert.ext_info，
     业务表 signal 保持干净。默认 None 零行为。"""
     with SessionLocal() as db:
         row = AlertLog(stock_code=stock_code, stock_name=stock_name, alert_type=alert_type,
                        severity=severity, message=message, action=action, signal=signal,
-                       pushed=pushed, source=source)
+                       pushed=pushed, source=source, user_id=user_id)
         db.add(row)
         task_queue.guarded_commit(db)
         db.refresh(row)
@@ -1264,11 +1383,12 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
 
 def insert_review(stock_code: str, stock_name: str, holding_id: int, exit_date: str,
                   hold_days: int, pnl_pct: float, plan_vs_actual: dict, lesson: str,
-                  feedback: dict) -> int:
+                  feedback: dict, user_id: int | None = None) -> int:
     with SessionLocal() as db:
         row = ReviewResult(stock_code=stock_code, stock_name=stock_name, holding_id=holding_id,
                            exit_date=exit_date, hold_days=hold_days, pnl_pct=pnl_pct,
-                           plan_vs_actual=plan_vs_actual, lesson=lesson, feedback=feedback)
+                           plan_vs_actual=plan_vs_actual, lesson=lesson, feedback=feedback,
+                           user_id=user_id)
         db.add(row)
         task_queue.guarded_commit(db)
         db.refresh(row)
@@ -1355,15 +1475,32 @@ def get_review_reject_history(code: str | None = None, limit: int = 10) -> list[
         return result
 
 
-def get_latest_preference() -> dict | None:
+def get_latest_preference(user_id: int | None = None) -> dict | None:
+    if user_id is None:
+        try:
+            from app.core.auth import current_user_id
+            user_id = current_user_id()
+        except Exception:
+            user_id = None
     with SessionLocal() as db:
-        row = db.execute(
-            select(AgentPreference).where(
-                # status 列为后加迁移列；NULL 视为历史 active，兼容旧 MySQL 数据。
-                (AgentPreference.status == "active") | AgentPreference.status.is_(None)
-            ).order_by(AgentPreference.version.desc()).limit(1)
-        ).scalar_one_or_none()
+        stmt = select(AgentPreference).where(
+            (AgentPreference.status == "active") | AgentPreference.status.is_(None))
+        if user_id is not None:
+            stmt = stmt.where((AgentPreference.user_id == user_id) |
+                              AgentPreference.user_id.is_(None))
+        row = db.execute(stmt.order_by(AgentPreference.version.desc()).limit(1)
+                         ).scalar_one_or_none()
         return _json(row.content) if row else None
+
+
+def get_latest_preference_version(user_id: int | None = None) -> int:
+    with SessionLocal() as db:
+        stmt = select(AgentPreference.version).where(
+            (AgentPreference.status == "active") | AgentPreference.status.is_(None))
+        if user_id is not None:
+            stmt = stmt.where((AgentPreference.user_id == user_id) | AgentPreference.user_id.is_(None))
+        value = db.execute(stmt.order_by(AgentPreference.version.desc()).limit(1)).scalar_one_or_none()
+        return int(value or 0)
 
 
 def upsert_preference(content: dict, source_review_id: int | None = None,
@@ -1373,17 +1510,25 @@ def upsert_preference(content: dict, source_review_id: int | None = None,
     有效复盘来源默认 pending，由审核采纳后激活；无复盘来源的旧调用默认 active，
     保持历史导入/接口兼容。调用方可显式传 status 覆盖默认值。
     """
+    try:
+        from app.core.auth import current_user_id
+        user_id = current_user_id() or 1
+    except Exception:
+        user_id = 1
     with SessionLocal() as db:
         if status is None:
             status = "active"
             if source_review_id is not None and db.get(ReviewResult, source_review_id) is not None:
                 status = "pending"
         latest = db.execute(
-            select(AgentPreference).order_by(AgentPreference.version.desc()).limit(1)
+            select(AgentPreference).where(
+                (AgentPreference.user_id == user_id) | AgentPreference.user_id.is_(None)
+            ).order_by(AgentPreference.version.desc()).limit(1)
         ).scalar_one_or_none()
         version = (latest.version + 1) if latest else 1
         db.add(AgentPreference(version=version, content=content,
-                               source_review_id=source_review_id, status=status))
+                               source_review_id=source_review_id, status=status,
+                               user_id=user_id))
         db.commit()
 
 
@@ -1471,6 +1616,13 @@ def add_news(stock_code: str, stock_name: str, title: str, content: str,
         db.add(NewsArticle(stock_code=stock_code, stock_name=stock_name, title=title,
                            content=content[:2000], source=source, url=url, published_at=published_at))
         db.commit()
+        upsert_public_fact(
+            "news", source or "news_article", stock_code,
+            published_at or _now().isoformat(timespec="seconds"),
+            {"stock_code": stock_code, "stock_name": stock_name, "title": title,
+             "content": content[:2000], "source": source, "url": url,
+             "published_at": published_at},
+        )
         return True
 
 
@@ -1497,11 +1649,19 @@ def get_recent_news(stock_code: str, days: int = 7) -> list[dict]:
 
 
 def get_trade_profile() -> TradeProfile | None:
-    """读取交易偏好档案（全局单行，id=1）"""
+    """读取当前用户交易偏好档案；关闭多人模式时兼容 legacy id=1。"""
+    try:
+        from app.core.auth import current_user_id
+        user_id = current_user_id() or 1
+    except Exception:
+        user_id = 1
     with SessionLocal() as db:
-        row = db.get(TradeProfile, 1)
+        row = db.execute(select(TradeProfile).where(
+            (TradeProfile.user_id == user_id) | (TradeProfile.id == user_id)
+        ).order_by(TradeProfile.id).limit(1)).scalar_one_or_none()
         if row is None:
-            row = TradeProfile(id=1, version=1, content=_default_profile())
+            row = TradeProfile(id=user_id, user_id=user_id, version=1,
+                               content=_default_profile())
             db.add(row)
             db.commit()
             db.refresh(row)
@@ -1514,11 +1674,18 @@ def get_trade_profile_content() -> dict:
 
 
 def update_trade_profile(content: dict) -> int:
-    """更新偏好档案，version 递增（用于 LLM 缓存失效）"""
+    """更新当前用户偏好档案，version 递增（用于 LLM 缓存失效）。"""
+    try:
+        from app.core.auth import current_user_id
+        user_id = current_user_id() or 1
+    except Exception:
+        user_id = 1
     with SessionLocal() as db:
-        row = db.get(TradeProfile, 1)
+        row = db.execute(select(TradeProfile).where(
+            (TradeProfile.user_id == user_id) | (TradeProfile.id == user_id)
+        ).order_by(TradeProfile.id).limit(1)).scalar_one_or_none()
         if row is None:
-            row = TradeProfile(id=1, version=1, content=content)
+            row = TradeProfile(id=user_id, user_id=user_id, version=1, content=content)
             db.add(row)
         else:
             row.version += 1
@@ -1528,12 +1695,13 @@ def update_trade_profile(content: dict) -> int:
 
 
 def insert_account_baseline(trade_date: str, total_asset: float, available_cash: float,
-                            position_pct: float, source: str = "ocr") -> int:
+                            position_pct: float, source: str = "ocr",
+                            user_id: int | None = None) -> int:
     """保存账户基准快照（人工确认后调用；每次插入一行保留历史，读取取最新）"""
     with SessionLocal() as db:
         row = AccountBaseline(trade_date=trade_date, total_asset=total_asset,
                               available_cash=available_cash, position_pct=position_pct,
-                              source=source)
+                              source=source, user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -1636,23 +1804,42 @@ def get_holding(holding_id: int) -> Holding | None:
         return db.get(Holding, holding_id)
 
 
-def get_active_holding_by_code(stock_code: str) -> Holding | None:
+def get_holding_for_user(holding_id: int, user_id: int, *, is_admin: bool = False) -> Holding | None:
+    try:
+        from app.core.auth import current_user_id
+        user_id = current_user_id() or 1
+    except Exception:
+        user_id = 1
+    with SessionLocal() as db:
+        stmt = select(Holding).where(Holding.id == holding_id)
+        if not is_admin:
+            stmt = stmt.where(Holding.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
+def get_active_holding_by_code(stock_code: str, user_id: int | None = None,
+                               *, is_admin: bool = False) -> Holding | None:
     """读取同代码当前唯一有效持仓，防止人工/OCR重复建仓污染生命周期口径。"""
     with SessionLocal() as db:
+        stmt = select(Holding).where(Holding.stock_code == stock_code,
+                                     Holding.status == "holding")
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(Holding.user_id == user_id)
         return db.execute(
-            select(Holding).where(Holding.stock_code == stock_code,
-                                  Holding.status == "holding")
+            stmt
             .order_by(Holding.id.desc()).limit(1)
         ).scalar_one_or_none()
 
 
 def insert_holding(stock_code: str, stock_name: str, entry_date: str, entry_price: float,
                    shares: int, cost: float, stop_loss: float = 0.0, take_profit: float = 0.0,
-                   target_pct: float = 0.0, plan_id: int | None = None, note: str = "") -> int:
+                   target_pct: float = 0.0, plan_id: int | None = None, note: str = "",
+                   user_id: int | None = None) -> int:
     with SessionLocal() as db:
         row = Holding(stock_code=stock_code, stock_name=stock_name, entry_date=entry_date,
                       entry_price=entry_price, shares=shares, cost=cost, stop_loss=stop_loss,
-                      take_profit=take_profit, target_pct=target_pct, plan_id=plan_id, note=note)
+                      take_profit=take_profit, target_pct=target_pct, plan_id=plan_id, note=note,
+                      user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -1713,11 +1900,11 @@ def ensure_opening_trade(holding_row: Holding) -> dict:
 
 
 def add_trade(holding_id: int, stock_code: str, side: str, price: float,
-              shares: int, trade_date: str, note: str = "") -> int:
+              shares: int, trade_date: str, note: str = "", user_id: int | None = None) -> int:
     with SessionLocal() as db:
         row = TradeRecord(holding_id=holding_id, stock_code=stock_code, side=side,
                           price=price, shares=shares, amount=round(price * shares, 2),
-                          trade_date=trade_date, note=note)
+                          trade_date=trade_date, note=note, user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -1739,7 +1926,8 @@ def record_holding_trade(holding_id: int, *, side: str, price: float, shares: in
                          trade_date: str, note: str,
                          before_shares: int | None = None,
                          after_shares: int | None = None,
-                         holding_fields: dict | None = None) -> int:
+                         holding_fields: dict | None = None,
+                         user_id: int | None = None) -> int:
     """事务化持仓操作写入（手动加仓/减仓/清仓/成本修正共用）：
     操作流水 + 持仓字段更新在单 session 一次 commit，失败整体回滚，保证流水与持仓
     状态一致（K223 留痕与事实一致）。仅数据存取，业务计算（加权成本/C3 等）由调用方
@@ -1751,7 +1939,8 @@ def record_holding_trade(holding_id: int, *, side: str, price: float, shares: in
         db.add(TradeRecord(holding_id=holding_id, stock_code=row.stock_code, side=side,
                            price=price, shares=shares, amount=round(price * shares, 2),
                            trade_date=trade_date, note=note,
-                           before_shares=before_shares, after_shares=after_shares))
+                           before_shares=before_shares, after_shares=after_shares,
+                           user_id=user_id if user_id is not None else row.user_id))
         if holding_fields:
             for k, v in holding_fields.items():
                 setattr(row, k, v)
@@ -2353,12 +2542,15 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
     return _dbq("plan", {"code": code, "limit": limit}, _load)
 
 
-def list_holdings(status: str | None = None) -> list[dict]:
+def list_holdings(status: str | None = None, user_id: int | None = None,
+                  *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(Holding).order_by(Holding.id.desc())
             if status:
                 stmt = stmt.where(Holding.status == status)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(Holding.user_id == user_id)
             rows = db.execute(stmt).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
@@ -2376,11 +2568,14 @@ def list_holdings(status: str | None = None) -> list[dict]:
     return _dbq("holding", {"status": status}, _load)
 
 
-def list_alerts(limit: int = 100) -> list[dict]:
+def list_alerts(limit: int = 100, user_id: int | None = None,
+                *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
-            rows = db.execute(
-                select(AlertLog).order_by(AlertLog.id.desc()).limit(limit)).scalars().all()
+            stmt = select(AlertLog).order_by(AlertLog.id.desc())
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(AlertLog.user_id == user_id)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
                                            "alert_type": r.alert_type, "severity": r.severity,
@@ -2392,12 +2587,15 @@ def list_alerts(limit: int = 100) -> list[dict]:
     return _dbq("alert", {"limit": limit}, _load)
 
 
-def list_reviews(code: str | None = None, limit: int = 50) -> list[dict]:
+def list_reviews(code: str | None = None, limit: int = 50, user_id: int | None = None,
+                 *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(ReviewResult).order_by(ReviewResult.id.desc())
             if code:
                 stmt = stmt.where(ReviewResult.stock_code == code)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(ReviewResult.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
@@ -2424,18 +2622,21 @@ def _paper_account_dict(row: PaperAccount) -> dict:
     return {"id": row.id, "name": row.name, "strategy_variant": row.strategy_variant,
             "initial_cash": row.initial_cash, "cash": row.cash, "status": row.status,
             "rule_version": row.rule_version, "model_version": row.model_version,
-            "source_label": row.source_label, "created_at": str(row.created_at),
+            "source_label": row.source_label, "user_id": row.user_id,
+            "created_at": str(row.created_at),
             "updated_at": str(row.updated_at)}
 
 
 def create_paper_account(name: str, initial_cash: float, strategy_variant: str = "current_gate",
-                         rule_version: str = "", model_version: str = "") -> dict:
+                         rule_version: str = "", model_version: str = "",
+                         user_id: int | None = None) -> dict:
     if initial_cash <= 0:
         raise ValueError("模拟账户初始资金必须大于 0")
     with SessionLocal() as db:
         row = PaperAccount(name=name or "AI模拟账户", initial_cash=round(initial_cash, 2),
                            cash=round(initial_cash, 2), strategy_variant=strategy_variant,
-                           rule_version=rule_version, model_version=model_version)
+                           rule_version=rule_version, model_version=model_version,
+                           user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -2447,11 +2648,22 @@ def get_paper_account(account_id: int) -> PaperAccount | None:
         return db.get(PaperAccount, account_id)
 
 
-def list_paper_accounts(status: str | None = None) -> list[dict]:
+def get_paper_account_for_user(account_id: int, user_id: int, *, is_admin: bool = False) -> PaperAccount | None:
+    with SessionLocal() as db:
+        stmt = select(PaperAccount).where(PaperAccount.id == account_id)
+        if not is_admin:
+            stmt = stmt.where(PaperAccount.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
+def list_paper_accounts(status: str | None = None, user_id: int | None = None,
+                        *, is_admin: bool = False) -> list[dict]:
     with SessionLocal() as db:
         stmt = select(PaperAccount).order_by(PaperAccount.id.desc())
         if status:
             stmt = stmt.where(PaperAccount.status == status)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PaperAccount.user_id == user_id)
         return [_paper_account_dict(r) for r in db.execute(stmt).scalars().all()]
 
 
@@ -2499,7 +2711,7 @@ def paper_apply_execution(account_id: int, payload: dict) -> dict:
             PaperExecution.execution_key == key)).scalar_one_or_none()
         if existing is not None:
             return paper_execution_dict(existing)
-        execution = PaperExecution(account_id=account_id, **{
+        execution = PaperExecution(account_id=account_id, user_id=account.user_id, **{
             k: v for k, v in payload.items() if k in {
                 "execution_key", "decision_id", "candidate_id", "score_id", "plan_id",
                 "stock_code", "stock_name", "side", "requested_price", "executed_price",
@@ -2521,7 +2733,8 @@ def paper_apply_execution(account_id: int, payload: dict) -> dict:
                     PaperPosition.account_id == account_id,
                     PaperPosition.stock_code == execution.stock_code)).scalar_one_or_none()
                 if pos is None:
-                    pos = PaperPosition(account_id=account_id, stock_code=execution.stock_code,
+                    pos = PaperPosition(account_id=account_id, user_id=account.user_id,
+                                        stock_code=execution.stock_code,
                                         stock_name=execution.stock_name or execution.stock_code,
                                         plan_id=execution.plan_id, shares=0, available_shares=0,
                                         cost=0.0, avg_price=0.0, high_price=0.0,
@@ -2648,7 +2861,9 @@ def create_paper_context(account_id: int, trade_date: str, mode: str, stock_code
                          stage: str, facts: dict, tool_trace: list | None = None,
                          source_refs: list | None = None) -> int:
     with SessionLocal() as db:
-        row = PaperContext(account_id=account_id, trade_date=trade_date, mode=mode,
+        account = db.get(PaperAccount, account_id)
+        row = PaperContext(account_id=account_id, user_id=account.user_id if account else None,
+                           trade_date=trade_date, mode=mode,
                            stock_code=stock_code or "", stage=stage or "",
                            facts=facts or {}, tool_trace=tool_trace or [],
                            source_refs=source_refs or [])
@@ -2672,7 +2887,9 @@ def list_paper_contexts(account_id: int, limit: int = 100) -> list[dict]:
 def create_paper_web_evidence(account_id: int, trade_date: str, stock_code: str,
                               values: dict) -> int:
     with SessionLocal() as db:
+        account = db.get(PaperAccount, account_id)
         row = PaperWebEvidence(account_id=account_id, trade_date=trade_date,
+                               user_id=account.user_id if account else None,
                                stock_code=stock_code or "", **{
                                    key: values.get(key, "") for key in (
                                        "url", "domain", "title", "excerpt", "published_at",
@@ -2699,7 +2916,9 @@ def list_paper_web_evidence(account_id: int, limit: int = 100) -> list[dict]:
 
 def create_paper_alert(account_id: int, stock_code: str, trade_date: str, values: dict) -> int:
     with SessionLocal() as db:
+        account = db.get(PaperAccount, account_id)
         row = PaperAlert(account_id=account_id, stock_code=stock_code or "",
+                         user_id=account.user_id if account else None,
                          trade_date=trade_date, severity=values.get("severity") or "info",
                          alert_type=values.get("alert_type") or "",
                          message=values.get("message") or "",
@@ -2724,7 +2943,9 @@ def list_paper_alerts(account_id: int, limit: int = 100) -> list[dict]:
 def create_paper_review(account_id: int, stock_code: str, stock_name: str,
                         review_date: str, content: dict, execution_id: int | None = None) -> int:
     with SessionLocal() as db:
+        account = db.get(PaperAccount, account_id)
         row = PaperReview(account_id=account_id, execution_id=execution_id,
+                          user_id=account.user_id if account else None,
                           stock_code=stock_code, stock_name=stock_name,
                           review_date=review_date, content=content or {}, source_type="paper")
         db.add(row)
@@ -2733,13 +2954,17 @@ def create_paper_review(account_id: int, stock_code: str, stock_name: str,
         return row.id
 
 
-def list_paper_reviews(account_id: int | None = None, limit: int = 100) -> list[dict]:
+def list_paper_reviews(account_id: int | None = None, limit: int = 100,
+                       user_id: int | None = None, *, is_admin: bool = False) -> list[dict]:
     with SessionLocal() as db:
         stmt = select(PaperReview).order_by(PaperReview.id.desc())
         if account_id is not None:
             stmt = stmt.where(PaperReview.account_id == account_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PaperReview.user_id == user_id)
         rows = db.execute(stmt.limit(limit)).scalars().all()
         return [{"id": r.id, "account_id": r.account_id, "execution_id": r.execution_id,
+                 "user_id": r.user_id,
                  "stock_code": r.stock_code, "stock_name": r.stock_name,
                  "review_date": r.review_date, "source_type": r.source_type,
                  "content": r.content or {}, "audit_status": r.audit_status,

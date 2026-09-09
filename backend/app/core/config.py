@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     db_backend: str = "sqlite"     # sqlite（默认，单文件 data/dev.db）/ mysql
     cache_backend: str = "memory"  # memory（默认，进程内）/ redis
     qdrant_mode: str = "local"     # local（默认，本地文件模式，存 data/qdrant_storage）/ server
+    multi_user_enabled: bool = False
+    auth_session_ttl_hours: int = 24
+    auth_default_username: str = "legacy"
+    auth_default_password: str = ""
+    redis_namespace: str = "stock-agent"
+    server_port: int = 8100
+    sqlite_path: str = ""
+    qdrant_local_path: str = ""
     # 高频读接口结果缓存（秒）：候选/评分/建仓/持仓/告警/复盘列表短缓存，
     # 写操作自动失效保证一致；设为 0 关闭（数据变更需即时可见的场景可关）
     db_query_cache_ttl: int = 60
@@ -234,7 +242,7 @@ class Settings(BaseSettings):
     @property
     def qdrant_path(self) -> Path:
         """本地文件模式 Qdrant 存储目录（迁移系统直接复制该目录）"""
-        return self.data_dir / "qdrant_storage"
+        return Path(self.qdrant_local_path) if self.qdrant_local_path else self.data_dir / "qdrant_storage"
 
     @property
     def redis_url(self) -> str:

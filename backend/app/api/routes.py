@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.review import llm_rethink_suggestion
 from app.core.config import settings
+from app.core.auth import current_user_role, require_user, issue_token
 from app.db import repo
 from app.graph import router as graph_router
 from app.scheduler import jobs as scheduler_jobs
@@ -29,6 +30,77 @@ from app.system_map import collaboration as collaboration_registry
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 SYNC_RUN_TIMEOUT_SECONDS = 30
+
+
+def _request_user_id() -> int:
+    return require_user()
+
+
+def _paper_account_for_request(account_id: int):
+    row = repo.get_paper_account_for_user(
+        account_id, _request_user_id(), is_admin=current_user_role() == "admin")
+    if row is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return row
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreateBody(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+    role: str = "researcher"
+
+
+class PublicFactBody(BaseModel):
+    fact_type: str = Field(min_length=1, max_length=32)
+    source: str = Field(min_length=1, max_length=64)
+    symbol: str = Field(min_length=1, max_length=32)
+    fact_as_of: str = Field(min_length=1, max_length=64)
+    payload: dict = Field(default_factory=dict)
+    content_hash: str | None = None
+
+
+@router.get("/auth/status")
+def auth_status():
+    from app.core.auth import current_user_id, current_user_role
+    return {"multi_user_enabled": settings.multi_user_enabled,
+            "user_id": current_user_id(), "role": current_user_role()}
+
+
+@router.post("/auth/login")
+def auth_login(body: LoginBody):
+    user = repo.get_user_by_credentials(body.username, body.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    return {**user, "access_token": issue_token(user["id"]), "token_type": "bearer"}
+
+
+@router.post("/auth/users")
+def auth_user_create(body: UserCreateBody):
+    if current_user_role() not in (None, "admin") and settings.multi_user_enabled:
+        raise HTTPException(status_code=403, detail="仅管理员可创建用户")
+    try:
+        return repo.create_user(body.username, body.password, body.role)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/public-facts")
+def public_facts(symbol: str | None = None, fact_type: str | None = None, limit: int = 100):
+    return repo.list_public_facts(symbol, fact_type, limit)
+
+
+@router.post("/public-facts")
+def public_fact_upsert(body: PublicFactBody):
+    forbidden = {"user_id", "account_id", "preference", "portfolio", "holding", "private"}
+    if forbidden.intersection(body.payload):
+        raise HTTPException(status_code=400, detail="公共事实不得包含用户私有字段")
+    return repo.upsert_public_fact(body.fact_type, body.source, body.symbol, body.fact_as_of,
+                                   body.payload, body.content_hash)
 
 
 # ================= 后台异步任务（耗时操作提交即返回，不阻塞页面） =================
@@ -321,7 +393,10 @@ def _submit_task(kind: str, params: dict) -> dict:
                             detail=f"已有同类任务（{_TASK_KINDS[kind][0]}）正在执行，"
                                    f"请等待其完成后重试")
     label, fn = _TASK_KINDS[kind]
-    tid = task_queue.submit(kind, label, fn, params)
+    task_params = dict(params or {})
+    task_params.setdefault("user_id", _request_user_id())
+    task_params.setdefault("user_role", current_user_role())
+    tid = task_queue.submit(kind, label, fn, task_params)
     return {"task_id": tid, "label": label, "status": "pending"}
 
 
@@ -883,7 +958,8 @@ def save_account_baseline(body: AccountBaselineBody):
     trade_date = body.trade_date.strip() or datetime.now(
         timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     bid = repo.insert_account_baseline(trade_date, body.total_asset, body.available_cash,
-                                       body.position_pct, body.source)
+                                       body.position_pct, body.source,
+                                       user_id=_request_user_id())
     return {"id": bid, "trade_date": trade_date, "saved": True}
 
 
@@ -891,7 +967,8 @@ def save_account_baseline(body: AccountBaselineBody):
 @router.get("/paper/accounts")
 def paper_accounts():
     return [{**row, "execution_mode": "paper", "source_label": "AI模拟"}
-            for row in repo.list_paper_accounts()]
+            for row in repo.list_paper_accounts(
+                user_id=_request_user_id(), is_admin=current_user_role() == "admin")]
 
 
 @router.post("/paper/accounts")
@@ -901,7 +978,8 @@ def paper_account_create(body: PaperAccountBody):
                             detail="初版模拟只执行现有 current_gate，不允许借模拟入口改规则")
     try:
         row = repo.create_paper_account(body.name, body.initial_cash, body.strategy_variant,
-                                        body.rule_version, body.model_version)
+                                        body.rule_version, body.model_version,
+                                        user_id=_request_user_id())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {**row, "execution_mode": "paper", "source_label": "AI模拟"}
@@ -909,8 +987,7 @@ def paper_account_create(body: PaperAccountBody):
 
 @router.get("/paper/accounts/{account_id}/summary")
 def paper_account_summary(account_id: int):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     from app.services import paper_valuation
     summary = paper_valuation.account_view(account_id, refresh=True)
     executions = repo.list_paper_executions(account_id, limit=500)
@@ -921,6 +998,7 @@ def paper_account_summary(account_id: int):
 
 @router.post("/paper/accounts/{account_id}/status")
 def paper_account_status(account_id: int, body: PaperStatusBody):
+    _paper_account_for_request(account_id)
     try:
         result = repo.update_paper_account_status(account_id, body.status)
     except ValueError as exc:
@@ -932,8 +1010,7 @@ def paper_account_status(account_id: int, body: PaperStatusBody):
 
 @router.get("/paper/accounts/{account_id}/positions")
 def paper_account_positions(account_id: int):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     from app.services import paper_valuation
     return [{**row, "execution_mode": "paper", "source_label": "AI模拟"}
             for row in paper_valuation.account_view(account_id, refresh=True)["positions"]]
@@ -941,16 +1018,14 @@ def paper_account_positions(account_id: int):
 
 @router.post("/paper/accounts/{account_id}/quotes/refresh")
 def paper_account_refresh(account_id: int):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     from app.services import paper_valuation
     return paper_valuation.account_view(account_id, refresh=True)
 
 
 @router.post("/paper/accounts/{account_id}/contexts")
 def paper_account_collect_context(account_id: int, body: PaperContextBody):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     from app.services import paper_context
     try:
         return paper_context.collect(account_id, body.stock_code,
@@ -963,8 +1038,7 @@ def paper_account_collect_context(account_id: int, body: PaperContextBody):
 
 @router.post("/paper/accounts/{account_id}/monitor")
 def paper_account_monitor(account_id: int, body: PaperMonitorBody | None = None):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     from app.services import paper_monitor
     try:
         return paper_monitor.run(account_id, (body.trade_date if body else "").strip() or time.strftime("%Y-%m-%d"))
@@ -974,35 +1048,32 @@ def paper_account_monitor(account_id: int, body: PaperMonitorBody | None = None)
 
 @router.get("/paper/accounts/{account_id}/contexts")
 def paper_account_contexts(account_id: int, limit: int = 100):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     return repo.list_paper_contexts(account_id, max(1, min(limit, 500)))
 
 
 @router.get("/paper/accounts/{account_id}/web-evidence")
 def paper_account_web_evidence(account_id: int, limit: int = 100):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     return repo.list_paper_web_evidence(account_id, max(1, min(limit, 500)))
 
 
 @router.get("/paper/accounts/{account_id}/alerts")
 def paper_account_alerts(account_id: int, limit: int = 100):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     return repo.list_paper_alerts(account_id, max(1, min(limit, 500)))
 
 
 @router.get("/paper/accounts/{account_id}/executions")
 def paper_account_executions(account_id: int, limit: int = 200):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     return [{**row, "execution_mode": "paper", "source_label": "AI模拟"}
             for row in repo.list_paper_executions(account_id, max(1, min(limit, 1000)))]
 
 
 @router.post("/paper/accounts/{account_id}/run")
 def paper_account_run(account_id: int, body: PaperRunBody | None = None):
+    _paper_account_for_request(account_id)
     body = body or PaperRunBody()
     trade_date = body.trade_date.strip() or time.strftime("%Y-%m-%d")
     from app.services import paper_execution
@@ -1015,16 +1086,19 @@ def paper_account_run(account_id: int, body: PaperRunBody | None = None):
 
 @router.get("/paper/reviews")
 def paper_reviews(account_id: int | None = None, limit: int = 100):
+    if account_id is not None:
+        _paper_account_for_request(account_id)
     return [{**row, "execution_mode": "paper", "review_source": "模拟复盘",
              "audit_status_label": "AI审核通过" if row["audit_status"] == "passed" else
              ("待AI审核" if row["audit_status"] == "pending" else "AI审核未通过")}
-            for row in repo.list_paper_reviews(account_id, max(1, min(limit, 500)))]
+            for row in repo.list_paper_reviews(
+                account_id, max(1, min(limit, 500)), user_id=_request_user_id(),
+                is_admin=current_user_role() == "admin")]
 
 
 @router.post("/paper/accounts/{account_id}/reviews")
 def paper_review_create(account_id: int, body: PaperReviewBody):
-    if repo.get_paper_account(account_id) is None:
-        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    _paper_account_for_request(account_id)
     review_date = body.review_date.strip() or time.strftime("%Y-%m-%d")
     rid = repo.create_paper_review(account_id, body.stock_code.strip(), body.stock_name.strip(),
                                    review_date, body.content, body.execution_id)
@@ -1230,7 +1304,8 @@ class ExitBody(BaseModel):
 
 @router.get("/holdings")
 def list_holdings(status: Optional[str] = None):
-    return repo.list_holdings(status)
+    return repo.list_holdings(status, user_id=_request_user_id(),
+                              is_admin=current_user_role() == "admin")
 
 
 @router.get("/holdings/quotes")
@@ -1246,7 +1321,9 @@ def add_holding(body: HoldingBody):
     code = body.stock_code.strip()
     if not code:
         raise HTTPException(status_code=400, detail="股票代码不能为空")
-    active = repo.get_active_holding_by_code(code)
+    user_id = _request_user_id()
+    active = repo.get_active_holding_by_code(code, user_id=user_id,
+                                             is_admin=current_user_role() == "admin")
     if active is not None:
         raise HTTPException(
             status_code=409,
@@ -1264,7 +1341,7 @@ def add_holding(body: HoldingBody):
     hid = repo.insert_holding(code, body.stock_name, body.entry_date,
                               body.entry_price, body.shares, body.cost or body.entry_price * body.shares,
                               body.stop_loss, body.take_profit, body.target_pct,
-                              body.plan_id, body.note)
+                              body.plan_id, body.note, user_id=user_id)
     return {"id": hid, "plan_id": body.plan_id}
 
 
@@ -1272,7 +1349,8 @@ def add_holding(body: HoldingBody):
 def exit_holding(hid: int, body: ExitBody):
     """记录卖出：股数清零则标记 exited 并自动触发 ReviewAgent 复盘。
     流水与持仓更新单事务写入（K223 留痕与事实一致）。"""
-    holding = repo.get_holding(hid)
+    holding = repo.get_holding_for_user(hid, _request_user_id(),
+                                        is_admin=current_user_role() == "admin")
     if holding is None or holding.status != "holding":
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
     if body.shares % 100 != 0:
@@ -1287,7 +1365,7 @@ def exit_holding(hid: int, body: ExitBody):
     repo.record_holding_trade(hid, side="sell", price=body.price, shares=body.shares,
                               trade_date=body.trade_date, note=body.note,
                               before_shares=holding.shares, after_shares=remain,
-                              holding_fields=fields)
+                              holding_fields=fields, user_id=holding.user_id)
 
     result = {"holding_id": hid, "remain_shares": remain, "review_task_id": None}
     if remain == 0:
@@ -1314,7 +1392,8 @@ class CostAdjustBody(BaseModel):
 def add_shares(hid: int, body: AddSharesBody):
     """手动加仓：加权成本重算 + C3 止损（成本×0.92，知识库红线）联动 + buy 流水留痕。
     流水与持仓更新单事务写入。"""
-    holding = repo.get_holding(hid)
+    holding = repo.get_holding_for_user(hid, _request_user_id(),
+                                        is_admin=current_user_role() == "admin")
     if holding is None or holding.status != "holding":
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
     if body.shares % 100 != 0:
@@ -1330,7 +1409,8 @@ def add_shares(hid: int, body: AddSharesBody):
                               before_shares=old_shares, after_shares=new_shares,
                               holding_fields={"shares": new_shares, "entry_price": new_entry,
                                               "cost": round(new_entry * new_shares, 2),
-                                              "stop_loss": new_stop})
+                                              "stop_loss": new_stop},
+                              user_id=holding.user_id)
     return {"holding_id": hid, "shares": new_shares, "cost_price": new_entry,
             "stop_loss": new_stop, "added_shares": body.shares}
 
@@ -1339,7 +1419,8 @@ def add_shares(hid: int, body: AddSharesBody):
 def adjust_cost(hid: int, body: CostAdjustBody):
     """手动成本修正：成本联动 C3 止损重算，adjust 流水留痕（原因必填）。
     流水与持仓更新单事务写入。"""
-    holding = repo.get_holding(hid)
+    holding = repo.get_holding_for_user(hid, _request_user_id(),
+                                        is_admin=current_user_role() == "admin")
     if holding is None or holding.status != "holding":
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
     if not (body.reason or "").strip():
@@ -1352,7 +1433,8 @@ def adjust_cost(hid: int, body: CostAdjustBody):
                               before_shares=holding.shares, after_shares=holding.shares,
                               holding_fields={"entry_price": body.cost_price,
                                               "cost": round(body.cost_price * holding.shares, 2),
-                                              "stop_loss": new_stop})
+                                              "stop_loss": new_stop},
+                              user_id=holding.user_id)
     return {"holding_id": hid, "cost_price": body.cost_price, "stop_loss": new_stop}
 
 
@@ -1360,6 +1442,10 @@ def adjust_cost(hid: int, body: CostAdjustBody):
 def holding_trades(hid: int):
     """操作流水（只读）：加仓/减仓/清仓/成本修正记录，最新在前（K223 可追溯）；
     before/after_shares 为操作前后持仓股数（旧数据为 None，展示层兼容）"""
+    holding = repo.get_holding_for_user(hid, _request_user_id(),
+                                        is_admin=current_user_role() == "admin")
+    if holding is None:
+        raise HTTPException(status_code=404, detail="持仓不存在")
     rows = repo.get_trades(hid)
     rows.sort(key=lambda r: (r.created_at, r.id), reverse=True)
     return [{"id": r.id, "holding_id": r.holding_id, "stock_code": r.stock_code,
@@ -1423,12 +1509,14 @@ async def ocr_holding(file: UploadFile = File(...)):
 # ================= 告警 / 复盘 =================
 @router.get("/alerts")
 def list_alerts(limit: int = 100):
-    return repo.list_alerts(limit)
+    return repo.list_alerts(limit, user_id=_request_user_id(),
+                            is_admin=current_user_role() == "admin")
 
 
 @router.get("/reviews")
 def list_reviews(code: Optional[str] = None, limit: int = 50):
-    return repo.list_reviews(code, limit)
+    return repo.list_reviews(code, limit, user_id=_request_user_id(),
+                             is_admin=current_user_role() == "admin")
 
 
 class RejectReviewBody(BaseModel):
