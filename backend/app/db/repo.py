@@ -1329,14 +1329,22 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
 
 def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: float,
                 batches: list, stop_loss: float, take_profit: float, rationale: str,
-                detail: dict | None = None, source: str = "manual") -> int:
+                detail: dict | None = None, source: str = "manual",
+                user_id: int | None = None) -> int:
     """detail: v3.0 白盒扩展（dimensions/final_advice/market_regime/freshness/quant），可选；
     旧调用零影响。同一标的同一交易日追加新版本，旧的 proposed 版本标记 superseded；
     已采纳版本保留原状态。source: candidate=每日候选池联动 / manual=手动生成。"""
+    if user_id is None:
+        try:
+            from app.core.auth import current_user_id
+            user_id = current_user_id() or 1
+        except Exception:
+            user_id = 1
     with SessionLocal() as db:
         stmt = (select(PositionPlan).where(
             PositionPlan.stock_code == stock_code, PositionPlan.plan_date == plan_date)
                 .order_by(PositionPlan.id.desc()))
+        stmt = stmt.where(PositionPlan.user_id == user_id)
         previous = db.execute(stmt).scalars().all()
         previous_id = previous[0].id if previous else None
         for old in previous:
@@ -1346,7 +1354,7 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
                            total_pct=total_pct, batches=batches, stop_loss=stop_loss,
                            take_profit=take_profit, rationale=rationale, detail=detail,
                            source=source if source in ("candidate", "manual") else "manual",
-                           supersedes_id=previous_id)
+                           supersedes_id=previous_id, user_id=user_id)
         db.add(row)
         task_queue.guarded_commit(db)
         db.refresh(row)
@@ -2002,12 +2010,16 @@ def get_latest_plan(code: str) -> PositionPlan | None:
             .order_by(PositionPlan.id.desc()).limit(1)).scalar_one_or_none()
 
 
-def get_plan(plan_id: int | None) -> PositionPlan | None:
+def get_plan(plan_id: int | None, user_id: int | None = None,
+             *, is_admin: bool = False) -> PositionPlan | None:
     """按明确版本读取建仓计划。"""
     if not plan_id:
         return None
     with SessionLocal() as db:
-        return db.get(PositionPlan, plan_id)
+        stmt = select(PositionPlan).where(PositionPlan.id == plan_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PositionPlan.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
 
 
 def get_plan_for_entry(stock_code: str, entry_date: str) -> tuple[PositionPlan | None, str]:
@@ -2022,10 +2034,14 @@ def get_plan_for_entry(stock_code: str, entry_date: str) -> tuple[PositionPlan |
         return (plan, "inferred_before_entry") if plan else (None, "missing")
 
 
-def update_plan_status(plan_id: int, status: str) -> dict | None:
+def update_plan_status(plan_id: int, status: str, user_id: int | None = None,
+                       *, is_admin: bool = False) -> dict | None:
     """人工确认建仓计划状态；只改生命周期，不触发交易或持仓变更。"""
     with SessionLocal() as db:
-        row = db.get(PositionPlan, plan_id)
+        stmt = select(PositionPlan).where(PositionPlan.id == plan_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PositionPlan.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return None
         row.status = status
@@ -2518,12 +2534,15 @@ def list_scores(code: str | None = None, date: str | None = None, limit: int = 1
     return _dbq("score", {"code": code, "date": date, "limit": limit}, _load)
 
 
-def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
+def list_plans(code: str | None = None, limit: int = 50, user_id: int | None = None,
+               *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(PositionPlan).order_by(PositionPlan.id.desc())
             if code:
                 stmt = stmt.where(PositionPlan.stock_code == code)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(PositionPlan.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
@@ -2539,7 +2558,8 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "supersedes_id": r.supersedes_id,
                                            "created_at": str(r.created_at)} for r in rows])
 
-    return _dbq("plan", {"code": code, "limit": limit}, _load)
+    return _dbq("plan", {"code": code, "limit": limit, "user_id": user_id,
+                           "is_admin": is_admin}, _load)
 
 
 def list_holdings(status: str | None = None, user_id: int | None = None,

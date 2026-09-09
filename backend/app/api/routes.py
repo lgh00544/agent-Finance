@@ -1267,7 +1267,8 @@ def create_plan(body: CodeBody):
 
 @router.get("/positions")
 def list_plans(code: Optional[str] = None, limit: int = 50):
-    return repo.list_plans(code, limit)
+    return repo.list_plans(code, limit, _request_user_id(),
+                           is_admin=current_user_role() == "admin")
 
 
 class PlanStatusBody(BaseModel):
@@ -1280,7 +1281,8 @@ def update_plan_status(plan_id: int, body: PlanStatusBody):
     status = body.status.strip()
     if status not in {"accepted", "abandoned"}:
         raise HTTPException(status_code=400, detail="计划状态只能为 accepted/abandoned")
-    row = repo.update_plan_status(plan_id, status)
+    row = repo.update_plan_status(plan_id, status, _request_user_id(),
+                                  is_admin=current_user_role() == "admin")
     if row is None:
         raise HTTPException(status_code=404, detail=f"建仓计划不存在: {plan_id}")
     return row
@@ -1337,7 +1339,8 @@ def add_holding(body: HoldingBody):
             detail=f"{code} 已有有效持仓（holding_id={active.id}），请使用加仓/成本修正，不要重复录入",
         )
     if body.plan_id is not None:
-        plan = repo.get_plan(body.plan_id)
+        plan = repo.get_plan(body.plan_id, user_id,
+                             is_admin=current_user_role() == "admin")
         if plan is None:
             raise HTTPException(status_code=400, detail=f"建仓计划不存在: {body.plan_id}")
         if plan.stock_code != code:

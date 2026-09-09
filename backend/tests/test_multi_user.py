@@ -6,7 +6,7 @@ import pytest
 from app import cache as cache_module
 from app.core import auth
 from app.db import repo
-from app.db.models import Holding, PaperAccount, TradeProfile, User
+from app.db.models import Holding, PaperAccount, PositionPlan, TradeProfile, User
 from app.db.session import SessionLocal, init_db
 
 
@@ -155,3 +155,30 @@ def test_task_owner_context_cannot_be_overridden(monkeypatch):
         auth.reset_user_context(tokens)
     assert captured["user_id"] == 42
     assert captured["user_role"] == "researcher"
+
+
+def test_position_plan_is_scoped_and_owned():
+    owner = repo.create_user("plan-owner", "secret", "researcher")
+    other = repo.create_user("plan-other", "secret", "researcher")
+    owner_tokens = auth.set_user_context(owner["id"], owner["role"])
+    try:
+        owner_id = repo.insert_plan("600911", "计划甲", "2026-09-09", 10,
+                                    [], 9, 12, "owner", user_id=owner["id"])
+        assert repo.get_plan(owner_id, owner["id"]) is not None
+        assert repo.get_plan(owner_id, other["id"]) is None
+    finally:
+        auth.reset_user_context(owner_tokens)
+    try:
+        other_id = repo.insert_plan("600912", "计划乙", "2026-09-09", 10,
+                                    [], 9, 12, "other", user_id=other["id"])
+        owner_rows = repo.list_plans(user_id=owner["id"])
+        other_rows = repo.list_plans(user_id=other["id"])
+        assert {row["stock_code"] for row in owner_rows} == {"600911"}
+        assert {row["stock_code"] for row in other_rows} == {"600912"}
+        assert repo.update_plan_status(owner_id, "accepted", other["id"]) is None
+        assert repo.update_plan_status(other_id, "accepted", other["id"]) is not None
+    finally:
+        with SessionLocal() as db:
+            db.query(PositionPlan).filter(PositionPlan.id.in_([owner_id, other_id])).delete(
+                synchronize_session=False)
+            db.commit()
