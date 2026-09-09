@@ -6,8 +6,8 @@ import logging
 
 from langgraph.graph import END, START, StateGraph
 
-from app.agents import (discover, market_intel, monitor, portfolio_sentinel,
-                        position, review, score, sell)
+from app.agents import (discover, market_intel, monitor, paper_execution,
+                        portfolio_sentinel, position, review, score, sell)
 from app.graph.state import StockAgentState
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,15 @@ def _build_portfolio_sentinel() -> StateGraph:
     return g
 
 
+def _build_paper_execution() -> StateGraph:
+    """独立模拟执行链：只落 paper_* 账本，不触碰真实持仓。"""
+    g = StateGraph(StockAgentState)
+    g.add_node("paper_execution", paper_execution.run)
+    g.add_edge(START, "paper_execution")
+    g.add_edge("paper_execution", END)
+    return g
+
+
 _BUILDERS = {
     "discover": _build_discover,
     "score": _build_score,
@@ -112,6 +121,7 @@ _BUILDERS = {
     "review": _build_review,
     "market_intel": _build_market_intel,
     "portfolio_sentinel": _build_portfolio_sentinel,
+    "paper_execution": _build_paper_execution,
 }
 
 

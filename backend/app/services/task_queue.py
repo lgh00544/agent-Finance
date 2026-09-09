@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 import uuid
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -59,6 +59,19 @@ def ensure_attempt_active() -> None:
     """
     if not _attempt_active(_current_attempt.get()):
         raise AttemptInvalidated("后台任务 attempt 已失效，放弃业务写入")
+
+
+def submit_with_attempt_context(executor: Any, fn: Callable[..., Any],
+                                *args: Any, **kwargs: Any):
+    """向子线程提交工作并传播当前后台任务 attempt 上下文。
+
+    ``ContextVar`` 默认按线程隔离，ThreadPoolExecutor 新线程不会继承
+    ``_current_attempt``。每次提交都复制一个独立 Context，避免多个并发 future
+    复用同一个 Context；取消、超时或重试后，子线程中的 guarded_commit 仍能
+    通过 attempt_id 栅栏拒绝旧业务写入。同步调用没有 attempt 时行为不变。
+    """
+    ctx = copy_context()
+    return executor.submit(ctx.run, fn, *args, **kwargs)
 
 
 def guarded_commit(db) -> None:

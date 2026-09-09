@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS agent_preference (
     version INT NOT NULL DEFAULT 1,
     content JSON NULL,
     source_review_id INT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -510,4 +511,167 @@ CREATE TABLE IF NOT EXISTS sector_next_hot (
     trigger_evidence JSON NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_snh_date_name (trade_date, sector_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- AI 模拟账本（与人工真实 holding/trade_record 永久隔离）
+CREATE TABLE IF NOT EXISTS paper_account (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(64) NOT NULL DEFAULT 'AI模拟账户',
+    strategy_variant VARCHAR(32) NOT NULL DEFAULT 'current_gate',
+    initial_cash FLOAT NOT NULL DEFAULT 1000000,
+    cash FLOAT NOT NULL DEFAULT 1000000,
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
+    rule_version VARCHAR(64) NOT NULL DEFAULT '',
+    model_version VARCHAR(128) NOT NULL DEFAULT '',
+    source_label VARCHAR(32) NOT NULL DEFAULT 'AI模拟',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY ix_paper_account_status (status),
+    KEY ix_paper_account_variant (strategy_variant)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS paper_position (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    shares INT NOT NULL DEFAULT 0,
+    available_shares INT NOT NULL DEFAULT 0,
+    avg_price FLOAT NOT NULL DEFAULT 0,
+    cost FLOAT NOT NULL DEFAULT 0,
+    opened_trade_date VARCHAR(10) NOT NULL DEFAULT '',
+    plan_id INT NULL,
+    stop_loss FLOAT NOT NULL DEFAULT 0,
+    take_profit FLOAT NOT NULL DEFAULT 0,
+    high_price FLOAT NOT NULL DEFAULT 0,
+    status VARCHAR(16) NOT NULL DEFAULT 'holding',
+    metadata_json JSON NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_paper_position_account_code (account_id, stock_code),
+    KEY ix_paper_position_account_status (account_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS paper_execution (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    execution_key VARCHAR(160) NOT NULL,
+    account_id INT NOT NULL,
+    decision_id VARCHAR(128) NOT NULL DEFAULT '',
+    candidate_id INT NULL,
+    score_id INT NULL,
+    plan_id INT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    side VARCHAR(8) NOT NULL,
+    requested_price FLOAT NOT NULL DEFAULT 0,
+    executed_price FLOAT NULL,
+    shares INT NOT NULL DEFAULT 0,
+    gross_amount FLOAT NOT NULL DEFAULT 0,
+    commission FLOAT NOT NULL DEFAULT 0,
+    stamp_tax FLOAT NOT NULL DEFAULT 0,
+    transfer_fee FLOAT NOT NULL DEFAULT 0,
+    total_amount FLOAT NOT NULL DEFAULT 0,
+    trade_date VARCHAR(10) NOT NULL,
+    fact_as_of VARCHAR(32) NOT NULL DEFAULT '',
+    available_on VARCHAR(10) NOT NULL DEFAULT '',
+    status VARCHAR(16) NOT NULL DEFAULT 'filled',
+    reject_reason VARCHAR(128) NOT NULL DEFAULT '',
+    strategy_variant VARCHAR(32) NOT NULL DEFAULT 'current_gate',
+    rule_version VARCHAR(64) NOT NULL DEFAULT '',
+    model_version VARCHAR(128) NOT NULL DEFAULT '',
+    source_label VARCHAR(32) NOT NULL DEFAULT 'AI模拟',
+    metadata_json JSON NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_paper_execution_key (execution_key),
+    KEY ix_paper_execution_account_date (account_id, trade_date),
+    KEY ix_paper_execution_code_date (stock_code, trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS paper_review (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT NOT NULL,
+    execution_id INT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    review_date VARCHAR(10) NOT NULL,
+    source_type VARCHAR(16) NOT NULL DEFAULT 'paper',
+    content JSON NULL,
+    audit_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    audit_verdict VARCHAR(16) NOT NULL DEFAULT '',
+    audit_reason TEXT,
+    shadow_status VARCHAR(16) NOT NULL DEFAULT 'not_started',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    audited_at DATETIME NULL,
+    KEY ix_paper_review_status (audit_status, shadow_status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS paper_quote_snapshot (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(64) NOT NULL DEFAULT '',
+    price FLOAT NULL,
+    change_pct FLOAT NULL,
+    source VARCHAR(32) NOT NULL DEFAULT '',
+    quote_time VARCHAR(32) NOT NULL DEFAULT '',
+    fact_as_of VARCHAR(32) NOT NULL DEFAULT '',
+    status VARCHAR(16) NOT NULL DEFAULT 'ok',
+    error VARCHAR(256) NOT NULL DEFAULT '',
+    snapshot JSON NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_paper_quote_account_code (account_id, stock_code),
+    KEY ix_paper_quote_account_updated (account_id, updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS paper_context (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT NOT NULL,
+    trade_date VARCHAR(10) NOT NULL,
+    mode VARCHAR(24) NOT NULL DEFAULT 'live_paper',
+    stock_code VARCHAR(16) NOT NULL DEFAULT '',
+    stage VARCHAR(32) NOT NULL DEFAULT '',
+    facts JSON NULL,
+    tool_trace JSON NULL,
+    source_refs JSON NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'frozen',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY ix_paper_context_account_date (account_id, trade_date),
+    KEY ix_paper_context_stock (stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS paper_web_evidence (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT NOT NULL,
+    trade_date VARCHAR(10) NOT NULL,
+    stock_code VARCHAR(16) NOT NULL DEFAULT '',
+    url VARCHAR(1024) NOT NULL DEFAULT '',
+    domain VARCHAR(128) NOT NULL DEFAULT '',
+    title VARCHAR(512) NOT NULL DEFAULT '',
+    excerpt TEXT,
+    published_at VARCHAR(64) NOT NULL DEFAULT '',
+    fetched_at VARCHAR(64) NOT NULL DEFAULT '',
+    fact_as_of VARCHAR(64) NOT NULL DEFAULT '',
+    content_hash VARCHAR(64) NOT NULL DEFAULT '',
+    status VARCHAR(16) NOT NULL DEFAULT 'ok',
+    error VARCHAR(256) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY ix_paper_web_evidence_account_date (account_id, trade_date),
+    KEY ix_paper_web_evidence_stock (stock_code),
+    KEY ix_paper_web_evidence_hash (content_hash)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS paper_alert (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT NOT NULL,
+    stock_code VARCHAR(16) NOT NULL DEFAULT '',
+    trade_date VARCHAR(10) NOT NULL,
+    severity VARCHAR(16) NOT NULL DEFAULT 'info',
+    alert_type VARCHAR(64) NOT NULL DEFAULT '',
+    message TEXT,
+    source VARCHAR(32) NOT NULL DEFAULT 'paper_monitor',
+    context_id INT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY ix_paper_alert_account_date (account_id, trade_date),
+    KEY ix_paper_alert_stock (stock_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

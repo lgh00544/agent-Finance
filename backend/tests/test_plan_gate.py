@@ -133,6 +133,19 @@ def test_insert_plan_same_day_keeps_history():
     assert by_id[second]["total_pct"] == 40.0, "最新计划应保留最新版内容"
 
 
+def test_update_plan_status_manual_confirmation_only():
+    """建仓计划状态由人工确认；采纳/放弃只改计划生命周期，不自动生成持仓。"""
+    plan_id = repo.insert_plan("600011", "确认测试", "2026-08-09", 20.0,
+                               [{"tranche": 1, "price_zone": "10~10.5", "ratio_pct": 20.0}],
+                               9.2, 12.0, "待确认方案")
+    row = repo.update_plan_status(plan_id, "accepted")
+    assert row is not None
+    assert row["status"] == "accepted"
+
+    rows = repo.list_plans(code="600011", limit=5)
+    assert next(r for r in rows if r["id"] == plan_id)["status"] == "accepted"
+
+
 def test_daily_pipeline_auto_plans_for_b_plus(monkeypatch):
     """每日流水线：打分完成后 B+ 候选自动生成建仓计划（同源联动）"""
     monkeypatch.setattr(router, "run_discover", lambda date: {

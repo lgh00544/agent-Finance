@@ -583,6 +583,43 @@ def get_sector_forecast_stats(end_date: str | None = None):
     return summarize_forecast_accuracy(end_date)
 
 
+@router.get("/sector-radar/list")
+def sector_radar_list(sector_code: str = "", days: int = 7, date: str = "", source_scope: str = ""):
+    """行业消息雷达列表：观察型 shadow，不进入正式 Agent prompt。"""
+    from app.services import sector_radar
+    return sector_radar.list_radar(sector_code, days, date, source_scope)
+
+
+@router.post("/sector-radar/interpret/run")
+def sector_radar_interpret(body: dict = Body(default=None)):
+    """手动触发单行业消息解读；K228 blocked 时只返回结果，不进入正式解读。"""
+    from app.services import sector_radar
+    body = body or {}
+    return sector_radar.run_interpret(str(body.get("sector_code") or ""),
+                                      [int(x) for x in (body.get("article_ids") or [])])
+
+
+@router.post("/sector-radar/feedback")
+def sector_radar_feedback(body: dict = Body(default=None)):
+    """用户反馈只写待审核队列，不直接修改行业字典。"""
+    from app.services import sector_radar
+    body = body or {}
+    return sector_radar.feedback(body.get("article_id"), body.get("interpret_id"),
+                                 str(body.get("feedback_type") or "dismiss"),
+                                 str(body.get("reason") or ""))
+
+
+@router.post("/sector-radar/collect/run")
+def sector_radar_collect(body: dict = Body(default=None)):
+    """手动抓取观察型雷达信号；auto_interpret 默认关闭，避免误触发大批 LLM。"""
+    from app.services import sector_radar
+    body = body or {}
+    return sector_radar.collect_sector_radar(
+        str(body.get("sector_code") or ""), bool(body.get("auto_interpret")),
+        int(body.get("max_sectors") or 8), int(body.get("max_stocks") or 5),
+        float(body.get("sleep_seconds") if body.get("sleep_seconds") is not None else 2.0))
+
+
 @router.get("/jobs/status")
 def job_status():
     return {"jobs": scheduler_jobs.job_status()}
@@ -793,6 +830,51 @@ class AccountBaselineBody(BaseModel):
     source: str = Field(default="ocr", description="来源：ocr / manual")
 
 
+class PaperAccountBody(BaseModel):
+    name: str = Field(default="AI模拟账户", max_length=64)
+    initial_cash: float = Field(gt=0, description="模拟初始资金（元）")
+    strategy_variant: str = Field(default="current_gate", description="只支持已有规则的 current_gate")
+    rule_version: str = Field(default="")
+    model_version: str = Field(default="")
+
+
+class PaperRunBody(BaseModel):
+    trade_date: str = Field(default="", description="事实日期；留空取今天")
+    facts: dict | None = Field(default=None, description="历史重放事实包；只能包含该日期已知事实")
+    requested_sides: dict[str, str] = Field(default_factory=dict,
+                                             description="可选的已存在模拟仓位卖出意图")
+
+
+class PaperStatusBody(BaseModel):
+    status: str = Field(description="active/paused")
+
+
+class PaperContextBody(BaseModel):
+    stock_code: str = Field(pattern=r"^\d{6}$")
+    trade_date: str = ""
+    mode: str = "live_paper"
+    web_query: str = Field(default="", max_length=200)
+    web_urls: list[str] = Field(default_factory=list, max_length=5)
+    historical_facts: dict | None = None
+
+
+class PaperMonitorBody(BaseModel):
+    trade_date: str = ""
+
+
+class PaperAuditBody(BaseModel):
+    verdict: str = Field(description="AI 审核结论：pass/fail")
+    reason: str = Field(default="", description="审核理由，必须可追溯")
+
+
+class PaperReviewBody(BaseModel):
+    stock_code: str = Field(min_length=1, max_length=16)
+    stock_name: str = Field(default="", max_length=64)
+    review_date: str = Field(default="")
+    execution_id: int | None = None
+    content: dict = Field(default_factory=dict)
+
+
 @router.post("/account/baseline")
 def save_account_baseline(body: AccountBaselineBody):
     """保存账户基准（仅人工确认后调用；每次插入一行保留历史，读取取最新）"""
@@ -803,6 +885,181 @@ def save_account_baseline(body: AccountBaselineBody):
     bid = repo.insert_account_baseline(trade_date, body.total_asset, body.available_cash,
                                        body.position_pct, body.source)
     return {"id": bid, "trade_date": trade_date, "saved": True}
+
+
+# ================= AI 模拟账本（与真实 Holding/TradeRecord 完全隔离） =================
+@router.get("/paper/accounts")
+def paper_accounts():
+    return [{**row, "execution_mode": "paper", "source_label": "AI模拟"}
+            for row in repo.list_paper_accounts()]
+
+
+@router.post("/paper/accounts")
+def paper_account_create(body: PaperAccountBody):
+    if body.strategy_variant != "current_gate":
+        raise HTTPException(status_code=400,
+                            detail="初版模拟只执行现有 current_gate，不允许借模拟入口改规则")
+    try:
+        row = repo.create_paper_account(body.name, body.initial_cash, body.strategy_variant,
+                                        body.rule_version, body.model_version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**row, "execution_mode": "paper", "source_label": "AI模拟"}
+
+
+@router.get("/paper/accounts/{account_id}/summary")
+def paper_account_summary(account_id: int):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    from app.services import paper_valuation
+    summary = paper_valuation.account_view(account_id, refresh=True)
+    executions = repo.list_paper_executions(account_id, limit=500)
+    return {**summary,
+            "filled_count": sum(1 for r in executions if r["status"] == "filled"),
+            "rejected_count": sum(1 for r in executions if r["status"] != "filled")}
+
+
+@router.post("/paper/accounts/{account_id}/status")
+def paper_account_status(account_id: int, body: PaperStatusBody):
+    try:
+        result = repo.update_paper_account_status(account_id, body.status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return {**result, "execution_mode": "paper", "source_label": "AI模拟"}
+
+
+@router.get("/paper/accounts/{account_id}/positions")
+def paper_account_positions(account_id: int):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    from app.services import paper_valuation
+    return [{**row, "execution_mode": "paper", "source_label": "AI模拟"}
+            for row in paper_valuation.account_view(account_id, refresh=True)["positions"]]
+
+
+@router.post("/paper/accounts/{account_id}/quotes/refresh")
+def paper_account_refresh(account_id: int):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    from app.services import paper_valuation
+    return paper_valuation.account_view(account_id, refresh=True)
+
+
+@router.post("/paper/accounts/{account_id}/contexts")
+def paper_account_collect_context(account_id: int, body: PaperContextBody):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    from app.services import paper_context
+    try:
+        return paper_context.collect(account_id, body.stock_code,
+                                     body.trade_date.strip() or time.strftime("%Y-%m-%d"),
+                                     mode=body.mode, web_query=body.web_query,
+                                     web_urls=body.web_urls, historical_facts=body.historical_facts)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/paper/accounts/{account_id}/monitor")
+def paper_account_monitor(account_id: int, body: PaperMonitorBody | None = None):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    from app.services import paper_monitor
+    try:
+        return paper_monitor.run(account_id, (body.trade_date if body else "").strip() or time.strftime("%Y-%m-%d"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/paper/accounts/{account_id}/contexts")
+def paper_account_contexts(account_id: int, limit: int = 100):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return repo.list_paper_contexts(account_id, max(1, min(limit, 500)))
+
+
+@router.get("/paper/accounts/{account_id}/web-evidence")
+def paper_account_web_evidence(account_id: int, limit: int = 100):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return repo.list_paper_web_evidence(account_id, max(1, min(limit, 500)))
+
+
+@router.get("/paper/accounts/{account_id}/alerts")
+def paper_account_alerts(account_id: int, limit: int = 100):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return repo.list_paper_alerts(account_id, max(1, min(limit, 500)))
+
+
+@router.get("/paper/accounts/{account_id}/executions")
+def paper_account_executions(account_id: int, limit: int = 200):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return [{**row, "execution_mode": "paper", "source_label": "AI模拟"}
+            for row in repo.list_paper_executions(account_id, max(1, min(limit, 1000)))]
+
+
+@router.post("/paper/accounts/{account_id}/run")
+def paper_account_run(account_id: int, body: PaperRunBody | None = None):
+    body = body or PaperRunBody()
+    trade_date = body.trade_date.strip() or time.strftime("%Y-%m-%d")
+    from app.services import paper_execution
+    try:
+        return paper_execution.run(account_id, trade_date, facts=body.facts,
+                                   requested_sides=body.requested_sides)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/paper/reviews")
+def paper_reviews(account_id: int | None = None, limit: int = 100):
+    return [{**row, "execution_mode": "paper", "review_source": "模拟复盘",
+             "audit_status_label": "AI审核通过" if row["audit_status"] == "passed" else
+             ("待AI审核" if row["audit_status"] == "pending" else "AI审核未通过")}
+            for row in repo.list_paper_reviews(account_id, max(1, min(limit, 500)))]
+
+
+@router.post("/paper/accounts/{account_id}/reviews")
+def paper_review_create(account_id: int, body: PaperReviewBody):
+    if repo.get_paper_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    review_date = body.review_date.strip() or time.strftime("%Y-%m-%d")
+    rid = repo.create_paper_review(account_id, body.stock_code.strip(), body.stock_name.strip(),
+                                   review_date, body.content, body.execution_id)
+    return {"id": rid, "account_id": account_id, "execution_mode": "paper",
+            "review_source": "模拟复盘", "audit_status": "pending",
+            "audit_status_label": "待AI审核", "shadow_status": "not_started"}
+
+
+@router.post("/paper/reviews/{review_id}/ai-audit")
+def paper_review_ai_audit(review_id: int):
+    """调用现有 Review LLM 通道做模拟复盘审核；审核通过才可进入 paper shadow。"""
+    try:
+        from app.agents.paper_review import audit_review
+        result = audit_review(review_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 审核失败不得伪造通过
+        logger.exception("模拟复盘 AI 审核失败 review#%s", review_id)
+        raise HTTPException(status_code=502, detail=f"AI审核失败: {str(exc)[:160]}") from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="模拟复盘不存在")
+    return {**result, "execution_mode": "paper", "review_source": "模拟复盘",
+            "audit_status_label": "AI审核通过" if result["audit_status"] == "passed" else "AI审核未通过"}
+
+
+@router.post("/paper/reviews/{review_id}/shadow")
+def paper_review_shadow(review_id: int):
+    try:
+        result = repo.mark_paper_shadow(review_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="模拟复盘不存在")
+    return {**result, "execution_mode": "paper", "review_source": "模拟复盘",
+            "source_type": "paper_shadow", "formal_rule_change": False}
 
 
 @router.post("/db/maintenance")
@@ -930,6 +1187,22 @@ def create_plan(body: CodeBody):
 @router.get("/positions")
 def list_plans(code: Optional[str] = None, limit: int = 50):
     return repo.list_plans(code, limit)
+
+
+class PlanStatusBody(BaseModel):
+    status: str = Field(description="计划状态：accepted/abandoned")
+
+
+@router.post("/positions/{plan_id}/status")
+def update_plan_status(plan_id: int, body: PlanStatusBody):
+    """人工确认建仓方案状态；只更新方案生命周期，不自动下单、不自动转持仓。"""
+    status = body.status.strip()
+    if status not in {"accepted", "abandoned"}:
+        raise HTTPException(status_code=400, detail="计划状态只能为 accepted/abandoned")
+    row = repo.update_plan_status(plan_id, status)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"建仓计划不存在: {plan_id}")
+    return row
 
 
 # ================= 持仓管理 =================
@@ -1173,22 +1446,31 @@ class ApproveSuggestionBody(BaseModel):
 
 @router.post("/reviews/{rid}/adopt")
 def adopt_review_suggestion(rid: int):
-    """采纳复盘给出的交易偏好优化建议 → 更新 sys_trade_profile"""
+    """采纳复盘反馈。
+
+    有 profile_suggestion 时更新个人偏好档案；只有通用 feedback 时，仅激活
+    对应 AgentPreference 版本作为评分参考。两条路径都必须由人工显式触发。
+    """
     review = repo.get_review(rid)
     if review is None:
         raise HTTPException(status_code=404, detail="复盘记录不存在")
     suggestion = (review.feedback or {}).get("profile_suggestion")
 
-    if not suggestion:
-        raise HTTPException(status_code=400, detail="该复盘无偏好优化建议")
-
-    content = repo.get_trade_profile_content()
-    content[suggestion["field"]] = suggestion["value"]
-    version = repo.update_trade_profile(content)
+    version = None
+    applied = "review_feedback"
+    if suggestion:
+        content = repo.get_trade_profile_content()
+        content[suggestion["field"]] = suggestion["value"]
+        version = repo.update_trade_profile(content)
+        applied = "profile"
+    elif not repo.activate_preference_for_review(rid):
+        raise HTTPException(status_code=400, detail="该复盘没有可采纳的待审核反馈")
     repo.update_review_suggestion_status(rid, "adopted")
-    return {"adopted": True, "field": suggestion["field"], "version": version,
+    return {"adopted": True, "applied": applied,
+            "field": suggestion.get("field") if suggestion else None,
+            "version": version,
             "legacy_adopt": True,
-            "warning": "旧复盘入口不具备 agent_suggestion 审核链，请优先使用 /agent-suggestions/{sid}/approve"}
+            "warning": "该入口是人工显式采纳；规则类建议仍请使用 AI 审核后的 agent-suggestion 入口"}
 
 
 @router.post("/reviews/{rid}/reject")

@@ -16,6 +16,7 @@ import time
 from pydantic import BaseModel
 
 from app.agents.schemas import ExperienceDraft, RouteConflict
+from app.cache import cache
 from app.core.config import settings
 from app.db import repo
 from app.llm.structured import ModelLevel, llm_call_json
@@ -38,6 +39,9 @@ DEFAULTS = {
     "memory_stale_hit_threshold": "0",
     "memory_duplicate_similarity": "0.86",
 }
+_WORKER_LOCK = "experience_worker"
+_WORKER_LOCK_TTL = 4 * 60 * 60
+_DB_RETRY_DELAYS = (0.3, 0.8, 1.5)
 
 
 def _cfg(key: str) -> str:
@@ -64,6 +68,41 @@ def _cfg_int(key: str) -> int:
 
 def _cfg_bool(key: str) -> bool:
     return str(_cfg(key)).lower() in ("1", "true", "yes")
+
+
+def _is_retryable_db_error(exc: BaseException) -> bool:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+        if len(chain) >= 5:
+            break
+    text = " ".join(str(item) for item in chain).lower()
+    return any(token in text for token in ("database is locked", "database is busy",
+                                           "sqlite busy", "locked"))
+
+
+def _retry_db_call(label: str, fn):
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate(_DB_RETRY_DELAYS, 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 transient sqlite contention
+            last_exc = exc
+            if attempt >= len(_DB_RETRY_DELAYS) or not _is_retryable_db_error(exc):
+                raise
+            logger.warning("经验 Worker %s 第 %d 次失败，重试: %s", label, attempt, exc)
+            time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+
+
+def _safe_release_pending(pending_id: int, error: str | None = None) -> None:
+    try:
+        repo.release_pending(pending_id, error=error)
+    except Exception as exc:  # noqa: BLE001 释放失败只记日志，不反噬主流程
+        logger.warning("经验 Worker 释放 pending=%s 失败: %s", pending_id, exc)
 
 
 def _split_tags(raw) -> set:
@@ -188,15 +227,15 @@ def _process_item(item: dict) -> None:
         draft = _llm_extract(experience_prompt.EXTRACT_SYSTEM, user, ExperienceDraft)
     except Exception as exc:  # noqa: BLE001 抽取失败标 done+error，不残留 processing
         logger.warning("经验抽取失败 pending=%s: %s", pending_id, exc)
-        repo.release_pending(pending_id, error=f"extract_failed: {exc}")
+        _safe_release_pending(pending_id, error=f"extract_failed: {exc}")
         return
     if not draft.worth:
-        repo.release_pending(pending_id, error=None)  # 无经验，正常完成
+        _safe_release_pending(pending_id, error=None)  # 无经验，正常完成
         return
     result = route_draft(draft, pending_id)
     logger.info("经验分流 pending=%s → %s（%s）", pending_id, result["status"],
                 result.get("reason", ""))
-    repo.release_pending(pending_id, error=None)
+    _safe_release_pending(pending_id, error=None)
 
 
 def worker_run(force: bool = False) -> dict:
@@ -210,17 +249,26 @@ def worker_run(force: bool = False) -> dict:
         logger.info("经验 Worker 跳过：积压 %s < 阈值 %s", backlog, threshold)
         return {"skipped": True, "reason": "backlog_low", "backlog": backlog,
                 "watchdog_reset": watchdog_reset}
-    if task_queue.has_active("experience"):
+    if task_queue.has_active("experience_worker"):
         logger.info("经验 Worker 推迟：experience 任务活跃")
         return {"skipped": True, "reason": "task_busy", "backlog": backlog,
                 "watchdog_reset": watchdog_reset}
+    if not cache.acquire_lock(_WORKER_LOCK, ttl_seconds=_WORKER_LOCK_TTL):
+        logger.info("经验 Worker 跳过：已有实例正在运行")
+        return {"skipped": True, "reason": "worker_locked", "backlog": backlog,
+                "watchdog_reset": watchdog_reset}
 
-    run_id = repo.start_worker_run()
-    claimed = repo.claim_pending_batch(batch_size=20)
+    run_id = None
+    claimed: list[dict] = []
     processed = 0
     err_count = 0
     sleep_sec = _cfg_float("worker_sleep_sec")
     try:
+        try:
+            run_id = _retry_db_call("start_worker_run", repo.start_worker_run)
+        except Exception as exc:  # noqa: BLE001 运行记录失败不应影响经验消费
+            logger.warning("经验 Worker 运行记录启动失败，继续执行: %s", exc)
+        claimed = _retry_db_call("claim_pending_batch", lambda: repo.claim_pending_batch(batch_size=20))
         for item in claimed:
             try:
                 _process_item(item)
@@ -228,12 +276,28 @@ def worker_run(force: bool = False) -> dict:
             except Exception as exc:  # noqa: BLE001 单条异常不中断批次
                 err_count += 1
                 logger.error("经验处理异常 pending=%s: %s", item.get("id"), exc)
-                repo.release_pending(item["id"], error=f"process_error: {exc}")
+                _safe_release_pending(item["id"], error=f"process_error: {exc}")
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
-        repo.finish_worker_run(run_id, processed, "success")
+        if run_id is not None:
+            try:
+                _retry_db_call("finish_worker_run",
+                               lambda: repo.finish_worker_run(run_id, processed, "success"))
+            except Exception as exc:  # noqa: BLE001 结束记录失败只记日志
+                logger.warning("经验 Worker 运行记录结束失败 run_id=%s: %s", run_id, exc)
         return {"run_id": run_id, "processed": processed, "errors": err_count,
                 "claimed": len(claimed), "watchdog_reset": watchdog_reset, "skipped": False}
     except Exception as exc:  # noqa: BLE001
-        repo.finish_worker_run(run_id, processed, "failed", error=str(exc))
+        if run_id is not None:
+            try:
+                repo.finish_worker_run(run_id, processed, "failed", error=str(exc))
+            except Exception as finish_exc:  # noqa: BLE001
+                logger.warning("经验 Worker 失败记录落库失败 run_id=%s: %s", run_id, finish_exc)
+        if _is_retryable_db_error(exc):
+            logger.warning("经验 Worker 遇到可重试数据库错误，返回失败结果: %s", exc)
+            return {"success": False, "status": "failed", "run_id": run_id,
+                    "processed": processed, "errors": err_count, "claimed": len(claimed),
+                    "watchdog_reset": watchdog_reset, "skipped": False, "error": str(exc)}
         raise
+    finally:
+        cache.release_lock(_WORKER_LOCK)

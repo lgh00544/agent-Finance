@@ -11,9 +11,25 @@ import { useNavigate } from 'react-router-dom'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { ChartCard, hotSectorBarOption } from '@/components/charts/ChartCard'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StockLabel } from '@/components/common'
+import { PaperTradingPanel } from '@/components/PaperTradingPanel'
 import type { AccountPnl, HotSector } from '@/types'
 
 const { Text } = Typography
+
+const TASK_KIND_LABELS: Record<string, string> = {
+  daily_pipeline: '每日挖掘',
+  monitor_all: '全持仓监控',
+  track_verify: '选股验证',
+  run_suggest: '建议生成',
+  review: '交易复盘',
+  review_rethink: '复盘重思考',
+  audit_one: '单条 AI 审核',
+  score: '评分分析',
+  position: '建仓方案',
+  sell_decision: '卖出决策',
+  market_intel: '市场研判',
+  knowledge_import: '知识导入',
+}
 
 type DashboardData = {
   checked_at?: string
@@ -107,12 +123,12 @@ function TaskStatusArea() {
       {rows.map((t) => (
         <Space key={t.task_id} style={{ width: '100%', marginBottom: 4, justifyContent: 'space-between' }}>
           <Space>
-            <Tag color={t.status === 'done' ? 'green' : t.status === 'failed' ? 'red' : t.status === 'running' ? 'blue' : 'orange'}>
-              {t.status === 'done' ? '完成' : t.status === 'failed' ? '失败' : t.status === 'running' ? '执行中' : '排队中'}
+            <Tag color={t.status === 'done' ? 'green' : t.status === 'failed' ? 'red' : t.status === 'running' ? 'blue' : t.status === 'canceled' ? 'default' : 'orange'}>
+              {t.status === 'done' ? '完成' : t.status === 'failed' ? '失败' : t.status === 'running' ? '执行中' : t.status === 'canceled' ? '已取消' : '排队中'}
             </Tag>
             <Text>{t.label}</Text>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {t.kind} · 提交于 {String(t.submitted_at ?? '').slice(5, 16)}
+            <Text type="secondary" style={{ fontSize: 12 }} title={t.kind}>
+              {TASK_KIND_LABELS[t.kind] ?? '其他任务'} · 提交于 {String(t.submitted_at ?? '').slice(5, 16)}
             </Text>
           </Space>
           {t.status === 'failed' ? (
@@ -216,13 +232,21 @@ export function OverviewPage() {
 
   const mods = dash?.modules ?? {}
   const holdings = (mods.holdings as Array<Record<string, unknown>>) ?? []
-  const tradeable = (mods.candidate_tradeable as { date?: string; count?: number; total?: number; items?: Array<Record<string, unknown>> }) ?? {}
+  const tradeable = (mods.candidate_tradeable as {
+    status?: 'ready' | 'pending' | 'error' | string
+    date?: string
+    count?: number | null
+    total?: number | null
+    items?: Array<Record<string, unknown>>
+    error?: string
+  }) ?? {}
   const marketCond = (mods.market_condition as Record<string, unknown>) ?? {}
   const scores = (mods.scores as Array<Record<string, unknown>>) ?? []
 
   const ops = (tpPlans?.rows ?? []) as Array<Record<string, unknown>>
 
   // ② 今日可建仓标的（is_tradeable 判定行；grade/score/因子从 dashboard.scores 同名代码取，缺则诚实降级）
+  const tradeableStatus = String(tradeable.status ?? 'unknown')
   const tradeableList = ((tradeable.items ?? []) as Array<Record<string, unknown>>).filter((i) => i.is_tradeable)
   // ③ 持仓分类：止盈/止损 = quotes 现价 vs 参考位；红线 = red_line_check 命中；质量低 holdings 无该字段，诚实置空
   const quoteRows = (quotes?.rows ?? []) as Array<Record<string, unknown>>
@@ -255,6 +279,7 @@ export function OverviewPage() {
 
   return (
     <div>
+      <PaperTradingPanel />
       <Space style={{ marginBottom: 12 }} wrap>
         <Text type="secondary">页面数据刷新时间：{dash?.checked_at ?? '—'}</Text>
         <Button type="primary" loading={dig.submit.isPending} onClick={() => dig.submit.mutate({})}>
@@ -315,10 +340,10 @@ export function OverviewPage() {
       {/* ② 今日可建仓（可建仓判定 top3；0 只 EmptyState） */}
       <Card size="small" title="今日可建仓" style={{ background: 'var(--bg-card)', marginBottom: 12 }}>
         <StatCard label="今日可建仓"
-          value={tradeable.count != null ? `${tradeable.count} / ${tradeable.total ?? 0} 只` : '—'}
-          tone={(tradeable.count ?? 0) > 0 ? 'ok' : 'warn'}
-          sub={`${tradeable.date ?? '今日'} · 候选池`} />
-        {tradeableList.length ? (
+          value={tradeableStatus === 'error' ? '不可用' : tradeableStatus === 'pending' ? '待计算' : tradeable.count != null ? `${tradeable.count} / ${tradeable.total ?? 0} 只` : '—'}
+          tone={tradeableStatus === 'error' ? 'warn' : tradeableStatus === 'ready' && (tradeable.count ?? 0) > 0 ? 'ok' : 'warn'}
+          sub={`${tradeable.date ?? '今日'} · ${tradeableStatus === 'ready' ? '判定已完成' : tradeableStatus === 'pending' ? '等待每日挖掘或刷新' : tradeableStatus === 'error' ? '读取失败，请查看任务' : '状态未知'}`} />
+        {tradeableStatus === 'ready' && tradeableList.length ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {tradeableList.slice(0, 3).map((it) => {
               const code = String(it.stock_code ?? '')
@@ -337,7 +362,9 @@ export function OverviewPage() {
             })}
           </div>
         ) : (
-          <EmptyState text="今日无可建仓标的" icon="—" />
+          <EmptyState
+            text={tradeableStatus === 'ready' ? '判定已完成，今日暂无可建仓标的' : tradeableStatus === 'pending' ? '今日可建仓判定尚未生成' : tradeableStatus === 'error' ? '可建仓判定读取失败' : '可建仓判定状态未知'}
+            icon="—" />
         )}
       </Card>
 

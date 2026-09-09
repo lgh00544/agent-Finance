@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState, type MouseEvent } from 'react'
+import { useEffect, useMemo, useState, type MouseEvent, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   App,
   Alert,
@@ -26,10 +27,13 @@ import { get } from '@/api/client'
 import { portfolioAttribution, reviews, stockCycleAttribution } from '@/api/reviews'
 import { candidateTradeable } from '@/api/candidates'
 import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion, reReviewSuggestion, ruleChanges } from '@/api/suggestions'
-import { trackVerifyDates, trackVerifyList, runTrackVerify, runTrackSuggest } from '@/api/track'
+import { trackVerifyDates, trackVerifyList } from '@/api/track'
+import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { traceDetail, traces } from '@/api/traces'
 import { reAuditSuggestion as triggerAiAudit } from '@/api/audit'
+import { auditPaperReview, paperReviews, type PaperReview } from '@/api/paper'
 import { ChartCard } from '@/components/charts/ChartCard'
+import { KlineChart } from '@/components/charts/KlineChart'
 import type { EChartsOption } from 'echarts'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StatusBadge, StockLabel } from '@/components/common'
 import type { AgentSuggestion, ReviewInfo, RuleChange, TrackVerifyRow } from '@/types'
@@ -68,6 +72,49 @@ function ReasonCell({ text }: { text: unknown }) {
       <Text type="secondary">{open ? full : brief}</Text>
       {full.length > 80 ? <Button size="small" type="link" style={{ padding: 0 }} onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>{open ? '收起全文' : '展开查看全文'}</Button> : null}
     </Space>
+  )
+}
+
+/** 模拟复盘复用本页入口：AI审核通过后才允许送入 paper shadow。 */
+function PaperReviewPanel() {
+  const { message } = App.useApp()
+  const qc = useQueryClient()
+  const { data, isLoading, isError, error } = useQuery({ queryKey: ['paper-reviews'], queryFn: () => paperReviews(), retry: 1 })
+  const audit = async (id: number) => {
+    try { await auditPaperReview(id); message.success('模拟复盘 AI 审核完成'); qc.invalidateQueries({ queryKey: ['paper-reviews'] }) }
+    catch (e) { message.error(e instanceof Error ? e.message : 'AI审核失败') }
+  }
+  const rows = data ?? []
+  return (
+    <Card size="small" title={<Space><span>AI模拟复盘</span><Tag color="blue">模拟复盘</Tag></Space>} style={{ marginBottom: 12 }}>
+      {isError ? <Alert type="error" showIcon message="模拟复盘加载失败" description={error instanceof Error ? error.message : '后端暂时不可用，请稍后重试'} style={{ marginBottom: 8 }} /> : null}
+      {isLoading ? <Text type="secondary">正在加载模拟复盘…</Text> : !rows.length ? <Text type="secondary">暂无模拟复盘；模拟卖出后会在此生成待 AI 审核案例。</Text> : (
+        <List size="small" dataSource={rows} renderItem={(r: PaperReview) => {
+          const content = r.content ?? {}
+          const provenance = content.provenance ?? {}
+          const auditPassed = r.audit_status === 'passed'
+          return (
+            <List.Item actions={[
+              r.audit_status === 'pending' ? <Button key="audit" size="small" type="primary" onClick={() => audit(r.id)}>AI审核</Button> : null,
+              auditPassed ? <Tag key="shadow" color={r.shadow_status === 'pending' || r.shadow_status === 'active' ? 'green' : 'blue'}>{r.shadow_status === 'pending' || r.shadow_status === 'active' ? '已进入影子验证' : '审核通过，待影子验证'}</Tag> : null,
+            ].filter(Boolean) as ReactNode[]}>
+              <List.Item.Meta
+                title={<Space wrap><StockLabel code={r.stock_code} name={r.stock_name} /><Tag color="blue">AI模拟</Tag><Tag>{r.audit_status_label ?? (auditPassed ? 'AI审核通过' : '待AI审核')}</Tag></Space>}
+                description={<Collapse ghost items={[{ key: 'detail', label: '查看复盘详情', children: <Descriptions size="small" column={1}>
+                  <Descriptions.Item label="复盘日期">{textVal(r.review_date)}</Descriptions.Item>
+                  <Descriptions.Item label="经验结论">{textVal(content.lesson, '暂无')}</Descriptions.Item>
+                  <Descriptions.Item label="计划与实际">{textVal(content.plan_vs_actual, '暂无')}</Descriptions.Item>
+                  <Descriptions.Item label="收益 / 持有天数">{content.pnl_pct == null ? '—' : `${Number(content.pnl_pct).toFixed(2)}%`} / {content.hold_days == null ? '—' : `${content.hold_days} 天`}</Descriptions.Item>
+                  <Descriptions.Item label="来源链路">{textVal(provenance.source_type ?? r.review_source, '模拟执行 Agent')} · 候选/评分/建仓计划均保留引用</Descriptions.Item>
+                  {r.knowledge_id != null ? <Descriptions.Item label="影子知识编号">{r.knowledge_id}</Descriptions.Item> : null}
+                </Descriptions>}]} />}
+              />
+            </List.Item>
+          )
+        }} />
+      )}
+      <Text type="secondary" style={{ fontSize: 12 }}>AI审核通过后由系统自动进入影子验证；影子案例不能直接改变正式规则，仍须人工采纳和回滚。</Text>
+    </Card>
   )
 }
 
@@ -196,20 +243,6 @@ interface DailySummaryPayload {
 function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onClose: () => void }) {
   const { message, modal } = App.useApp()
   const qc = useQueryClient()
-  const { data: klines } = useQuery({
-    queryKey: ['review-kline', r?.stock_code, r?.exit_date],
-    queryFn: async () => {
-      const end = String(r?.exit_date ?? '')
-      if (!end) return []
-      const s = new Date(end)
-      s.setDate(s.getDate() - 30)
-      const res = await get<{ klines: Array<Record<string, unknown>> }>(`/kline/${r?.stock_code}`, {
-        start: s.toISOString().slice(0, 10), end,
-      })
-      return res.klines ?? []
-    },
-    enabled: open && !!r?.stock_code && !!r?.exit_date,
-  })
   const { data: traceRows } = useQuery({
     queryKey: ['review-traces', r?.stock_code, r?.exit_date],
     queryFn: () => traces(r?.stock_code, String(r?.exit_date ?? ''), undefined, 20),
@@ -235,10 +268,16 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
   if (!r) return null
   const fb = (r.feedback ?? {}) as Record<string, unknown>
   const suggestion = (fb.profile_suggestion ?? {}) as Record<string, unknown>
+  const hasGenericFeedback = Object.entries(fb).some(([key, value]) => {
+    if (key === 'profile_suggestion' || value == null) return false
+    return typeof value === 'string' ? value.trim().length > 0 : true
+  })
 
   const adopt = () => modal.confirm({
-    title: '采纳建议并更新偏好档案', okText: '确认采纳',
-    content: '该建议将写入偏好档案，版本+1，全部 Agent 立即生效。',
+    title: suggestion.field ? '采纳建议并更新偏好档案' : '采纳复盘反馈', okText: '确认采纳',
+    content: suggestion.field
+      ? '该建议将写入偏好档案，版本+1，全部 Agent 立即生效。'
+      : '该反馈将作为后续评分的参考版本生效，不会修改硬规则。',
     onOk: async () => {
       try { await adoptSuggestion(r.id); message.success('已采纳'); qc.invalidateQueries({ queryKey: ['reviews'] }) }
       catch (e) { message.error(e instanceof Error ? e.message : '采纳失败') }
@@ -246,16 +285,6 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
   })
   const reject = () => openRejectConfirm(modal, message, '驳回该建议',
     (reason) => rejectSuggestion(r.id, reason), () => qc.invalidateQueries({ queryKey: ['reviews'] }))
-
-  const klineRows = klines ?? []
-  const klineOption: EChartsOption | null = klineRows.length ? {
-    tooltip: { trigger: 'axis' },
-    grid: { left: 8, right: 16, top: 24, bottom: 8, containLabel: true },
-    xAxis: { type: 'category', data: klineRows.map((k) => String(k.date ?? '')), axisLabel: { color: '#9ca3af' } },
-    yAxis: { type: 'value', axisLabel: { color: '#9ca3af' }, splitLine: { lineStyle: { color: 'rgba(60,80,120,0.2)' } } },
-    series: [{ type: 'line', data: klineRows.map((k) => Number(k.close) || 0), smooth: true, symbol: 'none',
-      itemStyle: { color: '#3b82f6' }, areaStyle: { color: 'rgba(59,130,246,0.15)' } }],
-  } : null
 
   return (
     <Drawer title={r.stock_name ? `${r.stock_code} ${r.stock_name}` : r.stock_code} open={open} onClose={onClose} width={620}>
@@ -267,9 +296,7 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
           <StatCard label="离场日期" value={String(r.exit_date ?? '—')} tone="mute" sub="触发复盘" />
           <StatCard label="计划兑现" value={r.plan_vs_actual ? '已记录' : '无'} tone={r.plan_vs_actual ? 'ok' : 'mute'} sub="建仓计划对照" />
         </StatCardGrid>
-        {klineOption ? (
-          <ChartCard title={`多日盈亏曲线（${r.stock_code} 离场前 30 日收盘）`} option={klineOption} height={220} />
-        ) : null}
+        <KlineChart code={r.stock_code} name={r.stock_name} anchorDate={String(r.exit_date ?? '')} anchorKind="exit" />
         <Card size="small" title="计划兑现度" style={{ background: 'var(--bg-input)' }}>
           <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, margin: 0 }}>{JSON.stringify(r.plan_vs_actual ?? {}, null, 2)}</pre>
         </Card>
@@ -330,10 +357,25 @@ function ReviewDrawer({ r, open, onClose }: { r: ReviewInfo; open: boolean; onCl
               : r.suggest_status === 'rejected' ? <Text type="secondary">已驳回</Text> : null}
           </Card>
         ) : null}
+        {!suggestion.field && hasGenericFeedback ? (
+          <Card size="small" title={`复盘反馈（第 ${r.suggest_iteration ?? 1} 版·${SUG_STATUS[r.suggest_status ?? '']?.label ?? '待审核'}）`}
+            style={{ background: 'var(--bg-input)' }}>
+            <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, margin: 0 }}>{JSON.stringify(fb, null, 2)}</pre>
+            {r.suggest_status === 'pending' ? (
+              <div style={{ marginTop: 8 }}>
+                <Space>
+                  <Button type="primary" onClick={adopt}>采纳为评分参考</Button>
+                  <Button type="default" danger onClick={reject}>驳回</Button>
+                </Space>
+              </div>
+            ) : r.suggest_status === 'adopted' ? <Text type="success">已采纳并生效</Text>
+              : r.suggest_status === 'rejected' ? <Text type="secondary">已驳回</Text> : null}
+          </Card>
+        ) : null}
         <Card size="small" title="复盘建议闭环" style={{ background: 'var(--bg-input)' }}>
           <Space direction="vertical" style={{ width: '100%' }} size={8}>
             <Text type="secondary">① 人工卖出 → 自动触发 ReviewAgent 复盘（盈亏归因 + 经验教训 + 偏好建议）</Text>
-            <Text type="secondary">② 产出偏好优化建议 → 人工审核「采纳并更新偏好档案」/「驳回」</Text>
+            <Text type="secondary">② 产出复盘反馈 → 人工审核「采纳并生效」/「驳回」；偏好字段会同步更新档案</Text>
             <Text type="secondary">③ 采纳后偏好档案版本 +1，全部 Agent 立即生效；驳回以「驳回 + 理由」留痕可追溯</Text>
             <Alert type="warning" showIcon message="所有 Agent 优化建议必须经人工审核确认后才生效，系统绝不自动、无监督修改任何策略与参数。" />
           </Space>
@@ -355,7 +397,7 @@ function ReviewsList() {
   const { data: sugs } = useQuery({ queryKey: ['agent-sug'], queryFn: () => agentSuggestions() })
   if (isError) return <ErrorCard title="复盘加载失败" message={error?.message} onRetry={() => refetch()} />
   const list = rows ?? []
-  if (!list.length) return <EmptyState text="暂无复盘记录。在「持仓监控」页录入人工卖出后自动触发复盘。" icon="🔁" />
+  if (!list.length) return <><PaperReviewPanel /><EmptyState text="暂无真实复盘记录。在「持仓监控」页录入人工卖出后自动触发复盘。" icon="🔁" /></>
 
   const sugList = sugs ?? []
   const passed = sugList.filter((s) => s.status === 'approved').length
@@ -394,9 +436,10 @@ function ReviewsList() {
     },
     {
       title: '建议状态', dataIndex: 'suggest_status', width: 110,
-      render: (v: string) => (
+      render: (v: string, r: ReviewInfo) => (
         <Tooltip title={v === 'pending' ? '待人工审核' : v === 'adopted' ? '已采纳并生效' : v === 'approved' ? '已人工采纳并生效' : v === 'rejected' ? '已驳回' : v}>
-          <Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? v}</Tag>
+          <Space size={4}><Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? v}</Tag>
+            <Tag color="blue">{String(r.review_source ?? '真实复盘')}</Tag></Space>
         </Tooltip>
       ),
     },
@@ -877,31 +920,32 @@ function TrackVerify() {
     () => (trackRules ?? []).filter((r: RuleChange) => reviewIdZero(r.review_id)),
     [trackRules],
   )
-  const runVerify = async () => {
-    try {
-      await runTrackVerify(false)
-      message.success('T+N 验证已提交后台')
+  const refreshTrack = () => {
       qc.invalidateQueries({ queryKey: ['tv-list'] })
       qc.invalidateQueries({ queryKey: ['agent-sug'] })
       qc.invalidateQueries({ queryKey: ['rule-changes'] })
-    } catch (e) { message.error(e instanceof Error ? e.message : '失败') }
+      qc.invalidateQueries({ queryKey: ['tv-dates'] })
   }
-  const runBackfill = async () => {
-    try {
-      await runTrackVerify(true)
-      message.success('历史回填已提交后台，将逐日补算候选 T+N')
-      qc.invalidateQueries({ queryKey: ['tv-list'] })
-      qc.invalidateQueries({ queryKey: ['agent-sug'] })
-      qc.invalidateQueries({ queryKey: ['rule-changes'] })
-    } catch (e) { message.error(e instanceof Error ? e.message : '失败') }
+  const verifyTask = useTaskSubmit('track_verify', () => {
+    message.success('T+N 验证已完成')
+    refreshTrack()
+  })
+  const backfillTask = useTaskSubmit('track_backfill', () => {
+    message.success('历史回填已完成')
+    refreshTrack()
+  })
+  const suggestTask = useTaskSubmit('track_suggest', () => {
+    message.success('建议生成已完成，并已进入 AI 审核队列')
+    refreshTrack()
+  })
+  const runVerify = () => {
+    verifyTask.submit.mutate({}, { onError: (e) => message.error(e instanceof Error ? e.message : '验证提交失败') })
   }
-  const runSuggest = async () => {
-    try {
-      await runTrackSuggest()
-      message.success('建议生成已提交后台，并会自动进入 AI 审核；AI 通过后到「策略闭环建议」人工采纳生效')
-      qc.invalidateQueries({ queryKey: ['agent-sug'] })
-      qc.invalidateQueries({ queryKey: ['rule-changes'] })
-    } catch (e) { message.error(e instanceof Error ? e.message : '失败') }
+  const runBackfill = () => {
+    backfillTask.submit.mutate({}, { onError: (e) => message.error(e instanceof Error ? e.message : '回填提交失败') })
+  }
+  const runSuggest = () => {
+    suggestTask.submit.mutate({}, { onError: (e) => message.error(e instanceof Error ? e.message : '建议提交失败') })
   }
 
   const ratingDist = useMemo(() => {
@@ -952,9 +996,9 @@ function TrackVerify() {
             { label: '最大回撤 高→低', value: 'dd-desc' },
           ]}
         />
-        <Button onClick={runVerify}>手动验证（T+N）</Button>
-        <Button onClick={runBackfill}>历史回填</Button>
-        <Button onClick={runSuggest}>生成建议</Button>
+        <Button loading={verifyTask.submit.isPending} onClick={runVerify}>手动验证（T+N）</Button>
+        <Button loading={backfillTask.submit.isPending} onClick={runBackfill}>历史回填</Button>
+        <Button loading={suggestTask.submit.isPending} onClick={runSuggest}>生成建议</Button>
       </Space>
       <StatCardGrid>
         <StatCard label="胜率" value={wr != null ? `${wr.toFixed(1)}%` : '无数据'}
@@ -1087,6 +1131,12 @@ function Suggestions() {
   const [selectedSug, setSelectedSug] = useState<AgentSuggestion | null>(null)
   const { data: rows } = useQuery({ queryKey: ['agent-sug'], queryFn: () => agentSuggestions() })
   const list = rows ?? []
+  const pendingAuditCount = list.filter((r) => r.status === 'pending' && ['pending', 'fail'].includes(auditVerdictOf(r))).length
+  const auditTask = useTaskSubmit('audit_pending', () => {
+    message.success('增量 AI 审核已完成')
+    qc.invalidateQueries({ queryKey: ['agent-sug'] })
+    qc.invalidateQueries({ queryKey: ['audit-stats'] })
+  })
   const byAgent = (() => {
     const m = new Map<string, number>()
     for (const s of list) { const a = s.target_agent ?? '其他'; m.set(a, (m.get(a) ?? 0) + 1) }
@@ -1154,6 +1204,7 @@ function Suggestions() {
 
   return (
     <>
+      <PaperReviewPanel />
       <Alert type="info" showIcon style={{ marginBottom: 10 }}
         title="交易复盘 · ReviewAgent 全链路"
         description="Agent 复盘后产出 review_log（Agent 调整建议 + 偏好优化建议），需经人工审核确认后才生效。包含两类建议：① 偏好类（写偏好档案）② 规则类（写生效规则表）；系统先做 AI 辩证审核，AI 通过后才开放人工采纳。" />
@@ -1170,6 +1221,14 @@ function Suggestions() {
         <StatCard label="硬规则候选" value={hardCount} tone={hardCount ? 'warn' : 'mute'} sub="二次确认后生效" />
       </StatCardGrid>
       <Space wrap style={{ margin: '10px 0' }}>
+        <Button
+          type="primary"
+          loading={auditTask.submit.isPending}
+          disabled={!pendingAuditCount}
+          onClick={() => auditTask.submit.mutate({ cutoff_id: 0, limit: 50 }, { onError: (e) => message.error(e instanceof Error ? e.message : '审核提交失败') })}
+        >
+          增量 AI 审核{pendingAuditCount ? `（${pendingAuditCount} 条）` : ''}
+        </Button>
         <Text type="secondary">规则类型：</Text>
         <Tag color={hardCount ? 'volcano' : 'default'}>硬规则 {hardCount}</Tag>
         <Tag>偏好/参数 {list.length - hardCount}</Tag>
@@ -1434,11 +1493,14 @@ function DailySummary() {
 
 /** 交易复盘页（Phase 4 黑盒规范） */
 export function ReviewsPage() {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedTab = searchParams.get('tab')
+  const activeTab = requestedTab && ['attr', 'reviews', 'track', 'sug'].includes(requestedTab) ? requestedTab : 'attr'
   return (
     <div>
       <Alert type="info" showIcon style={{ marginBottom: 12 }}
         message="交易复盘页汇聚 4 类看板：组合复盘（归因曲线/贡献瀑布/周期复利）· 每日复盘报告（人工卖出自动触发）· 选股效果验证（T+N 追踪胜率）· 策略闭环建议（人工审核后生效）。底部为每日组合总结。所有 Agent 优化建议必须经人工审核确认后生效。" />
-      <Tabs items={[
+      <Tabs activeKey={activeTab} onChange={(key) => setSearchParams(key === 'attr' ? {} : { tab: key })} items={[
         { key: 'attr', label: '组合复盘', children: <PortfolioAttributionView /> },
         { key: 'reviews', label: '每日复盘报告', children: <ReviewsList /> },
         { key: 'track', label: '选股效果验证', children: <TrackVerify /> },

@@ -23,6 +23,7 @@ import { trackVerifyStats } from '@/api/track'
 import { traceHistoryDetail, traces, tracesHistory, traceDetail } from '@/api/traces'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, StatCard, StatCardGrid, StockLabel } from '@/components/common'
+import { KlineChart } from '@/components/charts/KlineChart'
 import { applyBatchAdjust, batchMetaByAssistantId, chatHistory } from '@/api/chat'
 import type { AuditDecision, BatchAskResult, BlockDetail, Candidate, MarketAudit } from '@/types'
 
@@ -243,6 +244,7 @@ function CandidateExpand({ c }: { c: Candidate }) {
       ) : (
         <Alert type="info" showIcon style={{ marginBottom: 10 }} message="前瞻：暂无足够数据（历史同类样本不足）" />
       )}
+      <KlineChart code={c.stock_code} name={c.stock_name ?? c.stock_code} anchorDate={c.trade_date} anchorKind="select" />
       <Tabs defaultActiveKey="dims" size="small" items={items} />
     </div>
   )

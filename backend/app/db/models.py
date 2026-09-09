@@ -342,13 +342,18 @@ class NewsArticle(Base):
 
 
 class AgentPreference(Base):
-    """LLM 复盘反馈回流档案（ReviewAgent 写入，注入后续 Discover/Score prompt）"""
+    """LLM 复盘反馈回流档案。
+
+    复盘生成的反馈先以 pending 留痕，人工采纳后才允许注入 Discover/Score；
+    直接调用旧版 upsert_preference 的非复盘偏好仍可显式写入 active。
+    """
     __tablename__ = "agent_preference"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     version: Mapped[int] = mapped_column(Integer, default=1)         # 版本号递增
     content: Mapped[dict] = mapped_column(SafeJSON, default=dict)        # 偏好内容（LLM 输出）
     source_review_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending/active/rejected
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -907,6 +912,111 @@ class SectorLaunchReason(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class SectorDictV1(Base):
+    """行业消息雷达字典（人工维护；LLM/前端反馈无权直接改生效字典）"""
+    __tablename__ = "sector_dict_v1"
+    __table_args__ = (UniqueConstraint("sector_code", "version", name="uq_sdict_code_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sector_code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    sector_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    aliases: Mapped[list] = mapped_column(SafeJSON, default=list)
+    entity_keywords: Mapped[list] = mapped_column(SafeJSON, default=list)
+    industry_keywords: Mapped[list] = mapped_column(SafeJSON, default=list)
+    version: Mapped[str] = mapped_column(String(16), nullable=False, default="v1")
+    source: Mapped[str] = mapped_column(String(32), default="manual")
+    review_status: Mapped[str] = mapped_column(String(16), default="active")
+    reviewed_by: Mapped[str] = mapped_column(String(32), default="sir")
+    effective_from: Mapped[str] = mapped_column(String(10), default="")
+    effective_to: Mapped[str] = mapped_column(String(10), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SectorNewsArticle(Base):
+    """行业消息雷达原文信号；company_signal 必须诚实标注为成分股代理信号"""
+    __tablename__ = "sector_news_article"
+    __table_args__ = (
+        UniqueConstraint("content_hash", name="uq_sector_news_hash"),
+        Index("ix_sector_news_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_scope: Mapped[str] = mapped_column(String(32), default="company_signal")
+    source_type: Mapped[str] = mapped_column(String(32), default="company_news")
+    source_name: Mapped[str] = mapped_column(String(64), default="")
+    external_id: Mapped[str] = mapped_column(String(128), default="")
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="")
+    source_url: Mapped[str] = mapped_column(String(512), default="")
+    published_at: Mapped[str] = mapped_column(String(32), default="")
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    sector_codes: Mapped[list] = mapped_column(SafeJSON, default=list)
+    stock_codes: Mapped[list] = mapped_column(SafeJSON, default=list)
+    mapping_method: Mapped[str] = mapped_column(String(32), default="unmapped")
+    mapping_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(16), default="accepted", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SectorNewsAIInterpret(Base):
+    """行业消息 AI 解读；只读 shadow，不进入正式 Agent prompt"""
+    __tablename__ = "sector_news_ai_interpret"
+    __table_args__ = (Index("ix_sector_interpret_created", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    article_ids: Mapped[list] = mapped_column(SafeJSON, default=list)
+    sector_codes: Mapped[list] = mapped_column(SafeJSON, default=list)
+    polarity: Mapped[str] = mapped_column(String(16), default="uncertain")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    impact_mechanism: Mapped[str] = mapped_column(Text, default="")
+    impact_horizon: Mapped[str] = mapped_column(String(32), default="unknown")
+    information_score: Mapped[float] = mapped_column(Float, default=0.0)
+    direction_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    quote_evidence: Mapped[list] = mapped_column(SafeJSON, default=list)
+    affected_stock_codes: Mapped[list] = mapped_column(SafeJSON, default=list)
+    stock_relation_basis: Mapped[str] = mapped_column(Text, default="")
+    human_review_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    validator_status: Mapped[str] = mapped_column(String(16), default="pending")
+    model_version: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SectorNewsShadowVerify(Base):
+    """消息解读影子验证：T+1/T+3/T+5 只做观测，不改变候选池"""
+    __tablename__ = "sector_news_shadow_verify"
+    __table_args__ = (UniqueConstraint("interpret_id", name="uq_sector_shadow_interpret"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    interpret_id: Mapped[int] = mapped_column(Integer, ForeignKey("sector_news_ai_interpret.id"), index=True)
+    sector_code: Mapped[str] = mapped_column(String(64), index=True)
+    sector_name: Mapped[str] = mapped_column(String(64), default="")
+    signal_date: Mapped[str] = mapped_column(String(10), index=True)
+    base_index_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t1_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t3_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t5_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t1_at: Mapped[str] = mapped_column(String(10), default="")
+    t3_at: Mapped[str] = mapped_column(String(10), default="")
+    t5_at: Mapped[str] = mapped_column(String(10), default="")
+    direction_correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SectorNewsFeedback(Base):
+    """用户反馈只进入待处理队列，不直接修改行业字典"""
+    __tablename__ = "sector_news_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    article_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    interpret_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    feedback_type: Mapped[str] = mapped_column(String(16), default="dismiss")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    reviewer: Mapped[str] = mapped_column(String(32), default="sir")
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class SectorRegimeForecast(Base):
     """行情结构与板块轮动前瞻（C' 多窗口结构识别，每个交易日一条）"""
     __tablename__ = "sector_regime_forecast"
@@ -987,6 +1097,192 @@ class QuoteSnapshot(Base):
     change_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String(8), nullable=False, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class PaperAccount(Base):
+    """独立模拟账户；不得与人工真实 Holding/TradeRecord 混用。"""
+    __tablename__ = "paper_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), default="AI模拟账户")
+    strategy_variant: Mapped[str] = mapped_column(String(32), default="current_gate", index=True)
+    initial_cash: Mapped[float] = mapped_column(Float, default=1_000_000.0)
+    cash: Mapped[float] = mapped_column(Float, default=1_000_000.0)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    rule_version: Mapped[str] = mapped_column(String(64), default="")
+    model_version: Mapped[str] = mapped_column(String(128), default="")
+    source_label: Mapped[str] = mapped_column(String(32), default="AI模拟")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class PaperPosition(Base):
+    """模拟持仓；available_shares 用于强制 A 股 T+1。"""
+    __tablename__ = "paper_position"
+    __table_args__ = (
+        UniqueConstraint("account_id", "stock_code", name="uq_paper_position_account_code"),
+        Index("ix_paper_position_account_status", "account_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("paper_account.id"), index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    shares: Mapped[int] = mapped_column(Integer, default=0)
+    available_shares: Mapped[int] = mapped_column(Integer, default=0)
+    avg_price: Mapped[float] = mapped_column(Float, default=0.0)
+    cost: Mapped[float] = mapped_column(Float, default=0.0)
+    opened_trade_date: Mapped[str] = mapped_column(String(10), default="")
+    plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    stop_loss: Mapped[float] = mapped_column(Float, default=0.0)
+    take_profit: Mapped[float] = mapped_column(Float, default=0.0)
+    high_price: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(16), default="holding", index=True)
+    metadata_json: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class PaperExecution(Base):
+    """模拟订单/成交事件统一流水；rejected/no_fill 也必须留痕。"""
+    __tablename__ = "paper_execution"
+    __table_args__ = (
+        UniqueConstraint("execution_key", name="uq_paper_execution_key"),
+        Index("ix_paper_execution_account_date", "account_id", "trade_date"),
+        Index("ix_paper_execution_code_date", "stock_code", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("paper_account.id"), index=True)
+    decision_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    candidate_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    score_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    side: Mapped[str] = mapped_column(String(8))
+    requested_price: Mapped[float] = mapped_column(Float, default=0.0)
+    executed_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shares: Mapped[int] = mapped_column(Integer, default=0)
+    gross_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    commission: Mapped[float] = mapped_column(Float, default=0.0)
+    stamp_tax: Mapped[float] = mapped_column(Float, default=0.0)
+    transfer_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    total_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    fact_as_of: Mapped[str] = mapped_column(String(32), default="")
+    available_on: Mapped[str] = mapped_column(String(10), default="")
+    status: Mapped[str] = mapped_column(String(16), default="filled", index=True)
+    reject_reason: Mapped[str] = mapped_column(String(128), default="")
+    strategy_variant: Mapped[str] = mapped_column(String(32), default="current_gate")
+    rule_version: Mapped[str] = mapped_column(String(64), default="")
+    model_version: Mapped[str] = mapped_column(String(128), default="")
+    source_label: Mapped[str] = mapped_column(String(32), default="AI模拟")
+    metadata_json: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class PaperReview(Base):
+    """模拟复盘的审核闸门与影子状态；不进入正式 ReviewResult。"""
+    __tablename__ = "paper_review"
+    __table_args__ = (Index("ix_paper_review_status", "audit_status", "shadow_status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("paper_account.id"), index=True)
+    execution_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    review_date: Mapped[str] = mapped_column(String(10), index=True)
+    source_type: Mapped[str] = mapped_column(String(16), default="paper")
+    content: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    audit_status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    audit_verdict: Mapped[str] = mapped_column(String(16), default="")
+    audit_reason: Mapped[str] = mapped_column(Text, default="")
+    shadow_status: Mapped[str] = mapped_column(String(16), default="not_started", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    audited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PaperQuoteSnapshot(Base):
+    """模拟持仓专用行情快照；与真实持仓 quote_snapshot 隔离。"""
+    __tablename__ = "paper_quote_snapshot"
+    __table_args__ = (
+        UniqueConstraint("account_id", "stock_code", name="uq_paper_quote_account_code"),
+        Index("ix_paper_quote_account_updated", "account_id", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("paper_account.id"), index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), index=True)
+    stock_name: Mapped[str] = mapped_column(String(64), default="")
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    change_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String(32), default="")
+    quote_time: Mapped[str] = mapped_column(String(32), default="")
+    fact_as_of: Mapped[str] = mapped_column(String(32), default="")
+    status: Mapped[str] = mapped_column(String(16), default="ok")
+    error: Mapped[str] = mapped_column(String(256), default="")
+    snapshot: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class PaperContext(Base):
+    """一次纸面研究/决策的冻结上下文与工具调用摘要。"""
+    __tablename__ = "paper_context"
+    __table_args__ = (Index("ix_paper_context_account_date", "account_id", "trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("paper_account.id"), index=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    mode: Mapped[str] = mapped_column(String(24), default="live_paper")
+    stock_code: Mapped[str] = mapped_column(String(16), default="", index=True)
+    stage: Mapped[str] = mapped_column(String(32), default="")
+    facts: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    tool_trace: Mapped[list] = mapped_column(SafeJSON, default=list)
+    source_refs: Mapped[list] = mapped_column(SafeJSON, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="frozen")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class PaperWebEvidence(Base):
+    """受控联网只读证据；网页原文不进入正式规则。"""
+    __tablename__ = "paper_web_evidence"
+    __table_args__ = (Index("ix_paper_web_evidence_account_date", "account_id", "trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("paper_account.id"), index=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), default="", index=True)
+    url: Mapped[str] = mapped_column(String(1024), default="")
+    domain: Mapped[str] = mapped_column(String(128), default="")
+    title: Mapped[str] = mapped_column(String(512), default="")
+    excerpt: Mapped[str] = mapped_column(Text, default="")
+    published_at: Mapped[str] = mapped_column(String(64), default="")
+    fetched_at: Mapped[str] = mapped_column(String(64), default="")
+    fact_as_of: Mapped[str] = mapped_column(String(64), default="")
+    content_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    status: Mapped[str] = mapped_column(String(16), default="ok")
+    error: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class PaperAlert(Base):
+    """纸面监控/卖出告警；不写真实 AlertLog 或发送真实通知。"""
+    __tablename__ = "paper_alert"
+    __table_args__ = (Index("ix_paper_alert_account_date", "account_id", "trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("paper_account.id"), index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), default="", index=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    severity: Mapped[str] = mapped_column(String(16), default="info")
+    alert_type: Mapped[str] = mapped_column(String(64), default="")
+    message: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(32), default="paper_monitor")
+    context_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

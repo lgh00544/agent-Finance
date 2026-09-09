@@ -6,8 +6,9 @@ import pytest
 from sqlalchemy import create_engine, select
 
 from app.db import repo
-from app.db.models import ReviewResult
-from app.db.session import (SessionLocal, _ensure_agent_suggestion_columns,
+from app.db.models import AgentPreference, ReviewResult
+from app.db.session import (SessionLocal, _ensure_agent_preference_columns,
+                            _ensure_agent_suggestion_columns,
                             _ensure_review_result_columns, init_db)
 from agent_prompts import review_prompt
 
@@ -114,6 +115,75 @@ def test_adopt_sets_status_and_reject_history_feed():
     section = review_prompt.build_reject_history_section(hist)
     assert "历史驳回记录" in section
     assert "规则过于严格" in section
+
+
+def test_review_feedback_pending_until_suggestion_approved():
+    """复盘反馈必须先待审；对应 profile 建议采纳后才进入评分偏好。"""
+    rid = _insert_review(feedback={"偏好": "仅待审核反馈", "调整方向": "测试"})
+    repo.upsert_preference({"偏好": "仅待审核反馈"}, source_review_id=rid,
+                           status="pending")
+    with SessionLocal() as db:
+        pref = db.query(AgentPreference).filter(
+            AgentPreference.source_review_id == rid
+        ).order_by(AgentPreference.version.desc()).first()
+        assert pref is not None and pref.status == "pending"
+    # 待审核版本不能成为评分上下文
+    assert repo.get_latest_preference() != {"偏好": "仅待审核反馈"}
+
+    sid = repo.insert_agent_suggestion(
+        rid, "score", "测试偏好", "旧", "新", "理由", "证据",
+        target_kind="profile")
+    repo.update_agent_suggestion_status(sid, "approved")
+    with SessionLocal() as db:
+        pref = db.query(AgentPreference).filter(
+            AgentPreference.source_review_id == rid
+        ).order_by(AgentPreference.version.desc()).first()
+        assert pref.status == "active"
+
+
+def test_generic_review_feedback_has_manual_adoption_entry():
+    """没有 profile_suggestion 的通用反馈也能通过人工入口激活。"""
+    rid = _insert_review(feedback={"偏好": "提高景气关注", "调整方向": "加强资金验证"})
+    repo.upsert_preference({"偏好": "提高景气关注", "调整方向": "加强资金验证"},
+                           source_review_id=rid, status="pending")
+
+    from app.api.routes import adopt_review_suggestion
+
+    result = adopt_review_suggestion(rid)
+    assert result["adopted"] is True
+    assert result["applied"] == "review_feedback"
+    assert repo.get_review(rid).suggest_status == "adopted"
+    with SessionLocal() as db:
+        pref = db.query(AgentPreference).filter(
+            AgentPreference.source_review_id == rid
+        ).order_by(AgentPreference.version.desc()).first()
+        assert pref.status == "active"
+
+
+def test_agent_preference_migration_is_idempotent(tmp_path):
+    """旧 agent_preference 表增量补状态列，历史行默认 active。"""
+    eng = create_engine(f"sqlite:///{tmp_path / 'legacy_preference.db'}")
+    with eng.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE agent_preference ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, version INTEGER, "
+            "content JSON, source_review_id INTEGER, created_at DATETIME)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO agent_preference (version, content) VALUES (1, '{}')"
+        )
+
+    _ensure_agent_preference_columns(eng)
+    _ensure_agent_preference_columns(eng)
+    with eng.connect() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql(
+            "PRAGMA table_info(agent_preference)"
+        )}
+        assert "status" in cols
+        row = conn.exec_driver_sql(
+            "SELECT status FROM agent_preference WHERE id = 1"
+        ).fetchone()
+        assert row[0] == "active"
 
 
 def test_reject_history_section_empty_when_no_rows():

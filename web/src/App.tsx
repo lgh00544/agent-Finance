@@ -6,6 +6,7 @@ import { AppShell } from '@/components/layout/AppShell'
 // 13 页懒加载（路由级代码分割；AppShell 布局保持静态首屏加载）
 const OverviewPage = lazy(() => import('@/pages/OverviewPage'))
 const MarketIntelPage = lazy(() => import('@/pages/MarketIntelPage'))
+const NewsSectorPage = lazy(() => import('@/pages/NewsSectorPage'))
 const CandidatesPage = lazy(() => import('@/pages/CandidatesPage'))
 const ScoresPage = lazy(() => import('@/pages/ScoresPage'))
 const PlansPage = lazy(() => import('@/pages/PlansPage'))
@@ -37,6 +38,7 @@ export default function App() {
         <Route path="/" element={<AppShell />}>
           <Route index element={<OverviewPage />} />
           <Route path="market-intel" element={<MarketIntelPage />} />
+          <Route path="news-sector" element={<NewsSectorPage />} />
           <Route path="candidates" element={<CandidatesPage />} />
           <Route path="scores" element={<ScoresPage />} />
           <Route path="plans" element={<PlansPage />} />

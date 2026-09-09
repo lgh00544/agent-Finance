@@ -16,6 +16,8 @@ sys.path.insert(0, str(_BACKEND_DIR.parent))  # 项目根：agent_prompts/ 提�
 os.environ.setdefault("APP_ENV", "dev")
 
 from app.core.logging import get_logger  # noqa: E402
+from app.db import session as db_session  # noqa: E402
+from app.db.session import init_db  # noqa: E402
 
 log = get_logger("dev_run")
 
@@ -56,6 +58,9 @@ def _sync_on_start() -> None:
         if settings.db_backend != "mysql":
             log.info("DB_BACKEND=%s：未配置云端，跳过启动同步", settings.db_backend)
             return
+        with sync_manager.cloud_engine().begin() as conn:
+            [conn.exec_driver_sql(f"UPDATE `{t}` SET `{c}`='' WHERE `{c}` IS NULL")
+             for t, c in (("private_knowledge", "risk_note"), ("experience", "curator_note"))]
         log.info("SYNC_ON_START=true：同步云端 TiDB → 本地 SQLite（sync_manager backup）...")
         rc = sync_manager.cmd_backup()
         if rc == 0:
@@ -64,6 +69,20 @@ def _sync_on_start() -> None:
             log.warning("启动同步存在失败表（rc=%s），继续用本地数据启动", rc)
     except Exception as exc:  # noqa: BLE001 同步失败降级：提示但继续启动本地数据
         log.warning("启动同步失败（%s），降级使用本地数据启动", exc)
+
+
+def _init_local_schema() -> None:
+    """先迁移 sync_manager 的本地 SQLite，再恢复业务云端 engine。"""
+    import sync_manager
+
+    cloud_engine, local_engine = db_session.engine, sync_manager.local_engine()
+    db_session.engine = local_engine
+    db_session.SessionLocal.configure(bind=local_engine)
+    try:
+        init_db()
+    finally:
+        db_session.engine = cloud_engine; db_session.SessionLocal.configure(bind=cloud_engine)
+        local_engine.dispose()
 
 
 def _port_busy(host: str, port: int) -> bool:
@@ -82,6 +101,7 @@ if __name__ == "__main__":
                     "（防双实例双 APScheduler 抢任务锁）")
         sys.exit(1)
 
+    _init_local_schema()
     _sync_on_start()
 
     import uvicorn

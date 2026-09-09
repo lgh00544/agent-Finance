@@ -98,6 +98,31 @@ _COLLABORATION_RULES = [
         conflict_policy="audit_only_no_mutation",
         reason="审核 Agent 只能读取建议作为审核对象，不能自行修改规则。",
     ),
+    _rule(
+        "paper_execution", "discover", "reference",
+        conflict_policy="paper_read_only",
+        reason="模拟执行只读取候选事实，不调用发现 Agent 重新选股。",
+    ),
+    _rule(
+        "paper_execution", "score", "reference",
+        conflict_policy="paper_read_only",
+        reason="模拟执行只读取已落库评分，不重算评分。",
+    ),
+    _rule(
+        "paper_execution", "position", "reference",
+        conflict_policy="paper_read_only",
+        reason="模拟执行只读取已有建仓计划，不生成或修改计划。",
+    ),
+    *[
+        _rule(
+            "paper_execution",
+            target,
+            "reference",
+            conflict_policy="paper_snapshot_only",
+            reason="纸面沙盒可复用分析 Agent 的快照/只读能力，但不得调用其真实写入副作用。",
+        )
+        for target in ("monitor", "sell", "review", "market_intel")
+    ],
 ]
 
 _RULE_INDEX = {

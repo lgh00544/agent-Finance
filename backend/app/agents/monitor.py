@@ -338,3 +338,10 @@ def _days_ago(n: int) -> str:
     import datetime
 
     return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
+
+
+def paper_monitor_position(position: dict, quote: dict, context: dict) -> dict:
+    """Paper entry point reusing monitor's pure math without live Holding reads."""
+    from app.services.paper_analysis import monitor_position
+
+    return monitor_position(position, quote, context)

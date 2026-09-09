@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Alert, Button, Card, Descriptions, Drawer, Empty, Form, Input, Select, Space, Table, Tabs, Tag, Tooltip, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { useQuery } from '@tanstack/react-query'
@@ -19,6 +20,7 @@ import type {
   SystemMapCollaborationRule,
   SystemMapHealth,
   SystemMapHealthModule,
+  SystemMapHealthStatus,
   SystemMapMigrationSummary,
   SystemMapTool,
   SystemMapWorkflow,
@@ -59,19 +61,40 @@ const text = (value: unknown, fallback = '—') => {
   return s || fallback
 }
 const ENUM_LABELS: Record<string, string> = {
-  research_decision: '研究决策（research_decision）', entry_orchestrator: '入口编排（entry_orchestrator）',
-  experience: '经验治理（experience）', proposal: '提议权限（proposal）', advisory: '咨询权限（advisory）',
-  governance: '治理权限（governance）', readonly_data: '只读数据（readonly_data）',
-  return_error_payload: '返回错误载荷（return_error_payload）', deny_by_default: '默认拒绝（deny_by_default）',
-  call: '调用（call）', reference: '引用（reference）', propose_change: '提议变更（propose_change）',
-  agent: 'Agent 专属（agent）', market: '市场范围（market）', selected_agent: '指定 Agent（selected_agent）',
-  discover: '发现研判（discover）', score: '评分（score）', position: '建仓（position）',
-  monitor: '监控（monitor）', sell: '卖出（sell）', review: '复盘（review）',
-  market_intel: '市场研判（market_intel）', portfolio_sentinel: '组合哨兵（portfolio_sentinel）',
+  research_decision: '研究决策', entry_orchestrator: '入口编排',
+  experience: '经验治理', proposal: '提议权限', advisory: '咨询权限',
+  governance: '治理权限', readonly_data: '只读数据',
+  return_error_payload: '返回错误信息', deny_by_default: '默认拒绝',
+  call: '调用', reference: '引用', propose_change: '提议变更',
+  agent: 'Agent 专属', market: '市场范围', selected_agent: '指定 Agent',
+  discover: '发现研判', score: '评分', position: '建仓',
+  monitor: '监控', sell: '卖出', review: '复盘',
+  market_intel: '市场研判', portfolio_sentinel: '组合哨兵',
+  track_verify: '选股效果验证', agent_suggestion: 'Agent 优化建议',
+  get_quote: '实时行情快照', get_daily_kline: '日 K 线', get_news: '新闻公告',
+  get_financial: '财务指标', get_fund_flow: '资金流向', search_knowledge: '知识库检索',
+  get_sector_regime: '板块状态', get_factor_calibration: '因子校准',
+  get_distribution_phase: '派发阶段', get_capital_view: '资本视图', get_position_risk: '持仓风险',
+  pending: '待处理', processing: '处理中', done: '已完成', failed: '失败',
+  healthy: '正常', attention: '需关注', unknown: '未知', error: '错误',
+  source_module: '来源模块', select_date: '选股日期', is_finished: '是否完成',
+  t3_pct: 'T+3 收益率', t5_pct: 'T+5 收益率', t10_pct: 'T+10 收益率',
+  review_id: '复盘记录 ID', source_suggestion_id: '来源建议 ID',
 }
 const enumText = (value: unknown, fallback = '—') => {
   const raw = text(value, fallback)
   return ENUM_LABELS[raw] ?? raw
+}
+
+const KEY_LABELS: Record<string, string> = {
+  agent_id: '智能体标识', workflow_id: '工作流标识', tool_id: '工具标识', owner_module: '所属模块',
+  target_agent: '目标智能体', requester_agent: '请求智能体', source_module: '来源模块',
+  input_schema: '输入字段', output_schema: '输出字段', failure_policy: '失败处理',
+  conflict_policy: '冲突处理', audit_required: '需要审核', max_depth: '最大调用层数',
+  selected_agent: '指定智能体', stock_code: '股票代码', trade_date: '交易日期',
+  select_date: '选股日期', is_finished: '是否完成', t3_pct: 'T+3 收益率',
+  t5_pct: 'T+5 收益率', t10_pct: 'T+10 收益率', review_id: '复盘记录编号',
+  source_suggestion_id: '来源建议编号',
 }
 
 function TagList({ value, color }: { value: unknown; color?: string }) {
@@ -89,7 +112,9 @@ function CompactValue({ value }: { value: unknown }) {
   if (value && typeof value === 'object') {
     return (
       <Space size={[4, 4]} wrap>
-        {Object.keys(value as Record<string, unknown>).map((key) => <Tag key={key}>{key}</Tag>)}
+        {Object.keys(value as Record<string, unknown>).map((key) => (
+          <Tooltip key={key} title={`内部字段：${key}`}><Tag>{KEY_LABELS[key] ?? enumText(key)}</Tag></Tooltip>
+        ))}
       </Space>
     )
   }
@@ -123,6 +148,7 @@ const FIELD_LABELS: Record<string, string> = {
 }
 const fieldLabel = (key: string) => {
   if (FIELD_LABELS[key]) return FIELD_LABELS[key]
+  if (KEY_LABELS[key]) return KEY_LABELS[key]
   if (/^active_\d+$/.test(key)) return `活跃 ${key.slice(7)}`
   if (key.startsWith('curator_')) return '策展字段'
   if (key.startsWith('soft_')) return '软文字段'
@@ -227,7 +253,7 @@ function AgentsTab({ agents }: { agents: SystemMapAgent[] }) {
   const [selected, setSelected] = useState<SystemMapAgent | null>(null)
   if (!agents.length) return <EmptyState text="暂无 Agent 注册信息。" />
   const columns: ColumnsType<SystemMapAgent> = [
-    { title: '智能体（Agent）', dataIndex: 'name', width: 150, render: (_: unknown, row) => <Space direction="vertical" size={0}><Text strong>{text(row.name)}</Text><Text type="secondary">{row.agent_id}</Text></Space> },
+    { title: '智能体（Agent）', dataIndex: 'name', width: 150, render: (_: unknown, row) => <Space direction="vertical" size={0}><Text strong>{text(row.name)}</Text><Tooltip title={`内部标识：${row.agent_id}`}><Text type="secondary">{enumText(row.agent_id)}</Text></Tooltip></Space> },
     { title: '责任', dataIndex: 'responsibility', render: (v) => <Paragraph ellipsis={{ rows: 2, expandable: true }}>{text(v)}</Paragraph> },
     { title: '类型/权限', key: 'type', width: 150, render: (_: unknown, row) => <Space direction="vertical" size={2}><Tag>{enumText(row.agent_type)}</Tag><Tag color="blue">{enumText(row.authority_level)}</Tag></Space> },
     { title: '知识范围', dataIndex: 'knowledge_scope', width: 130, render: (v) => <Tag color="cyan">{enumText(v)}</Tag> },
@@ -247,7 +273,7 @@ function AgentsTab({ agents }: { agents: SystemMapAgent[] }) {
 function WorkflowsTab({ workflows }: { workflows: SystemMapWorkflow[] }) {
   if (!workflows.length) return <EmptyState text="暂无 Workflow 注册信息。" />
   const columns: ColumnsType<SystemMapWorkflow> = [
-    { title: '工作流（Workflow）', dataIndex: 'name', width: 170, render: (_: unknown, row) => <Space direction="vertical" size={0}><Text strong>{text(row.name)}</Text><Text type="secondary">{row.workflow_id}</Text></Space> },
+    { title: '工作流（Workflow）', dataIndex: 'name', width: 170, render: (_: unknown, row) => <Space direction="vertical" size={0}><Text strong>{text(row.name)}</Text><Tooltip title={`内部标识：${row.workflow_id}`}><Text type="secondary">{enumText(row.workflow_id)}</Text></Tooltip></Space> },
     { title: '示例意图', dataIndex: 'intent_examples', render: (v) => <TagList value={v} /> },
     { title: '步骤', dataIndex: 'steps', render: (v) => <TagList value={v} color="blue" /> },
     { title: '必填输入', dataIndex: 'required_inputs', render: (v) => <TagList value={v} color="orange" /> },
@@ -262,7 +288,7 @@ function WorkflowsTab({ workflows }: { workflows: SystemMapWorkflow[] }) {
 function ToolsTab({ tools }: { tools: SystemMapTool[] }) {
   if (!tools.length) return <EmptyState text="暂无只读工具注册信息。" />
   const columns: ColumnsType<SystemMapTool> = [
-    { title: '工具（Tool）', dataIndex: 'tool_id', width: 190, render: (v, row) => <Space direction="vertical" size={0}><Text strong>{text(v)}</Text><Text type="secondary">{text(row.owner_module)}</Text></Space> },
+    { title: '工具（Tool）', dataIndex: 'tool_id', width: 190, render: (v, row) => <Space direction="vertical" size={0}><Text strong>{enumText(v)}</Text><Tooltip title={`工具内部标识：${v}`}><Text type="secondary">{enumText(row.owner_module)}</Text></Tooltip></Space> },
     { title: '描述', dataIndex: 'description', render: (v) => <Paragraph ellipsis={{ rows: 2, expandable: true }}>{text(v)}</Paragraph> },
     { title: '类型（tool_type）', dataIndex: 'tool_type', width: 130, render: (v) => <Tag color="green">{enumText(v, 'readonly_data')}</Tag> },
     { title: '输入', dataIndex: 'inputs', render: (v) => <CompactValue value={v} /> },
@@ -311,8 +337,8 @@ function CollaborationQuery({ agentOptions, relationOptions }: { agentOptions: A
         {data ? (
           <Descriptions size="small" column={2} items={[
             { label: '允许（allowed）', children: <Tag color={tone.color}>{tone.label}</Tag> },
-            { label: '调用方（caller）', children: text(data.caller ?? data.requester_agent) },
-            { label: '目标（target）', children: text(data.target ?? data.target_agent) },
+            { label: '调用方（caller）', children: enumText(data.caller ?? data.requester_agent) },
+            { label: '目标（target）', children: enumText(data.target ?? data.target_agent) },
             { label: '关系（relation）', children: enumText(data.relation) },
             { label: '原因（reason）', children: text(data.reason) },
             { label: '未知调用方（unknown_caller）', children: String(!!data.unknown_caller) },
@@ -342,8 +368,8 @@ function CollaborationTab({ agents, rules }: { agents: SystemMapAgent[]; rules: 
     && (!filters.allowed || String(rule.allowed) === filters.allowed)
   ))
   const columns: ColumnsType<SystemMapCollaborationRule & { _synthetic?: boolean }> = [
-    { title: '请求方（requester）', dataIndex: 'requester_agent', width: 160, render: (v, row) => <Tag color={row._synthetic ? 'red' : 'blue'}>{text(v)}</Tag> },
-    { title: '目标（target）', dataIndex: 'target_agent', width: 150, render: (v, row) => <Tag color={row._synthetic ? 'red' : 'cyan'}>{text(v)}</Tag> },
+    { title: '请求方（requester）', dataIndex: 'requester_agent', width: 160, render: (v, row) => <Tag color={row._synthetic ? 'red' : 'blue'}>{enumText(v)}</Tag> },
+    { title: '目标（target）', dataIndex: 'target_agent', width: 150, render: (v, row) => <Tag color={row._synthetic ? 'red' : 'cyan'}>{enumText(v)}</Tag> },
     { title: '关系（relation）', dataIndex: 'relation', width: 150, render: (v) => <Tag>{enumText(v)}</Tag> },
     { title: '允许（allowed）', dataIndex: 'allowed', width: 120, render: (v) => { const tone = allowedTone(!!v); return <Tag color={tone.color}>{tone.label}</Tag> } },
     { title: '最大深度（max_depth）', dataIndex: 'max_depth', width: 100 },
@@ -376,6 +402,123 @@ const HEALTH_STATUS: Record<string, { label: string; color: string }> = {
 function HealthStatus({ status }: { status?: string }) {
   const item = HEALTH_STATUS[status ?? 'unknown'] ?? HEALTH_STATUS.unknown
   return <Tag color={item.color}>{item.label}</Tag>
+}
+
+function deriveGovernanceReview(module: SystemMapHealthModule) {
+  if (module.module === 'rule_change_audit') {
+    const counts = module.counts ?? {}
+    const pending = Number(counts.pending ?? 0)
+    const aiFailed = Number(counts.ai_failed ?? 0)
+    const manualPending = Number(counts.manual_pending ?? 0)
+    return {
+      title: '规则变更审计',
+      kind: 'attention',
+      reason: `pending ${pending} 项，AI 失败 ${aiFailed} 项${manualPending ? `，人工待审 ${manualPending} 项` : ''}`,
+      action: '先审 pending，再处理 AI 失败项；必要时补证、重提或归档，不自动放行。',
+    }
+  }
+  if (module.module === 'shadow') {
+    const counts = module.counts ?? {}
+    const unfinished = Number(counts.unfinished_t_plus_n ?? 0)
+    const failed = Number(counts.failed_or_error ?? 0)
+    return {
+      title: '影子记录 / 失败重放',
+      kind: module.status === 'unknown' ? 'unknown' : 'attention',
+      reason: module.status === 'unknown'
+        ? '当前没有可确认的影子数据'
+        : `待补算 ${unfinished} 项，失败/错误 ${failed} 项`,
+      action: module.status === 'unknown'
+        ? '保持只读，不视为故障；等有数据后再评估。'
+        : '先补算或回放失败记录，再决定是否纳入正式治理。'
+    }
+  }
+  if (module.module === 'database_migration') {
+    return {
+      title: '数据库迁移',
+      kind: 'unknown',
+      reason: module.reason ?? '当前没有迁移快照',
+      action: '重启或重新初始化后复核；没有快照时只保留 unknown 标识。',
+    }
+  }
+  return {
+    title: MODULE_LABELS[module.module] ?? module.module,
+    kind: module.status === 'attention' ? 'attention' : 'unknown',
+    reason: module.reason ?? '当前需要人工确认',
+    action: '保持只读，按模块自身的健康信息逐项核对。',
+  }
+}
+
+const GOVERNANCE_REVIEW_LINKS: Record<string, { label: string; path: string }> = {
+  rule_change_audit: { label: '打开建议审核', path: '/reviews?tab=sug' },
+  shadow: { label: '打开选股验证', path: '/reviews?tab=track' },
+  experience_memory: { label: '打开高影响经验审核', path: '/experience?tab=M3' },
+  knowledge: { label: '打开知识审核', path: '/knowledge' },
+}
+
+function GovernanceReviewCard({ data }: { data?: SystemMapHealth }) {
+  const navigate = useNavigate()
+  const modules = Object.values(data?.modules ?? {})
+  const targetModules = modules.filter((module) => module.status === 'attention' || module.status === 'unknown')
+  if (!targetModules.length) {
+    return (
+      <Card size="small" style={{ background: 'var(--bg-input)' }}>
+        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+          <Space wrap>
+            <Text strong>治理优化建议</Text>
+            <Tag color="green">无需处理</Tag>
+          </Space>
+          <Text type="secondary">当前没有需要人工审核的 attention / unknown 模块。</Text>
+        </Space>
+      </Card>
+    )
+  }
+  return (
+    <Card size="small" style={{ background: 'var(--bg-input)' }}>
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Space wrap>
+          <Text strong>治理优化建议</Text>
+          <Tag color="orange">待审核 {modules.filter((module) => module.status === 'attention').length}</Tag>
+          <Tag>未知 {modules.filter((module) => module.status === 'unknown').length}</Tag>
+        </Space>
+        <Alert
+          type="warning"
+          showIcon
+          message="这里只提供审核指引，不自动改状态，不自动修复。"
+          description="优先处理 attention 模块，再核对 unknown 模块是否只是缺少数据或接口。"
+        />
+        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+          {targetModules.map((module) => {
+            const review = deriveGovernanceReview(module)
+            return (
+              <Alert
+                key={module.module}
+                type={review.kind === 'attention' ? 'warning' : 'info'}
+                showIcon
+                message={(
+                  <Space wrap>
+                    <Text strong>{review.title}</Text>
+                    <HealthStatus status={review.kind as SystemMapHealthStatus} />
+                    <Text type="secondary">{review.reason}</Text>
+                  </Space>
+                )}
+                description={(
+                  <Space direction="vertical" size={2}>
+                    <Text type="secondary">建议动作：{review.action}</Text>
+                    {module.updated_at ? <Text type="secondary">最近刷新：{module.updated_at}</Text> : null}
+                    {GOVERNANCE_REVIEW_LINKS[module.module] ? (
+                      <Button size="small" onClick={() => navigate(GOVERNANCE_REVIEW_LINKS[module.module].path)}>
+                        {GOVERNANCE_REVIEW_LINKS[module.module].label}
+                      </Button>
+                    ) : null}
+                  </Space>
+                )}
+              />
+            )
+          })}
+        </Space>
+      </Space>
+    </Card>
+  )
 }
 
 function HealthFields({ values, limit }: { values?: Record<string, unknown>; limit?: number }) {
@@ -559,8 +702,9 @@ function HealthTab({ query }: { query: ReturnType<typeof useQuery<SystemMapHealt
         showIcon
         message="健康度只观察已有数据，不修改任何状态。active Knowledge 才进入正式注入；Shadow、Memory/Experience 不进入正式 prompt 或硬规则。"
       />
+      <GovernanceReviewCard data={data} />
       {data.last_errors?.length ? (
-        <Alert type="error" showIcon message="最近错误摘要" description={<Space direction="vertical">{data.last_errors.map((item, index) => <Text key={`${item.module}-${index}`}>{item.module}: {item.error}</Text>)}</Space>} />
+          <Alert type="error" showIcon message="最近错误摘要" description={<Space direction="vertical">{data.last_errors.map((item, index) => <Text key={`${item.module}-${index}`}>{enumText(item.module)}：{item.error}</Text>)}</Space>} />
       ) : null}
       {!data.modules?.database_migration ? <HealthModuleRow module={migration} /> : null}
       {standaloneModules.map((module) => <HealthModuleRow key={module.module} module={module} />)}

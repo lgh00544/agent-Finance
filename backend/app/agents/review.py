@@ -6,6 +6,7 @@ ReviewAgent 卖出复盘 - LangGraph 节点
 """
 import logging
 import time
+from datetime import date
 from hashlib import md5
 
 from app.agents.common import ModelLevel, agent_call
@@ -21,6 +22,25 @@ from app.agents.portfolio_sentinel import read_portfolio_overview
 logger = logging.getLogger(__name__)
 
 
+def _day_text(value: object, fallback: str = "") -> str:
+    """将日期/时间值归一为 YYYY-MM-DD；异常值返回 fallback。"""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value or "")[:10]
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return fallback
+    return text
+
+
+def _in_period(value: object, start_date: str, end_date: str) -> bool:
+    day = _day_text(value)
+    return bool(day) and start_date <= day <= end_date
+
+
 def collect_review(state: StockAgentState) -> StockAgentState:
     """节点1：聚合复盘所需全部原始数据【刚性代码逻辑】"""
     holding = repo.get_holding(state["holding_id"]) if state.get("holding_id") else None
@@ -31,7 +51,17 @@ def collect_review(state: StockAgentState) -> StockAgentState:
     state["stock_code"] = code
     state["stock_name"] = holding.stock_name
 
-    trades = repo.get_trades(holding.id)
+    entry_date = _day_text(holding.entry_date, _today())
+    all_trades = repo.get_trades(holding.id)
+    all_sells = [t for t in all_trades if t.side == "sell"]
+    # 退出日以最后一笔卖出成交日为准；旧数据没有卖出流水时退回本次任务日期。
+    exit_date = max((_day_text(t.trade_date) for t in all_sells), default="")
+    if not exit_date:
+        exit_date = _day_text(state.get("trade_date"), _today())
+    if exit_date < entry_date:
+        exit_date = entry_date
+    # 同一持仓的原始流水也限定在生命周期内，避免异常补录污染客观口径。
+    trades = [t for t in all_trades if _in_period(t.trade_date, entry_date, exit_date)]
     sells = [t for t in trades if t.side == "sell"]
     buys = [t for t in trades if t.side == "buy"]
 
@@ -40,10 +70,8 @@ def collect_review(state: StockAgentState) -> StockAgentState:
     pnl_pct = 0.0
     pnl_caliber = ""  # 口径回退标注（进 trace）
     if sells and buys:
-        from datetime import date
-
         def _d(s: str) -> date:
-            return date.fromisoformat(s)
+            return date.fromisoformat(_day_text(s))
 
         hold_days = (_d(sells[-1].trade_date) - _d(buys[0].trade_date)).days
         sell_amount = sum(t.amount for t in sells)
@@ -60,16 +88,24 @@ def collect_review(state: StockAgentState) -> StockAgentState:
     plan_binding = "holding.plan_id" if plan is not None else "missing"
     if plan is None and not getattr(holding, "plan_id", None):
         plan, plan_binding = repo.get_plan_for_entry(code, holding.entry_date)
-    score_row = repo.get_latest_score(code)
+    # 复盘只读取入场时点已存在的评分版本，禁止把退出后重评分带入历史结论。
+    score_row = repo.get_latest_score(code, as_of=entry_date)
 
     # 全链路落地表现聚合：持仓期间监控信号历史 + 卖出决策记录（各 Agent 输出方案的客观记录）
-    alerts = repo.get_alerts_by_code(code, limit=30)
+    alerts = repo.get_alerts_by_code(code, limit=30,
+                                     start_date=entry_date, end_date=exit_date)
+    alerts = [a for a in alerts
+              if _in_period(getattr(a, "created_at", None), entry_date, exit_date)]
     signal_rows = [{"date": a.created_at.strftime("%Y-%m-%d %H:%M"), "type": a.alert_type,
                     "severity": a.severity, "action": a.action, "message": a.message} for a in alerts]
     # 游资信号历史（留痕 source_module='hot_money'）：失败标的回溯当时游资信号的成败依据
     import json as _json
 
-    hm_traces = repo.list_traces(code=code, module="hot_money", limit=10)
+    # 先在仓储层按退出日截断，再做入场日过滤；否则历史复盘可能被近 10 条未来留痕占满。
+    hm_traces = repo.list_traces(code=code, module="hot_money", limit=10,
+                                 end_date=exit_date)
+    hm_traces = [t for t in hm_traces
+                 if _in_period(t.get("generate_date"), entry_date, exit_date)]
     hm_signals = []
     for t in hm_traces:
         try:
@@ -88,19 +124,31 @@ def collect_review(state: StockAgentState) -> StockAgentState:
             "confidence": concl.get("confidence"),
             "risk_note": t.get("risk_reasoning") or "",
         })
-    sell_decisions = repo.get_sell_decisions_by_code(code, limit=10)
+    sell_decisions = repo.get_sell_decisions_by_code(
+        code, limit=10, holding_id=holding.id,
+        start_date=entry_date, end_date=exit_date)
+    sell_decisions = [s for s in sell_decisions
+                      if _in_period(getattr(s, "created_at", None), entry_date, exit_date)]
     sell_rows = [{"date": s.created_at.strftime("%Y-%m-%d %H:%M"),
                   "action": (s.decision or {}).get("action"),
                   "confidence": (s.decision or {}).get("confidence"),
                   "reasons": (s.decision or {}).get("reasons", [])} for s in sell_decisions]
 
     source = get_datasource()
-    kline = source.fetch_daily_kline(code, holding.entry_date.replace("-", "")[:4] + "0101", _today())
+    # 行情查询边界与持仓生命周期一致，避免退出后的 K 线泄露到复盘统计。
+    kline = source.fetch_daily_kline(code, entry_date, exit_date)
 
     # 持仓期间行情统计（客观数值）
-    series = kline[kline["date"] >= holding.entry_date]
+    if (kline is not None and hasattr(kline, "empty") and not kline.empty
+            and "date" in kline.columns):
+        kline_days = kline["date"].map(_day_text)
+        series = kline[(kline_days >= entry_date) & (kline_days <= exit_date)].copy()
+        series["_review_day"] = kline_days.loc[series.index]
+        series = series.sort_values("_review_day")
+    else:
+        series = kline.iloc[0:0] if kline is not None else []
     price_stats = {}
-    if not series.empty:
+    if hasattr(series, "empty") and not series.empty:
         price_stats = {
             "period_high": float(series["high"].max()),
             "period_low": float(series["low"].min()),
@@ -109,7 +157,8 @@ def collect_review(state: StockAgentState) -> StockAgentState:
         }
 
     state["exit_suggest"] = {
-        "holding": {"entry_date": holding.entry_date, "entry_price": holding.entry_price,
+        "holding": {"entry_date": entry_date, "exit_date": exit_date,
+                    "entry_price": holding.entry_price,
                     "shares": holding.shares, "stop_loss": holding.stop_loss,
                     "take_profit": holding.take_profit, "note": holding.note},
         "trades": [{"side": t.side, "price": t.price, "shares": t.shares,
@@ -129,11 +178,16 @@ def collect_review(state: StockAgentState) -> StockAgentState:
         "hold_days": hold_days,
         "pnl_pct": pnl_pct,
         "price_stats": price_stats,
-        "portfolio_attribution": _portfolio_attribution(
-            code, pnl_pct, state.get("trade_date") or time.strftime("%Y-%m-%d")),
+        "portfolio_attribution": _portfolio_attribution(code, pnl_pct, exit_date),
         # 周期复利 + 组合归因（批次H）：历史多次操作汇总 + 组合曲线/贡献者/最大拖累者（复盘顶部事实）
-        "cycle_attribution": _cycle_attribution(code),
-        "portfolio_curve": _portfolio_curve_summary(),
+        # 组合当前视角无法证明历史时点；历史复盘明确返回缺失状态，避免把今天的持仓
+        # 曲线或周期统计伪装成退出日已经知道的事实。
+        "cycle_attribution": (_cycle_attribution(code)
+                               if exit_date >= _today()
+                               else {"status": "not_reconstructed", "as_of": exit_date}),
+        "portfolio_curve": (_portfolio_curve_summary()
+                             if exit_date >= _today()
+                             else {"status": "not_reconstructed", "as_of": exit_date}),
     }
     state["trace"] = [*state.get("trace", []),
                       f"复盘数据聚合: 持有{hold_days}天 盈亏{pnl_pct}%{pnl_caliber} 信号{len(signal_rows)}条 "
@@ -192,9 +246,11 @@ def llm_review(state: StockAgentState) -> StockAgentState:
     data = state["exit_suggest"]
     code = state["stock_code"]
     name = state.get("stock_name") or code
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    # 复盘的业务日期必须来自事实包的最后卖出日；任务提交日期只是调度元数据。
+    exit_date = str((data.get("holding") or {}).get("exit_date") or
+                    state.get("trade_date") or time.strftime("%Y-%m-%d"))[:10]
 
-    existing = repo.get_review_for_holding_exit(state["holding_id"], today)
+    existing = repo.get_review_for_holding_exit(state["holding_id"], exit_date)
     if existing is not None:
         state["stage"] = "exit_review"
         state["review_id"] = existing.id
@@ -213,7 +269,7 @@ def llm_review(state: StockAgentState) -> StockAgentState:
 
     output = agent_call(
         agent="review",
-        cache_key=f"{code}:{data['holding'].get('entry_date')}:{today}",
+        cache_key=f"{code}:{data['holding'].get('entry_date')}:{exit_date}",
         system_prompt=review_prompt.SYSTEM_PROMPT,
         user_prompt=review_prompt.build_user_prompt(review_data),
         schema=ReviewOutput,
@@ -227,12 +283,12 @@ def llm_review(state: StockAgentState) -> StockAgentState:
         stored_feedback["profile_suggestion"] = output.profile_suggestion.model_dump()
 
     review_id = repo.insert_review(
-        code, name, state["holding_id"], today,
+        code, name, state["holding_id"], exit_date,
         int(data.get("hold_days", 0)), float(data.get("pnl_pct", 0.0)),
         output.plan_vs_actual, output.lesson, stored_feedback,
     )
-    # 偏好回流：feedback 写入档案，注入后续 Discover/Score prompt
-    repo.upsert_preference(output.feedback, source_review_id=review_id)
+    # 偏好回流：先留在待审核状态；人工采纳后才注入后续 Discover/Score prompt
+    repo.upsert_preference(output.feedback, source_review_id=review_id, status="pending")
     # 策略闭环：各 Agent 优化建议落库为 pending，必须人工审核确认后才生效
     # （v2 一键采纳落地信息随建议持久化：rule_text/rule_type/priority/落地元数据）
     suggestion_count = 0
@@ -250,7 +306,8 @@ def llm_review(state: StockAgentState) -> StockAgentState:
     # 只留痕不改任何配置；无游资信号可回溯时 LLM 输出 null 跳过）
     hm_reviewed = False
     if getattr(output, "hot_money_review", None):
-        reasoning_trace.trace_hot_money_review(code, name, today, dict(output.hot_money_review))
+        reasoning_trace.trace_hot_money_review(code, name, exit_date,
+                                               dict(output.hot_money_review))
         hm_reviewed = True
     state["stage"] = "exit_review"
     state["trace"] = [*state.get("trace", []),
@@ -297,6 +354,8 @@ def llm_rethink_suggestion(review_id: int, reject_reason: str) -> dict:
     if output.profile_suggestion is not None:
         stored_feedback["profile_suggestion"] = output.profile_suggestion.model_dump()
     repo.apply_rethink_suggestion(review_id, stored_feedback, new_iteration)
+    # 新一轮反馈仍需人工采纳；保留旧版本以便审计和回溯。
+    repo.upsert_preference(stored_feedback, source_review_id=review_id, status="pending")
     logger.info("建议重思考 %s: 第%s版（原因: %s）", row.stock_code, new_iteration, reject_reason)
     return {"iteration": new_iteration, "feedback": stored_feedback,
             "profile_suggestion": stored_feedback.get("profile_suggestion")}
@@ -304,3 +363,10 @@ def llm_rethink_suggestion(review_id: int, reject_reason: str) -> dict:
 
 def _today() -> str:
     return time.strftime("%Y-%m-%d")
+
+
+def paper_review_cycle(facts: dict) -> dict:
+    """Review a frozen paper snapshot; do not invoke collect_review or live repos."""
+    from app.services.paper_analysis import review_cycle
+
+    return review_cycle(facts)

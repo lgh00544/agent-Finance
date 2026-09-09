@@ -59,8 +59,20 @@ class FallbackSource(DataSource):
     def fetch_spot_quote(self, code: str) -> dict:
         return self._primary.fetch_spot_quote(code)
 
+    def fetch_tencent_batch(self, codes: list[str], timeout: float = 8) -> dict:
+        return self._primary.fetch_tencent_batch(codes, timeout=timeout)
+
+    def fetch_tencent_quotes_batch(self, codes: list[str], timeout: float = 8) -> dict:
+        return self._primary.fetch_tencent_quotes_batch(codes, timeout=timeout)
+
+    def fetch_spot_quotes_batch(self, codes: list[str], **kwargs) -> dict:
+        return self._primary.fetch_spot_quotes_batch(codes, **kwargs)
+
     def fetch_industry_cons(self, board_name: str) -> pd.DataFrame:
         return self._primary.fetch_industry_cons(board_name)
+
+    def fetch_industry_hist(self, board_name: str, start_date: str, end_date: str) -> pd.DataFrame:
+        return self._primary.fetch_industry_hist(board_name, start_date, end_date)
 
     def fetch_trade_calendar(self) -> list[str]:
         return self._primary.fetch_trade_calendar()

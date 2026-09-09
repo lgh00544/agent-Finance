@@ -39,6 +39,8 @@ import { saveAccountBaseline } from '@/api/account'
 import { plans } from '@/api/positions'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { EmptyState, ErrorCard, StockLabel } from '@/components/common'
+import { KlineChart } from '@/components/charts/KlineChart'
+import { PaperTradingPanel } from '@/components/PaperTradingPanel'
 import { moneySigned } from '@/utils/format'
 import type { Holding } from '@/types'
 
@@ -472,6 +474,7 @@ function HoldingDrawer({ h, open, onClose, totalCapital, otherMv, shanghai }: {
   if (!h) return null
   return (
     <Drawer title={<StockLabel code={h.stock_code} name={h.stock_name} />} open={open} onClose={onClose} width={600}>
+      <KlineChart code={h.stock_code} name={h.stock_name} anchorDate={String(h.entry_date ?? '')} anchorKind="entry" />
       <HoldingOps h={h} currentPrice={h.current_price ?? null} totalCapital={totalCapital}
         otherMv={otherMv} shanghai={shanghai} />
       {tp ? (
@@ -585,7 +588,8 @@ function HoldingsTable() {
   const cols: Record<string, unknown>[] = [
     {
       title: '股票', key: 'stock', width: 150,
-      render: (_: unknown, m: MergedRow) => <StockLabel code={m.code} name={m.current.stock_name} />,
+      render: (_: unknown, m: MergedRow) => <Space size={4}><StockLabel code={m.code} name={m.current.stock_name} />
+        <Tag color="blue">{String(m.current.source_label ?? '真实交易')}</Tag></Space>,
     },
     {
       title: '建仓日', key: 'entry', width: 96,
@@ -884,6 +888,7 @@ export function HoldingsPage() {
 
   return (
     <div>
+      <PaperTradingPanel />
       <Space style={{ marginBottom: 12 }} wrap>
         <Button type="primary" loading={monitorAll.submit.isPending} onClick={() => monitorAll.submit.mutate({})}>
           立即刷新监控（后台）

@@ -255,7 +255,26 @@ def detect_anomalies(stats: dict) -> list[dict]:
 
 def build_stats_json(stats: dict, anomalies: list[dict]) -> str:
     """stats + anomalies → 紧凑 JSON 字符串（LLM user prompt 与缓存键共用）"""
-    return json.dumps({"stats": stats, "anomalies": anomalies},
+    dates = sorted(stats.get("by_date", {}))
+    return json.dumps({"stats": stats, "anomalies": anomalies,
+                       "evidence_scope": {
+                           "kind": "descriptive_candidate_returns",
+                           "period": stats.get("period"),
+                           "select_date_start": dates[0] if dates else None,
+                           "select_date_end": dates[-1] if dates else None,
+                           "selection_dates": len(dates),
+                           "window_note": "输入包含的候选样本，不能改称近20个交易日；各周期到期样本可能不同",
+                           "return_basis": "入选基准价到T+N收盘的候选收益，未验证实际入场成交和费用",
+                           "pl_ratio_definition": "盈利总额/亏损绝对值总额（利润因子），不是单笔计划盈亏比",
+                           "rating_provenance_verified": False,
+                           "rule_effect_validated": False,
+                           "limitations": [
+                               "评级可能混用Score与Discover，未按来源和规则版本统一",
+                               "没有候选通过与被拦截组的同口径对照、特征覆盖率或样本外验证",
+                               "同日和重复股票并非独立样本，收益与市场暴露可能相关",
+                               "最大回撤为入选后的结果，不能直接当作入选前过滤特征",
+                           ],
+                       }},
                       ensure_ascii=False, default=str)
 
 
@@ -683,22 +702,23 @@ def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
             hi_avg = hi.get("avg_pct")
             lo_avg = lo.get("avg_pct")
             out.append({
-                "target_agent": "discover", "target_kind": "prompt", "rule_type": "hard",
+                "target_agent": "discover", "target_kind": "prompt", "rule_type": "soft",
                 "priority": "high",
                 "rule_name": f"候选池评级正相关性校验（{pair} 倒挂）",
                 "current_value": "评级 A/B/C 默认代表选股质量优劣，未单独校验与后续涨幅的相关性",
                 "suggested_value": (f"{low} 档平均{period_label}涨幅 {lo_avg}% 高于 {high} 档 "
                                     f"{hi_avg}%，需人工复核评级维度权重"),
                 "reason": (f"统计显示 {low} 档平均涨幅高于 {high} 档，评级与后续表现相关性倒挂，"
-                           f"可能误导仓位分配"),
+                           f"需要先排查评级来源与样本口径"),
                 "evidence": (f"{low} 档 {lo.get('n')} 笔平均 {lo_avg}%，"
                              f"{high} 档 {hi.get('n')} 笔平均 {hi_avg}%"),
-                "rule_text": ("候选评级 A/B/C 必须接受实战 T+N 结果校验：低评级档平均 T+N 涨幅"
-                              "持续高于高评级档时，判定评级正相关性倒挂；倒挂未解除前，禁止仅因"
-                              "高评级而提高建仓优先级，必须同步参考实际涨幅、回撤和市场环境"),
-                "problem_desc": "评级体系与后续表现相关性倒挂，可能误导仓位分配与关注优先级",
-                "expected_effect": "恢复评级与表现的正常相关性，倒挂期避免高评级标的重仓",
-                "risk_note": "硬规则仅在人工二次确认后生效；小样本倒挂可能为噪声，采纳前需核对样本数与连续性",
+                "rule_text": (f"出现{period_label}评级分组收益倒挂时，在分析结论中列明样本期、数量、"
+                              "评级来源、评分版本和市场环境；来源或时点不一致时标记口径待核实。"
+                              "仅作为研究复核提示，不据此调整评级、排序、仓位或入池条件；"
+                              "需有同口径对照及样本外验证后，再单独提交规则变更。"),
+                "problem_desc": "混合评级的收益差异可能来自口径或市场暴露，尚不能归因为评分失效",
+                "expected_effect": "提高评级验证的可追溯性，减少由混合口径引起的错误调参",
+                "risk_note": "描述性分组差异不证明因果或盈利能力；本建议只约束研究说明，不改变交易条件",
                 "file_path": "agent_prompts/score_prompt.py", "insert_position": "评级维度权重段",
             })
         elif anom["type"] == "consecutive_decline":
@@ -709,37 +729,63 @@ def _template_suggestions(stats: dict, anomalies: list[dict]) -> list[dict]:
                 "priority": "high",
                 "rule_name": "候选池胜率连续下降预警阈值",
                 "current_value": "候选池胜率未设连续下滑预警机制",
-                "suggested_value": f"最近 3 期胜率连续下降（{seq}），需警惕选股逻辑失效",
-                "reason": "连续 3 期胜率下滑说明选股逻辑可能失效，需人工复核筛选标准",
+                "suggested_value": f"最近 3 期胜率连续下降（{seq}），核对样本、数据和市场变化",
+                "reason": "连续下降是研究线索，尚不能证明过滤条件需要收紧",
                 "evidence": seq,
-                "rule_text": ("候选池按日胜率连续 3 期（每期样本≥3）下降时，应在选股提示词中"
-                              "临时提高风险维度的权重并降低候选池规模，直至胜率回升后人工复核恢复"),
-                "problem_desc": "选股逻辑失效初期无预警，可能持续扩大回撤",
-                "expected_effect": "选股逻辑失效提前预警，及时收缩仓位控制回撤",
-                "risk_note": "预警触发后由人工决定是否收紧，禁止系统自动改变选股逻辑",
+                "rule_text": (f"候选池{period_label}按日胜率连续下降时，说明到期样本数、同日市场暴露、"
+                              "数据缺失及策略版本是否变化；对待验证原因和反例分别列证据。"
+                              "此提示不改变候选数量、评分权重或入池条件；提出收紧或放宽方案时，"
+                              "需同时给出通过组与拦截组对照、候选覆盖影响和退出条件。"),
+                "problem_desc": "胜率下降可能被错误解释为需要继续追加过滤条件",
+                "expected_effect": "区分数据、市场与策略原因，提高调优依据的质量",
+                "risk_note": "少量同日样本可能共享同一风险；未验证时只做原因核查，不执行参数调整",
                 "file_path": "agent_prompts/discover_prompt.py", "insert_position": "候选池规模段",
             })
         elif anom["type"] == "win_rate_low":
             d = anom["data"]
             out.append({
-                "target_agent": "discover", "target_kind": "prompt", "rule_type": "hard",
+                "target_agent": "discover", "target_kind": "prompt", "rule_type": "soft",
                 "priority": "high",
                 "rule_name": "候选池选股胜率下限复核",
                 "current_value": f"候选池{period_label}胜率 {d['win_rate']}%"
                                  f"（{d.get('wins', 0)}/{d['n']}）低于 {_WIN_LOW:.0f}%",
                 "suggested_value": f"胜率 {d['win_rate']}% 低于 {_WIN_LOW:.0f}%，建议人工复核选股标准",
-                "reason": "整体胜率过低说明选股标准可能过于激进或市场环境变化",
+                "reason": "低胜率可能来自数据、市场、择时或筛选条件，汇总结果不能确定原因",
                 "evidence": (f"n={d['n']} 胜率 {d['win_rate']}% 平均涨幅 {d['avg_pct']}% "
                              f"（{period_label}周期）"),
-                "rule_text": ("候选池 T+5 正收益胜率低于 40% 且样本≥3 时，必须触发实战校验红线："
-                              "下一轮选股不得扩大候选规模，必须提高风险过滤权重，并优先复核"
-                              "市场环境档位、评级倒挂和候选筛选条件是否过松"),
-                "problem_desc": "选股胜率持续偏低，候选池质量不足",
-                "expected_effect": "及时收敛候选标准，减少无效候选对注意力的消耗",
-                "risk_note": "硬规则仅在人工二次确认后生效；低胜率可能受极端市况影响，采纳前需结合市场背景",
+                "rule_text": (f"候选池{period_label}正收益胜率偏低时，在研究说明中核对事实数据完整性、"
+                              "评级来源、市场环境和入场时点，列出证据支持及不支持的原因。"
+                              "低胜率本身不改变候选池规模、风险权重或入池阈值；"
+                              "具体调整需另行提供同口径对照、覆盖率、适用范围、有效期和退出条件。"),
+                "problem_desc": "汇总收益异常尚不能证明入池条件过松，直接加码可能使研究范围持续缩小",
+                "expected_effect": "识别可验证的改进方向，避免仅凭低胜率反复增加过滤条件",
+                "risk_note": "保持既有交易风控；此建议只要求解释证据，不产生收紧或放宽操作",
                 "file_path": "agent_prompts/discover_prompt.py", "insert_position": "筛选条件段",
             })
     return out
+
+
+_UNVALIDATED_RESTRICTION_TERMS = (
+    "否则不纳入", "否则排除", "一律不纳入", "直接排除", "减少候选",
+    "候选池收缩", "候选数量", "提高门槛", "收紧条件", "强制叠加",
+    "量比>", "净流入", "板块内", "板块共振", "降低候选", "限制推荐",
+)
+
+
+def _allow_llm_proposal(item, stats: dict) -> bool:
+    """Aggregate returns alone cannot authorize a new discovery filter.
+
+    This deterministic guard is intentionally conservative.  It prevents a
+    model or a stale prompt from turning a descriptive anomaly into a new
+    exclusion rule before the caller has supplied validated counterfactual
+    evidence.  Diagnostic/observation proposals remain allowed.
+    """
+    if not item or getattr(item, "target_agent", "") != "discover":
+        return True
+    rule_text = str(getattr(item, "rule_text", "") or "")
+    if not rule_text:
+        return True
+    return not any(term in rule_text for term in _UNVALIDATED_RESTRICTION_TERMS)
 
 
 def generate_suggestions(stats: dict, anomalies: list[dict],
@@ -764,7 +810,7 @@ def generate_suggestions(stats: dict, anomalies: list[dict],
 
             out = agent_call(
                 agent="track_verify",
-                cache_key="trackverify:" + hashlib.md5(
+                cache_key="trackverify:evidence-v2:" + hashlib.md5(
                     stats_json.encode("utf-8")).hexdigest()[:12],
                 system_prompt=track_verify_prompt.SYSTEM_PROMPT,
                 user_prompt=track_verify_prompt.build_user_prompt(stats_json),
@@ -780,7 +826,13 @@ def generate_suggestions(stats: dict, anomalies: list[dict],
 
     inserted: list[dict] = []
     deduped = 0
+    blocked_unvalidated = 0
     for item in llm_items:
+        if not _allow_llm_proposal(item, stats):
+            blocked_unvalidated += 1
+            logger.warning("选股验证建议因缺少对照证据而阻止收紧条文: %s",
+                           getattr(item, "rule_name", ""))
+            continue
         if repo.has_pending_suggestion(item.rule_name, item.target_agent):
             deduped += 1
             continue
@@ -797,7 +849,8 @@ def generate_suggestions(stats: dict, anomalies: list[dict],
                          "suggestion_source": "llm"})
 
     fallbacks: list[dict] = []
-    if not llm_ok or (llm_items and not inserted) or (not llm_items and anomalies):
+    # 证据不足主动不提案、或建议已存在，都不是生成失败。
+    if not llm_ok:
         for tpl in _template_suggestions(stats, anomalies):
             if repo.has_pending_suggestion(tpl["rule_name"], tpl["target_agent"]):
                 deduped += 1
@@ -815,7 +868,8 @@ def generate_suggestions(stats: dict, anomalies: list[dict],
             fallbacks.append({"id": sid, "rule_name": tpl["rule_name"],
                               "suggestion_source": "template"})
     return {"suggestions": inserted, "fallbacks": fallbacks,
-            "deduped": deduped, "summary_note": summary_note}
+            "deduped": deduped, "blocked_unvalidated": blocked_unvalidated,
+            "summary_note": summary_note}
 
 
 def auto_audit_generated_suggestions(suggestions_result: dict) -> dict:
@@ -878,6 +932,15 @@ def _init_candidates() -> int:
                                  factor_scores=factor_scores)
         initialized += 1
     return initialized
+
+
+def register_new_candidates() -> int:
+    """登记候选池中尚未追踪的标的，供 Discover 完成落库后即时挂接。
+
+    仅创建幂等的 candidate_track_verify 行，不拉取行情、不计算 T+N；
+    后续验证任务仍负责按交易日填充实际表现。
+    """
+    return _init_candidates()
 
 
 def backfill_factor_scores() -> dict:

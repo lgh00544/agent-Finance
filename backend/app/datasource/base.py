@@ -63,6 +63,10 @@ class DataSource(ABC):
     def fetch_industry_cons(self, board_name: str) -> pd.DataFrame:
         """行业成分股（列：code/name/...）"""
 
+    @abstractmethod
+    def fetch_industry_hist(self, board_name: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """行业板块历史日线（列：date/close/...）"""
+
     # ---------- 交易日历 ----------
     @abstractmethod
     def fetch_trade_calendar(self) -> list[str]:

@@ -29,6 +29,7 @@ const NAV_GROUPS: Array<{
     items: [
       { path: '/', label: '系统概览', icon: <HomeOutlined /> },
       { path: '/market-intel', label: '市场研判', icon: <FundOutlined /> },
+      { path: '/news-sector', label: '行业消息雷达', icon: <AlertOutlined /> },
     ],
   },
   {

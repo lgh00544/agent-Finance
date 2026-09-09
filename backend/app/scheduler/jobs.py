@@ -179,6 +179,56 @@ def daily_discover_job() -> None:
         cache.release_lock("daily_discover")
 
 
+def paper_execution_job() -> None:
+    """收盘后审核模拟复盘；成交仅由盘中执行器使用实时行情完成。"""
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today) or not cache.acquire_lock("paper_execution", ttl_seconds=3600):
+        return
+    try:
+        # 模拟复盘的 AI 闸门自动运行；失败保留 pending，页面提供重试入口。
+        from app.agents.paper_review import audit_review
+        for review in repo.list_paper_reviews(limit=200):
+            if review.get("audit_status") == "pending":
+                try:
+                    audit_review(review["id"])
+                except Exception as exc:  # noqa: BLE001 审核失败不伪造通过
+                    logger.warning("模拟复盘 AI 审核失败 review#%s: %s", review.get("id"), exc)
+        cache.set("job:last_paper_execution", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        logger.info("模拟复盘审核轮询完成")
+    finally:
+        cache.release_lock("paper_execution")
+
+
+def paper_monitor_job() -> None:
+    """盘中模拟账户巡检；日历不可用时暂停，所有账户独立失败隔离。"""
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if not _in_trading_window(now):
+        return
+    today = now.date().isoformat()
+    try:
+        if today not in (AkshareSource().fetch_trade_calendar() or []):
+            return
+    except Exception as exc:
+        logger.warning("模拟监控暂停，交易日历不可用: %s", exc)
+        return
+    if not cache.acquire_lock("paper_monitor", ttl_seconds=3600):
+        return
+    try:
+        from app.services import paper_execution, paper_monitor
+        for account in repo.list_paper_accounts(status="active"):
+            try:
+                paper_execution.run(account["id"], today)
+            except Exception as exc:
+                logger.warning("模拟账户 %s 盘中建仓执行失败: %s", account.get("id"), exc)
+            try:
+                paper_monitor.run(account["id"], today)
+            except Exception as exc:
+                logger.warning("模拟账户 %s 盘中监控失败: %s", account.get("id"), exc)
+        cache.set("job:last_paper_monitor", now.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+    finally:
+        cache.release_lock("paper_monitor")
+
+
 def monitor_job() -> None:
     """批量持仓监控：交易时段高频（每 N 分钟）全量监控；收盘校验窗口低频兜底"""
     now = datetime.now()
@@ -369,6 +419,41 @@ def sector_next_hot_job() -> None:
         logger.error("下一个风口预测异常: %s", exc)
     finally:
         cache.release_lock("sector_next_hot")
+
+
+def sector_radar_job() -> None:
+    """行业消息雷达：观察型抓取 + K228 解读，失败不影响正式 Agent。"""
+    if not cache.acquire_lock("sector_radar", ttl_seconds=1800):
+        logger.info("sector_radar 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.sector_radar import collect_sector_radar
+        result = collect_sector_radar(auto_interpret=True)
+        _mark_sector_job("sector_radar", not result.get("errors"),
+                         "; ".join(result.get("errors", [])[:3]) or None)
+        logger.info("行业消息雷达完成: %s", result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("行业消息雷达失败: %s", exc)
+        _mark_sector_job("sector_radar", False, str(exc))
+    finally:
+        cache.release_lock("sector_radar")
+
+
+def sector_radar_shadow_job() -> None:
+    """行业消息雷达 shadow 回填：只做观测统计，不改变候选池。"""
+    if not cache.acquire_lock("sector_radar_shadow", ttl_seconds=1800):
+        logger.info("sector_radar_shadow 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.sector_radar import shadow_verify_worker
+        result = shadow_verify_worker()
+        _mark_sector_job("sector_radar_shadow", True)
+        logger.info("行业消息雷达 shadow 回填完成: %s", result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("行业消息雷达 shadow 回填失败: %s", exc)
+        _mark_sector_job("sector_radar_shadow", False, str(exc))
+    finally:
+        cache.release_lock("sector_radar_shadow")
 
 
 def distribution_phase_job() -> None:
@@ -650,12 +735,22 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=16, minute=30,
                       id="hot_money_win_rate", name="游资胜率迭代",
                       replace_existing=True, misfire_grace_time=3600)
+    # 工作日 16:35 收盘后审核模拟复盘；成交只在盘中进行。
+    scheduler.add_job(paper_execution_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=35,
+                      id="paper_execution", name="AI模拟复盘审核",
+                      replace_existing=True, misfire_grace_time=3600)
     # 交易日 9:00-16:00 每 N 分钟触发（函数内过滤：盘中高频 + 15:00-15:30 收盘校验低频）
     monitor_minutes = max(1, int(settings.monitor_interval_minutes))
     scheduler.add_job(monitor_job, "cron",
                       day_of_week="mon-fri", hour="9-16", minute=f"*/{monitor_minutes}",
                       id="monitor", name="盘中持仓监控",
                       replace_existing=True, misfire_grace_time=300)
+    # 模拟研究上下文每 15 分钟复用；监控轮询至少间隔 5 分钟，控制模型调用成本。
+    scheduler.add_job(paper_monitor_job, "cron",
+                      day_of_week="mon-fri", hour="9-15", minute=f"*/{max(5, monitor_minutes)}",
+                      id="paper_monitor", name="AI模拟盘中监控",
+                      replace_existing=True, misfire_grace_time=300, max_instances=1)
     # 交易日 9:00-16:00 每 10 分钟触发（函数内过滤交易时段窗口；组合级风控巡检，
     # 与 monitor 独立锁/独立频率，互不影响）
     scheduler.add_job(portfolio_sentinel_job, "cron",
@@ -740,6 +835,15 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=16, minute=5,
                       id="sector_forecast_verify", name="前瞻验证回填",
                       replace_existing=True, misfire_grace_time=3600)
+    # 行业消息雷达：观察型 shadow，不进入正式 Agent/候选池
+    scheduler.add_job(sector_radar_job, "cron",
+                      day_of_week="mon-sun", hour=8, minute=0,
+                      id="sector_radar", name="行业消息雷达",
+                      replace_existing=True, misfire_grace_time=3600)
+    scheduler.add_job(sector_radar_shadow_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=25,
+                      id="sector_radar_shadow", name="行业消息雷达shadow回填",
+                      replace_existing=True, misfire_grace_time=3600)
     # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
     scheduler.add_job(quote_snapshot_refresh_job, "cron",
                       day_of_week="mon-fri", hour="9-15", minute="*/5",
@@ -780,6 +884,10 @@ def job_status() -> list[dict]:
         out.append({"id": job.id, "name": job.name,
                     "next_run": str(job.next_run_time) if job.next_run_time else None})
     out.append({"id": "last_discover", "name": "最近挖掘", "next_run": cache.get("job:last_discover")})
+    out.append({"id": "last_paper_execution", "name": "最近 AI 模拟执行",
+                "next_run": cache.get("job:last_paper_execution")})
+    out.append({"id": "last_paper_monitor", "name": "最近 AI 模拟盘中监控",
+                "next_run": cache.get("job:last_paper_monitor")})
     out.append({"id": "last_monitor", "name": "最近监控", "next_run": cache.get("job:last_monitor")})
     out.append({"id": "last_portfolio_sentinel", "name": "最近组合哨兵", "next_run": cache.get("job:last_portfolio_sentinel")})
     out.append({"id": "last_track_verify", "name": "最近候选验证", "next_run": cache.get("job:last_track_verify")})

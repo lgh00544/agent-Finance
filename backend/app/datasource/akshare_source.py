@@ -81,8 +81,11 @@ _FINANCIAL_SINA_COLS = {
 }
 _FINANCIAL_THS_COLS = {
     "报告期": "report_date", "营业总收入同比增长率(%)": "revenue_yoy",
-    "净利润同比增长率(%)": "profit_yoy", "净资产收益率(%)": "roe",
-    "资产负债率(%)": "debt_ratio", "销售毛利率(%)": "gross_margin",
+    "营业总收入同比增长率": "revenue_yoy",
+    "净利润同比增长率(%)": "profit_yoy", "净利润同比增长率": "profit_yoy",
+    "净资产收益率(%)": "roe", "净资产收益率": "roe",
+    "资产负债率(%)": "debt_ratio", "资产负债率": "debt_ratio",
+    "销售毛利率(%)": "gross_margin", "销售毛利率": "gross_margin",
 }
 _NEWS_COLS = {"关键词": "keyword", "新闻标题": "title", "新闻内容": "content",
               "发布时间": "published_at", "文章来源": "source", "新闻链接": "url"}
@@ -165,6 +168,48 @@ def _normalize(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return out[[c for c in out.columns if c in keep]]
 
 
+_FINANCIAL_PERCENT_FIELDS = {
+    "revenue_yoy", "profit_yoy", "roe", "roe_diluted", "debt_ratio",
+    "net_margin", "gross_margin",
+}
+
+
+def _normalize_financial(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """Normalize financial aliases and values without silently dropping metrics.
+
+    THS currently returns percentage columns without the ``(%)`` suffix and
+    values such as ``"113.11%"``.  Keep the public schema stable while making
+    those values numeric and returning the newest report first.
+    """
+    if df is None or df.empty:
+        return df
+    # Select one source column per stable field.  This also avoids duplicate
+    # output names when an upstream response contains both alias variants.
+    aliases: dict[str, list[str]] = {}
+    for source_name, target_name in mapping.items():
+        aliases.setdefault(target_name, []).append(source_name)
+    out = pd.DataFrame(index=df.index)
+    for target_name, source_names in aliases.items():
+        source_name = next((name for name in source_names if name in df.columns), None)
+        if source_name is not None:
+            out[target_name] = df[source_name]
+    if out.empty:
+        return out
+    for col in _FINANCIAL_PERCENT_FIELDS.intersection(out.columns):
+        out[col] = pd.to_numeric(
+            out[col].astype(str).str.strip().str.replace("%", "", regex=False),
+            errors="coerce",
+        )
+    if "report_date" in out.columns:
+        parsed = pd.to_datetime(out["report_date"], errors="coerce")
+        out["report_date"] = parsed.dt.strftime("%Y-%m-%d")
+        out = (out.assign(_report_date_sort=parsed)
+                  .sort_values("_report_date_sort", ascending=False, na_position="last")
+                  .drop(columns=["_report_date_sort"])
+                  .reset_index(drop=True))
+    return out.astype(object).where(pd.notna(out), None)
+
+
 def _to_json_safe(df: pd.DataFrame) -> pd.DataFrame:
     """NaN → None，便于 JSON 序列化落库"""
     return df.where(pd.notna(df), None)
@@ -234,14 +279,17 @@ def _stock_news_em_fixed(code: str) -> pd.DataFrame:
 
 def _stock_announcements(code: str) -> pd.DataFrame:
     """东财个股公告（搜索新闻接口失效时的降级源，2026-08 起搜索接口仅返回 profile 数据）【刚性代码逻辑】
-    列表接口取最近公告，正文接口逐条取内容（最多 5 条正文，控制调用量）"""
+    列表接口取最近公告。雷达首轮保留标题和可追溯链接，不串行下载公告正文；
+    否则单标的最多 5 次正文请求会使全行业抓取卡住数分钟。"""
     import requests
 
     headers = {"user-agent": _NEWS_UA, "referer": "https://data.eastmoney.com/"}
     ann = requests.get("https://np-anotice-stock.eastmoney.com/api/security/ann",
                        params={"sr": -1, "page_size": 10, "page_index": 1, "ann_type": "A",
                                "client_source": "web", "stock_list": code},
-                       headers=headers, timeout=15).json()
+                       headers=headers,
+                       timeout=(settings.datasource_connect_timeout,
+                                min(settings.datasource_read_timeout, 5))).json()
     items = ((ann.get("data") or {}).get("list")) or []
     rows = []
     for it in items[:5]:
@@ -249,16 +297,7 @@ def _stock_announcements(code: str) -> pd.DataFrame:
         title = str(it.get("title") or "").strip()
         if not title or not art_code:
             continue
-        content = ""
-        try:
-            detail = requests.get(
-                "https://np-cnotice-stock.eastmoney.com/api/content/ann",
-                params={"art_code": art_code, "client_source": "web", "page_index": 1},
-                headers=headers, timeout=15).json()
-            content = str(((detail.get("data") or {}).get("notice_content") or ""))
-        except Exception as exc:  # noqa: BLE001 单条正文失败不阻塞
-            logger.warning("公告 %s 正文拉取失败: %s", art_code, exc)
-        rows.append({"新闻标题": title, "新闻内容": content,
+        rows.append({"新闻标题": title, "新闻内容": title,
                      "发布时间": str(it.get("notice_date") or "")[:10],
                      "文章来源": "东方财富-公告",
                      "新闻链接": f"https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"})
@@ -312,7 +351,7 @@ class AkshareSource(DataSource):
         self._quotes_session.mount("https://", _quotes_adapter)
 
     # ---------------- 腾讯批量实时价（持仓监控首选源，N 只 = 1 次 HTTP） ----------------
-    def fetch_tencent_batch(self, codes: list[str], timeout: float = 8) -> dict[str, float]:
+    def fetch_tencent_batch(self, codes: list[str], timeout: float = 8, *, detailed: bool = False) -> dict:
         """腾讯批量最新价：http://qt.gtimg.cn/q=sh600487,sz002475,...（6 开头加 sh，否则 sz）。
         解析每行 v_(字母数字)="[^"]*" 以 ~ 分割，price=fields[3]（原始价，不做任何派生推断）。
         3 次指数退避（1s/2s/4s+抖动），全失败返回 {}（调用方走下一级 DB 快照兜底）。
@@ -320,7 +359,7 @@ class AkshareSource(DataSource):
         codes = [str(c).strip().zfill(6) for c in codes if str(c).strip()]
         if not codes:
             return {}
-        q = ",".join(("sh" if c.startswith("6") else "sz") + c for c in codes)
+        q = ",".join(_market_of(c) + c for c in codes)
         url = f"http://qt.gtimg.cn/q={q}"
         for attempt in range(3):
             try:
@@ -339,7 +378,22 @@ class AkshareSource(DataSource):
                     if price > 0:
                         # fields[2] 为 6 位代码；兼容前缀键剥离（sh600487 → 600487）
                         code = re.sub(r"^(sh|sz|bj)", "", fields[2])
-                        result[code] = price
+                        if not detailed:
+                            result[code] = price
+                        elif len(fields) > 32:
+                            def number(index):
+                                try:
+                                    return float(fields[index])
+                                except (IndexError, TypeError, ValueError):
+                                    return None
+                            stamp = fields[30]
+                            if len(stamp) == 14 and stamp.isdigit():
+                                stamp = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[8:10]}:{stamp[10:12]}:{stamp[12:14]}"
+                            result[code] = {"code": code, "name": fields[1], "price": price,
+                                            "prev_close": number(4), "change_pct": number(32),
+                                            "volume": number(6), "bid": number(9), "ask": number(19),
+                                            "limit_up_price": number(47), "limit_down_price": number(48),
+                                            "time": stamp, "source": "tencent"}
                 if result:
                     return result
             except requests.RequestException as exc:
@@ -349,6 +403,10 @@ class AkshareSource(DataSource):
             if attempt < 2:
                 time.sleep((1 << attempt) + random.uniform(0, 1))  # 1s/2s/4s + 抖动
         return {}
+
+    def fetch_tencent_quotes_batch(self, codes: list[str], timeout: float = 8) -> dict:
+        """带交易所事实时间、昨收和成交量的完整报价，供纸面成交校验。"""
+        return self.fetch_tencent_batch(codes, timeout=timeout, detailed=True)
 
     # ---------------- 统一 fetch 封装 ----------------
     def _fetch(self, scope: str, func_name: str, call: Callable, ttl_seconds: int,
@@ -947,10 +1005,14 @@ class AkshareSource(DataSource):
             return self._call_with_timeout(ak.stock_financial_abstract_ths, symbol=code, indicator="按单季度")
         def fallback():
             return self._call_with_timeout(ak.stock_financial_analysis_indicator, stock=code)
-        df = self._fetch(f"fin:{code}", "fin", primary, ttl_seconds=86400, fallback=fallback,
-                         normalize=lambda d: _normalize(
+        # v2 cache namespace invalidates pre-fix rows that contained only
+        # report_date while retaining all unrelated datasource caches.
+        df = self._fetch(f"fin:v2:{code}", "fin", primary, ttl_seconds=86400, fallback=fallback,
+                         normalize=lambda d: _normalize_financial(
                              d, _FINANCIAL_THS_COLS if "报告期" in d.columns else _FINANCIAL_SINA_COLS))
-        return _to_json_safe(df)
+        # Cache JSON nulls can be inferred back as float NaN by pandas.
+        # Object dtype preserves None when Score converts the rows to dicts.
+        return _to_json_safe(df.astype(object))
 
     # ---------------- 资金流向 ----------------
     def fetch_fund_flow(self, code: str) -> pd.DataFrame:
@@ -1043,6 +1105,17 @@ class AkshareSource(DataSource):
         df = self._fetch(f"industry_cons:{board_name}", "industry_cons", call, ttl_seconds=3600,
                          normalize=lambda d: _normalize(d, _CONS_COLS), kind="snapshot")
         return _to_json_safe(df)
+
+    def fetch_industry_hist(self, board_name: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """行业板块历史日 K（消息雷达 shadow 验证取 close 序列）"""
+        def call():
+            return self._call_with_timeout(
+                ak.stock_board_industry_hist_em, symbol=board_name, period="日k",
+                start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust="")
+        df = self._fetch(f"industry_hist:{board_name}:{start_date}:{end_date}",
+                         "stock_board_industry_hist_em", call, ttl_seconds=3600, required=False,
+                         normalize=lambda d: _normalize(d, _KLINE_COLS), kind="snapshot")
+        return _to_json_safe(df if df is not None else pd.DataFrame())
 
     # ---------------- 主线板块箱位（主箱位 × 60 日箱位双视角，≤10 个板块） ----------------
     def fetch_board_box_positions(self, board_names: list) -> dict:

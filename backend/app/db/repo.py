@@ -24,8 +24,12 @@ from app.db.models import (
     Experience, ExperienceConfig, ForwardViewHistory, Holding, HotMoneyProfile,
     LhbOriginalFlow, MarketCondition, MarketIntel, NewsArticle, PendingExperience,
     PositionPlan, PrivateKnowledge, KnowledgeShadowHit, QuoteSnapshot, ReviewLog, ReviewResult, RuleChange,
+    PaperAccount, PaperPosition, PaperExecution, PaperReview, PaperQuoteSnapshot,
+    PaperContext, PaperWebEvidence, PaperAlert,
     SectorSnapshot, SectorDailySnapshot, SectorDailyRankLog, SectorLaunchReason,
-    SectorRegimeForecast, SectorForwardForecast, SectorForecastVerify, SectorNextHot,
+    SectorDictV1, SectorForwardForecast, SectorForecastVerify, SectorNextHot,
+    SectorNewsAIInterpret, SectorNewsArticle, SectorNewsFeedback, SectorNewsShadowVerify,
+    SectorRegimeForecast,
     SellDecision, StockCandidate, StockScore, TradeProfile,
     TradeRecord, WorkerRun, _now, DistributionPhaseLog,
 )
@@ -629,6 +633,259 @@ def list_sector_forecast_verify(start_date: str | None = None,
         } for r in result]
 
 
+# ==================== 行业消息雷达（观察型 shadow，不进入正式 Agent） ====================
+
+def upsert_sector_dict(rows: list[dict]) -> int:
+    """幂等补行业字典；只做人工种子落库，反馈/LLM 不走这里自动改字典。"""
+    inserted = 0
+    with SessionLocal() as db:
+        for r in rows:
+            code = str(r.get("sector_code") or "").strip()
+            version = str(r.get("version") or "v1")
+            if not code:
+                continue
+            exists = db.execute(select(SectorDictV1.id).where(
+                SectorDictV1.sector_code == code,
+                SectorDictV1.version == version)).first()
+            if exists:
+                continue
+            db.add(SectorDictV1(
+                sector_code=code, sector_name=str(r.get("sector_name") or code),
+                aliases=r.get("aliases") or [],
+                entity_keywords=r.get("entity_keywords") or [],
+                industry_keywords=r.get("industry_keywords") or [],
+                version=version, source=str(r.get("source") or "manual"),
+                review_status=str(r.get("review_status") or "active"),
+                reviewed_by=str(r.get("reviewed_by") or "sir"),
+                effective_from=str(r.get("effective_from") or ""),
+                effective_to=str(r.get("effective_to") or "")))
+            inserted += 1
+        db.commit()
+    return inserted
+
+
+def list_sector_dict(active_only: bool = True) -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(SectorDictV1).order_by(SectorDictV1.sector_name.asc())
+        if active_only:
+            stmt = stmt.where(SectorDictV1.review_status == "active")
+        rows = db.execute(stmt).scalars().all()
+    return [{
+        "id": r.id, "sector_code": r.sector_code, "sector_name": r.sector_name,
+        "aliases": r.aliases or [], "entity_keywords": r.entity_keywords or [],
+        "industry_keywords": r.industry_keywords or [], "version": r.version,
+        "source": r.source, "review_status": r.review_status,
+        "reviewed_by": r.reviewed_by, "effective_from": r.effective_from,
+        "effective_to": r.effective_to, "created_at": str(r.created_at)[:19],
+    } for r in rows]
+
+
+def add_sector_news_article(row: dict) -> tuple[int, bool]:
+    content_hash = str(row.get("content_hash") or "").strip()
+    if not content_hash:
+        raise ValueError("content_hash required")
+    with SessionLocal() as db:
+        existing = db.execute(select(SectorNewsArticle).where(
+            SectorNewsArticle.content_hash == content_hash)).scalars().first()
+        if existing:
+            return existing.id, False
+        rec = SectorNewsArticle(
+            source_scope=str(row.get("source_scope") or "company_signal"),
+            source_type=str(row.get("source_type") or "company_news"),
+            source_name=str(row.get("source_name") or ""),
+            external_id=str(row.get("external_id") or ""),
+            title=str(row.get("title") or ""),
+            content=str(row.get("content") or ""),
+            source_url=str(row.get("source_url") or ""),
+            published_at=str(row.get("published_at") or ""),
+            content_hash=content_hash,
+            sector_codes=row.get("sector_codes") or [],
+            stock_codes=row.get("stock_codes") or [],
+            mapping_method=str(row.get("mapping_method") or "unmapped"),
+            mapping_confidence=float(row.get("mapping_confidence") or 0.0),
+            status=str(row.get("status") or "accepted"))
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec.id, True
+
+
+def get_sector_news_articles(article_ids: list[int]) -> list[dict]:
+    if not article_ids:
+        return []
+    with SessionLocal() as db:
+        rows = db.execute(select(SectorNewsArticle).where(
+            SectorNewsArticle.id.in_([int(i) for i in article_ids]))).scalars().all()
+    return [_sector_news_article_dict(r) for r in rows]
+
+
+def list_sector_news_articles(sector_code: str = "", days: int = 7,
+                              status: str | None = None, date: str = "") -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(SectorNewsArticle)
+        if date:
+            day = datetime.strptime(date[:10], "%Y-%m-%d")
+            stmt = stmt.where(SectorNewsArticle.created_at >= day,
+                              SectorNewsArticle.created_at < day + timedelta(days=1))
+        else:
+            cutoff = datetime.now() - timedelta(days=max(1, min(int(days or 7), 30)))
+            stmt = stmt.where(SectorNewsArticle.created_at >= cutoff)
+        if status:
+            stmt = stmt.where(SectorNewsArticle.status == status)
+        rows = db.execute(stmt.order_by(SectorNewsArticle.created_at.desc())).scalars().all()
+    out = [_sector_news_article_dict(r) for r in rows]
+    if sector_code:
+        out = [r for r in out if sector_code in (r.get("sector_codes") or [])]
+    return out
+
+
+def add_sector_news_interpret(row: dict) -> int:
+    with SessionLocal() as db:
+        rec = SectorNewsAIInterpret(
+            article_ids=row.get("article_ids") or [],
+            sector_codes=row.get("sector_codes") or [],
+            polarity=str(row.get("polarity") or "uncertain"),
+            summary=str(row.get("summary") or ""),
+            impact_mechanism=str(row.get("impact_mechanism") or ""),
+            impact_horizon=str(row.get("impact_horizon") or "unknown"),
+            information_score=float(row.get("information_score") or 0.0),
+            direction_confidence=float(row.get("direction_confidence") or 0.0),
+            quote_evidence=row.get("quote_evidence") or [],
+            affected_stock_codes=row.get("affected_stock_codes") or [],
+            stock_relation_basis=str(row.get("stock_relation_basis") or ""),
+            human_review_required=bool(row.get("human_review_required")),
+            validator_status=str(row.get("validator_status") or "pending"),
+            model_version=str(row.get("model_version") or ""))
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec.id
+
+
+def get_sector_news_interpret(interpret_id: int) -> dict | None:
+    with SessionLocal() as db:
+        row = db.get(SectorNewsAIInterpret, int(interpret_id))
+        return _sector_interpret_dict(row) if row is not None else None
+
+
+def add_sector_news_shadow(row: dict) -> int:
+    interpret_id = int(row.get("interpret_id") or 0)
+    if not interpret_id:
+        raise ValueError("interpret_id required")
+    with SessionLocal() as db:
+        existing = db.execute(select(SectorNewsShadowVerify).where(
+            SectorNewsShadowVerify.interpret_id == interpret_id)).scalars().first()
+        if existing:
+            return existing.id
+        rec = SectorNewsShadowVerify(
+            interpret_id=interpret_id, sector_code=str(row.get("sector_code") or ""),
+            sector_name=str(row.get("sector_name") or ""),
+            signal_date=str(row.get("signal_date") or time.strftime("%Y-%m-%d")),
+            base_index_value=row.get("base_index_value"))
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec.id
+
+
+def list_sector_shadow_pending(limit: int = 200) -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(select(SectorNewsShadowVerify).where(
+            or_(SectorNewsShadowVerify.t1_return.is_(None),
+                SectorNewsShadowVerify.t3_return.is_(None),
+                SectorNewsShadowVerify.t5_return.is_(None))
+        ).order_by(SectorNewsShadowVerify.signal_date.asc()).limit(limit)).scalars().all()
+    return [_sector_shadow_dict(r) for r in rows]
+
+
+def update_sector_shadow(verify_id: int, values: dict) -> bool:
+    allowed = {"base_index_value", "t1_return", "t3_return", "t5_return",
+               "t1_at", "t3_at", "t5_at", "direction_correct"}
+    payload = {k: v for k, v in values.items() if k in allowed}
+    if not payload:
+        return False
+    with SessionLocal() as db:
+        row = db.get(SectorNewsShadowVerify, int(verify_id))
+        if row is None:
+            return False
+        for k, v in payload.items():
+            setattr(row, k, v)
+        db.commit()
+        return True
+
+
+def add_sector_news_feedback(row: dict) -> int:
+    with SessionLocal() as db:
+        rec = SectorNewsFeedback(
+            article_id=row.get("article_id"), interpret_id=row.get("interpret_id"),
+            feedback_type=str(row.get("feedback_type") or "dismiss"),
+            reason=str(row.get("reason") or ""),
+            reviewer=str(row.get("reviewer") or "sir"),
+            status="pending")
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec.id
+
+
+def list_sector_radar(sector_code: str = "", days: int = 7,
+                      date: str = "", source_scope: str = "") -> dict:
+    articles = list_sector_news_articles(sector_code, days, date=date)
+    if source_scope:
+        articles = [a for a in articles if a.get("source_scope") == source_scope]
+    with SessionLocal() as db:
+        interprets = db.execute(select(SectorNewsAIInterpret).order_by(
+            SectorNewsAIInterpret.created_at.desc())).scalars().all()
+        shadows = db.execute(select(SectorNewsShadowVerify)).scalars().all()
+    shadow_by_iid = {s.interpret_id: _sector_shadow_dict(s) for s in shadows}
+    out = []
+    for article in articles:
+        inter = next((i for i in interprets if article["id"] in (i.article_ids or [])), None)
+        item = {"article": article, "interpret": None, "shadow": None}
+        if inter is not None:
+            item["interpret"] = _sector_interpret_dict(inter)
+            item["shadow"] = shadow_by_iid.get(inter.id)
+        out.append(item)
+    return {"items": out, "sectors": list_sector_dict(), "total": len(out)}
+
+
+def _sector_news_article_dict(r: SectorNewsArticle) -> dict:
+    return {
+        "id": r.id, "source_scope": r.source_scope, "source_type": r.source_type,
+        "source_name": r.source_name, "external_id": r.external_id, "title": r.title,
+        "content": r.content, "source_url": r.source_url, "published_at": r.published_at,
+        "fetched_at": str(r.fetched_at)[:19], "content_hash": r.content_hash,
+        "sector_codes": r.sector_codes or [], "stock_codes": r.stock_codes or [],
+        "mapping_method": r.mapping_method, "mapping_confidence": r.mapping_confidence,
+        "status": r.status, "created_at": str(r.created_at)[:19],
+    }
+
+
+def _sector_interpret_dict(r: SectorNewsAIInterpret) -> dict:
+    return {
+        "id": r.id, "article_ids": r.article_ids or [], "sector_codes": r.sector_codes or [],
+        "polarity": r.polarity, "summary": r.summary,
+        "impact_mechanism": r.impact_mechanism, "impact_horizon": r.impact_horizon,
+        "information_score": r.information_score, "direction_confidence": r.direction_confidence,
+        "quote_evidence": r.quote_evidence or [], "affected_stock_codes": r.affected_stock_codes or [],
+        "stock_relation_basis": r.stock_relation_basis,
+        "human_review_required": r.human_review_required,
+        "validator_status": r.validator_status, "model_version": r.model_version,
+        "created_at": str(r.created_at)[:19],
+    }
+
+
+def _sector_shadow_dict(r: SectorNewsShadowVerify) -> dict:
+    return {
+        "id": r.id, "interpret_id": r.interpret_id, "sector_code": r.sector_code,
+        "sector_name": r.sector_name, "signal_date": r.signal_date,
+        "base_index_value": r.base_index_value, "t1_return": r.t1_return,
+        "t3_return": r.t3_return, "t5_return": r.t5_return,
+        "t1_at": r.t1_at, "t3_at": r.t3_at, "t5_at": r.t5_at,
+        "direction_correct": r.direction_correct, "created_at": str(r.created_at)[:19],
+    }
+
+
 # ==================== 持仓实时价快照（quote_snapshot，持仓监控页 DB 兜底） ====================
 
 def upsert_quote_snapshot(rows: list[dict]) -> int:
@@ -796,7 +1053,7 @@ def list_candidate_tradeable(trade_date: str | None = None, limit: int = 200) ->
             if trade_date:
                 stmt = stmt.where(CandidateTradeable.trade_date == trade_date)
             rows = db.execute(stmt.limit(limit)).scalars().all()
-            return [{"stock_code": r.stock_code, "stock_name": r.stock_name,
+            return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
                      "trade_date": r.trade_date, "tier": r.tier,
                      "is_tradeable": r.is_tradeable, "label": r.label,
                      "plan_exists": r.plan_exists, "price_zone": r.price_zone,
@@ -1031,6 +1288,16 @@ def update_review_suggestion_status(review_id: int, status: str) -> None:
         if row is None:
             return
         row.suggest_status = status
+        # 旧复盘入口的人工采纳也必须打开同一条偏好门禁；生成时保持 pending。
+        # 驳回则关闭该版本，保留记录供审计但不能再次被误认为待处理反馈。
+        if status in ("adopted", "rejected"):
+            pref = db.execute(
+                select(AgentPreference).where(
+                    AgentPreference.source_review_id == review_id
+                ).order_by(AgentPreference.version.desc()).limit(1)
+            ).scalar_one_or_none()
+            if pref is not None:
+                pref.status = "active" if status == "adopted" else "rejected"
         db.commit()
         _invalidate("review")
 
@@ -1091,19 +1358,52 @@ def get_review_reject_history(code: str | None = None, limit: int = 10) -> list[
 def get_latest_preference() -> dict | None:
     with SessionLocal() as db:
         row = db.execute(
-            select(AgentPreference).order_by(AgentPreference.version.desc()).limit(1)
+            select(AgentPreference).where(
+                # status 列为后加迁移列；NULL 视为历史 active，兼容旧 MySQL 数据。
+                (AgentPreference.status == "active") | AgentPreference.status.is_(None)
+            ).order_by(AgentPreference.version.desc()).limit(1)
         ).scalar_one_or_none()
         return _json(row.content) if row else None
 
 
-def upsert_preference(content: dict, source_review_id: int | None = None) -> None:
+def upsert_preference(content: dict, source_review_id: int | None = None,
+                      status: str | None = None) -> None:
+    """写入偏好版本。
+
+    有效复盘来源默认 pending，由审核采纳后激活；无复盘来源的旧调用默认 active，
+    保持历史导入/接口兼容。调用方可显式传 status 覆盖默认值。
+    """
     with SessionLocal() as db:
+        if status is None:
+            status = "active"
+            if source_review_id is not None and db.get(ReviewResult, source_review_id) is not None:
+                status = "pending"
         latest = db.execute(
             select(AgentPreference).order_by(AgentPreference.version.desc()).limit(1)
         ).scalar_one_or_none()
         version = (latest.version + 1) if latest else 1
-        db.add(AgentPreference(version=version, content=content, source_review_id=source_review_id))
+        db.add(AgentPreference(version=version, content=content,
+                               source_review_id=source_review_id, status=status))
         db.commit()
+
+
+def activate_preference_for_review(review_id: int) -> bool:
+    """人工采纳复盘反馈对应的最新偏好版本。
+
+    返回是否找到对应反馈；重复采纳保持幂等。状态变更只作用于该复盘来源，
+    不会把其他复盘或无来源偏好带入正式评分。
+    """
+    with SessionLocal() as db:
+        pref = db.execute(
+            select(AgentPreference).where(
+                AgentPreference.source_review_id == review_id
+            ).order_by(AgentPreference.version.desc()).limit(1)
+        ).scalar_one_or_none()
+        if pref is None:
+            return False
+        pref.status = "active"
+        db.commit()
+        return True
 
 
 # ==================== 存储空间维护（低频；仅清理非核心数据，不动关键分析数据） ====================
@@ -1473,12 +1773,17 @@ def get_trades(holding_id: int) -> list[TradeRecord]:
             .order_by(TradeRecord.trade_date)).scalars().all())
 
 
-def get_latest_score(code: str) -> StockScore | None:
-    """该股最新一次评分（PositionAgent 建仓输入用）"""
+def get_latest_score(code: str, as_of: str | None = None) -> StockScore | None:
+    """读取该股最新评分；as_of 存在时只允许使用不晚于该日的版本。
+
+    默认行为保持为读取当前最新评分，供实时建仓/评分链路使用；历史复盘应传入
+    入场日，避免把退出后新生成的评分带入历史事实包。
+    """
     with SessionLocal() as db:
-        return db.execute(
-            select(StockScore).where(StockScore.stock_code == code)
-            .order_by(StockScore.trade_date.desc()).limit(1)).scalar_one_or_none()
+        stmt = select(StockScore).where(StockScore.stock_code == code)
+        if as_of:
+            stmt = stmt.where(StockScore.trade_date <= as_of)
+        return db.execute(stmt.order_by(StockScore.trade_date.desc()).limit(1)).scalar_one_or_none()
 
 
 def get_closest_score_grade(stock_code: str, trade_date: str) -> str | None:
@@ -1528,6 +1833,26 @@ def get_plan_for_entry(stock_code: str, entry_date: str) -> tuple[PositionPlan |
         return (plan, "inferred_before_entry") if plan else (None, "missing")
 
 
+def update_plan_status(plan_id: int, status: str) -> dict | None:
+    """人工确认建仓计划状态；只改生命周期，不触发交易或持仓变更。"""
+    with SessionLocal() as db:
+        row = db.get(PositionPlan, plan_id)
+        if row is None:
+            return None
+        row.status = status
+        task_queue.guarded_commit(db)
+        db.refresh(row)
+        _invalidate("plan")
+        return {"id": row.id, "stock_code": row.stock_code, "stock_name": row.stock_name,
+                "plan_date": row.plan_date, "status": row.status,
+                "total_pct": row.total_pct, "batches": row.batches,
+                "stop_loss": row.stop_loss, "take_profit": row.take_profit,
+                "rationale": row.rationale, "detail": row.detail or {},
+                "source": row.source or "manual",
+                "supersedes_id": row.supersedes_id,
+                "created_at": str(row.created_at)}
+
+
 # ==================== 面板读取（API 层统一经此网关，禁止直连会话） ====================
 
 def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
@@ -1548,7 +1873,8 @@ def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
 
 
 def list_traces(code: str | None = None, date: str | None = None,
-                module: str | None = None, limit: int = 50) -> list[dict]:
+                module: str | None = None, limit: int = 50,
+                end_date: str | None = None) -> list[dict]:
     """推理留痕轻量列表（不含长文本，详情按需单查；L1 缓存 dbq:trace:，写后由
     reasoning_trace._flush 失效）"""
     def _load() -> list[dict]:
@@ -1559,6 +1885,8 @@ def list_traces(code: str | None = None, date: str | None = None,
                 stmt = stmt.where(AiReasoningTrace.stock_code == code)
             if date:
                 stmt = stmt.where(AiReasoningTrace.generate_date == date)
+            if end_date:
+                stmt = stmt.where(AiReasoningTrace.generate_date <= end_date)
             if module:
                 stmt = stmt.where(AiReasoningTrace.source_module == module)
             rows = db.execute(stmt.limit(limit)).scalars().all()
@@ -1568,7 +1896,8 @@ def list_traces(code: str | None = None, date: str | None = None,
                      "data_source": r.data_source, "create_time": r.create_time}
                     for r in rows]
 
-    return _dbq("trace", {"code": code, "date": date, "module": module, "limit": limit}, _load)
+    return _dbq("trace", {"code": code, "date": date, "module": module,
+                           "limit": limit, "end_date": end_date}, _load)
 
 
 def get_trace(trace_id: int) -> dict | None:
@@ -2015,6 +2344,9 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "rationale": r.rationale,
                                            "detail": r.detail or {},
                                            "source": r.source or "manual",
+                                           "execution_mode": "planning",
+                                           "source_label": "建仓计划",
+                                           "audit_status": "not_required",
                                            "supersedes_id": r.supersedes_id,
                                            "created_at": str(r.created_at)} for r in rows])
 
@@ -2036,6 +2368,9 @@ def list_holdings(status: str | None = None) -> list[dict]:
                                            "take_profit": r.take_profit,
                                            "target_pct": r.target_pct, "status": r.status,
                                            "plan_id": r.plan_id, "note": r.note,
+                                           "execution_mode": "real",
+                                           "source_label": "真实交易",
+                                           "audit_status": "not_required",
                                            "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("holding", {"status": status}, _load)
@@ -2074,10 +2409,373 @@ def list_reviews(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "reject_reason": r.reject_reason,
                                            "suggest_iteration": r.suggest_iteration,
                                            "suggest_history": r.suggest_history or [],
+                                           "execution_mode": "real",
+                                           "review_source": "真实复盘",
+                                           "audit_status": "not_required",
                                            "created_at": str(r.created_at)}
                                           for r in rows])
 
     return _dbq("review", {"code": code, "limit": limit}, _load)
+
+
+# ==================== 独立 AI 模拟账本（严禁写入 Holding/TradeRecord） ====================
+
+def _paper_account_dict(row: PaperAccount) -> dict:
+    return {"id": row.id, "name": row.name, "strategy_variant": row.strategy_variant,
+            "initial_cash": row.initial_cash, "cash": row.cash, "status": row.status,
+            "rule_version": row.rule_version, "model_version": row.model_version,
+            "source_label": row.source_label, "created_at": str(row.created_at),
+            "updated_at": str(row.updated_at)}
+
+
+def create_paper_account(name: str, initial_cash: float, strategy_variant: str = "current_gate",
+                         rule_version: str = "", model_version: str = "") -> dict:
+    if initial_cash <= 0:
+        raise ValueError("模拟账户初始资金必须大于 0")
+    with SessionLocal() as db:
+        row = PaperAccount(name=name or "AI模拟账户", initial_cash=round(initial_cash, 2),
+                           cash=round(initial_cash, 2), strategy_variant=strategy_variant,
+                           rule_version=rule_version, model_version=model_version)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _paper_account_dict(row)
+
+
+def get_paper_account(account_id: int) -> PaperAccount | None:
+    with SessionLocal() as db:
+        return db.get(PaperAccount, account_id)
+
+
+def list_paper_accounts(status: str | None = None) -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(PaperAccount).order_by(PaperAccount.id.desc())
+        if status:
+            stmt = stmt.where(PaperAccount.status == status)
+        return [_paper_account_dict(r) for r in db.execute(stmt).scalars().all()]
+
+
+def update_paper_account_status(account_id: int, status: str) -> dict | None:
+    if status not in ("active", "paused"):
+        raise ValueError("模拟账户状态仅支持 active/paused")
+    with SessionLocal() as db:
+        row = db.get(PaperAccount, account_id)
+        if row is None:
+            return None
+        row.status = status
+        db.commit()
+        return _paper_account_dict(row)
+
+
+def release_paper_t1(account_id: int, trade_date: str) -> int:
+    """新交易日开始释放前一交易日以前买入的股数，幂等。"""
+    with SessionLocal() as db:
+        rows = db.execute(select(PaperPosition).where(
+            PaperPosition.account_id == account_id, PaperPosition.status == "holding",
+            PaperPosition.opened_trade_date < trade_date)).scalars().all()
+        changed = 0
+        for row in rows:
+            if row.available_shares < row.shares:
+                row.available_shares = row.shares
+                changed += 1
+        if changed:
+            db.commit()
+        return changed
+
+
+def paper_apply_execution(account_id: int, payload: dict) -> dict:
+    """原子写入模拟流水并更新独立现金/持仓；execution_key 提供幂等保护。"""
+    key = str(payload.get("execution_key") or "").strip()
+    if not key:
+        raise ValueError("模拟执行缺少 execution_key")
+    with SessionLocal() as db:
+        # 同一账户的盘中任务、手动运行按账户行串行结算。
+        account = db.execute(select(PaperAccount).where(PaperAccount.id == account_id).with_for_update()).scalar_one_or_none()
+        if account is None:
+            raise ValueError("模拟账户不存在")
+        if account.status != "active":
+            raise ValueError("模拟账户已暂停")
+        existing = db.execute(select(PaperExecution).where(
+            PaperExecution.execution_key == key)).scalar_one_or_none()
+        if existing is not None:
+            return paper_execution_dict(existing)
+        execution = PaperExecution(account_id=account_id, **{
+            k: v for k, v in payload.items() if k in {
+                "execution_key", "decision_id", "candidate_id", "score_id", "plan_id",
+                "stock_code", "stock_name", "side", "requested_price", "executed_price",
+                "shares", "gross_amount", "commission", "stamp_tax", "transfer_fee",
+                "total_amount", "trade_date", "fact_as_of", "available_on", "status",
+                "reject_reason", "strategy_variant", "rule_version", "model_version",
+                "source_label", "metadata_json",
+            }
+        })
+        if execution.status == "filled":
+            side = execution.side
+            if execution.shares <= 0 or execution.shares % 100 or side not in {"buy", "sell"}:
+                raise ValueError("模拟成交方向或整手数量无效")
+            if side == "buy":
+                if account.cash + 1e-8 < execution.total_amount:
+                    raise ValueError("模拟账户现金不足")
+                account.cash = round(account.cash - execution.total_amount, 2)
+                pos = db.execute(select(PaperPosition).where(
+                    PaperPosition.account_id == account_id,
+                    PaperPosition.stock_code == execution.stock_code)).scalar_one_or_none()
+                if pos is None:
+                    pos = PaperPosition(account_id=account_id, stock_code=execution.stock_code,
+                                        stock_name=execution.stock_name or execution.stock_code,
+                                        plan_id=execution.plan_id, shares=0, available_shares=0,
+                                        cost=0.0, avg_price=0.0, high_price=0.0,
+                                        stop_loss=float((payload.get("metadata_json") or {}).get("stop_loss") or 0),
+                                        take_profit=float((payload.get("metadata_json") or {}).get("take_profit") or 0))
+                    db.add(pos)
+                elif pos.status == "holding" and pos.shares:
+                    raise ValueError("模拟持仓已存在，禁止并发重复买入")
+                else:
+                    pos.opened_trade_date = execution.trade_date
+                    pos.available_shares = 0
+                    pos.cost = 0.0
+                    pos.high_price = 0.0
+                    pos.plan_id = execution.plan_id
+                    pos.stop_loss = float((payload.get("metadata_json") or {}).get("stop_loss") or 0)
+                    pos.take_profit = float((payload.get("metadata_json") or {}).get("take_profit") or 0)
+                old_cost = pos.cost or 0.0
+                pos.shares += execution.shares
+                pos.available_shares += 0
+                pos.cost = round(old_cost + execution.total_amount, 2)
+                pos.avg_price = round(pos.cost / pos.shares, 4) if pos.shares else 0.0
+                pos.opened_trade_date = pos.opened_trade_date or execution.trade_date
+                pos.high_price = max(pos.high_price or 0, execution.executed_price or 0)
+                pos.status = "holding"
+            elif side == "sell":
+                pos = db.execute(select(PaperPosition).where(
+                    PaperPosition.account_id == account_id,
+                    PaperPosition.stock_code == execution.stock_code,
+                    PaperPosition.status == "holding")).scalar_one_or_none()
+                if pos is None or pos.available_shares < execution.shares or pos.opened_trade_date >= execution.trade_date:
+                    raise ValueError("模拟持仓可卖股数不足（T+1 或数量限制）")
+                account.cash = round(account.cash + execution.total_amount, 2)
+                pos.shares -= execution.shares
+                pos.available_shares -= execution.shares
+                pos.cost = round(pos.avg_price * pos.shares, 2)
+                if pos.shares <= 0:
+                    pos.shares = pos.available_shares = 0
+                    pos.status = "exited"
+        db.add(execution)
+        db.commit()
+        db.refresh(execution)
+        return paper_execution_dict(execution)
+
+
+def paper_execution_dict(row: PaperExecution) -> dict:
+    return {"id": row.id, "execution_key": row.execution_key, "account_id": row.account_id,
+            "decision_id": row.decision_id, "candidate_id": row.candidate_id,
+            "score_id": row.score_id, "plan_id": row.plan_id, "stock_code": row.stock_code,
+            "stock_name": row.stock_name, "side": row.side, "requested_price": row.requested_price,
+            "executed_price": row.executed_price, "shares": row.shares,
+            "gross_amount": row.gross_amount, "commission": row.commission,
+            "stamp_tax": row.stamp_tax, "transfer_fee": row.transfer_fee,
+            "total_amount": row.total_amount, "trade_date": row.trade_date,
+            "fact_as_of": row.fact_as_of, "available_on": row.available_on,
+            "status": row.status, "reject_reason": row.reject_reason,
+            "strategy_variant": row.strategy_variant, "rule_version": row.rule_version,
+            "model_version": row.model_version, "source_label": row.source_label,
+            "metadata": row.metadata_json or {}, "created_at": str(row.created_at)}
+
+
+def list_paper_positions(account_id: int, status: str | None = None) -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(PaperPosition).where(PaperPosition.account_id == account_id)
+        if status:
+            stmt = stmt.where(PaperPosition.status == status)
+        rows = db.execute(stmt.order_by(PaperPosition.id.desc())).scalars().all()
+        return [{"id": r.id, "account_id": r.account_id, "stock_code": r.stock_code,
+                 "stock_name": r.stock_name, "shares": r.shares,
+                 "available_shares": r.available_shares, "avg_price": r.avg_price,
+                 "cost": r.cost, "opened_trade_date": r.opened_trade_date,
+                 "plan_id": r.plan_id, "stop_loss": r.stop_loss, "take_profit": r.take_profit,
+                 "high_price": r.high_price, "status": r.status,
+                 "metadata": r.metadata_json or {}, "updated_at": str(r.updated_at)} for r in rows]
+
+
+def list_paper_executions(account_id: int, limit: int = 200) -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(select(PaperExecution).where(
+            PaperExecution.account_id == account_id).order_by(PaperExecution.id.desc()).limit(limit)
+        ).scalars().all()
+        return [paper_execution_dict(r) for r in rows]
+
+
+def upsert_paper_quotes(account_id: int, rows: list[dict]) -> int:
+    """幂等写入模拟账户专用行情快照。"""
+    if not rows:
+        return 0
+    with SessionLocal() as db:
+        count = 0
+        for item in rows:
+            code = str(item.get("stock_code") or "").strip()
+            if not code:
+                continue
+            row = db.execute(select(PaperQuoteSnapshot).where(
+                PaperQuoteSnapshot.account_id == account_id,
+                PaperQuoteSnapshot.stock_code == code)).scalar_one_or_none()
+            if row is None:
+                row = PaperQuoteSnapshot(account_id=account_id, stock_code=code)
+                db.add(row)
+            for key in ("stock_name", "price", "change_pct", "source", "quote_time",
+                        "fact_as_of", "status", "error", "snapshot"):
+                if key in item:
+                    setattr(row, key, item.get(key))
+            row.updated_at = _now()
+            count += 1
+        db.commit()
+        return count
+
+
+def list_paper_quotes(account_id: int, within_minutes: int | None = 10) -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(PaperQuoteSnapshot).where(PaperQuoteSnapshot.account_id == account_id)
+        if within_minutes is not None:
+            stmt = stmt.where(PaperQuoteSnapshot.updated_at >= _now() - timedelta(minutes=max(0, within_minutes)))
+        rows = db.execute(stmt.order_by(PaperQuoteSnapshot.id.desc())).scalars().all()
+        return [{**(r.snapshot or {}), "id": r.id, "account_id": r.account_id, "stock_code": r.stock_code,
+                 "stock_name": r.stock_name, "price": r.price, "change_pct": r.change_pct,
+                 "source": r.source, "quote_time": r.quote_time, "fact_as_of": r.fact_as_of,
+                 "status": r.status, "error": r.error, "updated_at": str(r.updated_at)}
+                for r in rows]
+
+
+def create_paper_context(account_id: int, trade_date: str, mode: str, stock_code: str,
+                         stage: str, facts: dict, tool_trace: list | None = None,
+                         source_refs: list | None = None) -> int:
+    with SessionLocal() as db:
+        row = PaperContext(account_id=account_id, trade_date=trade_date, mode=mode,
+                           stock_code=stock_code or "", stage=stage or "",
+                           facts=facts or {}, tool_trace=tool_trace or [],
+                           source_refs=source_refs or [])
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def list_paper_contexts(account_id: int, limit: int = 100) -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(select(PaperContext).where(PaperContext.account_id == account_id)
+                          .order_by(PaperContext.id.desc()).limit(limit)).scalars().all()
+        return [{"id": r.id, "account_id": r.account_id, "trade_date": r.trade_date,
+                 "mode": r.mode, "stock_code": r.stock_code, "stage": r.stage,
+                 "facts": r.facts or {}, "tool_trace": r.tool_trace or [],
+                 "source_refs": r.source_refs or [], "status": r.status,
+                 "created_at": str(r.created_at)} for r in rows]
+
+
+def create_paper_web_evidence(account_id: int, trade_date: str, stock_code: str,
+                              values: dict) -> int:
+    with SessionLocal() as db:
+        row = PaperWebEvidence(account_id=account_id, trade_date=trade_date,
+                               stock_code=stock_code or "", **{
+                                   key: values.get(key, "") for key in (
+                                       "url", "domain", "title", "excerpt", "published_at",
+                                       "fetched_at", "fact_as_of", "content_hash", "status", "error")
+                               })
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def list_paper_web_evidence(account_id: int, limit: int = 100) -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(select(PaperWebEvidence).where(
+            PaperWebEvidence.account_id == account_id).order_by(PaperWebEvidence.id.desc())
+                          .limit(limit)).scalars().all()
+        return [{"id": r.id, "account_id": r.account_id, "trade_date": r.trade_date,
+                 "stock_code": r.stock_code, "url": r.url, "domain": r.domain,
+                 "title": r.title, "excerpt": r.excerpt, "published_at": r.published_at,
+                 "fetched_at": r.fetched_at, "fact_as_of": r.fact_as_of,
+                 "content_hash": r.content_hash, "status": r.status, "error": r.error,
+                 "created_at": str(r.created_at)} for r in rows]
+
+
+def create_paper_alert(account_id: int, stock_code: str, trade_date: str, values: dict) -> int:
+    with SessionLocal() as db:
+        row = PaperAlert(account_id=account_id, stock_code=stock_code or "",
+                         trade_date=trade_date, severity=values.get("severity") or "info",
+                         alert_type=values.get("alert_type") or "",
+                         message=values.get("message") or "",
+                         source=values.get("source") or "paper_monitor",
+                         context_id=values.get("context_id"))
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def list_paper_alerts(account_id: int, limit: int = 100) -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(select(PaperAlert).where(PaperAlert.account_id == account_id)
+                          .order_by(PaperAlert.id.desc()).limit(limit)).scalars().all()
+        return [{"id": r.id, "account_id": r.account_id, "stock_code": r.stock_code,
+                 "trade_date": r.trade_date, "severity": r.severity,
+                 "alert_type": r.alert_type, "message": r.message, "source": r.source,
+                 "context_id": r.context_id, "created_at": str(r.created_at)} for r in rows]
+
+
+def create_paper_review(account_id: int, stock_code: str, stock_name: str,
+                        review_date: str, content: dict, execution_id: int | None = None) -> int:
+    with SessionLocal() as db:
+        row = PaperReview(account_id=account_id, execution_id=execution_id,
+                          stock_code=stock_code, stock_name=stock_name,
+                          review_date=review_date, content=content or {}, source_type="paper")
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def list_paper_reviews(account_id: int | None = None, limit: int = 100) -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(PaperReview).order_by(PaperReview.id.desc())
+        if account_id is not None:
+            stmt = stmt.where(PaperReview.account_id == account_id)
+        rows = db.execute(stmt.limit(limit)).scalars().all()
+        return [{"id": r.id, "account_id": r.account_id, "execution_id": r.execution_id,
+                 "stock_code": r.stock_code, "stock_name": r.stock_name,
+                 "review_date": r.review_date, "source_type": r.source_type,
+                 "content": r.content or {}, "audit_status": r.audit_status,
+                 "audit_verdict": r.audit_verdict, "audit_reason": r.audit_reason,
+                 "shadow_status": r.shadow_status, "created_at": str(r.created_at),
+                 "audited_at": str(r.audited_at) if r.audited_at else None} for r in rows]
+
+
+def audit_paper_review(review_id: int, verdict: str, reason: str) -> dict | None:
+    if verdict not in ("pass", "fail"):
+        raise ValueError("审核结论仅支持 pass/fail")
+    with SessionLocal() as db:
+        row = db.get(PaperReview, review_id)
+        if row is None:
+            return None
+        row.audit_status = "passed" if verdict == "pass" else "failed"
+        row.audit_verdict, row.audit_reason, row.audited_at = verdict, reason or "", _now()
+        if verdict != "pass":
+            row.shadow_status = "blocked"
+        db.commit()
+        return {"id": row.id, "audit_status": row.audit_status,
+                "audit_verdict": row.audit_verdict, "audit_reason": row.audit_reason,
+                "shadow_status": row.shadow_status}
+
+
+def mark_paper_shadow(review_id: int) -> dict | None:
+    with SessionLocal() as db:
+        row = db.get(PaperReview, review_id)
+        if row is None:
+            return None
+        if row.audit_status != "passed":
+            raise ValueError("模拟复盘必须先通过 AI 审核")
+        row.shadow_status = "pending"
+        db.commit()
+        return {"id": row.id, "source_type": "paper", "shadow_status": row.shadow_status,
+                "audit_status": row.audit_status}
 
 
 def get_review(review_id: int) -> ReviewResult | None:
@@ -2333,11 +3031,21 @@ def get_latest_sell_decision(holding_id: int) -> SellDecision | None:
             .order_by(SellDecision.id.desc()).limit(1)).scalar_one_or_none()
 
 
-def get_sell_decisions_by_code(stock_code: str, limit: int = 20) -> list[SellDecision]:
+def get_sell_decisions_by_code(stock_code: str, limit: int = 20,
+                               holding_id: int | None = None,
+                               start_date: str | None = None,
+                               end_date: str | None = None) -> list[SellDecision]:
+    """读取卖出建议；可按持仓及生成日期限定历史事实窗口。"""
     with SessionLocal() as db:
+        stmt = select(SellDecision).where(SellDecision.stock_code == stock_code)
+        if holding_id is not None:
+            stmt = stmt.where(SellDecision.holding_id == holding_id)
+        if start_date:
+            stmt = stmt.where(func.date(SellDecision.created_at) >= start_date)
+        if end_date:
+            stmt = stmt.where(func.date(SellDecision.created_at) <= end_date)
         return list(db.execute(
-            select(SellDecision).where(SellDecision.stock_code == stock_code)
-            .order_by(SellDecision.id.desc()).limit(limit)).scalars().all())
+            stmt.order_by(SellDecision.id.desc()).limit(limit)).scalars().all())
 
 
 # ==================== 策略闭环建议（复盘进化Agent 输出，人工审核后生效） ====================
@@ -2470,6 +3178,16 @@ def update_agent_suggestion_status(suggestion_id: int, status: str,
         row.status = status
         if status == "rejected" and reason:
             row.reject_reason = reason.strip()
+        # profile 建议与复盘反馈共用 source_review_id；采纳建议时打开该复盘
+        # 的最新偏好版本，避免 feedback 在建议审核前旁路进入评分。
+        if status == "approved" and row.target_kind == "profile":
+            pref = db.execute(
+                select(AgentPreference).where(
+                    AgentPreference.source_review_id == row.review_id
+                ).order_by(AgentPreference.version.desc()).limit(1)
+            ).scalar_one_or_none()
+            if pref is not None:
+                pref.status = "active"
         db.commit()
         db.refresh(row)
         return row
@@ -2634,11 +3352,18 @@ def rollback_rule_change(rule_change_id: int, reason: str) -> bool:
 
 # ==================== 监控信号历史（ReviewAgent 复盘聚合用） ====================
 
-def get_alerts_by_code(stock_code: str, limit: int = 50) -> list[AlertLog]:
+def get_alerts_by_code(stock_code: str, limit: int = 50,
+                       start_date: str | None = None,
+                       end_date: str | None = None) -> list[AlertLog]:
+    """读取告警日志；可限定 created_at 落在指定日期闭区间内。"""
     with SessionLocal() as db:
+        stmt = select(AlertLog).where(AlertLog.stock_code == stock_code)
+        if start_date:
+            stmt = stmt.where(func.date(AlertLog.created_at) >= start_date)
+        if end_date:
+            stmt = stmt.where(func.date(AlertLog.created_at) <= end_date)
         return list(db.execute(
-            select(AlertLog).where(AlertLog.stock_code == stock_code)
-            .order_by(AlertLog.id.desc()).limit(limit)).scalars().all())
+            stmt.order_by(AlertLog.id.desc()).limit(limit)).scalars().all())
 
 
 # ==================== Agent 专属对话（Agent 对话页，全程可回溯） ====================

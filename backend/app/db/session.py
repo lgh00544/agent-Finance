@@ -141,8 +141,10 @@ def init_db() -> dict:
     identity = _database_identity()
     try:
         Base.metadata.create_all(bind=engine)
+        _add_columns(engine, "paper_quote_snapshot", {"snapshot": "JSON NULL"})
         _ensure_experience_fts()
         _ensure_review_result_columns()
+        _ensure_agent_preference_columns()
         _ensure_stock_candidate_detail()
         _ensure_trade_record_columns()
         _ensure_agent_suggestion_columns()
@@ -287,6 +289,12 @@ def _ensure_review_result_columns(eng=None) -> None:
         "suggest_history": "JSON",
     }
     _add_columns(eng, "review_result", additions)
+
+
+def _ensure_agent_preference_columns(eng=None) -> None:
+    """幂等补齐 agent_preference 审核状态列；历史偏好默认 active，避免升级后失效。"""
+    eng = eng or engine
+    _add_columns(eng, "agent_preference", {"status": "VARCHAR(16) DEFAULT 'active'"})
 
 
 def _ensure_knowledge_hit_columns(eng=None) -> dict:

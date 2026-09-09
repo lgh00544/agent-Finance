@@ -4,6 +4,7 @@ import json
 import logging
 import concurrent.futures
 import time
+from hashlib import sha256
 
 from app.agents.common import ModelLevel, agent_call
 from app.agents.review import llm_rethink_suggestion
@@ -18,30 +19,49 @@ AUDIT_ITEM_TIMEOUT_SECONDS = 90
 
 def collect_audit(suggestion) -> dict:
     """聚合单条待审建议 → 审核输入（只读，不改任何字段）"""
-    return {"id": suggestion.id, "target_agent": suggestion.target_agent,
-            "rule_name": suggestion.rule_name, "current_value": suggestion.current_value,
-            "suggested_value": suggestion.suggested_value, "reason": suggestion.reason,
-            "evidence": suggestion.evidence, "expected_effect": suggestion.expected_effect,
-            "risk_note": suggestion.risk_note}
+    fields = (
+        "id", "review_id", "target_agent", "target_kind", "rule_type", "priority",
+        "rule_name", "current_value", "suggested_value", "rule_text", "problem_desc",
+        "reason", "evidence", "expected_effect", "risk_note", "suggestion_source",
+        "file_path", "insert_position", "conflict_note", "dedup_note",
+    )
+    data = {field: getattr(suggestion, field, None) for field in fields}
+    target_agent = data["target_agent"] or ""
+    # 仅供叠加审查，沿用正式注入的 target_agent/all/空作用域兼容范围。
+    # 读取失败向上抛出，不能把未知的现有约束伪装成空规则集后继续审批。
+    data["active_rules"] = [
+        dict(rule) for rule in repo.get_active_rules()
+        if (rule.get("target_agent") or "") in (target_agent, "all", "")
+    ]
+    return data
+
+
+def _call_audit(suggestion, audit_round: int, dissent_view: str = "") -> AuditOutput:
+    data = collect_audit(suggestion)
+    user_prompt = (audit_prompt.build_re_audit_user_prompt(data, dissent_view)
+                   if audit_round == 2 else audit_prompt.build_user_prompt(data))
+    # 绑定正文、作用域内生效规则及实际提示词，防止同编号改文后复用旧裁决。
+    digest = sha256(json.dumps(
+        {"input": data, "system_prompt": audit_prompt.SYSTEM_PROMPT,
+         "user_prompt": user_prompt, "round": audit_round, "dissent_view": dissent_view},
+        ensure_ascii=False, sort_keys=True, default=str,
+    ).encode("utf-8")).hexdigest()
+    return agent_call(
+        agent="audit",
+        cache_key=f"audit:agent_suggestion:{suggestion.id}:round{audit_round}:{digest}",
+        system_prompt=audit_prompt.SYSTEM_PROMPT, user_prompt=user_prompt,
+        schema=AuditOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP,
+    )
 
 
 def llm_audit(suggestion) -> AuditOutput:
-    """round1 首审：辩证裁决（缓存键含 round，不污染原缓存）"""
-    return agent_call(agent="audit",
-                      cache_key=f"audit:agent_suggestion:{suggestion.id}:round1",
-                      system_prompt=audit_prompt.SYSTEM_PROMPT,
-                      user_prompt=audit_prompt.build_user_prompt(collect_audit(suggestion)),
-                      schema=AuditOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP)
+    """round1 首审：辩证裁决，缓存绑定完整审核输入。"""
+    return _call_audit(suggestion, 1)
 
 
 def llm_re_audit(suggestion, dissent_view: str) -> AuditOutput:
     """round2 重审：追加历史 fail 原因，逐条回应反对意见"""
-    return agent_call(agent="audit",
-                      cache_key=f"audit:agent_suggestion:{suggestion.id}:round2",
-                      system_prompt=audit_prompt.SYSTEM_PROMPT,
-                      user_prompt=audit_prompt.build_re_audit_user_prompt(
-                          collect_audit(suggestion), dissent_view),
-                      schema=AuditOutput, ttl_seconds=86400, model_level=ModelLevel.DEEP)
+    return _call_audit(suggestion, 2, dissent_view)
 
 
 def _persist(suggestion, audit_round: int, out: AuditOutput, duration_ms: int) -> int:
@@ -139,3 +159,10 @@ def trigger_audit_for_suggestion(suggestion_id: int) -> dict:
     log_id = _persist(s, nxt, out, int((time.time() - t0) * 1000))
     return {"audited": True, "suggestion_id": suggestion_id, "verdict": out.verdict,
             "round": nxt, "audit_log_id": log_id}
+
+
+def paper_audit_case(facts: dict, review: dict) -> dict:
+    """Audit paper facts and generated review without touching formal audit logs."""
+    from app.services.paper_analysis import audit_case
+
+    return audit_case(facts, review)

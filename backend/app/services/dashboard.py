@@ -48,11 +48,13 @@ def _module_tradeable_view() -> dict:
     trade_date = time.strftime("%Y-%m-%d")
     try:
         items = repo.list_candidate_tradeable(trade_date, limit=50)
-        return {"date": trade_date,
+        return {"status": "ready" if items else "pending", "date": trade_date,
                 "count": sum(1 for i in items if i.get("is_tradeable")),
                 "total": len(items), "items": items}
-    except Exception:  # noqa: BLE001 失败返回空 items 不阻塞聚合整体
-        return {"date": trade_date, "count": 0, "items": [], "total": 0}
+    except Exception as exc:  # noqa: BLE001 失败不阻塞聚合整体，但不能伪装成零机会
+        logger.warning("首页可建仓判定读取失败: %s", exc)
+        return {"status": "error", "date": trade_date, "count": None,
+                "items": [], "total": None, "error": type(exc).__name__}
 
 
 def _module(fn):

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   App,
   Alert,
@@ -51,7 +52,16 @@ const INFO_LABEL: Record<string, string> = {
   stock_code: '股票代码',
   signal_type: '信号类型',
   original_ref: '原始引用',
+  source_module: '来源模块',
+  source_task_id: '来源任务编号',
+  artifacts_ref: '产物引用',
+  experience_id: '经验编号',
+  impact: '影响等级',
+  confidence: '置信度',
+  stage: '业务阶段',
 }
+
+const infoLabel = (key: string) => INFO_LABEL[key] ?? `扩展字段（${key}）`
 
 function renderInfo(v: unknown) {
   if (typeof v !== 'string' || !v.trim()) return '（无）'
@@ -59,7 +69,7 @@ function renderInfo(v: unknown) {
     const data = JSON.parse(v) as Record<string, unknown>
     return (
       <Descriptions size="small" column={1} items={Object.entries(data).map(([label, children]) => ({
-        label: INFO_LABEL[label] ?? label,
+        label: <Tooltip title={`内部字段：${label}`}>{infoLabel(label)}</Tooltip>,
         children: children == null || children === '' ? '（无）' : String(children),
       }))} />
     )
@@ -71,7 +81,11 @@ function M1StatusBadge({ status }: { status?: string }) {
   return <Tooltip title={s.tip}><span><StatusBadge text={s.text} tone={s.tone} /></span></Tooltip>
 }
 
-function M1Detail({ row }: { row: PendingExperience & Record<string, unknown> }) {
+function M1Detail({ row, onGoM2, onGoM3 }: {
+  row: PendingExperience & Record<string, unknown>
+  onGoM2?: () => void
+  onGoM3?: (eid: number) => void
+}) {
   const status = String(row.status ?? '')
   const next = status === 'done' ? '待 M2 审核；高影响经验会转 M3，两步确认通过后才生效 LLM'
     : status === 'processing' ? '等待 Worker 产出正式经验，再进入 M2/M3'
@@ -104,7 +118,15 @@ function M1Detail({ row }: { row: PendingExperience & Record<string, unknown> })
           { label: '结构化信息', children: renderInfo(row.ext_info ?? row.artifacts_ref) },
         ]} />
       </Card>
-      <Alert type="info" showIcon title="下一步" description={`当前状态：${M1_STATUS[status]?.text ?? val(status)}；下一步：${next}`} />
+      <Alert type="info" showIcon title="下一步" description={(
+        <Space wrap>
+          <Text>当前状态：{M1_STATUS[status]?.text ?? val(status)}；{next}</Text>
+          {status === 'done' && onGoM2 ? <Button size="small" onClick={onGoM2}>前往 M2 经验过目</Button> : null}
+          {status === 'done' && String(row.impact) === 'high' && row.experience_id && onGoM3
+            ? <Button size="small" type="primary" onClick={() => onGoM3(Number(row.experience_id))}>前往 M3 高影响审核</Button>
+            : null}
+        </Space>
+      )} />
     </Space>
   )
 }
@@ -114,7 +136,7 @@ function ModuleHint({ message, description }: { message: string; description: st
 }
 
 // ================= M1 沉淀队列（只读看板） =================
-function ExpQueuePanel() {
+function ExpQueuePanel({ onGoM2, onGoM3 }: { onGoM2: () => void; onGoM3: (eid: number) => void }) {
   const { message } = App.useApp()
   const qc = useQueryClient()
   const [stage, setStage] = useState('全部')
@@ -167,10 +189,10 @@ function ExpQueuePanel() {
               render: (_: unknown, r) => <Button size="small" onClick={(e) => { e.stopPropagation(); setSelected(r as PendingExperience & Record<string, unknown>) }}>查看详情</Button>,
             },
           ]}
-          expandable={{ expandedRowRender: (r) => <M1Detail row={r as PendingExperience & Record<string, unknown>} /> }} />
+          expandable={{ expandedRowRender: (r) => <M1Detail row={r as PendingExperience & Record<string, unknown>} onGoM2={onGoM2} onGoM3={onGoM3} /> }} />
       )}
       <Drawer title="M1 队列详情" open={!!selected} size={720} onClose={() => setSelected(null)} destroyOnHidden>
-        {selected ? <M1Detail row={selected} /> : null}
+        {selected ? <M1Detail row={selected} onGoM2={onGoM2} onGoM3={onGoM3} /> : null}
       </Drawer>
     </Card>
   )
@@ -582,8 +604,18 @@ const TABS = [
 ]
 
 function ExpPanelRoot() {
-  const [tab, setTab] = useState('M1')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedTab = searchParams.get('tab')
+  const initialTab = TABS.some((item) => item.value === requestedTab) ? requestedTab! : 'M1'
+  const [tab, setTab] = useState(initialTab)
   const [selEid, setSelEid] = useState<number | null>(null)
+  useEffect(() => {
+    if (TABS.some((item) => item.value === requestedTab) && requestedTab !== tab) setTab(requestedTab!)
+  }, [requestedTab, tab])
+  const goTab = (value: string) => {
+    setTab(value)
+    setSearchParams(value === 'M1' ? {} : { tab: value })
+  }
   return (
     <Space orientation="vertical" style={{ width: '100%' }} size={12}>
       <Card>
@@ -600,9 +632,9 @@ function ExpPanelRoot() {
           )} />
       </Card>
       <Card>
-        <Segmented value={tab} onChange={(v) => setTab(String(v))} options={TABS} style={{ marginBottom: 14 }} />
-        {tab === 'M1' && <ExpQueuePanel />}
-        {tab === 'M2' && <ExpDigestPanel onGoHigh={(eid) => { setSelEid(eid); setTab('M3') }} />}
+        <Segmented value={tab} onChange={(v) => goTab(String(v))} options={TABS} style={{ marginBottom: 14 }} />
+        {tab === 'M1' && <ExpQueuePanel onGoM2={() => goTab('M2')} onGoM3={(eid) => { setSelEid(eid); goTab('M3') }} />}
+        {tab === 'M2' && <ExpDigestPanel onGoHigh={(eid) => { setSelEid(eid); goTab('M3') }} />}
         {tab === 'M3' && <ExpReviewPanel selEid={selEid} setSelEid={setSelEid} />}
         {tab === 'M4' && <ExpLibraryPanel />}
         {tab === 'M5' && <ExpSettingsPanel />}

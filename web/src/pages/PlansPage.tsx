@@ -8,14 +8,15 @@ import {
   Form,
   Input,
   Modal,
+  Popconfirm,
   Select,
   Space,
   Table,
   Tag,
   Typography,
 } from 'antd'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { plans } from '@/api/positions'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { plans, updatePlanStatus } from '@/api/positions'
 import { candidates } from '@/api/candidates'
 import { scores } from '@/api/scores'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
@@ -25,7 +26,7 @@ import type { PositionPlan, StockScoreInfo } from '@/types'
 const { Text } = Typography
 
 const STATUS_MAP: Record<string, { label: string; color: string }> = {
-  proposed: { label: '待评估', color: 'orange' },
+  proposed: { label: '待确认', color: 'orange' },
   accepted: { label: '已采纳', color: 'green' },
   abandoned: { label: '已放弃', color: 'default' },
   superseded: { label: '已被新版本替代', color: 'default' },
@@ -40,7 +41,7 @@ const FRESHNESS_LABEL: Record<string, { label: string; color: string }> = {
   unknown: { label: '数据时效未知', color: 'red' },
 }
 
-/** 触发信号：止盈已触发=涨=红(var--up) / 止损已触发=跌=绿(var--down) / 正常待评估=橙(var--warn) */
+/** 触发信号：止盈已触发=涨=红(var--up) / 止损已触发=跌=绿(var--down) / 监控中=橙(var--warn) */
 function signalOf(p: PositionPlan): { label: string; color: string; bar: string } {
   const q = (p.detail?.quant ?? {}) as Record<string, unknown>
   const cur = Number(q.current_price)
@@ -48,7 +49,12 @@ function signalOf(p: PositionPlan): { label: string; color: string; bar: string 
   const sl = parseFloat(String(q.initial_stop ?? ''))
   if (Number.isFinite(cur) && Number.isFinite(tp) && cur >= tp) return { label: '止盈已触发', color: 'red', bar: 'var(--up)' }
   if (Number.isFinite(cur) && Number.isFinite(sl) && cur <= sl) return { label: '止损已触发', color: 'green', bar: 'var(--down)' }
-  return { label: '正常待评估', color: 'orange', bar: 'var(--warn)' }
+  return { label: '监控中', color: 'orange', bar: 'var(--warn)' }
+}
+
+function planConclusion(p: PositionPlan): string {
+  const detail = (p.detail ?? {}) as Record<string, unknown>
+  return String(detail.final_advice ?? p.rationale ?? '').trim()
 }
 
 /** 维度归因条（与候选池页同款渲染：名称 + 分数条 + 结论 + 建议） */
@@ -247,6 +253,8 @@ function NewPlanModal({ open, onClose, scoreMap }: { open: boolean; onClose: () 
 
 /** 建仓计划页（Phase 2） */
 export function PlansPage() {
+  const { message } = App.useApp()
+  const qc = useQueryClient()
   const [status, setStatus] = useState('全部')
   const [date, setDate] = useState('')
   const [grade, setGrade] = useState('全部评级')
@@ -256,6 +264,17 @@ export function PlansPage() {
 
   const { data: rows, isError, error, refetch } = useQuery({ queryKey: ['plans'], queryFn: () => plans(undefined, 200) })
   const { data: scoreRows } = useQuery({ queryKey: ['scores-all'], queryFn: () => scores(undefined, undefined, 500) })
+  const statusMut = useMutation({
+    mutationFn: ({ planId, nextStatus }: { planId: number; nextStatus: 'accepted' | 'abandoned' }) =>
+      updatePlanStatus(planId, nextStatus),
+    onSuccess: (_, vars) => {
+      message.success(vars.nextStatus === 'accepted' ? '建仓方案已采纳' : '建仓方案已放弃')
+      qc.invalidateQueries({ queryKey: ['plans'] })
+    },
+    onError: (e) => {
+      message.error(e instanceof Error ? e.message : '状态更新失败')
+    },
+  })
 
   const scoreMap = (scoreRows ?? []).reduce<Record<string, StockScoreInfo>>((m, s) => {
     if (s.stock_code) m[s.stock_code] = s
@@ -310,14 +329,45 @@ export function PlansPage() {
       title: '状态', dataIndex: 'status', width: 90,
       render: (v: string) => <Tag color={STATUS_MAP[v]?.color ?? 'default'}>{STATUS_MAP[v]?.label ?? v}</Tag>,
     },
+    {
+      title: '计划结论', key: 'conclusion', width: 360,
+      render: (_: unknown, p: PositionPlan) => {
+        const conclusion = planConclusion(p)
+        return conclusion ? (
+          <Text style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+            {conclusion}
+          </Text>
+        ) : <Text type="secondary">暂无结论</Text>
+      },
+    },
     { title: '总仓位', dataIndex: 'total_pct', width: 80, render: (v: number) => `${v}%` },
     {
       title: '来源', dataIndex: 'source', width: 100,
-      render: (v: string) => <Tag color={v === 'candidate' ? 'blue' : 'default'}>{SOURCE_LABEL[v] ?? v}</Tag>,
+      render: (v: string, p: PositionPlan) => <Space size={4}><Tag color={v === 'candidate' ? 'blue' : 'default'}>{SOURCE_LABEL[v] ?? v}</Tag>
+        <Tag color="default">{String(p.source_label ?? '建仓计划')}</Tag></Space>,
     },
     { title: '止损', dataIndex: 'stop_loss', width: 80, render: (v: number) => v ?? '—' },
     { title: '止盈', dataIndex: 'take_profit', width: 80, render: (v: number) => v ?? '—' },
     { title: '生成时间', dataIndex: 'created_at', width: 150, render: (v: string) => String(v ?? '').slice(0, 16) },
+    {
+      title: '操作', key: 'actions', width: 150, fixed: 'right' as const,
+      render: (_: unknown, p: PositionPlan) => {
+        if (p.status !== 'proposed' || p.id == null) return <Text type="secondary">—</Text>
+        const loading = statusMut.isPending
+        return (
+          <Space size={6}>
+            <Button size="small" type="primary" loading={loading}
+              onClick={() => statusMut.mutate({ planId: Number(p.id), nextStatus: 'accepted' })}>
+              采纳
+            </Button>
+            <Popconfirm title="放弃这份建仓方案？" okText="放弃" cancelText="取消"
+              onConfirm={() => statusMut.mutate({ planId: Number(p.id), nextStatus: 'abandoned' })}>
+              <Button size="small" loading={loading}>放弃</Button>
+            </Popconfirm>
+          </Space>
+        )
+      },
+    },
   ]
 
   const sourceOpts = ['全部来源', '每日候选池', '手动生成'].map((s) => ({ label: s, value: s === '每日候选池' ? 'candidate' : s === '手动生成' ? 'manual' : s }))
@@ -326,7 +376,7 @@ export function PlansPage() {
     <div>
       <Space style={{ marginBottom: 10 }} wrap>
         <Select value={status} onChange={(v) => setStatus(v)} style={{ width: 120 }}
-          options={['全部', '待评估', '已采纳', '已放弃'].map((s) => ({ label: s, value: s }))} />
+          options={['全部', '待确认', '已采纳', '已放弃'].map((s) => ({ label: s, value: s }))} />
         <Select value={date} onChange={(v) => setDate(v)} style={{ width: 130 }}
           options={[{ label: '全部日期', value: '全部日期' }, ...dates.map((d) => ({ label: d, value: d }))]} />
         <Select value={grade} onChange={(v) => setGrade(v)} style={{ width: 120 }}

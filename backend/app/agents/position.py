@@ -125,12 +125,13 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
     )
 
     # 新鲜度只描述事实数据，不再用评级推断“实时”。
+    # 先固定量化所需的指标快照，再读取日期，避免指标未赋值导致 B/A 计划生成异常。
+    indicators = (info or {}).get("indicators") or {}
     grade = (state.get("score_result") or {}).get("grade") or ""
     data_as_of = str(indicators.get("latest_date") or "")
     freshness = _data_freshness(data_as_of, today)
     analysis_generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
     # 量化计算（纯计算零 LLM）：金额/股数（100 整数倍）/分级 C1 上限/盈亏比/资金缩减
-    indicators = (info or {}).get("indicators") or {}
     quant = plan_quant.quantify(
         code, name, grade,
         [b.model_dump() for b in output.batches],

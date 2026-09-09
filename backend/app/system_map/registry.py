@@ -58,6 +58,27 @@ _COMMON_AGENT_DEFAULTS = {
 }
 
 _SYSTEM_AGENT_META = {
+    "paper_execution": {
+        "name": "AI模拟执行 Agent",
+        "responsibility": "读取候选池、评分、建仓计划和可建仓状态，按确定性 A 股约束更新独立模拟账本。",
+        "knowledge": "候选/评分/建仓计划事实快照；不重新选股、不修改正式规则。",
+        "agent_type": "paper_execution",
+        "authority_level": "simulation_only",
+        "inputs_required": ["paper_account_id", "trade_date"],
+        "outputs": ["paper_execution", "paper_position", "paper_rejection_reason"],
+        "can_call": [],
+        "can_reference": ["candidate_pool", "score", "position_plan", "candidate_tradeable",
+                          "market_data", "news", "financial", "fund_flow", "knowledge",
+                          "market_regime", "factor_calibration", "capital_view", "hot_money"],
+        "tool_allowlist": [
+            "get_quote", "get_daily_kline", "get_news", "get_financial", "get_fund_flow",
+            "search_knowledge", "get_sector_regime", "get_factor_calibration",
+            "get_distribution_phase", "get_capital_view", "get_hot_money_context",
+        ],
+        "cannot_do": ["write_holding", "write_trade_record", "place_order", "change_rule"],
+        "knowledge_scope": "paper",
+        "human_gate_required": False,
+    },
     "market_intel": {
         "name": "市场研判 Agent",
         "responsibility": "聚合大盘、板块、情绪与结构事实，生成市场环境参考，不直接改变交易执行。",
@@ -197,6 +218,18 @@ _WORKFLOWS = [
         "audit_required": False,
         "human_confirm_required": False,
         "final_responder": "selected_agent",
+    },
+    {
+        "workflow_id": "paper_execution",
+        "name": "AI模拟执行",
+        "intent_examples": ["运行模拟账户", "回放模拟交易"],
+        "steps": ["paper_execution"],
+        "required_inputs": ["paper_account_id", "trade_date"],
+        "optional_inputs": ["paper_facts", "requested_sides"],
+        "allowed_entry_agents": ["paper_execution"],
+        "audit_required": False,
+        "human_confirm_required": False,
+        "final_responder": "paper_execution",
     },
 ]
 

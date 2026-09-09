@@ -234,3 +234,184 @@ def test_cancel_running_task_cannot_write_business_row():
             select(AlertLog).where(AlertLog.stock_code == code)
         ).scalars().all()
     assert rows == []
+
+
+def _wait_task_terminal(tid: str, timeout: float = 5.0) -> dict:
+    from app.services import task_queue
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        task = task_queue.get(tid)
+        if task and task["status"] in ("done", "failed", "canceled"):
+            return task
+        time.sleep(0.02)
+    raise AssertionError(f"任务 {tid} 未在 {timeout}s 内结束: {task_queue.get(tid)}")
+
+
+def test_cancel_daily_pipeline_parallel_score_cannot_write_business_row(monkeypatch):
+    """每日链路评分线程必须继承 attempt；取消后子线程的旧写入被栅栏拒绝。"""
+    from sqlalchemy import delete, select
+
+    from app.db import repo
+    from app.db.models import AlertLog
+    from app.db.session import SessionLocal
+    from app.graph import router
+    from app.services import task_queue
+
+    code_prefix = "ZZPAR_SCORE_"
+    candidates = [{"stock_code": f"{code_prefix}{i}", "stock_name": f"评分取消{i}"}
+                  for i in range(1, 6)]
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fake_discover(_trade_date=None):
+        return {"candidates": candidates}
+
+    def _fake_run_score(code, stock_name="", trade_date=None):
+        started.set()
+        release.wait(5)
+        repo.insert_alert(code, stock_name, "cancel_probe", "info",
+                          "并行评分旧 attempt 不应落库", "review", {}, False)
+        return {"score_result": {"score": 80, "grade": "C"}}
+
+    monkeypatch.setattr(router, "run_discover", _fake_discover)
+    monkeypatch.setattr(router, "run_score", _fake_run_score)
+    monkeypatch.setattr("app.services.candidate_tradeable.ensure_tradeable", lambda _date: 0)
+
+    tid = task_queue.submit("test_cancel_parallel_score", "并行评分取消栅栏",
+                            lambda p: router.run_daily_pipeline("2026-08-05"))
+    assert started.wait(2)
+    assert task_queue.cancel(tid) is True
+    release.set()
+    task = _wait_task_terminal(tid)
+    assert task["status"] == "canceled"
+    assert task["result"] is None
+
+    try:
+        with SessionLocal() as db:
+            rows = db.execute(select(AlertLog).where(
+                AlertLog.stock_code.like(f"{code_prefix}%"),
+                AlertLog.alert_type == "cancel_probe")).scalars().all()
+        assert rows == []
+    finally:
+        with SessionLocal() as db:
+            db.execute(delete(AlertLog).where(AlertLog.stock_code.like(f"{code_prefix}%")))
+            db.commit()
+
+
+def test_cancel_daily_pipeline_parallel_plan_cannot_write_business_row(monkeypatch):
+    """每日链路建仓线程同样继承 attempt；取消后旧计划线程不得写业务表。"""
+    from sqlalchemy import delete, select
+
+    from app.db import repo
+    from app.db.models import AlertLog
+    from app.db.session import SessionLocal
+    from app.graph import router
+    from app.services import task_queue
+
+    code_prefix = "ZZPAR_PLAN_"
+    candidates = [{"stock_code": f"{code_prefix}{i}", "stock_name": f"建仓取消{i}"}
+                  for i in range(1, 6)]
+    plan_started = threading.Event()
+    release = threading.Event()
+
+    def _fake_discover(_trade_date=None):
+        return {"candidates": candidates}
+
+    def _fake_run_score(code, stock_name="", trade_date=None):
+        return {"score_result": {"score": 90, "grade": "A"}}
+
+    def _fake_run_position(code, stock_name="", trade_date=None, source="manual"):
+        plan_started.set()
+        release.wait(5)
+        repo.insert_alert(code, stock_name, "cancel_probe", "info",
+                          "并行建仓旧 attempt 不应落库", "review", {}, False)
+        return {"position_plan": {"plan_id": code}}
+
+    monkeypatch.setattr(router, "run_discover", _fake_discover)
+    monkeypatch.setattr(router, "run_score", _fake_run_score)
+    monkeypatch.setattr(router, "run_position", _fake_run_position)
+    monkeypatch.setattr("app.services.candidate_tradeable.ensure_tradeable", lambda _date: 0)
+
+    tid = task_queue.submit("test_cancel_parallel_plan", "并行建仓取消栅栏",
+                            lambda p: router.run_daily_pipeline("2026-08-05"))
+    assert plan_started.wait(2)
+    assert task_queue.cancel(tid) is True
+    release.set()
+    task = _wait_task_terminal(tid)
+    assert task["status"] == "canceled"
+    assert task["result"] is None
+
+    try:
+        with SessionLocal() as db:
+            rows = db.execute(select(AlertLog).where(
+                AlertLog.stock_code.like(f"{code_prefix}%"),
+                AlertLog.alert_type == "cancel_probe")).scalars().all()
+        assert rows == []
+    finally:
+        with SessionLocal() as db:
+            db.execute(delete(AlertLog).where(AlertLog.stock_code.like(f"{code_prefix}%")))
+            db.commit()
+
+
+def test_retry_invalidates_old_parallel_context_before_delayed_write():
+    """重试替换 attempt_id 后，旧 attempt 的延迟子线程不能发布业务结果。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from sqlalchemy import delete, select
+
+    from app.db import repo
+    from app.db.models import AlertLog
+    from app.db.session import SessionLocal
+    from app.services import task_queue
+
+    code = "ZZRETRY_CTX"
+    child_started = threading.Event()
+    release = threading.Event()
+    executors: list[ThreadPoolExecutor] = []
+    calls = {"n": 0}
+
+    def _delayed_write(_params):
+        child_started.set()
+        release.wait(5)
+        try:
+            repo.insert_alert(code, "重试上下文", "retry_probe", "info",
+                              "旧 attempt 不应落库", "review", {}, False)
+        except task_queue.AttemptInvalidated:
+            return "blocked"
+        return "unexpected"
+
+    def _retryable(_params):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            executor = ThreadPoolExecutor(max_workers=1)
+            executors.append(executor)
+            task_queue.submit_with_attempt_context(executor, _delayed_write, {})
+            assert child_started.wait(2)
+            executor.shutdown(wait=False)
+            raise RuntimeError("首次 attempt 失败")
+        return "retry-ok"
+
+    tid = task_queue.submit("test_retry_context", "重试上下文栅栏", _retryable)
+    _wait_task_terminal(tid)
+    assert task_queue.retry(tid) is True
+    task = _wait_task_terminal(tid)
+    assert task["status"] == "done"
+    assert task["result"] == "retry-ok"
+
+    release.set()
+    try:
+        for executor in executors:
+            executor.shutdown(wait=True)
+        with SessionLocal() as db:
+            rows = db.execute(select(AlertLog).where(
+                AlertLog.stock_code == code,
+                AlertLog.alert_type == "retry_probe")).scalars().all()
+        assert rows == []
+    finally:
+        release.set()
+        for executor in executors:
+            executor.shutdown(wait=True)
+        with SessionLocal() as db:
+            db.execute(delete(AlertLog).where(AlertLog.stock_code == code))
+            db.commit()

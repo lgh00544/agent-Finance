@@ -330,6 +330,9 @@ export interface PositionPlan {
   rationale?: string
   detail?: Record<string, unknown>
   source?: string
+  execution_mode?: string
+  source_label?: string
+  audit_status?: string
   created_at?: string
   [k: string]: unknown
 }
@@ -350,6 +353,9 @@ export interface Holding {
   status?: string
   /** 新建持仓时绑定的入场建仓计划版本 */
   plan_id?: number | null
+  execution_mode?: string
+  source_label?: string
+  audit_status?: string
   /** 前端去重合并标记：当前有效 / 重复录入（已自动忽略） / 历史买入 */
   _dedupe_status?: string
   created_at?: string
@@ -428,6 +434,9 @@ export interface ReviewInfo {
   suggest_status?: string
   suggest_iteration?: number
   suggest_history?: unknown[]
+  execution_mode?: string
+  review_source?: string
+  audit_status?: string
   created_at?: string
   [k: string]: unknown
 }

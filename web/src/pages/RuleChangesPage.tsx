@@ -6,6 +6,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { agentSuggestions, rejectSuggestion, reReviewSuggestion, ruleChanges, rollbackRuleChange } from '@/api/suggestions'
 import { getAuditLogFull, reAuditSuggestion } from '@/api/audit'
 import { EmptyState, StatusBadge } from '@/components/common'
+import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 
 const { Text } = Typography
 
@@ -27,6 +28,13 @@ const AUDIT_TONE: Record<string, { label: string; tone: string }> = {
 }
 
 const val = (v: unknown) => String(v ?? '').trim() || '—'
+const AGENT_LABELS: Record<string, string> = {
+  discover: '候选发现', score: '个股评分', position: '建仓规划', monitor: '持仓监控',
+  sell: '卖出建议', review: '交易复盘', track_verify: '选股验证', market_intel: '市场研判',
+}
+const agentLabel = (v: unknown) => AGENT_LABELS[String(v ?? '')] ?? val(v)
+const statusLabel = (v: unknown) => ({ pending: '待审核', pass: '通过', fail: '未通过', auditing: '审核中',
+  approved: '已通过', adopted: '已采纳', rejected: '已驳回', active: '生效中', rolled_back: '已回滚' } as Record<string, string>)[String(v ?? '')] ?? val(v)
 const desc = (items: Array<[string, string | number]>) => <Descriptions size="small" column={1} items={items.map(([label, children]) => ({ label, children }))} />
 type RuleRow = Record<string, unknown> & { id: number; _sid: number; _sug: Record<string, unknown>; _column: string; _audit: string; _round: number }
 const COLUMNS = [
@@ -51,19 +59,19 @@ function AuditPopoverContent({ sid, sug }: { sid: number; sug: Record<string, un
         <Descriptions.Item label="问题">{val(sug.problem_desc)}</Descriptions.Item>
         <Descriptions.Item label="规则条文">{ruleText}</Descriptions.Item>
         <Descriptions.Item label="风险">{val(sug.risk_note)}</Descriptions.Item>
-        <Descriptions.Item label="状态">{val(sug.status)} / {val(sug.reject_reason)} / {val(sug.created_at)}</Descriptions.Item>
+        <Descriptions.Item label="状态">{statusLabel(sug.status)} / {val(sug.reject_reason)} / {val(sug.created_at)}</Descriptions.Item>
       </Descriptions>
       <Text strong>AI 审核</Text>
       {!log ? (
-        <Text type="secondary">未审核 — 等待 03:30 cron 或手动 audit_pending(cutoff_id=0)</Text>
+        <Text type="secondary">尚未完成 AI 审核，可点击上方“增量 AI 审核”处理新进入队列的建议。</Text>
       ) : (
         <Descriptions size="small" column={1}>
-          <Descriptions.Item label="结论">{val(log.verdict)} / 第{val(log.round)}轮 / {val(log.confidence)}</Descriptions.Item>
+          <Descriptions.Item label="结论">{statusLabel(log.verdict)} / 第{val(log.round)}轮 / 置信度 {val(log.confidence)}</Descriptions.Item>
           <Descriptions.Item label="支持">{val(log.support_view)}</Descriptions.Item>
           <Descriptions.Item label="反对">{val(log.dissent_view)}</Descriptions.Item>
           <Descriptions.Item label="边界">{val(log.boundary_cases)}</Descriptions.Item>
           <Descriptions.Item label="证据">{Array.isArray(log.evidence_refs) ? log.evidence_refs.join(', ') : val(log.evidence_refs)}</Descriptions.Item>
-          <Descriptions.Item label="模型">{val(log.audit_model)} / {val(log.created_at)}</Descriptions.Item>
+          <Descriptions.Item label="审核模型版本">{val(log.audit_model)} / {val(log.created_at)}</Descriptions.Item>
           <Descriptions.Item label="原始JSON"><Typography.Paragraph ellipsis={{ rows: 3, expandable: true }}>{val(log.reasoning).slice(0, 300)}</Typography.Paragraph></Descriptions.Item>
         </Descriptions>
       )}
@@ -79,11 +87,11 @@ function ExpandedRuleChange({ r, sug }: { r: Record<string, unknown>; sug: Recor
   return (
     <Space orientation="vertical" size={10} style={{ width: '100%' }}>
       <div><Text strong>原建议</Text>{desc([
-        ['规则名', val(sug.rule_name ?? r.rule_name)], ['当前值', val(sug.current_value)], ['建议值', val(sug.suggested_value ?? r.after_text)], ['原因', val(sug.reason)], ['依据', val(sug.evidence)], ['问题', val(sug.problem_desc)], ['规则条文', ruleText], ['风险', val(sug.risk_note)], ['状态', `${val(sug.status)} / ${val(sug.reject_reason)}`],
+        ['规则名', val(sug.rule_name ?? r.rule_name)], ['当前值', val(sug.current_value)], ['建议值', val(sug.suggested_value ?? r.after_text)], ['原因', val(sug.reason)], ['依据', val(sug.evidence)], ['问题', val(sug.problem_desc)], ['规则条文', ruleText], ['风险', val(sug.risk_note)], ['状态', `${statusLabel(sug.status)} / ${val(sug.reject_reason)}`],
       ])}</div>
       <div><Text strong>AI 审核</Text>{desc(!log || verdict === 'pending'
-        ? [['结论', '⏳ 未审核 — 等待 03:30 cron 或点击右上方“重新审核”按钮手动触发'], ['轮次', val(sug.audit_round ?? r.audit_round ?? 0)]]
-        : [['结论', `${val(log.verdict)} / 第${val(log.round)}轮 / ${val(log.confidence)}`], ['支持', val(log.support_view)], ['反对', val(log.dissent_view)], ['边界', val(log.boundary_cases)], ['证据', Array.isArray(log.evidence_refs) ? log.evidence_refs.join(', ') : val(log.evidence_refs)], ['模型', `${val(log.audit_model)} / ${val(log.created_at)}`], ['原始 reasoning', val(log.reasoning).slice(0, 300)]])}</div>
+        ? [['结论', '⏳ 尚未完成 AI 审核，可点击上方“增量 AI 审核”处理新进入队列的建议'], ['轮次', val(sug.audit_round ?? r.audit_round ?? 0)]]
+        : [['结论', `${statusLabel(log.verdict)} / 第${val(log.round)}轮 / 置信度 ${val(log.confidence)}`], ['支持', val(log.support_view)], ['反对', val(log.dissent_view)], ['边界', val(log.boundary_cases)], ['证据', Array.isArray(log.evidence_refs) ? log.evidence_refs.join(', ') : val(log.evidence_refs)], ['审核模型版本', `${val(log.audit_model)} / ${val(log.created_at)}`], ['原始审核记录', val(log.reasoning).slice(0, 300)]])}</div>
       <div><Text strong>变更记录元信息</Text>{desc([['来源复盘', val(r.review_id)], ['创建时间', val(r.created_at)]])}</div>
     </Space>
   )
@@ -186,7 +194,17 @@ export function RuleChangesPage() {
     return sortOrder === 'desc' ? result : -result
   })
   const grouped = Object.fromEntries(COLUMNS.map((c) => [c.key, rowsView.filter((r) => r._column === c.key)])) as Record<string, RuleRow[]>
-  const agentOptions = Array.from(new Set(rowsView.map((r) => String(r.target_agent)).filter(Boolean))).map((value) => ({ value, label: value }))
+  const agentOptions = Array.from(new Set(rowsView.map((r) => String(r.target_agent)).filter(Boolean))).map((value) => ({ value, label: agentLabel(value) }))
+  const pendingAuditCount = (sugRows ?? []).filter((s) => {
+    const verdict = String((s as Record<string, unknown>).audit_verdict ?? '')
+    return (verdict === '' || verdict === 'pending' || verdict === 'fail') && String(s.status ?? '') === 'pending'
+  }).length
+  const auditTask = useTaskSubmit('audit_pending', () => {
+    message.success('增量 AI 审核已完成')
+    qc.invalidateQueries({ queryKey: ['rule-changes'] })
+    qc.invalidateQueries({ queryKey: ['agent-suggestions-audit'] })
+    qc.invalidateQueries({ queryKey: ['audit-stats'] })
+  })
 
   if (isError) return (
     <div>
@@ -194,7 +212,7 @@ export function RuleChangesPage() {
       <Button onClick={() => refetch()}>重试</Button>
     </div>
   )
-  if (!list.length) return <EmptyState text="暂无规则变更记录。在「交易复盘」页对规则类建议执行「一键采纳」后会在此留痕。" icon="📜" />
+  if (!list.length && !pendingAuditCount) return <EmptyState text="暂无规则变更记录。在「交易复盘」页对规则类建议执行「一键采纳」后会在此留痕。" icon="📜" />
 
   const rollback = (r: { id: number; rule_name?: unknown }) => {
     let reason = ''
@@ -278,6 +296,14 @@ export function RuleChangesPage() {
     <div>
       <Space wrap style={{ marginBottom: 10 }}>
         <Text type="secondary">全部规则变更在此全量留痕，可回滚（原因必填）</Text>
+        <Button
+          type="primary"
+          loading={auditTask.submit.isPending}
+          disabled={!pendingAuditCount}
+          onClick={() => auditTask.submit.mutate({ cutoff_id: 0, limit: 50 })}
+        >
+          增量 AI 审核{pendingAuditCount ? `（${pendingAuditCount} 条）` : ''}
+        </Button>
         <Input.Search allowClear placeholder="搜索规则名/原因" style={{ width: 240 }} onChange={(e) => setKeyword(e.target.value)} />
         <Select mode="multiple" allowClear placeholder="目标 Agent（多选）" options={agentOptions} style={{ width: 180 }} value={agents} onChange={setAgents} />
         <Select mode="multiple" allowClear placeholder="类型" style={{ width: 180 }} value={types} onChange={setTypes}

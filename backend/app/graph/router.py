@@ -91,6 +91,19 @@ def run_discover(trade_date: str | None = None) -> StockAgentState:
     graph = get_graph("discover")
     state = _new_state(trade_date=date_key)
     result = graph.invoke(state)
+    # Discover 落库后立即登记验证行，避免候选池与选股验证页面在下次定时任务前断流。
+    # 仅初始化 tracking 行；T+N 收益仍由验证任务按已确认交易日计算，失败不阻塞候选主链路。
+    try:
+        from app.services import track_verify
+
+        initialized = (track_verify.register_new_candidates()
+                       if result.get("candidates") else 0)
+        result["track_verify_initialized"] = initialized
+        if initialized:
+            result["trace"] = [*(result.get("trace") or []),
+                                f"即时登记选股验证: {initialized}只"]
+    except Exception:  # noqa: BLE001 验证登记失败不阻塞 Discover 主链路
+        logger.warning("Discover 后即时登记选股验证失败（降级不影响候选落库）", exc_info=True)
     logger.info("discover 完成: candidates=%s", len(result.get("candidates") or []))
     _record_pending_experience("discover", result)
     return result
@@ -258,6 +271,7 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
     run_score 图，同一 prompt/schema，结果与串行一致，提速不降质）；
     候选 <5 只保持单 Agent 串行模式。SQLite 已启用 WAL + busy_timeout，并发安全。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.services import task_queue
 
     date_key = trade_date or time.strftime("%Y-%m-%d")
     discover_result = run_discover(date_key)
@@ -285,7 +299,8 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
     scores = []
     if len(score_cands) >= _PARALLEL_SCORE_MIN:
         with ThreadPoolExecutor(max_workers=min(_PARALLEL_SCORE_MAX, len(score_cands))) as pool:
-            futures = [pool.submit(_score_one, cand) for cand in score_cands]
+            futures = [task_queue.submit_with_attempt_context(pool, _score_one, cand)
+                        for cand in score_cands]
             for fut in as_completed(futures):
                 item = fut.result()
                 if item:
@@ -314,7 +329,9 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
     if bplus:
         if len(bplus) >= _PARALLEL_SCORE_MIN:
             with ThreadPoolExecutor(max_workers=min(_PARALLEL_SCORE_MAX, len(bplus))) as pool:
-                plans_made = sum(pool.map(_plan_one, bplus))
+                futures = [task_queue.submit_with_attempt_context(pool, _plan_one, item)
+                            for item in bplus]
+                plans_made = sum(fut.result() for fut in futures)
         else:
             plans_made = sum(_plan_one(i) for i in bplus)
     logger.info("建仓计划联动完成: B+ 候选 %s 只，生成 %s 份", len(bplus), plans_made)

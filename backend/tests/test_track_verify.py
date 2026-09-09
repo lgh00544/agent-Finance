@@ -251,6 +251,31 @@ def test_chain_init_due_and_idempotent():
     assert r3["finished_new"] == 0     # 已完成历史行不重复计入新增到期
 
 
+def test_run_discover_registers_tracking_row_immediately(monkeypatch):
+    """Discover 落库后即时登记 tracking 行，尚未到期时不伪造 T+N 结果。"""
+    from app.graph import router as graph_router
+
+    class _DiscoverGraph:
+        def invoke(self, state):
+            repo.upsert_candidate("600105", "即时登记股", state["trade_date"], 1,
+                                  ["候选理由"], ["候选风险"], {"price": 10.0},
+                                  {"confidence_tier": "建议关注"})
+            return {**state, "candidates": [{"stock_code": "600105", "stock_name": "即时登记股"}],
+                    "trace": []}
+
+    monkeypatch.setattr(graph_router, "get_graph", lambda kind: _DiscoverGraph())
+    monkeypatch.setattr(graph_router, "_record_pending_experience", lambda *args: None)
+
+    result = graph_router.run_discover("2026-08-03")
+
+    assert result["track_verify_initialized"] == 1
+    rows = repo.list_track_verify(select_date="2026-08-03")
+    assert len(rows) == 1
+    assert rows[0]["stock_code"] == "600105"
+    assert rows[0]["is_finished"] == 0
+    assert rows[0]["t3_pct"] is None
+
+
 def test_chain_insufficient_keeps_tracking():
     closes = [10, 10.5, 11]  # T+3 不足
     _seed_candidate("600102", "2026-08-03", 10.0)

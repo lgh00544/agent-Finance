@@ -516,14 +516,24 @@ function SectorRotationTab() {
       </div>
 
       <Card size="small" title="可延续板块（下一阶段值得关注）" extra={<Text type="secondary">基于 AI 评估 × 持续信号规则筛出</Text>}>
-        {continuations.length ? <Space wrap>
-          {continuations.map((lr, i) => <Card key={i} size="small" hoverable title={<div style={{ wordBreak: 'break-word', whiteSpace: 'normal' }}>{lr.sector_name ?? '—'}</div>}>
-            <Space orientation="vertical" size={4}>
-              <Space wrap><Tag color="blue">{st === 'mainline' ? '主线' : st === 'rotation' ? '轮动' : '观察'}</Tag><Text type="secondary">预期延续 {continuationDays(lr as Record<string, unknown>)} 天</Text></Space>
-              <Text type="secondary" style={{ display: 'block', wordBreak: 'break-word' }}>{lr.reason_text ?? '—'}</Text>
-            </Space>
-          </Card>)}
-        </Space> : <EmptyState text="（暂无明确可延续板块）" icon="📌" />}
+        {continuations.length ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
+            {continuations.map((lr, i) => (
+              <Card key={i} size="small" hoverable title={<Text strong style={{ display: 'block', wordBreak: 'break-word', whiteSpace: 'normal' }}>{lr.sector_name ?? '—'}</Text>}
+                styles={{ body: { padding: 10 } }}>
+                <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                  <Space wrap size={4}>
+                    <Tag color="blue">{st === 'mainline' ? '主线' : st === 'rotation' ? '轮动' : '观察'}</Tag>
+                    <Text type="secondary">预期延续 {continuationDays(lr as Record<string, unknown>)} 天</Text>
+                  </Space>
+                  <Text type="secondary" style={{ display: '-webkit-box', overflow: 'hidden', wordBreak: 'break-word', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3 }}>
+                    {lr.reason_text ?? '—'}
+                  </Text>
+                </Space>
+              </Card>
+            ))}
+          </div>
+        ) : <EmptyState text="（暂无明确可延续板块）" icon="📌" />}
       </Card>
 
       {/* AI 评估区 */}

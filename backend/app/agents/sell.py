@@ -254,3 +254,11 @@ def _days_ago(n: int) -> str:
     import datetime
 
     return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
+
+
+def paper_sell_position(position: dict, quote: dict, context: dict,
+                        signal: dict | None = None) -> dict:
+    """Paper entry point: same SellOutput schema, snapshot-only and no writes."""
+    from app.services.paper_analysis import sell_position
+
+    return sell_position(position, quote, context, signal)
