@@ -6,8 +6,12 @@ import pytest
 from app import cache as cache_module
 from app.core import auth
 from app.db import repo
-from app.db.models import Holding, PaperAccount, PositionPlan, TradeProfile, User
+from app.db.models import (
+    AiReasoningTrace, AiReasoningTraceHistory, Holding, PaperAccount, PositionPlan,
+    TradeProfile, User,
+)
 from app.db.session import SessionLocal, init_db
+from app.services import reasoning_trace
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -77,6 +81,108 @@ def test_trade_profile_isolated_by_user_context():
         for row in rows:
             db.delete(row)
         db.commit()
+
+
+def test_reasoning_trace_isolation_and_idor(monkeypatch):
+    from fastapi import HTTPException
+    from app.api import routes
+
+    stamp = str(int(datetime.now().timestamp() * 1_000_000))
+    code = f"6{stamp[-5:]}"
+    date = "2026-09-10"
+    owner = repo.create_user(f"trace-owner-{stamp}", "secret", "researcher")
+    other = repo.create_user(f"trace-other-{stamp}", "secret", "researcher")
+    admin = repo.create_user(f"trace-admin-{stamp}", "secret", "admin")
+    monkeypatch.setattr(repo.settings, "multi_user_enabled", True)
+
+    try:
+        owner_tokens = auth.set_user_context(owner["id"], owner["role"])
+        try:
+            reasoning_trace.trace_score(
+                code, "留痕隔离股", date, 80.0, "B",
+                {"技术趋势": {"comment": "owner"}}, [],
+            )
+        finally:
+            auth.reset_user_context(owner_tokens)
+
+        other_tokens = auth.set_user_context(other["id"], other["role"])
+        try:
+            reasoning_trace.trace_score(
+                code, "留痕隔离股", date, 90.0, "A",
+                {"技术趋势": {"comment": "other"}}, [],
+            )
+        finally:
+            auth.reset_user_context(other_tokens)
+        reasoning_trace.flush()
+        assert repo.list_traces(code=code, date=date) == []
+        assert repo.list_trace_history(code=code, date=date) == []
+
+        owner_tokens = auth.set_user_context(owner["id"], owner["role"])
+        try:
+            owner_rows = routes.list_traces(code=code, date=date)
+            owner_history = routes.list_trace_history(code=code, date=date)
+            assert len(owner_rows) == len(owner_history) == 1
+            owner_trace_id = owner_rows[0]["trace_id"]
+            owner_history_id = owner_history[0]["history_id"]
+            assert "owner" in routes.get_trace(owner_trace_id)["technical_reasoning"]
+            assert "owner" in routes.get_trace_history(owner_history_id)["technical_reasoning"]
+        finally:
+            auth.reset_user_context(owner_tokens)
+
+        other_tokens = auth.set_user_context(other["id"], other["role"])
+        try:
+            other_rows = routes.list_traces(code=code, date=date)
+            other_history = routes.list_trace_history(code=code, date=date)
+            assert len(other_rows) == len(other_history) == 1
+            other_trace_id = other_rows[0]["trace_id"]
+            other_history_id = other_history[0]["history_id"]
+            assert other_trace_id != owner_trace_id
+            assert "other" in routes.get_trace(other_trace_id)["technical_reasoning"]
+            assert "other" in routes.get_trace_history(other_history_id)["technical_reasoning"]
+            with pytest.raises(HTTPException, match="留痕记录不存在") as exc:
+                routes.get_trace(owner_trace_id)
+            assert exc.value.status_code == 404
+            with pytest.raises(HTTPException, match="历史留痕记录不存在") as exc:
+                routes.get_trace_history(owner_history_id)
+            assert exc.value.status_code == 404
+        finally:
+            auth.reset_user_context(other_tokens)
+
+        admin_tokens = auth.set_user_context(admin["id"], admin["role"])
+        try:
+            assert {row["trace_id"] for row in routes.list_traces(code=code, date=date)} == {
+                owner_trace_id, other_trace_id,
+            }
+            assert {row["history_id"] for row in routes.list_trace_history(code=code, date=date)} == {
+                owner_history_id, other_history_id,
+            }
+        finally:
+            auth.reset_user_context(admin_tokens)
+
+        with SessionLocal() as db:
+            current_rows = db.query(AiReasoningTrace).filter(
+                AiReasoningTrace.stock_code == code,
+                AiReasoningTrace.generate_date == date,
+                AiReasoningTrace.source_module == "score",
+            ).all()
+            history_rows = db.query(AiReasoningTraceHistory).filter(
+                AiReasoningTraceHistory.stock_code == code,
+                AiReasoningTraceHistory.generate_date == date,
+                AiReasoningTraceHistory.source_module == "score",
+            ).all()
+            assert {row.user_id for row in current_rows} == {owner["id"], other["id"]}
+            assert {row.user_id for row in history_rows} == {owner["id"], other["id"]}
+    finally:
+        with SessionLocal() as db:
+            db.query(AiReasoningTraceHistory).filter(
+                AiReasoningTraceHistory.stock_code == code,
+                AiReasoningTraceHistory.generate_date == date,
+            ).delete(synchronize_session=False)
+            db.query(AiReasoningTrace).filter(
+                AiReasoningTrace.stock_code == code,
+                AiReasoningTrace.generate_date == date,
+            ).delete(synchronize_session=False)
+            db.commit()
 
 
 def test_redis_namespace_is_applied_to_backend_keys(monkeypatch):

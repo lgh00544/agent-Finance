@@ -1278,20 +1278,22 @@ def list_scores(code: Optional[str] = None, date: Optional[str] = None, limit: i
 def list_traces(code: Optional[str] = None, date: Optional[str] = None,
                 module: Optional[str] = None, limit: int = 50):
     """推理留痕轻量列表（不含长文本，毫秒级；详情按需单查）"""
-    return repo.list_traces(code, date, module, limit)
+    return repo.list_traces(code, date, module, limit,
+                            user_id=_request_user_id(), is_admin=_is_admin())
 
 
 @router.get("/traces/history")
 def list_trace_history(code: Optional[str] = None, date: Optional[str] = None,
                        module: Optional[str] = None, limit: int = 100):
     """推理留痕追加历史（轻量列表；现有 /traces 仍为当前版本投影）。"""
-    return repo.list_trace_history(code, date, module, limit)
+    return repo.list_trace_history(code, date, module, limit,
+                                   user_id=_request_user_id(), is_admin=_is_admin())
 
 
 @router.get("/traces/history/{history_id}")
 def get_trace_history(history_id: int):
     """推理留痕历史完整详情（只读）。"""
-    trace = repo.get_trace_history(history_id)
+    trace = repo.get_trace_history(history_id, _request_user_id(), is_admin=_is_admin())
     if trace is None:
         raise HTTPException(status_code=404, detail="历史留痕记录不存在")
     return trace
@@ -1300,7 +1302,7 @@ def get_trace_history(history_id: int):
 @router.get("/traces/{trace_id}")
 def get_trace(trace_id: int):
     """推理留痕完整详情（结论卡 + 分层推理全文）"""
-    trace = repo.get_trace(trace_id)
+    trace = repo.get_trace(trace_id, _request_user_id(), is_admin=_is_admin())
     if trace is None:
         raise HTTPException(status_code=404, detail="留痕记录不存在")
     return trace
@@ -2258,7 +2260,8 @@ def hot_money_flows(date: Optional[str] = None, code: Optional[str] = None,
 @router.get("/hot-money/traces")
 def hot_money_traces(code: Optional[str] = None, limit: int = 50):
     """游资研判留痕（source_module='hot_money'，跨模块联查一次拿到全研判）"""
-    return repo.list_traces(code=code, module="hot_money", limit=limit)
+    return repo.list_traces(code=code, module="hot_money", limit=limit,
+                            user_id=_request_user_id(), is_admin=_is_admin())
 
 
 @router.post("/hot-money/win-rate-iteration")

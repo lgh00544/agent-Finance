@@ -27,7 +27,7 @@ _FLUSH_SECONDS = 1.0     # 兜底间隔：满 1 秒未凑满也提交
 _MAX_RETRY = 3           # 批量写入失败重试次数（指数退避）
 
 # upsert 列全集（trace_id 自增除外；create_time 冲突时刷新为本次写入时间）
-_UP_COLS = ("stock_code", "stock_name", "source_module", "generate_date",
+_UP_COLS = ("user_id", "stock_code", "stock_name", "source_module", "generate_date",
             "fact_basis", "technical_reasoning", "capital_reasoning",
             "fundamental_reasoning", "risk_reasoning", "rule_refs",
             "final_conclusion", "confidence", "data_source", "create_time", "ext_info")
@@ -54,6 +54,8 @@ def _start_worker() -> None:
 def submit(payload: dict) -> None:
     """提交一条留痕记录（fire-and-forget：任何异常都不抛给主流程）"""
     try:
+        from app.core.auth import current_user_id
+        payload = {**payload, "user_id": payload.get("user_id") or current_user_id() or 1}
         _start_worker()
         _q.put(payload)
     except Exception:  # noqa: BLE001
@@ -101,7 +103,7 @@ def _upsert_one(db, payload: dict) -> None:
         from sqlalchemy.dialects.sqlite import insert
         stmt = insert(AiReasoningTrace).values(**values)
         db.execute(stmt.on_conflict_do_update(
-            index_elements=["stock_code", "generate_date", "source_module"],
+            index_elements=["user_id", "stock_code", "generate_date", "source_module"],
             set_={k: getattr(stmt.excluded, k) for k in _UP_COLS}))
     else:
         from sqlalchemy.dialects.mysql import insert

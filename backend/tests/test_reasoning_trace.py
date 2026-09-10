@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.agents.schemas import DiscoverCandidate
+from app.core import auth
 from app.db import repo
 from app.db.models import AiReasoningTrace, AiReasoningTraceHistory
 from app.db.session import SessionLocal, init_db
@@ -18,6 +19,16 @@ from app.services import reasoning_trace
 @pytest.fixture(scope="module", autouse=True)
 def _db_ready():
     init_db()
+
+
+@pytest.fixture(autouse=True)
+def _legacy_owner_context():
+    """Trace reads require an authenticated owner in multi-user mode."""
+    tokens = auth.set_user_context(repo.ensure_default_user(), "admin")
+    try:
+        yield
+    finally:
+        auth.reset_user_context(tokens)
 
 
 def _traces() -> list[AiReasoningTrace]:
@@ -226,14 +237,17 @@ def test_schema_rule_refs_field():
 
 
 def test_indexes_exist():
-    """当前投影保留唯一约束，历史表提供追加查询索引。"""
+    """当前投影与历史表的索引均包含用户范围。"""
     from sqlalchemy import inspect
     from app.db.session import engine
 
     insp = inspect(engine)
     idx = {i["name"]: i for i in insp.get_indexes("ai_reasoning_trace")}
-    assert "ix_trace_module_date" in idx
-    uniq = {u["name"]: u for u in insp.get_unique_constraints("ai_reasoning_trace")}
-    assert "uq_trace_code_date_module" in uniq
+    assert "ix_trace_user_module_date" in idx
+    unique_columns = {tuple(u["column_names"]) for u in insp.get_unique_constraints(
+        "ai_reasoning_trace")}
+    assert (
+        "user_id", "stock_code", "generate_date", "source_module",
+    ) in unique_columns
     history_indexes = {i["name"] for i in insp.get_indexes("ai_reasoning_trace_history")}
-    assert "ix_trace_history_code_date_module" in history_indexes
+    assert "ix_trace_history_user_code_date_module" in history_indexes

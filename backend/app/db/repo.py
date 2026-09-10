@@ -2137,9 +2137,14 @@ def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
 
 def list_traces(code: str | None = None, date: str | None = None,
                 module: str | None = None, limit: int = 50,
-                end_date: str | None = None) -> list[dict]:
+                end_date: str | None = None, user_id: int | None = None,
+                *, is_admin: bool = False) -> list[dict]:
     """推理留痕轻量列表（不含长文本，详情按需单查；L1 缓存 dbq:trace:，写后由
     reasoning_trace._flush 失效）"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return []
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(AiReasoningTrace).order_by(
@@ -2152,6 +2157,8 @@ def list_traces(code: str | None = None, date: str | None = None,
                 stmt = stmt.where(AiReasoningTrace.generate_date <= end_date)
             if module:
                 stmt = stmt.where(AiReasoningTrace.source_module == module)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTrace.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return [{"trace_id": r.trace_id, "stock_code": r.stock_code,
                      "stock_name": r.stock_name, "source_module": r.source_module,
@@ -2160,14 +2167,22 @@ def list_traces(code: str | None = None, date: str | None = None,
                     for r in rows]
 
     return _dbq("trace", {"code": code, "date": date, "module": module,
-                           "limit": limit, "end_date": end_date}, _load)
+                           "limit": limit, "end_date": end_date, "user_id": user_id,
+                           "is_admin": is_admin}, _load)
 
 
-def get_trace(trace_id: int) -> dict | None:
+def get_trace(trace_id: int, user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """推理留痕完整详情（含全部推理分层文本）"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return None
+
     def _load() -> dict | None:
         with SessionLocal() as db:
-            r = db.get(AiReasoningTrace, trace_id)
+            stmt = select(AiReasoningTrace).where(AiReasoningTrace.trace_id == trace_id)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTrace.user_id == user_id)
+            r = db.execute(stmt).scalar_one_or_none()
             if r is None:
                 return None
             return {"trace_id": r.trace_id, "stock_code": r.stock_code,
@@ -2181,12 +2196,18 @@ def get_trace(trace_id: int) -> dict | None:
                     "data_source": r.data_source, "create_time": r.create_time,
                     "ext_info": r.ext_info}
 
-    return _dbq("trace", {"id": trace_id}, _load)
+    return _dbq("trace", {"id": trace_id, "user_id": user_id,
+                           "is_admin": is_admin}, _load)
 
 
 def list_trace_history(code: str | None = None, date: str | None = None,
-                       module: str | None = None, limit: int = 100) -> list[dict]:
+                       module: str | None = None, limit: int = 100,
+                       user_id: int | None = None, *, is_admin: bool = False) -> list[dict]:
     """推理留痕追加历史轻量列表；当前 /traces 投影接口保持最新版本语义。"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return []
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(AiReasoningTraceHistory).order_by(
@@ -2198,6 +2219,8 @@ def list_trace_history(code: str | None = None, date: str | None = None,
                 stmt = stmt.where(AiReasoningTraceHistory.generate_date == date)
             if module:
                 stmt = stmt.where(AiReasoningTraceHistory.source_module == module)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTraceHistory.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return [{"history_id": r.history_id, "stock_code": r.stock_code,
                      "stock_name": r.stock_name, "source_module": r.source_module,
@@ -2206,14 +2229,24 @@ def list_trace_history(code: str | None = None, date: str | None = None,
                      "recorded_at": str(r.recorded_at)} for r in rows]
 
     return _dbq("trace_history",
-                {"code": code, "date": date, "module": module, "limit": limit}, _load)
+                {"code": code, "date": date, "module": module, "limit": limit,
+                 "user_id": user_id, "is_admin": is_admin}, _load)
 
 
-def get_trace_history(history_id: int) -> dict | None:
+def get_trace_history(history_id: int, user_id: int | None = None,
+                      *, is_admin: bool = False) -> dict | None:
     """读取单条推理留痕历史全文；只读，不影响当前投影。"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return None
+
     def _load() -> dict | None:
         with SessionLocal() as db:
-            r = db.get(AiReasoningTraceHistory, history_id)
+            stmt = select(AiReasoningTraceHistory).where(
+                AiReasoningTraceHistory.history_id == history_id)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTraceHistory.user_id == user_id)
+            r = db.execute(stmt).scalar_one_or_none()
             if r is None:
                 return None
             return {"history_id": r.history_id, "stock_code": r.stock_code,
@@ -2227,7 +2260,8 @@ def get_trace_history(history_id: int) -> dict | None:
                     "data_source": r.data_source, "create_time": r.create_time,
                     "ext_info": r.ext_info, "recorded_at": str(r.recorded_at)}
 
-    return _dbq("trace_history", {"id": history_id}, _load)
+    return _dbq("trace_history", {"id": history_id, "user_id": user_id,
+                                   "is_admin": is_admin}, _load)
 
 
 def list_candidate_dates(limit: int = 30) -> list[str]:

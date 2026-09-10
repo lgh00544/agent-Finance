@@ -299,17 +299,18 @@ class AiReasoningTrace(Base):
     monitor持仓监控/alert告警/review复盘/sell卖出决策）
 
     一次生成、结构化入库、多端复用；纠察复盘Agent 的「决策黑匣子」数据源。
-    同 code+generate_date+source_module 保留最新一次研判（写入覆盖，uq 约束天然支撑
+    同用户+code+generate_date+source_module 保留最新一次研判（写入覆盖，uq 约束天然支撑
     联合查询，无需重复建普通联合索引；长文本列一律不建索引）。
     """
     __tablename__ = "ai_reasoning_trace"
     __table_args__ = (
-        UniqueConstraint("stock_code", "generate_date", "source_module",
+        UniqueConstraint("user_id", "stock_code", "generate_date", "source_module",
                          name="uq_trace_code_date_module"),
-        Index("ix_trace_module_date", "source_module", "generate_date"),  # 模块+日期批量查询
+        Index("ix_trace_user_module_date", "user_id", "source_module", "generate_date"),
     )
 
     trace_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
     stock_name: Mapped[str] = mapped_column(String(64))            # 禁止只存代码不存名称
     source_module: Mapped[str] = mapped_column(String(16), index=True)  # discover/score/position/monitor/alert/review/sell
@@ -335,12 +336,13 @@ class AiReasoningTraceHistory(Base):
     """
     __tablename__ = "ai_reasoning_trace_history"
     __table_args__ = (
-        Index("ix_trace_history_code_date_module", "stock_code", "generate_date",
+        Index("ix_trace_history_user_code_date_module", "user_id", "stock_code", "generate_date",
               "source_module"),
         Index("ix_trace_history_recorded_at", "recorded_at"),
     )
 
     history_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
     stock_name: Mapped[str] = mapped_column(String(64))
     source_module: Mapped[str] = mapped_column(String(16), index=True)

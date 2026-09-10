@@ -7,7 +7,7 @@ $env:CACHE_BACKEND = 'memory'
 $env:QDRANT_MODE = 'local'
 $env:QDRANT_LOCAL_PATH = 'D:\self-multi-user\data\qdrant_multi_auth_demo'
 $env:SYNC_ON_START = 'false'
-$env:AUTH_DEFAULT_USERNAME = 'legacy'
+$env:AUTH_DEFAULT_USERNAME = 'lugenghua'
 $env:AUTH_DEFAULT_PASSWORD = 'DemoLegacy-2026!'
 $env:PYTEST_CURRENT_TEST = 'local-multi-user-demo'
 New-Item -ItemType Directory -Force 'D:\self-multi-user\data' | Out-Null
