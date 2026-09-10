@@ -18,3 +18,5 @@ export type LoginResult = {
 export const authStatus = (): Promise<AuthStatus> => get('/auth/status')
 export const login = (username: string, password: string): Promise<LoginResult> =>
   post('/auth/login', { username, password })
+export const register = (username: string, password: string): Promise<LoginResult> =>
+  post('/auth/register', { username, password })

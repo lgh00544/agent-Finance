@@ -93,7 +93,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # SPA shell and compiled assets must remain public so an unauthenticated
             # browser can load the login screen; only API routes are gated.
             public = (not request.url.path.startswith("/api/") or request.url.path in {
-                "/api/auth/login", "/api/auth/status", "/api/health", "/health",
+                "/api/auth/login", "/api/auth/register", "/api/auth/status", "/api/health", "/health",
             })
             if settings.multi_user_enabled and not public and user is None:
                 return JSONResponse(status_code=401, content={"detail": "需要有效的 Bearer 会话令牌"})

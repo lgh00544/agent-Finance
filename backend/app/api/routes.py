@@ -118,6 +118,21 @@ def auth_login(body: LoginBody):
     return {**user, "access_token": issue_token(user["id"]), "token_type": "bearer"}
 
 
+@router.post("/auth/register")
+def auth_register(body: LoginBody):
+    """Self-service researcher registration for first-time local users."""
+    username = body.username.strip()
+    if len(username) < 2:
+        raise HTTPException(status_code=400, detail="用户名至少需要 2 个字符")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="密码至少需要 8 个字符")
+    try:
+        user = repo.create_user(username, body.password, "researcher")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**user, "access_token": issue_token(user["id"]), "token_type": "bearer"}
+
+
 @router.post("/auth/users")
 def auth_user_create(body: UserCreateBody):
     require_write_access()
