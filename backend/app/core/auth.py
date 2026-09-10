@@ -18,6 +18,7 @@ from app.db import repo
 
 _current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
 _current_user_role: ContextVar[str | None] = ContextVar("current_user_role", default=None)
+_current_user_username: ContextVar[str | None] = ContextVar("current_user_username", default=None)
 
 
 def current_user_id() -> int | None:
@@ -28,19 +29,24 @@ def current_user_role() -> str | None:
     return _current_user_role.get()
 
 
+def current_user_username() -> str | None:
+    return _current_user_username.get()
+
+
 def current_user_is_admin() -> bool:
     return current_user_role() == "admin"
 
 
 def set_user_context(user_id: int | None, role: str | None = None):
     """为后台线程显式设置请求等价的用户上下文，返回可用于 reset 的 token。"""
-    return _current_user_id.set(user_id), _current_user_role.set(role)
+    return _current_user_id.set(user_id), _current_user_role.set(role), _current_user_username.set(None)
 
 
 def reset_user_context(tokens) -> None:
-    user_token, role_token = tokens
+    user_token, role_token, username_token = tokens
     _current_user_id.reset(user_token)
     _current_user_role.reset(role_token)
+    _current_user_username.reset(username_token)
 
 
 def hash_password(password: str, salt: str | None = None) -> str:
@@ -79,8 +85,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
         user = authenticate_token(bearer) if bearer else None
         user_id = user["id"] if user else None
         role = user["role"] if user else None
+        username = user["username"] if user else None
         reset_id = _current_user_id.set(user_id)
         reset_role = _current_user_role.set(role)
+        reset_username = _current_user_username.set(username)
         try:
             public = request.url.path in {
                 "/api/auth/login", "/api/auth/status", "/api/health", "/health",
@@ -95,6 +103,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         finally:
             _current_user_id.reset(reset_id)
             _current_user_role.reset(reset_role)
+            _current_user_username.reset(reset_username)
 
 
 def require_user() -> int:

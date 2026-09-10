@@ -104,9 +104,10 @@ class PublicFactBody(BaseModel):
 
 @router.get("/auth/status")
 def auth_status():
-    from app.core.auth import current_user_id, current_user_role
+    from app.core.auth import current_user_id, current_user_role, current_user_username
     return {"multi_user_enabled": settings.multi_user_enabled,
-            "user_id": current_user_id(), "role": current_user_role()}
+            "user_id": current_user_id(), "username": current_user_username(),
+            "role": current_user_role()}
 
 
 @router.post("/auth/login")

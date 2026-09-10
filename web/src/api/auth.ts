@@ -3,6 +3,7 @@ import { get, post } from './client'
 export type AuthStatus = {
   multi_user_enabled: boolean
   user_id: number | null
+  username: string | null
   role: 'admin' | 'researcher' | 'viewer' | null
 }
 

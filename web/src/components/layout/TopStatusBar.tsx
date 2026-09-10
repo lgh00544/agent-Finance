@@ -4,6 +4,8 @@ import { marketIndices } from '@/api/market'
 import { health } from '@/api/system'
 import { getExperienceList } from '@/api/experience'
 import { holdingQuotes } from '@/api/holdings'
+import { authStatus } from '@/api/auth'
+import { setAuthToken } from '@/api/client'
 import { money, moneySigned, sign } from '@/utils/format'
 
 /** 北京时间（每秒更新） */
@@ -94,6 +96,7 @@ function AssetsBar() {
  * 接口失败优雅降级显示"—"，绝不白屏。 */
 export function TopStatusBar() {
   const now = useBeijingTime()
+  const { data: auth } = useQuery({ queryKey: ['auth-status'], queryFn: authStatus, staleTime: 60_000 })
   const { data: indices } = useQuery({
     queryKey: ['market-indices'],
     queryFn: marketIndices,
@@ -149,6 +152,15 @@ export function TopStatusBar() {
         <span className={ok ? 'tsb-ok-dot' : 'tsb-err-dot'} />
         系统{ok ? '正常' : '异常'}
       </span>
+      {auth?.multi_user_enabled && auth.user_id != null ? (
+        <span className="tsb-item" title={`用户ID：${auth.user_id} · 角色：${auth.role ?? '未知'}`}>
+          当前账号 <b>{auth.username ?? `用户#${auth.user_id}`}</b>
+          <button type="button" onClick={() => { setAuthToken(''); window.location.reload() }}
+            style={{ marginLeft: 6, border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer' }}>
+            退出
+          </button>
+        </span>
+      ) : null}
       {expPending !== undefined ? (
         <span className="tsb-item">
           <span>经验待审核</span>
