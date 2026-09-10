@@ -353,3 +353,61 @@ def test_shared_task_state_is_mirrored_when_redis_enabled(monkeypatch):
             break
     shared = task_queue._load_shared_task(tid)
     assert shared and shared["status"] == "done"
+
+
+def test_account_baseline_and_pnl_are_scoped_by_user():
+    owner = repo.create_user(f"acct-owner-{datetime.now().timestamp()}", "secret", "researcher")
+    other = repo.create_user(f"acct-other-{datetime.now().timestamp()}", "secret", "researcher")
+    try:
+        repo.insert_account_baseline("2026-09-10", 101000, 50000, 50, user_id=owner["id"])
+        repo.insert_account_baseline("2026-09-10", 202000, 100000, 25, user_id=other["id"])
+        repo.upsert_account_pnl_snapshot("2026-09-10", "10:00:00", pnl_yk=11,
+                                         user_id=owner["id"])
+        repo.upsert_account_pnl_snapshot("2026-09-10", "10:00:00", pnl_yk=22,
+                                         user_id=other["id"])
+        assert repo.get_latest_account_baseline(owner["id"])["total_asset"] == 101000
+        assert repo.get_latest_account_baseline(other["id"])["total_asset"] == 202000
+        assert repo.get_latest_account_pnl(owner["id"])["pnl_yk"] == 11
+        assert repo.get_latest_account_pnl(other["id"])["pnl_yk"] == 22
+    finally:
+        from app.db.models import AccountBaseline, AccountPnlSnapshot
+        with SessionLocal() as db:
+            db.query(AccountBaseline).filter(AccountBaseline.user_id.in_([owner["id"], other["id"]])).delete(synchronize_session=False)
+            db.query(AccountPnlSnapshot).filter(AccountPnlSnapshot.user_id.in_([owner["id"], other["id"]])).delete(synchronize_session=False)
+            db.commit()
+
+
+def test_feishu_binding_and_unbound_sender_are_fail_closed(monkeypatch):
+    from app.services import chat_handlers
+
+    owner = repo.create_user(f"feishu-owner-{datetime.now().timestamp()}", "secret", "researcher")
+    repo.bind_user_feishu_open_id(owner["id"], "ou_bound_user")
+    monkeypatch.setattr(chat_handlers.settings, "multi_user_enabled", True)
+    assert chat_handlers._feishu_user("ou_bound_user")["id"] == owner["id"]
+    assert chat_handlers.dispatch("查持仓", "holdings", {}, "", "ou_unbound_user").startswith(
+        "飞书账号尚未绑定")
+
+
+def test_remote_task_control_respects_owner_scope(monkeypatch):
+    from app.services import task_queue
+    owner = repo.create_user(f"remote-owner-{datetime.now().timestamp()}", "secret", "researcher")
+    other = repo.create_user(f"remote-other-{datetime.now().timestamp()}", "secret", "researcher")
+
+    class Shared:
+        def __init__(self):
+            self.data = {}
+        def get(self, key):
+            return self.data.get(key)
+        def set(self, key, value, ttl):
+            self.data[key] = value
+        def delete(self, key):
+            self.data.pop(key, None)
+
+    shared = Shared()
+    monkeypatch.setattr(task_queue, "cache", shared)
+    monkeypatch.setattr(task_queue.settings, "multi_user_enabled", True)
+    monkeypatch.setattr(task_queue.settings, "cache_backend", "redis")
+    shared.set("tasks:item:remote", '{"task_id":"remote","params":{"user_id":%d},"status":"running"}' % owner["id"], 10)
+    assert task_queue.cancel("remote", other["id"]) is False
+    assert task_queue.cancel("remote", owner["id"]) is True
+    assert '"action": "cancel"' in shared.get("tasks:control:remote")

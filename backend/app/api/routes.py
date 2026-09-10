@@ -926,7 +926,8 @@ def market_hot_sectors():
 def account_summary():
     """账户核心资产摘要（双数据路径：有 OCR 账户基准用券商值，否则按总资金设定估算；
     纯数学计算，不落库不研判）"""
-    return holding_view.build_account_summary()
+    return holding_view.build_account_summary(
+        _request_user_id(), is_admin=current_user_role() == "admin")
 
 
 @router.get("/account/pnl")
@@ -941,7 +942,8 @@ def account_pnl():
     if not ths_pnl_service.load_cookie():
         return {"configured": False}
     return {"configured": True,
-            "snapshot": ths_pnl_service.refresh_snapshot_if_needed()}
+            "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
+                user_id=_request_user_id(), is_admin=current_user_role() == "admin")}
 
 
 @router.post("/account/pnl/refresh")
@@ -954,7 +956,9 @@ def account_pnl_refresh():
     if not ths_pnl_service.load_cookie():
         return {"configured": False}
     return {"configured": True,
-            "snapshot": ths_pnl_service.refresh_snapshot_if_needed(force=True)}
+            "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
+                force=True, user_id=_request_user_id(),
+                is_admin=current_user_role() == "admin")}
 
 
 class AccountBaselineBody(BaseModel):
@@ -1380,7 +1384,8 @@ def list_holdings(status: Optional[str] = None):
 def holding_quotes():
     """持仓列表视图：实时行情 + 参考止损/止盈 + 目标仓位%（只读，不落库；
     去重合并由前端展示层完成，数据库原始记录完整保留）"""
-    return holding_view.build_holding_view()
+    return holding_view.build_holding_view(
+        _request_user_id(), is_admin=current_user_role() == "admin")
 
 
 @router.post("/holdings")

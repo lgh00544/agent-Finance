@@ -52,6 +52,8 @@ def ensure_default_user() -> int:
     with SessionLocal() as db:
         row = db.execute(select(User).where(User.id == 1)).scalar_one_or_none()
         if row is None:
+            if settings.multi_user_enabled and not settings.auth_default_password:
+                raise RuntimeError("多人模式禁止使用空默认密码，请设置 AUTH_DEFAULT_PASSWORD")
             row = User(id=1, username=settings.auth_default_username,
                        password_hash=hash_password(settings.auth_default_password or "legacy"),
                        role="admin")
@@ -74,7 +76,7 @@ def create_user(username: str, password: str, role: str = "researcher") -> dict:
         db.commit()
         db.refresh(row)
         return {"id": row.id, "username": row.username, "role": row.role,
-                "is_active": row.is_active}
+                "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
 
 
 def get_user_by_credentials(username: str, password: str) -> dict | None:
@@ -85,7 +87,47 @@ def get_user_by_credentials(username: str, password: str) -> dict | None:
         if row is None or not verify_password(password, row.password_hash):
             return None
         return {"id": row.id, "username": row.username, "role": row.role,
-                "is_active": row.is_active}
+                "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
+
+
+def get_user_by_feishu_open_id(open_id: str) -> dict | None:
+    """Resolve a Feishu sender to an application user without trusting message payloads."""
+    if not open_id:
+        return None
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(
+            User.feishu_open_id == open_id, User.is_active.is_(True)
+        )).scalar_one_or_none()
+        if row is None:
+            return None
+        return {"id": row.id, "username": row.username, "role": row.role,
+                "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
+
+
+def bind_user_feishu_open_id(user_id: int, open_id: str) -> bool:
+    """Bind one Feishu open_id to one user; duplicate bindings are rejected."""
+    if not open_id:
+        raise ValueError("open_id 不能为空")
+    with SessionLocal() as db:
+        row = db.get(User, user_id)
+        if row is None:
+            return False
+        other = db.execute(select(User).where(
+            User.feishu_open_id == open_id, User.id != user_id
+        )).scalar_one_or_none()
+        if other is not None:
+            raise ValueError("open_id 已绑定其他用户")
+        row.feishu_open_id = open_id
+        db.commit()
+        return True
+
+
+def list_active_users() -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(select(User).where(User.is_active.is_(True)).order_by(User.id)).scalars().all()
+        return [{"id": r.id, "username": r.username, "role": r.role,
+                 "is_active": r.is_active, "feishu_open_id": r.feishu_open_id}
+                for r in rows]
 
 
 def create_user_session(user_id: int, token: str, expires_at: datetime) -> int:
@@ -1710,6 +1752,7 @@ def insert_account_baseline(trade_date: str, total_asset: float, available_cash:
                             position_pct: float, source: str = "ocr",
                             user_id: int | None = None) -> int:
     """保存账户基准快照（人工确认后调用；每次插入一行保留历史，读取取最新）"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
         row = AccountBaseline(trade_date=trade_date, total_asset=total_asset,
                               available_cash=available_cash, position_pct=position_pct,
@@ -1720,12 +1763,14 @@ def insert_account_baseline(trade_date: str, total_asset: float, available_cash:
         return row.id
 
 
-def get_latest_account_baseline() -> dict | None:
+def get_latest_account_baseline(user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """读取最新账户基准快照；无记录返回 None"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        row = db.execute(
-            select(AccountBaseline).order_by(AccountBaseline.id.desc()).limit(1)
-        ).first()
+        stmt = select(AccountBaseline).order_by(AccountBaseline.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AccountBaseline.user_id == user_id)
+        row = db.execute(stmt.limit(1)).first()
         if row is None:
             return None
         r = row[0]
@@ -1739,20 +1784,23 @@ def get_latest_account_baseline() -> dict | None:
 def upsert_account_pnl_snapshot(trade_date: str, ts: str, pnl_yk: float | None = None,
                                 pnl_pct: float | None = None, sh_pct: float | None = None,
                                 chart_data: list | None = None, source: str = "ths",
-                                error: str = "", token_expired: bool = False) -> int:
+                                error: str = "", token_expired: bool = False,
+                                user_id: int | None = None) -> int:
     """按 (trade_date, ts) 幂等 upsert 同花顺盈亏快照；返回行 id"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        row = db.execute(
-            select(AccountPnlSnapshot).where(
+        stmt = select(AccountPnlSnapshot).where(
                 AccountPnlSnapshot.trade_date == trade_date,
                 AccountPnlSnapshot.ts == ts,
             )
-        ).scalar_one_or_none()
+        if user_id is not None:
+            stmt = stmt.where(AccountPnlSnapshot.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             row = AccountPnlSnapshot(
                 trade_date=trade_date, ts=ts, pnl_yk=pnl_yk, pnl_pct=pnl_pct,
                 sh_pct=sh_pct, chart_data=chart_data or [], source=source,
-                error=error, token_expired=token_expired)
+                error=error, token_expired=token_expired, user_id=user_id)
             db.add(row)
         else:
             row.pnl_yk = pnl_yk
@@ -1767,12 +1815,14 @@ def upsert_account_pnl_snapshot(trade_date: str, ts: str, pnl_yk: float | None =
         return row.id
 
 
-def get_latest_account_pnl() -> dict | None:
+def get_latest_account_pnl(user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """读取最新同花顺盈亏快照；无记录返回 None"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        row = db.execute(
-            select(AccountPnlSnapshot).order_by(AccountPnlSnapshot.id.desc()).limit(1)
-        ).first()
+        stmt = select(AccountPnlSnapshot).order_by(AccountPnlSnapshot.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AccountPnlSnapshot.user_id == user_id)
+        row = db.execute(stmt.limit(1)).first()
         if row is None:
             return None
         r = row[0]
@@ -1782,13 +1832,17 @@ def get_latest_account_pnl() -> dict | None:
                 "updated_at": str(r.updated_at)}
 
 
-def list_account_pnl_history(days: int = 30) -> list[dict]:
+def list_account_pnl_history(days: int = 30, user_id: int | None = None,
+                             *, is_admin: bool = False) -> list[dict]:
     """近 N 天同花顺盈亏快照历史（按日降序；每行只取核心字段）"""
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
+        stmt = select(AccountPnlSnapshot).where(AccountPnlSnapshot.trade_date >= cutoff)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AccountPnlSnapshot.user_id == user_id)
         rows = db.execute(
-            select(AccountPnlSnapshot)
-            .where(AccountPnlSnapshot.trade_date >= cutoff)
+            stmt
             .order_by(AccountPnlSnapshot.trade_date.desc(), AccountPnlSnapshot.ts.desc())
             .limit(500)
         ).scalars().all()
@@ -1958,10 +2012,13 @@ def record_holding_trade(holding_id: int, *, side: str, price: float, shares: in
         return row.id
 
 
-def get_active_holdings() -> list[Holding]:
+def get_active_holdings(user_id: int | None = None, *, is_admin: bool = False) -> list[Holding]:
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        return list(db.execute(
-            select(Holding).where(Holding.status == "holding")).scalars().all())
+        stmt = select(Holding).where(Holding.status == "holding")
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(Holding.user_id == user_id)
+        return list(db.execute(stmt).scalars().all())
 
 
 def get_trades(holding_id: int) -> list[TradeRecord]:

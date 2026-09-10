@@ -165,6 +165,8 @@ def init_db() -> dict:
         _ensure_distribution_phase_table()
         _ensure_capital_view_tables()
         _ensure_identity_tables()
+        _ensure_user_identity_columns()
+        _ensure_account_pnl_user_index()
         _ensure_user_columns()
         knowledge = _ensure_knowledge_hit_columns()
         experience = _ensure_experience_curator_columns()
@@ -206,9 +208,38 @@ def _ensure_identity_tables() -> None:
     Base.metadata.create_all(bind=engine, tables=[
         User.__table__, UserSession.__table__, PublicFactSnapshot.__table__,
     ])
+    _ensure_user_identity_columns()
     from app.db import repo
     default_id = repo.ensure_default_user()
     _ = default_id
+
+
+def _ensure_user_identity_columns() -> None:
+    """Add optional external identity columns to existing app_user tables."""
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(app_user)")}
+            if "feishu_open_id" not in existing:
+                _add_column(conn, "app_user", "feishu_open_id", "VARCHAR(128) NULL")
+    else:
+        _add_columns(engine, "app_user", {"feishu_open_id": "VARCHAR(128) NULL"})
+
+
+def _ensure_account_pnl_user_index() -> None:
+    """Move MySQL installs from the legacy global snapshot key to user scope."""
+    if engine.dialect.name != "mysql":
+        return
+    with engine.begin() as conn:
+        indexes = list(conn.exec_driver_sql(
+            "SHOW INDEX FROM account_pnl_snapshot"))
+        names = {str(row[2]) for row in indexes}
+        if "uq_account_pnl_date_ts" in names:
+            conn.exec_driver_sql(
+                "ALTER TABLE account_pnl_snapshot DROP INDEX uq_account_pnl_date_ts")
+        if "uq_account_pnl_user_date_ts" not in names:
+            conn.exec_driver_sql(
+                "ALTER TABLE account_pnl_snapshot ADD UNIQUE KEY "
+                "uq_account_pnl_user_date_ts (user_id, trade_date, ts)")
 
 
 def _ensure_user_columns() -> None:

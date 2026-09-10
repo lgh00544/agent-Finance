@@ -33,13 +33,14 @@ def _spot_to_prices(spot_df, codes: list[str], code_set: set[str]) -> dict[str, 
     return out
 
 
-def refresh_quote_snapshot() -> dict:
+def refresh_quote_snapshot(user_id: int | None = None, *, is_admin: bool = False) -> dict:
     """刷新持仓价快照（腾讯批量 → 失败再试全市场快照 → 落库；失败不抛）
 
     返回 {"success": bool, "rows": int, "error": str|None, "source": str, "updated_at": str}
     source 取值 'tencent' / 'universe' / 'none'（无持仓时不落库）。
     """
-    holdings = repo.list_holdings(status="holding") or []
+    holdings = repo.list_holdings(status="holding", user_id=user_id,
+                                  is_admin=is_admin) or []
     if not holdings:
         return {"success": True, "rows": 0, "error": None, "source": "none",
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}

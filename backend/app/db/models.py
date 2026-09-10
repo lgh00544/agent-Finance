@@ -47,6 +47,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(256), default="")
     role: Mapped[str] = mapped_column(String(16), default="researcher", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    feishu_open_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
@@ -492,11 +493,12 @@ class AccountBaseline(Base):
 class AccountPnlSnapshot(Base):
     """同花顺投资账本真实账户今日盈亏快照（P0 数据通道；默认 ths_pnl_enable=false 不采集）
 
-    trade_date+ts 唯一，upsert 幂等（R5 防重复采集/误报）；
+    user_id+trade_date+ts 唯一，upsert 幂等（R5 防重复采集/误报）；
     失败快照写 error 字段，不伪造 0 值（R1 token 过期标记 token_expired）。
     """
     __tablename__ = "account_pnl_snapshot"
-    __table_args__ = (UniqueConstraint("trade_date", "ts", name="uq_account_pnl_date_ts"),)
+    __table_args__ = (UniqueConstraint("user_id", "trade_date", "ts",
+                                       name="uq_account_pnl_user_date_ts"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_date: Mapped[str] = mapped_column(String(10), index=True)   # YYYY-MM-DD

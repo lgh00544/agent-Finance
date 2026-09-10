@@ -42,8 +42,10 @@ _seq = 0  # 提交序号（秒级时间戳相同场景下保证顺序稳定）
 _instance_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 _SHARED_TASK_TTL_SECONDS = 24 * 3600
 _SHARED_RECENT_LIMIT = 200
+_CONTROL_TTL_SECONDS = 3600
 _current_attempt: ContextVar[tuple[str, str] | None] = ContextVar(
     "task_queue_current_attempt", default=None)
+_control_watchers: dict[str, threading.Event] = {}
 
 
 class AttemptInvalidated(RuntimeError):
@@ -152,6 +154,11 @@ def submit(kind: str, label: str, fn: Callable, params: dict | None = None) -> s
         _tasks[tid] = task
         _trim_locked()
         _publish_task_locked(task)
+        if _shared_enabled():
+            stop_event = threading.Event()
+            _control_watchers[tid] = stop_event
+            threading.Thread(target=_remote_control_loop, args=(tid, stop_event),
+                             name=f"task-control-{tid}", daemon=True).start()
     _executor.submit(_run, tid)
     return tid
 
@@ -200,6 +207,12 @@ def _run(tid: str) -> None:
                 _publish_task_locked(current)
         logger.error("后台任务 %s(%s) 失败: %s", task["kind"], tid, exc)
     finally:
+        with _lock:
+            current_state = _tasks.get(tid, {}).get("status")
+        if current_state in ("done", "canceled"):
+            watcher = _control_watchers.pop(tid, None)
+            if watcher is not None:
+                watcher.set()
         if user_tokens is not None:
             from app.core.auth import reset_user_context
             reset_user_context(user_tokens)
@@ -242,6 +255,10 @@ def _shared_enabled() -> bool:
 
 def _task_key(tid: str) -> str:
     return f"tasks:item:{tid}"
+
+
+def _control_key(tid: str) -> str:
+    return f"tasks:control:{tid}"
 
 
 def _recent_key() -> str:
@@ -293,6 +310,67 @@ def _load_shared_recent() -> list[dict]:
         return []
 
 
+def _send_remote_control(tid: str, action: str, user_id: int | None,
+                         is_admin: bool) -> bool:
+    if not _shared_enabled():
+        return False
+    task = _load_shared_task(tid)
+    if not task or not _visible(task, user_id, is_admin):
+        return False
+    try:
+        cache.set(_control_key(tid), json.dumps({"action": action, "requested_by": user_id}),
+                  _CONTROL_TTL_SECONDS)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("远程任务控制写入失败 tid=%s: %s", tid, exc)
+        return False
+
+
+def _remote_control_loop(tid: str, stop_event: threading.Event) -> None:
+    while True:
+        if stop_event.wait(0.5):
+            return
+        if not _shared_enabled():
+            return
+        try:
+            raw = cache.get(_control_key(tid))
+            if not raw:
+                continue
+            cache.delete(_control_key(tid))
+            action = json.loads(raw).get("action")
+        except Exception:
+            continue
+        with _publish_fence:
+            with _lock:
+                task = _tasks.get(tid)
+                if not task:
+                    return
+                if task["status"] in ("done", "canceled"):
+                    return
+                if action == "cancel" and task["status"] in ("pending", "running"):
+                    task["status"] = "canceled"
+                    task["cancel_requested"] = True
+                    task["error"] = "canceled by user"
+                    task["canceled_at"] = _now()
+                    task["finished_at"] = _now()
+                    _publish_task_locked(task)
+                    if task.get("_started_mono"):
+                        _replace_executor_locked()
+                    continue
+                if action == "retry" and task["status"] == "failed":
+                    task["status"] = "pending"
+                    task["attempt_id"] = uuid.uuid4().hex[:12]
+                    task["cancel_requested"] = False
+                    task["error"] = None
+                    task["result"] = None
+                    task["started_at"] = None
+                    task["finished_at"] = None
+                    task["submitted_at"] = _now()
+                    _publish_task_locked(task)
+                    _executor.submit(_run, tid)
+                    continue
+
+
 def get(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """任务详情（去掉内部 _fn 引用）"""
     with _lock:
@@ -322,7 +400,9 @@ def retry(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> bo
     """失败任务重试：重置状态重新入队（复用原 task_id 与执行函数）"""
     with _lock:
         task = _tasks.get(tid)
-        if task is None or not _visible(task, user_id, is_admin) or task["status"] != "failed":
+        if task is None:
+            return _send_remote_control(tid, "retry", user_id, is_admin)
+        if not _visible(task, user_id, is_admin) or task["status"] != "failed":
             return False
         task["status"] = "pending"
         task["attempt_id"] = uuid.uuid4().hex[:12]
@@ -355,7 +435,9 @@ def cancel(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> b
     with _publish_fence:
         with _lock:
             task = _tasks.get(tid)
-            if (task is None or not _visible(task, user_id, is_admin)
+            if task is None:
+                return _send_remote_control(tid, "cancel", user_id, is_admin)
+            if (not _visible(task, user_id, is_admin)
                     or task["status"] not in ("pending", "running")):
                 return False
             task["status"] = "canceled"

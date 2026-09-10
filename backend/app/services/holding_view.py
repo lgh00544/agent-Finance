@@ -61,7 +61,7 @@ def _round2(value: float) -> float:
     return round(value, 2)
 
 
-def build_holding_view() -> dict:
+def build_holding_view(user_id: int | None = None, *, is_admin: bool = False) -> dict:
     """持仓列表视图：原始记录 + 实时行情 + 参考止损/止盈 + 目标仓位%。
 
     返回 {rows, quote_time, quote_error}：rows 为 repo 原始记录基础上追加
@@ -69,7 +69,10 @@ def build_holding_view() -> dict:
     并补全 stop_loss/take_profit（人工设置优先 → 关联建仓计划 → 默认风控比例）。
     """
     now_min = time.strftime("%Y-%m-%d %H:%M")
-    rows = repo.list_holdings(status="holding")
+    try:
+        rows = repo.list_holdings(status="holding", user_id=user_id, is_admin=is_admin)
+    except TypeError:
+        rows = repo.list_holdings(status="holding")
     if not rows:
         return {"rows": [], "quote_time": now_min, "quote_error": None,
                 "total_capital": settings.total_capital}
@@ -80,7 +83,10 @@ def build_holding_view() -> dict:
     # 三级取数：腾讯批量 → DB 快照 → 全市场快照（任一成功即返回，全失败不阻塞列表）
     quotes, source, quote_error = _fetch_holding_quotes([r["stock_code"] for r in rows])
 
-    plan_rows = repo.list_plans(limit=500)
+    try:
+        plan_rows = repo.list_plans(limit=500, user_id=user_id, is_admin=is_admin)
+    except TypeError:
+        plan_rows = repo.list_plans(limit=500)
     plans = {p["id"]: p for p in plan_rows}
     latest_plan_by_code: dict[str, dict] = {}
     for p in plan_rows:  # list_plans 按 id 倒序，首见即最新
@@ -119,7 +125,7 @@ def build_holding_view() -> dict:
             "source": source, "total_capital": settings.total_capital}
 
 
-def build_account_summary() -> dict:
+def build_account_summary(user_id: int | None = None, *, is_admin: bool = False) -> dict:
     """账户核心资产摘要（双数据路径，纯数学计算，不落库不研判）：
 
     - 有账户基准（OCR 截图人工确认保存）：总资产/可用资金/仓位占比直接用券商真实值；
@@ -127,7 +133,7 @@ def build_account_summary() -> dict:
     - 总持仓成本/总盈亏金额/比例始终按持仓 + 最新市价实时计算；
     - 行情整体失败且有持仓时，与市价相关的项返回 None（前端显示「—」+ 标注，不伪造 0）。
     """
-    view = build_holding_view()
+    view = build_holding_view(user_id, is_admin=is_admin)
     rows = view["rows"]
 
     total_cost = sum(float(r.get("cost") or 0) for r in rows)
@@ -137,7 +143,10 @@ def build_account_summary() -> dict:
     pnl = sum(float(r.get("pnl_amount") or 0) for r in rows
               if r.get("pnl_amount") is not None)
 
-    baseline = repo.get_latest_account_baseline()
+    try:
+        baseline = repo.get_latest_account_baseline(user_id, is_admin=is_admin)
+    except TypeError:
+        baseline = repo.get_latest_account_baseline()
     source = "baseline" if baseline else "estimate"
 
     if not rows or mv_known:

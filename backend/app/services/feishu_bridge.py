@@ -89,10 +89,17 @@ def _on_message(data) -> None:
         if not sender:
             return
         admins = _admin_open_ids()
-        if not admins:
+        from app.db import repo
+        bound = repo.get_user_by_feishu_open_id(sender)
+        configured_bindings = [
+            item.split(":", 1)[0].strip()
+            for item in str(getattr(settings, "feishu_user_bindings", "") or "").split(",")
+            if ":" in item
+        ]
+        if not admins and not bound and sender not in configured_bindings:
             logger.warning("飞书桥未配白名单，收到首条消息 open_id=%s（请填入 FEISHU_ADMIN_OPEN_IDS）", sender)
             return
-        if sender not in admins:
+        if sender not in admins and not bound and sender not in configured_bindings:
             logger.info("飞书桥忽略非白名单 sender=%s", sender)
             return
         msg = event.message

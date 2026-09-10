@@ -7,6 +7,7 @@
 所有密钥仅从环境变量/.env 读取，代码零硬编码。
 """
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -87,6 +88,7 @@ class Settings(BaseSettings):
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_admin_open_ids: str = ""  # 白名单 open_id，逗号分隔；空=只打印 open_id 不回复
+    feishu_user_bindings: str = ""  # open_id:user_id 映射，逗号分隔
     feishu_bridge_alert_direct: bool = False  # 告警双通道：true=webhook 外同时机器人直发
     feishu_media_dir: str = "data/feishu_media"  # 视频/文件存档目录（批3 预留）
 
@@ -261,6 +263,23 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def validate_multi_user_startup() -> None:
+    """Fail closed before startup when shared resources are misconfigured."""
+    if not settings.multi_user_enabled:
+        return
+    errors = []
+    if settings.db_backend.lower() != "mysql":
+        errors.append("DB_BACKEND=mysql")
+    if settings.cache_backend.lower() != "redis":
+        errors.append("CACHE_BACKEND=redis")
+    if settings.qdrant_mode.lower() != "server":
+        errors.append("QDRANT_MODE=server")
+    if not settings.auth_default_password:
+        errors.append("AUTH_DEFAULT_PASSWORD")
+    if errors:
+        raise RuntimeError("多人模式启动校验失败，必须配置: " + ", ".join(errors))
 
 
 def market_band_info(score: float) -> tuple[int, str, str, str]:
