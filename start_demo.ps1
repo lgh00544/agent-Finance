@@ -11,6 +11,5 @@ $env:AUTH_DEFAULT_USERNAME = 'legacy'
 $env:AUTH_DEFAULT_PASSWORD = 'DemoLegacy-2026!'
 $env:PYTEST_CURRENT_TEST = 'local-multi-user-demo'
 New-Item -ItemType Directory -Force 'D:\self-multi-user\data' | Out-Null
-Remove-Item 'D:\self-multi-user\data\multi-auth-demo.db' -Force -ErrorAction SilentlyContinue
 $proc = Start-Process -FilePath 'D:\self\.venv\Scripts\python.exe' -ArgumentList '-m','uvicorn','app.main:app','--app-dir','D:\self-multi-user\backend','--host','127.0.0.1','--port','8100' -WorkingDirectory 'D:\self-multi-user' -WindowStyle Hidden -PassThru
 Write-Output "pid=$($proc.Id)"
