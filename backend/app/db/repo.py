@@ -40,8 +40,8 @@ from app.services import reasoning_trace, task_queue
 logger = logging.getLogger(__name__)
 
 
-def _experience_scope_user(user_id: int | None = None) -> int | None:
-    """Return explicit/request owner for private experience data; fail closed in multi-user mode."""
+def _experience_scope_user(user_id: int | None = None, *, for_write: bool = False) -> int | None:
+    """Resolve private experience owner; multi-user calls fail closed without context."""
     if user_id is not None:
         return int(user_id)
     try:
@@ -53,7 +53,7 @@ def _experience_scope_user(user_id: int | None = None) -> int | None:
         return int(current)
     if settings.multi_user_enabled:
         raise RuntimeError("experience data requires an authenticated user context")
-    return None
+    return 1 if for_write else None
 
 
 def _json(value: Any) -> Any:
