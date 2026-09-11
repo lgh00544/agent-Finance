@@ -288,8 +288,8 @@ def worker_run(force: bool = False, user_id: int | None = None) -> dict:
         logger.info("经验 Worker 推迟：experience 任务活跃")
         return {"skipped": True, "reason": "task_busy", "backlog": backlog,
                 "watchdog_reset": watchdog_reset}
-    lock_name = (_WORKER_LOCK if not settings.multi_user_enabled and user_id is None
-                 else f"{_WORKER_LOCK}:u{user_id if user_id is not None else 'legacy'}")
+    lock_name = (_WORKER_LOCK if user_id is None
+                 else f"{_WORKER_LOCK}:u{user_id}")
     if not cache.acquire_lock(lock_name, ttl_seconds=_WORKER_LOCK_TTL):
         logger.info("经验 Worker 跳过：已有实例正在运行")
         return {"skipped": True, "reason": "worker_locked", "backlog": backlog,

@@ -4369,10 +4369,13 @@ def update_experience_status(id, status, reviewer=None, action=None, note=None, 
 def experience_version(user_id=None) -> str:
     owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
-        stmt=select(func.count(), func.max(Experience.id))
+        stmt=select(func.count(), func.max(Experience.id),
+                    func.max(Experience.created_at), func.max(Experience.last_reviewed_at))
         if owner_id is not None: stmt=stmt.select_from(Experience).where(Experience.user_id==owner_id)
         else: stmt=stmt.select_from(Experience)
-        count,max_id=db.execute(stmt).one(); return f"e{count}:{max_id or 0}"
+        count, max_id, created_at, reviewed_at = db.execute(stmt).one()
+        stamp = max(created_at, reviewed_at) if created_at or reviewed_at else "0"
+        return f"e{count}:{max_id or 0}:{stamp}"
 
 
 def write_review_log(experience_id, action, reviewer, note=None, user_id=None) -> None:
