@@ -1,8 +1,7 @@
-"""Self-service registration contract tests.
+"""Authentication registration and account isolation contract tests.
 
-These tests build a small FastAPI app without the production lifespan, so no
-scheduler, external service, or production database is started.  The global
-test conftest forces SQLite into a PID-scoped temporary database.
+These tests use the project conftest's PID-scoped SQLite database and build a
+small FastAPI app without the production lifespan or scheduler.
 """
 
 from uuid import uuid4
@@ -25,7 +24,6 @@ def _db_ready():
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(settings, "multi_user_enabled", True)
-    monkeypatch.setattr(settings, "auth_self_registration_enabled", True)
     app = FastAPI()
     app.add_middleware(AuthMiddleware)
     app.include_router(router)
@@ -36,7 +34,8 @@ def _name(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex[:10]}"
 
 
-def _register(client: TestClient, username: str | None = None, password: str = "safe-pass-1"):
+def _register(client: TestClient, username: str | None = None,
+              password: str = "safe-pass-1"):
     return client.post(
         "/api/auth/register",
         json={"username": username or _name("user"), "password": password},
@@ -47,11 +46,15 @@ def test_anonymous_register_returns_token_and_status_identity(client):
     username = _name("alice")
     before = client.get("/api/auth/status")
     assert before.status_code == 200
-    assert before.json()["registration_enabled"] is True
-    assert before.json()["user_id"] is None
+    assert before.json() == {
+        "multi_user_enabled": True,
+        "user_id": None,
+        "username": None,
+        "role": None,
+    }
 
     response = _register(client, username)
-    assert response.status_code == 201
+    assert response.status_code == 200
     body = response.json()
     assert body["username"] == username
     assert body["role"] == "researcher"
@@ -67,7 +70,6 @@ def test_anonymous_register_returns_token_and_status_identity(client):
     assert status.json()["username"] == username
     assert status.json()["user_id"] == body["id"]
     assert status.json()["role"] == "researcher"
-    assert status.json()["registration_enabled"] is True
 
 
 def test_registered_users_cannot_read_each_others_private_paper_accounts(client):
@@ -92,42 +94,46 @@ def test_registered_users_cannot_read_each_others_private_paper_accounts(client)
 
 
 @pytest.mark.parametrize(
-    ("multi_user", "self_registration"),
-    [(False, True), (True, False)],
-)
-def test_registration_requires_both_feature_switches(client, monkeypatch, multi_user, self_registration):
-    monkeypatch.setattr(settings, "multi_user_enabled", multi_user)
-    monkeypatch.setattr(settings, "auth_self_registration_enabled", self_registration)
-    status = client.get("/api/auth/status")
-    assert status.status_code == 200
-    assert status.json()["registration_enabled"] is False
-    response = _register(client)
-    assert response.status_code == 403
-
-
-@pytest.mark.parametrize(
-    "payload",
+    ("username", "password", "detail"),
     [
-        {"username": "a", "password": "safe-pass-1"},
-        {"username": "   ", "password": "safe-pass-1"},
-        {"username": "u" * 65, "password": "safe-pass-1"},
-        {"username": "valid-user", "password": "short"},
-        {"username": "valid-user", "password": "p" * 257},
-        {"username": "valid-user", "password": "safe-pass-1", "role": "admin"},
-        {"username": "valid-user", "password": "safe-pass-1", "user_id": 1},
+        ("a", "safe-pass-1", "用户名至少需要 2 个字符"),
+        ("   ", "safe-pass-1", "用户名至少需要 2 个字符"),
+        ("valid-user", "short", "密码至少需要 8 个字符"),
     ],
 )
-def test_registration_rejects_invalid_or_privileged_payload(client, payload):
-    response = client.post("/api/auth/register", json=payload)
-    assert response.status_code == 422
+def test_registration_rejects_invalid_credentials(client, username, password, detail):
+    response = _register(client, username, password)
+    assert response.status_code == 400
+    assert response.json()["detail"] == detail
 
 
-def test_registration_trims_username_and_rejects_normalized_duplicate(client):
+def test_registration_trims_username_and_rejects_duplicate(client):
     username = _name("duplicate")
     first = _register(client, f"  {username}  ")
-    assert first.status_code == 201
+    assert first.status_code == 200
     assert first.json()["username"] == username
 
     duplicate = _register(client, username)
-    assert duplicate.status_code == 409
+    assert duplicate.status_code == 400
+    assert duplicate.json()["detail"] == "用户名已存在"
 
+
+def test_password_change_requires_authenticated_user_and_rotates_credentials(client):
+    username = _name("password")
+    created = _register(client, username, "old-pass-1").json()
+    headers = {"Authorization": f"Bearer {created['access_token']}"}
+
+    changed = client.post(
+        "/api/auth/password",
+        headers=headers,
+        json={"current_password": "old-pass-1", "new_password": "new-pass-1"},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["ok"] is True
+
+    old_login = client.post("/api/auth/login",
+                            json={"username": username, "password": "old-pass-1"})
+    assert old_login.status_code == 401
+    new_login = client.post("/api/auth/login",
+                            json={"username": username, "password": "new-pass-1"})
+    assert new_login.status_code == 200
