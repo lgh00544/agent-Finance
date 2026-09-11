@@ -3,6 +3,7 @@ import { App, Button, Card, Col, Divider, Form, Input, InputNumber, Row, Space, 
 import { SaveOutlined, DownloadOutlined, UploadOutlined, PlusOutlined, DeleteOutlined } from '@ant-design/icons'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getProfile, putProfile, exportProfile, importProfile } from '@/api/profile'
+import { changePassword } from '@/api/auth'
 
 type ExtraField = { key: string; value: string }
 
@@ -12,6 +13,7 @@ export default function ProfilePage() {
   const [form] = Form.useForm<Record<string, unknown>>()
   const [extras, setExtras] = useState<ExtraField[]>([])
   const [importText, setImportText] = useState('')
+  const [passwordForm] = Form.useForm<{ current_password: string; new_password: string; confirm_password: string }>()
 
   const { data, isLoading } = useQuery({
     queryKey: ['profile'],
@@ -154,6 +156,30 @@ export default function ProfilePage() {
         <Button type="primary" danger icon={<UploadOutlined />} style={{ marginTop: 8 }} onClick={handleImport}>
           确认导入
         </Button>
+      </Card>
+
+      <Card title="修改登录密码">
+        <Form form={passwordForm} layout="vertical" onFinish={async (values) => {
+          if (values.new_password !== values.confirm_password) { message.error('两次输入的新密码不一致'); return }
+          try {
+            await changePassword(values.current_password, values.new_password)
+            passwordForm.resetFields()
+            message.success('密码已修改，请退出后使用新密码登录')
+          } catch (e: unknown) {
+            message.error(`修改失败：${e instanceof Error ? e.message : String(e)}`)
+          }
+        }} style={{ maxWidth: 460 }}>
+          <Form.Item name="current_password" label="当前密码" rules={[{ required: true, message: '请输入当前密码' }]}>
+            <Input.Password autoComplete="current-password" />
+          </Form.Item>
+          <Form.Item name="new_password" label="新密码" rules={[{ required: true, min: 8, message: '新密码至少 8 位' }]}>
+            <Input.Password autoComplete="new-password" />
+          </Form.Item>
+          <Form.Item name="confirm_password" label="确认新密码" rules={[{ required: true, message: '请再次输入新密码' }]}>
+            <Input.Password autoComplete="new-password" />
+          </Form.Item>
+          <Button type="primary" htmlType="submit">修改密码</Button>
+        </Form>
       </Card>
     </Space>
   )

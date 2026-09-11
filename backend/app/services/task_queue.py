@@ -15,12 +15,18 @@
 本模块不包含任何市场判断。
 """
 import logging
+import json
+import os
+import socket
 import threading
 import time
 import uuid
 from contextvars import ContextVar, copy_context
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
+
+from app.cache import cache
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +39,13 @@ _lock = threading.Lock()
 _publish_fence = threading.Lock()
 _tasks: dict[str, dict] = {}
 _seq = 0  # 提交序号（秒级时间戳相同场景下保证顺序稳定）
+_instance_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+_SHARED_TASK_TTL_SECONDS = 24 * 3600
+_SHARED_RECENT_LIMIT = 200
+_CONTROL_TTL_SECONDS = 3600
 _current_attempt: ContextVar[tuple[str, str] | None] = ContextVar(
     "task_queue_current_attempt", default=None)
+_control_watchers: dict[str, threading.Event] = {}
 
 
 class AttemptInvalidated(RuntimeError):
@@ -104,6 +115,7 @@ def _watchdog_loop() -> None:
                         task["cancel_requested"] = True
                         task["error"] = f"timeout after {_TIMEOUT_SECONDS // 60} minutes"
                         task["finished_at"] = _now()
+                        _publish_task_locked(task)
                         _replace_executor_locked()
 
 
@@ -137,10 +149,16 @@ def submit(kind: str, label: str, fn: Callable, params: dict | None = None) -> s
             "attempt_id": uuid.uuid4().hex[:12], "cancel_requested": False,
             "canceled_at": None,
             "submitted_at": _now(), "started_at": None, "finished_at": None,
-            "error": None, "result": None, "_fn": fn,
+            "error": None, "result": None, "instance_id": _instance_id, "_fn": fn,
         }
         _tasks[tid] = task
         _trim_locked()
+        _publish_task_locked(task)
+        if _shared_enabled():
+            stop_event = threading.Event()
+            _control_watchers[tid] = stop_event
+            threading.Thread(target=_remote_control_loop, args=(tid, stop_event),
+                             name=f"task-control-{tid}", daemon=True).start()
     _executor.submit(_run, tid)
     return tid
 
@@ -153,11 +171,17 @@ def _run(tid: str) -> None:
         task["status"] = "running"
         task["started_at"] = _now()
         task["_started_mono"] = time.monotonic()  # 超时终结基准（watchdog 用）
+        _publish_task_locked(task)
         attempt_id = task["attempt_id"]
         fn = task["_fn"]
         params = task["params"]
     token = _current_attempt.set((tid, attempt_id))
+    user_tokens = None
     try:
+        user_id = params.get("user_id") if isinstance(params, dict) else None
+        if user_id is not None:
+            from app.core.auth import set_user_context
+            user_tokens = set_user_context(user_id, params.get("user_role"))
         result = fn(params)  # 执行函数统一签名 fn(params: dict)
         with _lock:
             current = _tasks.get(tid)
@@ -168,6 +192,7 @@ def _run(tid: str) -> None:
                 return
             current["status"] = "done"
             current["result"] = _safe_result(result)
+            _publish_task_locked(current)
     except AttemptInvalidated as exc:
         logger.warning("后台任务 %s(%s) attempt 已失效，放弃发布结果: %s",
                        task["kind"], tid, exc)
@@ -179,8 +204,18 @@ def _run(tid: str) -> None:
                     and not current["cancel_requested"]):
                 current["status"] = "failed"
                 current["error"] = str(exc)
+                _publish_task_locked(current)
         logger.error("后台任务 %s(%s) 失败: %s", task["kind"], tid, exc)
     finally:
+        with _lock:
+            current_state = _tasks.get(tid, {}).get("status")
+        if current_state in ("done", "canceled"):
+            watcher = _control_watchers.pop(tid, None)
+            if watcher is not None:
+                watcher.set()
+        if user_tokens is not None:
+            from app.core.auth import reset_user_context
+            reset_user_context(user_tokens)
         _current_attempt.reset(token)
         with _lock:
             current = _tasks.get(tid)
@@ -188,6 +223,7 @@ def _run(tid: str) -> None:
                     and current["finished_at"] is None
                     and current["status"] in ("done", "failed", "canceled")):
                 current["finished_at"] = _now()
+                _publish_task_locked(current)
 
 
 def _safe_result(result: Any) -> Any:
@@ -203,25 +239,170 @@ def _safe_result(result: Any) -> Any:
     return str(result)[:200]
 
 
-def get(tid: str) -> dict | None:
+def _visible(task: dict, user_id: int | None, is_admin: bool) -> bool:
+    """多人模式下只允许任务所有者或管理员访问任务记录。"""
+    if not settings.multi_user_enabled:
+        return True
+    if is_admin:
+        return True
+    owner_id = (task.get("params") or {}).get("user_id")
+    return user_id is not None and owner_id == user_id
+
+
+def _shared_enabled() -> bool:
+    return settings.multi_user_enabled and settings.cache_backend == "redis"
+
+
+def _task_key(tid: str) -> str:
+    return f"tasks:item:{tid}"
+
+
+def _control_key(tid: str) -> str:
+    return f"tasks:control:{tid}"
+
+
+def _recent_key() -> str:
+    return "tasks:recent"
+
+
+def _publish_task_locked(task: dict) -> None:
+    if not _shared_enabled():
+        return
+    public = _public(task)
+    try:
+        cache.set(_task_key(public["task_id"]),
+                  json.dumps(public, ensure_ascii=False, default=str),
+                  _SHARED_TASK_TTL_SECONDS)
+        raw = cache.get(_recent_key())
+        ids = json.loads(raw) if raw else []
+        ids = [public["task_id"]] + [tid for tid in ids if tid != public["task_id"]]
+        cache.set(_recent_key(), json.dumps(ids[:_SHARED_RECENT_LIMIT]),
+                  _SHARED_TASK_TTL_SECONDS)
+    except Exception as exc:  # noqa: BLE001 状态镜像失败不影响本实例任务执行
+        logger.warning("共享任务状态写入失败: %s", exc)
+
+
+def _load_shared_task(tid: str) -> dict | None:
+    if not _shared_enabled():
+        return None
+    try:
+        raw = cache.get(_task_key(tid))
+        return json.loads(raw) if raw else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("共享任务状态读取失败: %s", exc)
+        return None
+
+
+def _load_shared_recent() -> list[dict]:
+    if not _shared_enabled():
+        return []
+    try:
+        raw = cache.get(_recent_key())
+        ids = json.loads(raw) if raw else []
+        rows: list[dict] = []
+        for tid in ids[:_SHARED_RECENT_LIMIT]:
+            row = _load_shared_task(str(tid))
+            if row:
+                rows.append(row)
+        return rows
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("共享任务列表读取失败: %s", exc)
+        return []
+
+
+def _send_remote_control(tid: str, action: str, user_id: int | None,
+                         is_admin: bool) -> bool:
+    if not _shared_enabled():
+        return False
+    task = _load_shared_task(tid)
+    if not task or not _visible(task, user_id, is_admin):
+        return False
+    try:
+        cache.set(_control_key(tid), json.dumps({"action": action, "requested_by": user_id}),
+                  _CONTROL_TTL_SECONDS)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("远程任务控制写入失败 tid=%s: %s", tid, exc)
+        return False
+
+
+def _remote_control_loop(tid: str, stop_event: threading.Event) -> None:
+    while True:
+        if stop_event.wait(0.5):
+            return
+        if not _shared_enabled():
+            return
+        try:
+            raw = cache.get(_control_key(tid))
+            if not raw:
+                continue
+            cache.delete(_control_key(tid))
+            action = json.loads(raw).get("action")
+        except Exception:
+            continue
+        with _publish_fence:
+            with _lock:
+                task = _tasks.get(tid)
+                if not task:
+                    return
+                if task["status"] in ("done", "canceled"):
+                    return
+                if action == "cancel" and task["status"] in ("pending", "running"):
+                    task["status"] = "canceled"
+                    task["cancel_requested"] = True
+                    task["error"] = "canceled by user"
+                    task["canceled_at"] = _now()
+                    task["finished_at"] = _now()
+                    _publish_task_locked(task)
+                    if task.get("_started_mono"):
+                        _replace_executor_locked()
+                    continue
+                if action == "retry" and task["status"] == "failed":
+                    task["status"] = "pending"
+                    task["attempt_id"] = uuid.uuid4().hex[:12]
+                    task["cancel_requested"] = False
+                    task["error"] = None
+                    task["result"] = None
+                    task["started_at"] = None
+                    task["finished_at"] = None
+                    task["submitted_at"] = _now()
+                    _publish_task_locked(task)
+                    _executor.submit(_run, tid)
+                    continue
+
+
+def get(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """任务详情（去掉内部 _fn 引用）"""
     with _lock:
         task = _tasks.get(tid)
-        return _public(task) if task else None
+        if task and _visible(task, user_id, is_admin):
+            return _public(task)
+    shared = _load_shared_task(tid)
+    return shared if shared and _visible(shared, user_id, is_admin) else None
 
 
-def recent_tasks(limit: int = 10) -> list[dict]:
+def recent_tasks(limit: int = 10, user_id: int | None = None,
+                 *, is_admin: bool = False) -> list[dict]:
     """最近任务（提交序号倒序 = 最新在前，供页面顶部任务状态区轮询）"""
     with _lock:
-        items = [t for t in sorted(_tasks.values(), key=lambda t: t["seq"], reverse=True)[:limit]]
-        return [_public(t) for t in items]
+        local = [_public(t) for t in _tasks.values()]
+    merged: dict[str, dict] = {}
+    for task in _load_shared_recent() + local:
+        if _visible(task, user_id, is_admin):
+            merged[task["task_id"]] = task
+    rows = sorted(merged.values(),
+                  key=lambda t: (str(t.get("submitted_at") or ""), int(t.get("seq") or 0)),
+                  reverse=True)
+    return rows[:limit]
 
 
-def retry(tid: str) -> bool:
+def retry(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> bool:
     """失败任务重试：重置状态重新入队（复用原 task_id 与执行函数）"""
     with _lock:
         task = _tasks.get(tid)
-        if task is None or task["status"] != "failed":
+        if task is None:
+            return _send_remote_control(tid, "retry", user_id, is_admin)
+        if not _visible(task, user_id, is_admin) or task["status"] != "failed":
             return False
         task["status"] = "pending"
         task["attempt_id"] = uuid.uuid4().hex[:12]
@@ -232,31 +413,39 @@ def retry(tid: str) -> bool:
         task["started_at"] = None
         task["finished_at"] = None
         task["submitted_at"] = _now()
+        _publish_task_locked(task)
     _executor.submit(_run, tid)
     return True
 
 
-def has_active(kind: str) -> bool:
+def has_active(kind: str, user_id: int | None = None, *, is_admin: bool = False) -> bool:
     """是否存在未结束（pending/running）的同类型任务：供重复触发防护"""
     with _lock:
-        return any(t["kind"] == kind and t["status"] in ("pending", "running")
-                   for t in _tasks.values())
+        if any(t["kind"] == kind and t["status"] in ("pending", "running")
+               and _visible(t, user_id, is_admin) for t in _tasks.values()):
+            return True
+    return any(t.get("kind") == kind and t.get("status") in ("pending", "running")
+               and _visible(t, user_id, is_admin) for t in _load_shared_recent())
 
 
-def cancel(tid: str) -> bool:
+def cancel(tid: str, user_id: int | None = None, *, is_admin: bool = False) -> bool:
     """手动取消卡死任务：仅 pending/running 可取消（failed/done/canceled 不可）。
     取消后释放任务队列（正在执行的线程无法强杀，留在旧池后台耗，
     但队列立即腾出，新任务可提交；旧线程失去本次 attempt 的发布资格。"""
     with _publish_fence:
         with _lock:
             task = _tasks.get(tid)
-            if task is None or task["status"] not in ("pending", "running"):
+            if task is None:
+                return _send_remote_control(tid, "cancel", user_id, is_admin)
+            if (not _visible(task, user_id, is_admin)
+                    or task["status"] not in ("pending", "running")):
                 return False
             task["status"] = "canceled"
             task["cancel_requested"] = True
             task["error"] = "canceled by user"
             task["canceled_at"] = _now()
             task["finished_at"] = _now()
+            _publish_task_locked(task)
             if task.get("_started_mono"):
                 _replace_executor_locked()  # 正在执行：丢弃旧池，释放被占的单线程队列
     logger.warning("后台任务 %s(%s) 已被手动取消", task["kind"], tid)

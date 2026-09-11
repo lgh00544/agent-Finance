@@ -37,6 +37,34 @@ def _now() -> datetime:
     return datetime.now()
 
 
+class User(Base):
+    """认证主体；旧单用户数据统一回填到 id=1 的 legacy 用户。"""
+    __tablename__ = "app_user"
+    __table_args__ = (UniqueConstraint("username", name="uq_app_user_username"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(64), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(256), default="")
+    role: Mapped[str] = mapped_column(String(16), default="researcher", index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    feishu_open_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class UserSession(Base):
+    """短期 bearer 会话；只保存 token 摘要，原 token 不落库。"""
+    __tablename__ = "user_session"
+    __table_args__ = (Index("ix_user_session_expires", "expires_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("app_user.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class StockCandidate(Base):
     """每日候选池（DiscoverAgent 输出）"""
     __tablename__ = "stock_candidate"
@@ -178,6 +206,7 @@ class PositionPlan(Base):
     source: Mapped[str] = mapped_column(String(16), default="manual", index=True)  # candidate/manual（来源标记）
     supersedes_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)  # 替代的上一版本
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class Holding(Base):
@@ -201,6 +230,7 @@ class Holding(Base):
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class TradeRecord(Base):
@@ -219,6 +249,7 @@ class TradeRecord(Base):
     before_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 操作前股数（K223 留痕）
     after_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)   # 操作后股数（K223 留痕）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class AlertLog(Base):
@@ -236,6 +267,7 @@ class AlertLog(Base):
     pushed: Mapped[bool] = mapped_column(Boolean, default=False)     # 是否已推飞书
     source: Mapped[str] = mapped_column(String(32), default="monitor")  # 告警来源标记 monitor/portfolio_sentinel
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class ReviewResult(Base):
@@ -259,6 +291,7 @@ class ReviewResult(Base):
     suggest_iteration: Mapped[int] = mapped_column(Integer, default=1)  # 建议迭代次数（第几版）
     suggest_history: Mapped[list] = mapped_column(SafeJSON, default=list)   # 迭代轨迹 [{iteration, suggestion, reject_reason}]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class AiReasoningTrace(Base):
@@ -266,17 +299,18 @@ class AiReasoningTrace(Base):
     monitor持仓监控/alert告警/review复盘/sell卖出决策）
 
     一次生成、结构化入库、多端复用；纠察复盘Agent 的「决策黑匣子」数据源。
-    同 code+generate_date+source_module 保留最新一次研判（写入覆盖，uq 约束天然支撑
+    同用户+code+generate_date+source_module 保留最新一次研判（写入覆盖，uq 约束天然支撑
     联合查询，无需重复建普通联合索引；长文本列一律不建索引）。
     """
     __tablename__ = "ai_reasoning_trace"
     __table_args__ = (
-        UniqueConstraint("stock_code", "generate_date", "source_module",
+        UniqueConstraint("user_id", "stock_code", "generate_date", "source_module",
                          name="uq_trace_code_date_module"),
-        Index("ix_trace_module_date", "source_module", "generate_date"),  # 模块+日期批量查询
+        Index("ix_trace_user_module_date", "user_id", "source_module", "generate_date"),
     )
 
     trace_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
     stock_name: Mapped[str] = mapped_column(String(64))            # 禁止只存代码不存名称
     source_module: Mapped[str] = mapped_column(String(16), index=True)  # discover/score/position/monitor/alert/review/sell
@@ -302,12 +336,13 @@ class AiReasoningTraceHistory(Base):
     """
     __tablename__ = "ai_reasoning_trace_history"
     __table_args__ = (
-        Index("ix_trace_history_code_date_module", "stock_code", "generate_date",
+        Index("ix_trace_history_user_code_date_module", "user_id", "stock_code", "generate_date",
               "source_module"),
         Index("ix_trace_history_recorded_at", "recorded_at"),
     )
 
     history_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     stock_code: Mapped[str] = mapped_column(String(16), index=True)
     stock_name: Mapped[str] = mapped_column(String(64))
     source_module: Mapped[str] = mapped_column(String(16), index=True)
@@ -355,6 +390,7 @@ class AgentPreference(Base):
     source_review_id: Mapped[int] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending/active/rejected
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class TradeProfile(Base):
@@ -368,6 +404,7 @@ class TradeProfile(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     content: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PrivateKnowledge(Base):
@@ -392,6 +429,7 @@ class PrivateKnowledge(Base):
     status: Mapped[str] = mapped_column(String(16), index=True, default="active")
     risk_note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class KnowledgeShadowHit(Base):
@@ -433,6 +471,7 @@ class SellDecision(Base):
     stock_name: Mapped[str] = mapped_column(String(64))
     decision: Mapped[dict] = mapped_column(SafeJSON, default=dict)   # 完整决策结构化输出（LLM 输出）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class AccountBaseline(Base):
@@ -450,16 +489,18 @@ class AccountBaseline(Base):
     position_pct: Mapped[float] = mapped_column(Float, default=0.0)  # 整体仓位占比 %
     source: Mapped[str] = mapped_column(String(32), default="ocr")   # ocr / manual
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class AccountPnlSnapshot(Base):
     """同花顺投资账本真实账户今日盈亏快照（P0 数据通道；默认 ths_pnl_enable=false 不采集）
 
-    trade_date+ts 唯一，upsert 幂等（R5 防重复采集/误报）；
+    user_id+trade_date+ts 唯一，upsert 幂等（R5 防重复采集/误报）；
     失败快照写 error 字段，不伪造 0 值（R1 token 过期标记 token_expired）。
     """
     __tablename__ = "account_pnl_snapshot"
-    __table_args__ = (UniqueConstraint("trade_date", "ts", name="uq_account_pnl_date_ts"),)
+    __table_args__ = (UniqueConstraint("user_id", "trade_date", "ts",
+                                       name="uq_account_pnl_user_date_ts"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_date: Mapped[str] = mapped_column(String(10), index=True)   # YYYY-MM-DD
@@ -472,6 +513,7 @@ class AccountPnlSnapshot(Base):
     error: Mapped[str] = mapped_column(Text, default="")                 # 失败原因（空=成功）
     token_expired: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class AgentSuggestion(Base):
@@ -512,6 +554,7 @@ class AgentSuggestion(Base):
     audit_verdict: Mapped[str] = mapped_column(String(8), default="pending", index=True)  # pending/pass/fail
     audit_round: Mapped[int] = mapped_column(Integer, default=0)   # 0=未审 1=首审 2=重审（不超 2）
     last_audit_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 最近一次 audit_log.id
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class AuditLog(Base):
@@ -519,6 +562,7 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
     __table_args__ = (
         Index("ix_audit_target", "target_type", "target_id"),
+        Index("ix_audit_user_target", "user_id", "target_type", "target_id"),
         Index("ix_audit_verdict", "verdict"),
         Index("ix_audit_created", "created_at"),
     )
@@ -537,6 +581,8 @@ class AuditLog(Base):
     reasoning: Mapped[str] = mapped_column(Text, default="")           # LLM 原始 JSON 全文
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    # NULL is reserved for explicitly system-scoped audits with no private target.
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class RuleChange(Base):
@@ -575,6 +621,7 @@ class RuleChange(Base):
     rollback_time: Mapped[str] = mapped_column(String(16), default="")  # YYYY-MM-DD HH:mm
     operator: Mapped[str] = mapped_column(String(32), default="")  # 操作人（单机自部署固定本机用户）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class AgentChatMessage(Base):
@@ -597,6 +644,7 @@ class AgentChatMessage(Base):
     knowledge_id: Mapped[int] = mapped_column(Integer, nullable=True)  # 沉淀知识条目 ID
     meta: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class HotMoneyProfile(Base):
@@ -730,6 +778,7 @@ class PendingExperience(Base):
     __tablename__ = "pending_experience"
     __table_args__ = (
         Index("ix_pending_status_id", "status", "id"),   # 认领批次按状态+ID 顺序
+        Index("ix_pending_user_status_id", "user_id", "status", "id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -740,6 +789,7 @@ class PendingExperience(Base):
     artifacts_ref: Mapped[str | None] = mapped_column(Text)          # 产物引用（记录 ID，非全文）
     status: Mapped[str] = mapped_column(String(12), default="pending")
     error: Mapped[str | None] = mapped_column(Text)                  # Worker 失败原因（done+error 表示）
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class Experience(Base):
@@ -749,6 +799,8 @@ class Experience(Base):
     __table_args__ = (
         Index("ix_experience_status_stage", "status", "stage"),
         Index("ix_experience_stage_id", "stage", "id"),
+        Index("ix_experience_user_status_stage", "user_id", "status", "stage"),
+        Index("ix_experience_user_stage_id", "user_id", "stage", "id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -768,6 +820,7 @@ class Experience(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     curator_note: Mapped[str] = mapped_column(Text, default="")
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class ReviewLog(Base):
@@ -775,6 +828,7 @@ class ReviewLog(Base):
     __tablename__ = "review_log"
     __table_args__ = (
         Index("ix_reviewlog_exp", "experience_id"),
+        Index("ix_reviewlog_user_exp", "user_id", "experience_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -784,11 +838,14 @@ class ReviewLog(Base):
     reviewer: Mapped[str] = mapped_column(String(16))                # sir/auto
     at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     note: Mapped[str | None] = mapped_column(Text)
+    # NULL is reserved for explicit system actions such as strictness_freeze.
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class WorkerRun(Base):
     """Worker 运行记录（每次消费批次的开始/结束/处理数/状态）"""
     __tablename__ = "worker_run"
+    __table_args__ = (Index("ix_worker_run_user_status", "user_id", "status"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -796,6 +853,7 @@ class WorkerRun(Base):
     processed_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(12), default="running")  # running/success/failed
     error: Mapped[str | None] = mapped_column(Text)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class ExperienceConfig(Base):
@@ -1115,6 +1173,7 @@ class PaperAccount(Base):
     source_label: Mapped[str] = mapped_column(String(32), default="AI模拟")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PaperPosition(Base):
@@ -1142,6 +1201,7 @@ class PaperPosition(Base):
     metadata_json: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PaperExecution(Base):
@@ -1182,6 +1242,7 @@ class PaperExecution(Base):
     source_label: Mapped[str] = mapped_column(String(32), default="AI模拟")
     metadata_json: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PaperReview(Base):
@@ -1203,6 +1264,7 @@ class PaperReview(Base):
     shadow_status: Mapped[str] = mapped_column(String(16), default="not_started", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     audited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PaperQuoteSnapshot(Base):
@@ -1227,6 +1289,7 @@ class PaperQuoteSnapshot(Base):
     snapshot: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PaperContext(Base):
@@ -1245,6 +1308,7 @@ class PaperContext(Base):
     source_refs: Mapped[list] = mapped_column(SafeJSON, default=list)
     status: Mapped[str] = mapped_column(String(16), default="frozen")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PaperWebEvidence(Base):
@@ -1267,6 +1331,7 @@ class PaperWebEvidence(Base):
     status: Mapped[str] = mapped_column(String(16), default="ok")
     error: Mapped[str] = mapped_column(String(256), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class PaperAlert(Base):
@@ -1283,6 +1348,26 @@ class PaperAlert(Base):
     message: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(32), default="paper_monitor")
     context_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class PublicFactSnapshot(Base):
+    """可跨用户复用的公共事实快照；不允许携带个人结论或资产字段。"""
+    __tablename__ = "public_fact_snapshot"
+    __table_args__ = (
+        UniqueConstraint("source", "symbol", "fact_as_of", "content_hash",
+                         name="uq_public_fact_identity"),
+        Index("ix_public_fact_symbol_asof", "symbol", "fact_as_of"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    fact_type: Mapped[str] = mapped_column(String(32), index=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    fact_as_of: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 

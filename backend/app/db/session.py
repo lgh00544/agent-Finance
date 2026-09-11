@@ -10,7 +10,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
@@ -43,7 +43,7 @@ def _build_engine_url() -> str:
     # 默认：SQLite 单文件（SQLITE_PATH 便于测试隔离）
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    db_file = os.environ.get("SQLITE_PATH") or (data_dir / "dev.db")
+    db_file = os.environ.get("SQLITE_PATH") or settings.sqlite_path or (data_dir / "dev.db")
     return f"sqlite:///{db_file}"
 
 
@@ -164,6 +164,12 @@ def init_db() -> dict:
         _ensure_quote_snapshot_table()
         _ensure_distribution_phase_table()
         _ensure_capital_view_tables()
+        _ensure_identity_tables()
+        _ensure_user_identity_columns()
+        _ensure_user_columns()
+        _ensure_account_pnl_user_index()
+        _ensure_reasoning_trace_user_scope()
+        experience_ownership = _ensure_experience_audit_user_scope()
         knowledge = _ensure_knowledge_hit_columns()
         experience = _ensure_experience_curator_columns()
     except Exception as exc:  # noqa: BLE001 startup must expose migration failures
@@ -183,19 +189,341 @@ def init_db() -> dict:
         "status": "ok",
         **identity,
         "initialized_at": datetime.now().isoformat(timespec="seconds"),
-        "migrations": {"knowledge": knowledge, "experience": experience},
+        "migrations": {
+            "knowledge": knowledge,
+            "experience": experience,
+            "experience_ownership": experience_ownership,
+        },
     }
     logger.info(
         "数据库初始化/迁移完成 backend=%s database=%s knowledge_added=%s "
-        "knowledge_existing=%s experience_added=%s experience_existing=%s",
+        "knowledge_existing=%s experience_added=%s experience_existing=%s "
+        "experience_ownership_columns_added=%s",
         identity.get("backend"),
         identity.get("database") or identity.get("sqlite_path_digest"),
         len(knowledge["added"]),
         len(knowledge["existing"]),
         len(experience["added"]),
         len(experience["existing"]),
+        sum(len(result["added"]) for result in experience_ownership["columns"].values()),
     )
     return _LAST_INIT_DB_RESULT
+
+
+def _ensure_identity_tables() -> None:
+    """创建用户/会话/公共事实表并为历史单用户数据准备默认主体。"""
+    from app.db.models import PublicFactSnapshot, User, UserSession
+    Base.metadata.create_all(bind=engine, tables=[
+        User.__table__, UserSession.__table__, PublicFactSnapshot.__table__,
+    ])
+    _ensure_user_identity_columns()
+    from app.db import repo
+    default_id = repo.ensure_default_user()
+    _ = default_id
+
+
+def _ensure_user_identity_columns() -> None:
+    """Add optional external identity columns to existing app_user tables."""
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(app_user)")}
+            if "feishu_open_id" not in existing:
+                _add_column(conn, "app_user", "feishu_open_id", "VARCHAR(128) NULL")
+    else:
+        _add_columns(engine, "app_user", {"feishu_open_id": "VARCHAR(128) NULL"})
+
+
+def _ensure_account_pnl_user_index() -> None:
+    """Move legacy global PnL snapshot uniqueness to a user-scoped key."""
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            indexes = list(conn.exec_driver_sql("PRAGMA index_list(account_pnl_snapshot)"))
+            unique_columns = {
+                tuple(row[2] for row in conn.exec_driver_sql(f"PRAGMA index_info({index[1]})"))
+                for index in indexes if index[2]
+            }
+            desired = ("user_id", "trade_date", "ts")
+            if desired in unique_columns:
+                return
+            conn.exec_driver_sql("""
+                CREATE TABLE account_pnl_snapshot_scoped (
+                    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                    trade_date VARCHAR(10) NOT NULL,
+                    ts VARCHAR(32) NOT NULL,
+                    pnl_yk FLOAT,
+                    pnl_pct FLOAT,
+                    sh_pct FLOAT,
+                    chart_data JSON NOT NULL DEFAULT '[]',
+                    source VARCHAR(32) NOT NULL DEFAULT 'ths',
+                    error TEXT NOT NULL DEFAULT '',
+                    token_expired BOOLEAN NOT NULL DEFAULT 0,
+                    updated_at DATETIME NOT NULL,
+                    user_id INTEGER,
+                    CONSTRAINT uq_account_pnl_user_date_ts
+                        UNIQUE (user_id, trade_date, ts)
+                )
+            """)
+            conn.exec_driver_sql("""
+                INSERT INTO account_pnl_snapshot_scoped (
+                    id, trade_date, ts, pnl_yk, pnl_pct, sh_pct, chart_data,
+                    source, error, token_expired, updated_at, user_id
+                )
+                SELECT id, trade_date, ts, pnl_yk, pnl_pct, sh_pct, chart_data,
+                       source, error, token_expired, updated_at, user_id
+                FROM account_pnl_snapshot
+            """)
+            conn.exec_driver_sql("DROP TABLE account_pnl_snapshot")
+            conn.exec_driver_sql(
+                "ALTER TABLE account_pnl_snapshot_scoped RENAME TO account_pnl_snapshot")
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_account_pnl_snapshot_trade_date "
+                "ON account_pnl_snapshot (trade_date)")
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_account_pnl_snapshot_user_id "
+                "ON account_pnl_snapshot (user_id)")
+        return
+    with engine.begin() as conn:
+        indexes = list(conn.exec_driver_sql(
+            "SHOW INDEX FROM account_pnl_snapshot"))
+        names = {str(row[2]) for row in indexes}
+        if "uq_account_pnl_date_ts" in names:
+            conn.exec_driver_sql(
+                "ALTER TABLE account_pnl_snapshot DROP INDEX uq_account_pnl_date_ts")
+        if "uq_account_pnl_user_date_ts" not in names:
+            conn.exec_driver_sql(
+                "ALTER TABLE account_pnl_snapshot ADD UNIQUE KEY "
+                "uq_account_pnl_user_date_ts (user_id, trade_date, ts)")
+
+
+def _ensure_user_columns() -> None:
+    """给既有私有表增加可空归属列，并把旧数据归档到默认用户。"""
+    from app.db import repo
+    default_id = repo.ensure_default_user()
+    tables = (
+        "position_plan", "holding", "trade_record", "alert_log", "review_result",
+        "agent_preference", "sys_trade_profile", "private_knowledge", "sell_decision",
+        "account_baseline", "account_pnl_snapshot", "agent_suggestion", "rule_change",
+        "agent_chat_message", "paper_account", "paper_position", "paper_execution",
+        "paper_review", "paper_quote_snapshot", "paper_context", "paper_web_evidence",
+        "paper_alert", "ai_reasoning_trace", "ai_reasoning_trace_history",
+    )
+    with engine.begin() as conn:
+        for table in tables:
+            existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")} \
+                if engine.dialect.name == "sqlite" else set()
+            if "user_id" not in existing:
+                try:
+                    _add_column(conn, table, "user_id", "INTEGER NULL")
+                except Exception:
+                    if engine.dialect.name != "sqlite":
+                        raise
+            conn.execute(
+                text(f"UPDATE {table} SET user_id = :user_id WHERE user_id IS NULL"),
+                {"user_id": default_id},
+            )
+
+
+def _ensure_index(eng, table: str, name: str, columns: tuple[str, ...]) -> str:
+    """Create a named index once on SQLite or MySQL without replacing existing data."""
+    column_sql = ", ".join(columns)
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            before = {
+                str(row[1]) for row in conn.exec_driver_sql(f"PRAGMA index_list({table})")
+            }
+            conn.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column_sql})")
+            return "existing" if name in before else "added"
+        existing = {
+            str(row[2]) for row in conn.exec_driver_sql(f"SHOW INDEX FROM {table}")
+        }
+        if name in existing:
+            return "existing"
+        conn.exec_driver_sql(f"ALTER TABLE {table} ADD INDEX {name} ({column_sql})")
+        return "added"
+
+
+def _ensure_experience_audit_user_scope(eng=None, default_user_id: int | None = None) -> dict:
+    """Scope private experience history to one account and retain only explicit system logs.
+
+    Experience records and worker execution history are private.  Review/audit rows
+    inherit ownership only from a known private target; rows without such a target
+    stay NULL as system scope instead of being exposed as an account record.
+    """
+    eng = eng or engine
+    if default_user_id is None:
+        from app.db import repo
+        default_user_id = repo.ensure_default_user()
+
+    columns = {
+        table: _add_columns(eng, table, {"user_id": "INTEGER NULL"})
+        for table in (
+            "pending_experience", "experience", "review_log", "worker_run", "audit_log",
+        )
+    }
+    with eng.begin() as conn:
+        for table in ("pending_experience", "experience", "worker_run"):
+            conn.execute(text(
+                f"UPDATE {table} SET user_id = :user_id WHERE user_id IS NULL"),
+                {"user_id": int(default_user_id)},
+            )
+
+        # Only experience-linked review rows have a private owner.  System actions
+        # without an experience_id deliberately retain NULL ownership.
+        conn.execute(text("""
+            UPDATE review_log
+            SET user_id = (
+                SELECT owner_row.user_id
+                FROM experience AS owner_row
+                WHERE owner_row.id = review_log.experience_id
+            )
+            WHERE review_log.user_id IS NULL
+              AND review_log.experience_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM experience AS owner_row
+                WHERE owner_row.id = review_log.experience_id
+                  AND owner_row.user_id IS NOT NULL
+            )
+        """))
+
+        # Audit ownership is derived only for supported account-scoped targets.
+        # Unknown target types remain system scope and must not inherit a default user.
+        for target_type, table in (
+            ("agent_suggestion", "agent_suggestion"),
+            ("pending_experience", "pending_experience"),
+            ("experience", "experience"),
+            ("rule_change", "rule_change"),
+            ("review_result", "review_result"),
+        ):
+            conn.execute(text(f"""
+                UPDATE audit_log
+                SET user_id = (
+                    SELECT owner_row.user_id
+                    FROM {table} AS owner_row
+                    WHERE owner_row.id = audit_log.target_id
+                )
+                WHERE audit_log.user_id IS NULL
+                  AND audit_log.target_type = :target_type
+                  AND EXISTS (
+                    SELECT 1 FROM {table} AS owner_row
+                    WHERE owner_row.id = audit_log.target_id
+                      AND owner_row.user_id IS NOT NULL
+                  )
+            """), {"target_type": target_type})
+
+    index_specs = (
+        ("pending_experience", "ix_pending_user_status_id", ("user_id", "status", "id")),
+        ("experience", "ix_experience_user_status_stage", ("user_id", "status", "stage")),
+        ("experience", "ix_experience_user_stage_id", ("user_id", "stage", "id")),
+        ("review_log", "ix_reviewlog_user_exp", ("user_id", "experience_id")),
+        ("worker_run", "ix_worker_run_user_status", ("user_id", "status")),
+        ("audit_log", "ix_audit_user_target", ("user_id", "target_type", "target_id")),
+    )
+    indexes = {
+        name: _ensure_index(eng, table, name, index_columns)
+        for table, name, index_columns in index_specs
+    }
+    return {"columns": columns, "indexes": indexes}
+
+
+def _ensure_reasoning_trace_user_scope() -> None:
+    """Make decision traces private and include their owner in the upsert key."""
+    from app.db import repo
+
+    default_id = repo.ensure_default_user()
+    _add_columns(engine, "ai_reasoning_trace_history", {"user_id": "INTEGER NULL"})
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            trace_columns = {row[1] for row in conn.exec_driver_sql(
+                "PRAGMA table_info(ai_reasoning_trace)")}
+            indexes = list(conn.exec_driver_sql("PRAGMA index_list(ai_reasoning_trace)"))
+            unique_columns = {
+                tuple(row[2] for row in conn.exec_driver_sql(f"PRAGMA index_info({index[1]})"))
+                for index in indexes if index[2]
+            }
+            desired = ("user_id", "stock_code", "generate_date", "source_module")
+            if desired not in unique_columns:
+                user_expr = "COALESCE(user_id, :user_id)" if "user_id" in trace_columns else ":user_id"
+                conn.exec_driver_sql("""
+                    CREATE TABLE ai_reasoning_trace_scoped (
+                        trace_id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NULL,
+                        stock_code VARCHAR(16) NOT NULL,
+                        stock_name VARCHAR(64) NOT NULL,
+                        source_module VARCHAR(16) NOT NULL,
+                        generate_date VARCHAR(10) NOT NULL,
+                        fact_basis TEXT NOT NULL,
+                        technical_reasoning TEXT NOT NULL,
+                        capital_reasoning TEXT NOT NULL,
+                        fundamental_reasoning TEXT NOT NULL,
+                        risk_reasoning TEXT NOT NULL,
+                        rule_refs TEXT NOT NULL,
+                        final_conclusion TEXT NOT NULL,
+                        confidence FLOAT NOT NULL,
+                        data_source VARCHAR(64) NOT NULL,
+                        create_time VARCHAR(16) NOT NULL,
+                        ext_info TEXT NOT NULL,
+                        CONSTRAINT uq_trace_code_date_module
+                            UNIQUE (user_id, stock_code, generate_date, source_module)
+                    )
+                """)
+                conn.exec_driver_sql(f"""
+                    INSERT INTO ai_reasoning_trace_scoped (
+                        trace_id, user_id, stock_code, stock_name, source_module, generate_date,
+                        fact_basis, technical_reasoning, capital_reasoning, fundamental_reasoning,
+                        risk_reasoning, rule_refs, final_conclusion, confidence, data_source,
+                        create_time, ext_info
+                    )
+                    SELECT trace_id, {user_expr}, stock_code, stock_name, source_module, generate_date,
+                           fact_basis, technical_reasoning, capital_reasoning, fundamental_reasoning,
+                           risk_reasoning, rule_refs, final_conclusion, confidence, data_source,
+                           create_time, ext_info
+                    FROM ai_reasoning_trace
+                """, {"user_id": default_id})
+                conn.exec_driver_sql("DROP TABLE ai_reasoning_trace")
+                conn.exec_driver_sql("ALTER TABLE ai_reasoning_trace_scoped RENAME TO ai_reasoning_trace")
+            elif "user_id" not in trace_columns:
+                _add_column(conn, "ai_reasoning_trace", "user_id", "INTEGER NULL")
+            conn.execute(text(
+                "UPDATE ai_reasoning_trace SET user_id = :user_id WHERE user_id IS NULL"),
+                {"user_id": default_id})
+            conn.execute(text(
+                "UPDATE ai_reasoning_trace_history SET user_id = :user_id WHERE user_id IS NULL"),
+                {"user_id": default_id})
+            for statement in (
+                "CREATE INDEX IF NOT EXISTS ix_ai_reasoning_trace_user_id ON ai_reasoning_trace (user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_ai_reasoning_trace_stock_code ON ai_reasoning_trace (stock_code)",
+                "CREATE INDEX IF NOT EXISTS ix_ai_reasoning_trace_source_module ON ai_reasoning_trace (source_module)",
+                "CREATE INDEX IF NOT EXISTS ix_ai_reasoning_trace_generate_date ON ai_reasoning_trace (generate_date)",
+                "CREATE INDEX IF NOT EXISTS ix_trace_user_module_date ON ai_reasoning_trace (user_id, source_module, generate_date)",
+                "CREATE INDEX IF NOT EXISTS ix_ai_reasoning_trace_history_user_id ON ai_reasoning_trace_history (user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_trace_history_user_code_date_module ON ai_reasoning_trace_history (user_id, stock_code, generate_date, source_module)",
+                "CREATE INDEX IF NOT EXISTS ix_trace_history_recorded_at ON ai_reasoning_trace_history (recorded_at)",
+            ):
+                conn.exec_driver_sql(statement)
+        return
+
+    _add_columns(engine, "ai_reasoning_trace", {"user_id": "INTEGER NULL"})
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE ai_reasoning_trace SET user_id = :user_id WHERE user_id IS NULL",
+        ), {"user_id": default_id})
+        conn.execute(text(
+            "UPDATE ai_reasoning_trace_history SET user_id = :user_id WHERE user_id IS NULL",
+        ), {"user_id": default_id})
+        rows = list(conn.exec_driver_sql("SHOW INDEX FROM ai_reasoning_trace"))
+        index_columns: dict[str, list[tuple[int, str]]] = {}
+        for row in rows:
+            index_columns.setdefault(str(row[2]), []).append((int(row[3]), str(row[4])))
+        current_key = tuple(column for _, column in sorted(
+            index_columns.get("uq_trace_code_date_module", [])))
+        desired_key = ("user_id", "stock_code", "generate_date", "source_module")
+        if current_key != desired_key:
+            if "uq_trace_code_date_module" in index_columns:
+                conn.exec_driver_sql("ALTER TABLE ai_reasoning_trace DROP INDEX uq_trace_code_date_module")
+            conn.exec_driver_sql("ALTER TABLE ai_reasoning_trace ADD UNIQUE KEY "
+                                 "uq_trace_code_date_module "
+                                 "(user_id, stock_code, generate_date, source_module)")
 
 
 def _ensure_experience_fts() -> None:

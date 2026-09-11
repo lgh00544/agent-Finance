@@ -7,6 +7,7 @@ DeepSeek 结构化输出封装（OpenAI 兼容端点）
 【刚性代码逻辑】只负责调用与结构校验，不参与任何市场研判内容。
 """
 import logging
+import hashlib
 import time
 from enum import Enum
 from typing import Type, TypeVar
@@ -140,10 +141,20 @@ def call_llm_cached(agent: str, cache_key: str, system_prompt: str, user_prompt:
     level = model_level if isinstance(model_level, ModelLevel) else ModelLevel(model_level)
     model = _model_for(level)
     cache_agent = f"{agent}:{model}"
-    cached = cache.get_llm_json(cache_agent, cache_key, ttl_seconds)
+    try:
+        from app.core.auth import current_user_id
+        from app.db import repo
+        user_id = current_user_id() or 1
+        pref_version = repo.get_latest_preference_version(user_id=user_id)
+    except Exception:
+        user_id, pref_version = 1, 0
+    context_hash = hashlib.sha256(
+        f"{system_prompt}\n{user_prompt}".encode("utf-8")).hexdigest()[:16]
+    effective_key = f"u{user_id}:p{pref_version}:c{context_hash}:{cache_key}"
+    cached = cache.get_llm_json(cache_agent, effective_key, ttl_seconds)
     if cached is not None:
-        logger.info("LLM 缓存命中: %s/%s", cache_agent, cache_key)
+        logger.info("LLM 缓存命中: %s/%s", cache_agent, effective_key)
         return schema.model_validate(cached)
     result = llm_call_json(system_prompt, user_prompt, schema, model_level=level)
-    cache.set_llm_json(cache_agent, cache_key, result.model_dump(), ttl_seconds)
+    cache.set_llm_json(cache_agent, effective_key, result.model_dump(), ttl_seconds)
     return result

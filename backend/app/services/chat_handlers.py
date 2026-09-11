@@ -31,6 +31,36 @@ _INTENT_TARGETS = {
 }
 
 
+def _feishu_user(open_id: str) -> dict | None:
+    """Resolve Feishu identity to an application user.
+
+    Explicit DB binding wins; a small environment mapping is supported for
+    bootstrap. In multi-user mode an unbound sender is denied private work.
+    """
+    user = repo.get_user_by_feishu_open_id(open_id)
+    if user:
+        return user
+    for item in str(getattr(settings, "feishu_user_bindings", "") or "").split(","):
+        if ":" not in item:
+            continue
+        oid, raw_id = item.split(":", 1)
+        if oid.strip() != open_id:
+            continue
+        try:
+            uid = int(raw_id.strip())
+        except ValueError:
+            return None
+        with repo.SessionLocal() as db:
+            from app.db.models import User
+            row = db.get(User, uid)
+            if row and row.is_active:
+                return {"id": row.id, "username": row.username, "role": row.role,
+                        "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
+    if settings.multi_user_enabled:
+        return None
+    return {"id": repo.ensure_default_user(), "role": "admin", "username": "legacy"}
+
+
 def _collaboration_rejection(intent: str, params: dict) -> dict | None:
     caller = str(params.get("_caller_agent") or "").strip()
     if not caller:
@@ -58,16 +88,25 @@ def _format_collaboration_rejection(result: dict) -> str:
 
 def dispatch(text: str, intent: str, params: dict, hint: str, open_id: str) -> str:
     """分发：长任务异步提交回执，其余同步 format；任何异常回处理失败不崩溃"""
-    rejection = _collaboration_rejection(intent, params or {})
+    user = _feishu_user(open_id)
+    if user is None:
+        return "飞书账号尚未绑定系统用户，暂不执行私有任务"
+    params = dict(params or {})
+    params["user_id"] = user["id"]
+    params["user_role"] = user.get("role")
+    params["open_id"] = open_id
+    rejection = _collaboration_rejection(intent, params)
     if rejection is not None:
         return _format_collaboration_rejection(rejection)
     if intent in _LONG:
         kind = f"feishu_{intent}"
-        if not task_queue.has_active(kind):
+        if not task_queue.has_active(kind, user["id"], is_admin=user.get("role") == "admin"):
             task_queue.submit(kind, _LABEL[intent],
                               lambda p, i=intent, o=open_id: _long_job(i, p, o), params)
             return "任务进行中，完成会通知你" + _NOTE
         return "同类任务正在执行中，请稍后再试"
+    from app.core.auth import set_user_context, reset_user_context
+    tokens = set_user_context(user["id"], user.get("role"))
     try:
         if intent == "draft":
             return _handle_draft(open_id, text)
@@ -82,6 +121,8 @@ def dispatch(text: str, intent: str, params: dict, hint: str, open_id: str) -> s
     except Exception as exc:  # noqa: BLE001 单意图失败回处理失败，不崩溃
         logger.error("飞书意图 %s 执行失败: %s", intent, exc)
         return f"处理失败: {str(exc)[:120]}"
+    finally:
+        reset_user_context(tokens)
 
 
 def _long_job(intent: str, params: dict, open_id: str) -> dict:
@@ -98,7 +139,8 @@ def _long_job(intent: str, params: dict, open_id: str) -> dict:
 
 def _fmt_holdings(params: dict, hint: str) -> str:
     """持仓摘要：持仓数/总市值/浮动盈亏/前 5 只"""
-    view = holding_view.build_holding_view()
+    view = holding_view.build_holding_view(
+        params.get("user_id"), is_admin=params.get("user_role") == "admin")
     rows = view["rows"]
     if not rows:
         return "当前无持仓"
@@ -117,7 +159,8 @@ def _fmt_pnl(params: dict, hint: str) -> str:
     """今日真实盈亏三态：未接入 / Cookie 过期 / 正常（¥与%）"""
     if not (settings.ths_pnl_enable and ths_pnl.load_cookie()):
         return "同花顺未接入（THS_PNL_ENABLE=false 或未配 Cookie）"
-    snap = repo.get_latest_account_pnl() or {}
+    snap = repo.get_latest_account_pnl(
+        params.get("user_id"), is_admin=params.get("user_role") == "admin") or {}
     if snap.get("token_expired"):
         return "同花顺 Cookie 过期，请到 DSH 插件重新登录"
     if snap.get("pnl_yk") is None:
@@ -143,7 +186,9 @@ def _fmt_score(params: dict, hint: str) -> str:
 def _fmt_sell(params: dict, hint: str) -> str:
     """卖出决策（长任务）：按 code 找持仓 hid → run_sell_decision"""
     code = params.get("code", "")
-    holding = next((r for r in repo.list_holdings("holding")
+    holding = next((r for r in repo.list_holdings(
+                        "holding", user_id=params.get("user_id"),
+                        is_admin=params.get("user_role") == "admin")
                     if r["stock_code"] == code), None) if code else None
     if holding is None:
         return f"未找到持仓 {code or params.get('name') or ''}，无法生成卖出决策"
@@ -197,7 +242,8 @@ def _fmt_market(params: dict, hint: str) -> str:
 
 def _fmt_monitor(params: dict, hint: str) -> str:
     """最新 N 条告警"""
-    rows = repo.list_alerts(5)
+    rows = repo.list_alerts(5, user_id=params.get("user_id"),
+                            is_admin=params.get("user_role") == "admin")
     if not rows:
         return "暂无告警记录"
     lines = ["最近告警："]
@@ -209,7 +255,8 @@ def _fmt_monitor(params: dict, hint: str) -> str:
 
 def _fmt_review(params: dict, hint: str) -> str:
     """最新复盘"""
-    rows = repo.list_reviews(None, 3)
+    rows = repo.list_reviews(None, 3, user_id=params.get("user_id"),
+                             is_admin=params.get("user_role") == "admin")
     if not rows:
         return "暂无复盘记录"
     lines = ["最近复盘："] + [f"{r['stock_name'] or r['stock_code']} {r.get('exit_date') or ''} "

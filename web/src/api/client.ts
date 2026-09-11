@@ -18,10 +18,31 @@ const apiOcr = axios.create({ baseURL: '/api', timeout: 180_000 })
 /** chat_learn 上传 60s */
 const apiUpload = axios.create({ baseURL: '/api', timeout: 60_000 })
 
+const AUTH_TOKEN_KEY = 'stock-agent.auth_token'
+
+export function getAuthToken(): string {
+  return typeof window === 'undefined' ? '' : (window.localStorage.getItem(AUTH_TOKEN_KEY) ?? '')
+}
+
+export function setAuthToken(token: string) {
+  if (typeof window === 'undefined') return
+  if (token) window.localStorage.setItem(AUTH_TOKEN_KEY, token)
+  else window.localStorage.removeItem(AUTH_TOKEN_KEY)
+}
+
+for (const inst of [api, apiPost, apiOcr, apiUpload]) {
+  inst.interceptors.request.use((config) => {
+    const token = getAuthToken()
+    if (token) config.headers.Authorization = `Bearer ${token}`
+    return config
+  })
+}
+
 function toErr(err: unknown): Error {
   if (axios.isAxiosError(err)) {
     const status = err.response?.status
     const detail = (err.response?.data as { detail?: unknown } | undefined)?.detail
+    if (status === 401) setAuthToken('')
     if (status === 409) return new ConflictError(typeof detail === 'string' ? detail : '状态冲突：操作不允许')
     if (err.response) return new Error(typeof detail === 'string' ? detail : `请求失败（HTTP ${status}）`)
     return new Error('网络错误：无法连接后端服务')

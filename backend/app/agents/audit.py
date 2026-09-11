@@ -3,6 +3,7 @@ collect_audit 读建议 → llm_audit 首审 / llm_re_audit 重审 → run_pendi
 import json
 import logging
 import concurrent.futures
+import contextvars
 import time
 from hashlib import sha256
 
@@ -19,6 +20,11 @@ AUDIT_ITEM_TIMEOUT_SECONDS = 90
 
 def collect_audit(suggestion) -> dict:
     """聚合单条待审建议 → 审核输入（只读，不改任何字段）"""
+    from app.core.auth import current_user_id
+    owner_id = current_user_id()
+    if settings.multi_user_enabled and (owner_id is None or
+                                        getattr(suggestion, "user_id", None) != owner_id):
+        raise PermissionError("建议不属于当前账号")
     fields = (
         "id", "review_id", "target_agent", "target_kind", "rule_type", "priority",
         "rule_name", "current_value", "suggested_value", "rule_text", "problem_desc",
@@ -66,6 +72,11 @@ def llm_re_audit(suggestion, dissent_view: str) -> AuditOutput:
 
 def _persist(suggestion, audit_round: int, out: AuditOutput, duration_ms: int) -> int:
     """落 audit_log + 原表 3 个 audit 字段（reasoning 存 LLM 原始 JSON 全文）"""
+    from app.core.auth import current_user_id
+    owner_id = current_user_id()
+    if settings.multi_user_enabled and (owner_id is None or
+                                        getattr(suggestion, "user_id", None) != owner_id):
+        raise PermissionError("建议不属于当前账号")
     log_id = repo.insert_audit_log(
         target_type="agent_suggestion", target_id=suggestion.id, audit_round=audit_round,
         verdict=out.verdict, confidence=out.confidence,
@@ -73,15 +84,16 @@ def _persist(suggestion, audit_round: int, out: AuditOutput, duration_ms: int) -
         boundary_cases=out.boundary_cases, evidence_refs=list(out.evidence_refs or []),
         audit_model=settings.deepseek_reasoning_model,
         reasoning=json.dumps(out.model_dump(), ensure_ascii=False, default=str),
-        duration_ms=duration_ms)
+        duration_ms=duration_ms, user_id=owner_id)
     repo.update_agent_suggestion_audit(suggestion.id, audit_verdict=out.verdict,
-                                       audit_round=audit_round, last_audit_id=log_id)
+                                       audit_round=audit_round, last_audit_id=log_id,
+                                       user_id=owner_id)
     return log_id
 
 
 def _call_with_timeout(fn, timeout_seconds: int, *args):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(fn, *args)
+    future = executor.submit(contextvars.copy_context().run, fn, *args)
     try:
         return future.result(timeout=timeout_seconds)
     except concurrent.futures.TimeoutError as exc:
@@ -91,12 +103,21 @@ def _call_with_timeout(fn, timeout_seconds: int, *args):
 
 
 def run_pending_audits(cutoff_id: int = 0, last_scanned_id: int | None = None,
-                       limit: int = 50) -> dict:
+                       limit: int = 50, user_id: int | None = None) -> dict:
     """批量扫描待审建议辩证审核（幂等：pass/round2-fail 不再自动重审）。
     单条 fail/异常/超时隔离：不中断整批；round2 仍 fail → 定格不再第 3 轮。"""
-    cursor = max(cutoff_id or 0, int(repo.get_config("audit_cursor.last_id") or 0),
+    from app.core.auth import current_user_id
+    owner_id = user_id if user_id is not None else current_user_id()
+    if owner_id is None and not settings.multi_user_enabled:
+        owner_id = None
+    elif owner_id is None:
+        raise RuntimeError("audit batch requires authenticated user context")
+    if user_id is not None and user_id != current_user_id():
+        raise PermissionError("audit context cannot process another user's suggestions")
+    cursor_key = f"audit_cursor.u{owner_id}.last_id" if owner_id is not None else "audit_cursor.last_id"
+    cursor = max(cutoff_id or 0, int(repo.get_config(cursor_key) or 0),
                  last_scanned_id or 0)
-    rows = repo.list_agent_suggestions_for_audit(cursor, limit)
+    rows = repo.list_agent_suggestions_for_audit(cursor, limit, user_id=owner_id)
     audited, rethunk, failed = 0, 0, 0
     errors: list[dict] = []
     blocked_id: int | None = None
@@ -105,7 +126,7 @@ def run_pending_audits(cutoff_id: int = 0, last_scanned_id: int | None = None,
             nxt = (s.audit_round or 0) + 1
             prev_dissent = ""
             if nxt >= 2 and s.last_audit_id:
-                prev_log = repo.get_audit_log(s.last_audit_id)
+                prev_log = repo.get_audit_log(s.last_audit_id, user_id=owner_id)
                 prev_dissent = prev_log.dissent_view if prev_log else ""
             t0 = time.time()
             if nxt >= 2:
@@ -124,13 +145,13 @@ def run_pending_audits(cutoff_id: int = 0, last_scanned_id: int | None = None,
                     logger.warning("audit 触发 rethink 失败 review#%s: %s", s.review_id, exc)
             elif blocked_id is None:
                 cursor = max(cursor, s.id)
-                repo.set_config("audit_cursor.last_id", str(cursor))
+                repo.set_config(cursor_key, str(cursor))
         except Exception as exc:  # noqa: BLE001 单条失败隔离，后续建议继续审核
             failed += 1
             blocked_id = s.id if blocked_id is None else min(blocked_id, s.id)
             errors.append({"id": s.id, "error": str(exc)[:300]})
             logger.exception("audit 单条审核失败 suggestion#%s: %s", s.id, exc)
-    repo.set_config("audit_cursor.last_id", str(cursor))
+    repo.set_config(cursor_key, str(cursor))
     return {"audited": audited, "rethunk": rethunk, "failed": failed,
             "errors": errors, "cursor": cursor}
 
@@ -141,8 +162,12 @@ def _call_re_audit(suggestion, dissent_view: str) -> AuditOutput:
 
 def trigger_audit_for_suggestion(suggestion_id: int) -> dict:
     """手动触发单条建议审核：仅 pending/fail 跑一次，不推进批量游标。"""
-    s = repo.get_agent_suggestion(suggestion_id)
-    if s is None:
+    from app.core.auth import current_user_id
+    owner_id = current_user_id()
+    if owner_id is None:
+        raise RuntimeError("audit requires authenticated user context")
+    s = repo.get_agent_suggestion_for_user(suggestion_id, owner_id, is_admin=False)
+    if s is None or (settings.multi_user_enabled and getattr(s, "user_id", None) != owner_id):
         raise LookupError("建议不存在")
     verdict = s.audit_verdict or "pending"
     if verdict not in ("pending", "fail"):
@@ -152,7 +177,7 @@ def trigger_audit_for_suggestion(suggestion_id: int) -> dict:
     nxt = (s.audit_round or 0) + 1
     prev_dissent = ""
     if nxt >= 2 and s.last_audit_id:
-        prev_log = repo.get_audit_log(s.last_audit_id)
+        prev_log = repo.get_audit_log(s.last_audit_id, user_id=owner_id)
         prev_dissent = prev_log.dissent_view if prev_log else ""
     t0 = time.time()
     out = llm_re_audit(s, prev_dissent) if nxt >= 2 else llm_audit(s)

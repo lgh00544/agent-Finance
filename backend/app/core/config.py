@@ -7,6 +7,7 @@
 所有密钥仅从环境变量/.env 读取，代码零硬编码。
 """
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -30,6 +31,16 @@ class Settings(BaseSettings):
     db_backend: str = "sqlite"     # sqlite（默认，单文件 data/dev.db）/ mysql
     cache_backend: str = "memory"  # memory（默认，进程内）/ redis
     qdrant_mode: str = "local"     # local（默认，本地文件模式，存 data/qdrant_storage）/ server
+    multi_user_enabled: bool = False
+    auth_session_ttl_hours: int = 24
+    auth_default_username: str = "legacy"
+    auth_default_password: str = ""
+    redis_namespace: str = "stock-agent"
+    scheduler_leader_ttl_seconds: int = 90
+    scheduler_leader_renew_seconds: int = 30
+    server_port: int = 8100
+    sqlite_path: str = ""
+    qdrant_local_path: str = ""
     # 高频读接口结果缓存（秒）：候选/评分/建仓/持仓/告警/复盘列表短缓存，
     # 写操作自动失效保证一致；设为 0 关闭（数据变更需即时可见的场景可关）
     db_query_cache_ttl: int = 60
@@ -77,6 +88,7 @@ class Settings(BaseSettings):
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_admin_open_ids: str = ""  # 白名单 open_id，逗号分隔；空=只打印 open_id 不回复
+    feishu_user_bindings: str = ""  # open_id:user_id 映射，逗号分隔
     feishu_bridge_alert_direct: bool = False  # 告警双通道：true=webhook 外同时机器人直发
     feishu_media_dir: str = "data/feishu_media"  # 视频/文件存档目录（批3 预留）
 
@@ -234,7 +246,7 @@ class Settings(BaseSettings):
     @property
     def qdrant_path(self) -> Path:
         """本地文件模式 Qdrant 存储目录（迁移系统直接复制该目录）"""
-        return self.data_dir / "qdrant_storage"
+        return Path(self.qdrant_local_path) if self.qdrant_local_path else self.data_dir / "qdrant_storage"
 
     @property
     def redis_url(self) -> str:
@@ -251,6 +263,23 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def validate_multi_user_startup() -> None:
+    """Fail closed before startup when shared resources are misconfigured."""
+    if not settings.multi_user_enabled:
+        return
+    errors = []
+    if settings.db_backend.lower() != "mysql":
+        errors.append("DB_BACKEND=mysql")
+    if settings.cache_backend.lower() != "redis":
+        errors.append("CACHE_BACKEND=redis")
+    if settings.qdrant_mode.lower() != "server":
+        errors.append("QDRANT_MODE=server")
+    if not settings.auth_default_password:
+        errors.append("AUTH_DEFAULT_PASSWORD")
+    if errors:
+        raise RuntimeError("多人模式启动校验失败，必须配置: " + ", ".join(errors))
 
 
 def market_band_info(score: float) -> tuple[int, str, str, str]:

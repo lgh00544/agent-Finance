@@ -164,11 +164,12 @@ def run_position(code: str, stock_name: str = "", trade_date: str | None = None,
 
 
 def run_monitor(holding_id: int, trade_date: str | None = None,
-                batch_quotes: dict[str, dict] | None = None) -> StockAgentState:
+                batch_quotes: dict[str, dict] | None = None,
+                user_id: int | None = None, *, is_admin: bool = False) -> StockAgentState:
     """单持仓监控（行情 → LLM 信号 → 去重推送）"""
     from app.db import repo
 
-    holding = repo.get_holding(holding_id)
+    holding = repo.get_holding_for_user(holding_id, user_id, is_admin=is_admin)
     if holding is None:
         return _new_state(holding_id=holding_id, error=f"持仓不存在: {holding_id}")
     graph = get_graph("monitor")
@@ -181,13 +182,14 @@ def run_monitor(holding_id: int, trade_date: str | None = None,
     return result
 
 
-def run_monitor_all(trade_date: str | None = None) -> list[StockAgentState]:
+def run_monitor_all(trade_date: str | None = None, user_id: int | None = None,
+                    *, is_admin: bool = False) -> list[StockAgentState]:
     """批量监控全部持仓：行情一次批量预取（全持仓统一获取后再过滤），
     避免逐只循环请求触发数据源限流；单持仓手动监控路径不受影响"""
     from app.db import repo
     from app.datasource.fallback import get_datasource
 
-    holdings = repo.get_active_holdings()
+    holdings = repo.get_active_holdings(user_id, is_admin=is_admin)
     codes = [h.stock_code for h in holdings]
     batch: dict[str, dict] = {}
     try:
@@ -197,7 +199,8 @@ def run_monitor_all(trade_date: str | None = None) -> list[StockAgentState]:
     results = []
     for h in holdings:
         try:
-            results.append(run_monitor(h.id, trade_date, batch))
+            results.append(run_monitor(h.id, trade_date, batch, user_id,
+                                       is_admin=is_admin))
         except Exception as exc:  # noqa: BLE001 单持仓失败不阻塞其他
             logger.error("监控 %s 失败: %s", h.stock_code, exc)
     logger.info("批量监控完成: %s/%s（批量行情命中 %s/%s）",
@@ -205,11 +208,12 @@ def run_monitor_all(trade_date: str | None = None) -> list[StockAgentState]:
     return results
 
 
-def run_sell_decision(holding_id: int, trade_date: str | None = None) -> StockAgentState:
+def run_sell_decision(holding_id: int, trade_date: str | None = None,
+                      user_id: int | None = None, *, is_admin: bool = False) -> StockAgentState:
     """单持仓卖出决策（人工按需触发）"""
     from app.db import repo
 
-    holding = repo.get_holding(holding_id)
+    holding = repo.get_holding_for_user(holding_id, user_id, is_admin=is_admin)
     if holding is None:
         return _new_state(holding_id=holding_id, error=f"持仓不存在: {holding_id}")
     graph = get_graph("sell")

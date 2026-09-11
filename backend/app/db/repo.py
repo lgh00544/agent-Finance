@@ -31,7 +31,8 @@ from app.db.models import (
     SectorNewsAIInterpret, SectorNewsArticle, SectorNewsFeedback, SectorNewsShadowVerify,
     SectorRegimeForecast,
     SellDecision, StockCandidate, StockScore, TradeProfile,
-    TradeRecord, WorkerRun, _now, DistributionPhaseLog,
+    TradeRecord, WorkerRun, _now, DistributionPhaseLog, User, UserSession,
+    PublicFactSnapshot,
 )
 from app.db.session import SessionLocal
 from app.services import reasoning_trace, task_queue
@@ -39,8 +40,192 @@ from app.services import reasoning_trace, task_queue
 logger = logging.getLogger(__name__)
 
 
+def _experience_scope_user(user_id: int | None = None, *, for_write: bool = False) -> int | None:
+    """Resolve private experience owner; multi-user calls fail closed without context."""
+    if user_id is not None:
+        return int(user_id)
+    try:
+        from app.core.auth import current_user_id
+        current = current_user_id()
+    except Exception:
+        current = None
+    if current is not None:
+        return int(current)
+    if settings.multi_user_enabled:
+        raise RuntimeError("experience data requires an authenticated user context")
+    return 1 if for_write else None
+
+
 def _json(value: Any) -> Any:
     return value if value is not None else None
+
+
+# ==================== 多人身份与公共事实 ====================
+
+def ensure_default_user() -> int:
+    """幂等创建旧单用户兼容主体并回填其 id。"""
+    from app.core.auth import hash_password
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(User.id == 1)).scalar_one_or_none()
+        if row is None:
+            if settings.multi_user_enabled and not settings.auth_default_password:
+                raise RuntimeError("多人模式禁止使用空默认密码，请设置 AUTH_DEFAULT_PASSWORD")
+            row = User(id=1, username=settings.auth_default_username,
+                       password_hash=hash_password(settings.auth_default_password or "legacy"),
+                       role="admin")
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        return row.id
+
+
+def create_user(username: str, password: str, role: str = "researcher") -> dict:
+    if role not in {"admin", "researcher", "viewer"}:
+        raise ValueError("角色仅支持 admin/researcher/viewer")
+    from app.core.auth import hash_password
+    with SessionLocal() as db:
+        if db.execute(select(User).where(User.username == username)).scalar_one_or_none():
+            raise ValueError("用户名已存在")
+        row = User(username=username.strip(), password_hash=hash_password(password),
+                   role=role, is_active=True)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"id": row.id, "username": row.username, "role": row.role,
+                "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
+
+
+def get_user_by_credentials(username: str, password: str) -> dict | None:
+    from app.core.auth import verify_password
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(User.username == username.strip(),
+                                             User.is_active.is_(True))).scalar_one_or_none()
+        if row is None or not verify_password(password, row.password_hash):
+            return None
+        return {"id": row.id, "username": row.username, "role": row.role,
+                "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
+
+
+def change_user_password(user_id: int, current_password: str, new_password: str) -> bool:
+    """Verify the current secret, rotate the hash, and revoke all old sessions."""
+    from app.core.auth import hash_password, verify_password
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(User.id == int(user_id),
+                                            User.is_active.is_(True))).scalar_one_or_none()
+        if row is None or not verify_password(current_password, row.password_hash):
+            return False
+        row.password_hash = hash_password(new_password)
+        db.query(UserSession).filter(UserSession.user_id == row.id,
+                                     UserSession.revoked_at.is_(None)).update(
+                                         {UserSession.revoked_at: _now()},
+                                         synchronize_session=False)
+        db.commit()
+        return True
+
+
+def get_user_by_feishu_open_id(open_id: str) -> dict | None:
+    """Resolve a Feishu sender to an application user without trusting message payloads."""
+    if not open_id:
+        return None
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(
+            User.feishu_open_id == open_id, User.is_active.is_(True)
+        )).scalar_one_or_none()
+        if row is None:
+            return None
+        return {"id": row.id, "username": row.username, "role": row.role,
+                "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
+
+
+def bind_user_feishu_open_id(user_id: int, open_id: str) -> bool:
+    """Bind one Feishu open_id to one user; duplicate bindings are rejected."""
+    if not open_id:
+        raise ValueError("open_id 不能为空")
+    with SessionLocal() as db:
+        row = db.get(User, user_id)
+        if row is None:
+            return False
+        other = db.execute(select(User).where(
+            User.feishu_open_id == open_id, User.id != user_id
+        )).scalar_one_or_none()
+        if other is not None:
+            raise ValueError("open_id 已绑定其他用户")
+        row.feishu_open_id = open_id
+        db.commit()
+        return True
+
+
+def list_active_users() -> list[dict]:
+    with SessionLocal() as db:
+        rows = db.execute(select(User).where(User.is_active.is_(True)).order_by(User.id)).scalars().all()
+        return [{"id": r.id, "username": r.username, "role": r.role,
+                 "is_active": r.is_active, "feishu_open_id": r.feishu_open_id}
+                for r in rows]
+
+
+def create_user_session(user_id: int, token: str, expires_at: datetime) -> int:
+    with SessionLocal() as db:
+        row = UserSession(user_id=user_id,
+                          token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                          expires_at=expires_at)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def get_user_by_token(token: str) -> dict | None:
+    if not token:
+        return None
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with SessionLocal() as db:
+        row = db.execute(
+            select(User, UserSession).join(UserSession, UserSession.user_id == User.id).where(
+                UserSession.token_hash == digest, UserSession.revoked_at.is_(None),
+                UserSession.expires_at > _now(), User.is_active.is_(True))
+        ).first()
+        if row is None:
+            return None
+        user, _session = row
+        return {"id": user.id, "username": user.username, "role": user.role,
+                "is_active": user.is_active}
+
+
+def upsert_public_fact(fact_type: str, source: str, symbol: str, fact_as_of: str,
+                       payload: dict, content_hash: str | None = None) -> dict:
+    digest = content_hash or hashlib.sha256(
+        json.dumps(payload or {}, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+    with SessionLocal() as db:
+        row = db.execute(select(PublicFactSnapshot).where(
+            PublicFactSnapshot.source == source, PublicFactSnapshot.symbol == symbol,
+            PublicFactSnapshot.fact_as_of == fact_as_of,
+            PublicFactSnapshot.content_hash == digest)).scalar_one_or_none()
+        if row is None:
+            row = PublicFactSnapshot(fact_type=fact_type, source=source, symbol=symbol,
+                                     fact_as_of=fact_as_of, content_hash=digest,
+                                     payload=payload or {})
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        return {"id": row.id, "fact_type": row.fact_type, "source": row.source,
+                "symbol": row.symbol, "fact_as_of": row.fact_as_of,
+                "content_hash": row.content_hash, "payload": row.payload or {}}
+
+
+def list_public_facts(symbol: str | None = None, fact_type: str | None = None,
+                      limit: int = 100) -> list[dict]:
+    with SessionLocal() as db:
+        stmt = select(PublicFactSnapshot).order_by(PublicFactSnapshot.id.desc())
+        if symbol:
+            stmt = stmt.where(PublicFactSnapshot.symbol == symbol)
+        if fact_type:
+            stmt = stmt.where(PublicFactSnapshot.fact_type == fact_type)
+        rows = db.execute(stmt.limit(max(1, min(limit, 1000)))).scalars().all()
+        return [{"id": r.id, "fact_type": r.fact_type, "source": r.source,
+                 "symbol": r.symbol, "fact_as_of": r.fact_as_of,
+                 "content_hash": r.content_hash, "payload": r.payload or {},
+                 "created_at": str(r.created_at)} for r in rows]
 
 
 # ==================== 高频读结果缓存（TTL 短缓存，写操作自动失效） ====================
@@ -72,6 +257,14 @@ def _invalidate(table: str) -> None:
     """写操作后失效该表全部读缓存（按命名空间批量删除）"""
     if settings.db_query_cache_ttl > 0:
         cache.delete_prefix(f"dbq:{table}:")
+
+
+def _context_user_id(default: int | None = None) -> int | None:
+    try:
+        from app.core.auth import current_user_id
+        return current_user_id() or default
+    except Exception:
+        return default
 
 
 def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: int,
@@ -905,6 +1098,14 @@ def upsert_quote_snapshot(rows: list[dict]) -> int:
                 updated_at=_parse_ts(r.get("updated_at")),
             ))
         db.commit()
+    for r in rows:
+        upsert_public_fact(
+            "quote", str(r.get("source") or "quote_snapshot"),
+            str(r.get("stock_code") or ""), str(r.get("updated_at") or _now()),
+            {"stock_code": r.get("stock_code"), "name": r.get("name", ""),
+             "price": r.get("price", 0.0), "change_pct": r.get("change_pct"),
+             "source": r.get("source", "")},
+        )
     return len(rows)
 
 
@@ -1211,14 +1412,22 @@ def upsert_score(stock_code: str, stock_name: str, trade_date: str, score: float
 
 def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: float,
                 batches: list, stop_loss: float, take_profit: float, rationale: str,
-                detail: dict | None = None, source: str = "manual") -> int:
+                detail: dict | None = None, source: str = "manual",
+                user_id: int | None = None) -> int:
     """detail: v3.0 白盒扩展（dimensions/final_advice/market_regime/freshness/quant），可选；
     旧调用零影响。同一标的同一交易日追加新版本，旧的 proposed 版本标记 superseded；
     已采纳版本保留原状态。source: candidate=每日候选池联动 / manual=手动生成。"""
+    if user_id is None:
+        try:
+            from app.core.auth import current_user_id
+            user_id = current_user_id() or 1
+        except Exception:
+            user_id = 1
     with SessionLocal() as db:
         stmt = (select(PositionPlan).where(
             PositionPlan.stock_code == stock_code, PositionPlan.plan_date == plan_date)
                 .order_by(PositionPlan.id.desc()))
+        stmt = stmt.where(PositionPlan.user_id == user_id)
         previous = db.execute(stmt).scalars().all()
         previous_id = previous[0].id if previous else None
         for old in previous:
@@ -1228,7 +1437,7 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
                            total_pct=total_pct, batches=batches, stop_loss=stop_loss,
                            take_profit=take_profit, rationale=rationale, detail=detail,
                            source=source if source in ("candidate", "manual") else "manual",
-                           supersedes_id=previous_id)
+                           supersedes_id=previous_id, user_id=user_id)
         db.add(row)
         task_queue.guarded_commit(db)
         db.refresh(row)
@@ -1242,13 +1451,14 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
 
 def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: str,
                  message: str, action: str, signal: dict, pushed: bool,
-                 source: str = "monitor", extra: dict | None = None) -> int:
+                 source: str = "monitor", extra: dict | None = None,
+                 user_id: int | None = None) -> int:
     """写告警日志；source 标记来源（monitor/portfolio_sentinel）。extra=thinking 摘要，仅进 trace_alert.ext_info，
     业务表 signal 保持干净。默认 None 零行为。"""
     with SessionLocal() as db:
         row = AlertLog(stock_code=stock_code, stock_name=stock_name, alert_type=alert_type,
                        severity=severity, message=message, action=action, signal=signal,
-                       pushed=pushed, source=source)
+                       pushed=pushed, source=source, user_id=user_id)
         db.add(row)
         task_queue.guarded_commit(db)
         db.refresh(row)
@@ -1264,11 +1474,12 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
 
 def insert_review(stock_code: str, stock_name: str, holding_id: int, exit_date: str,
                   hold_days: int, pnl_pct: float, plan_vs_actual: dict, lesson: str,
-                  feedback: dict) -> int:
+                  feedback: dict, user_id: int | None = None) -> int:
     with SessionLocal() as db:
         row = ReviewResult(stock_code=stock_code, stock_name=stock_name, holding_id=holding_id,
                            exit_date=exit_date, hold_days=hold_days, pnl_pct=pnl_pct,
-                           plan_vs_actual=plan_vs_actual, lesson=lesson, feedback=feedback)
+                           plan_vs_actual=plan_vs_actual, lesson=lesson, feedback=feedback,
+                           user_id=user_id)
         db.add(row)
         task_queue.guarded_commit(db)
         db.refresh(row)
@@ -1355,15 +1566,28 @@ def get_review_reject_history(code: str | None = None, limit: int = 10) -> list[
         return result
 
 
-def get_latest_preference() -> dict | None:
+def get_latest_preference(user_id: int | None = None) -> dict | None:
+    if user_id is None:
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
     with SessionLocal() as db:
-        row = db.execute(
-            select(AgentPreference).where(
-                # status 列为后加迁移列；NULL 视为历史 active，兼容旧 MySQL 数据。
-                (AgentPreference.status == "active") | AgentPreference.status.is_(None)
-            ).order_by(AgentPreference.version.desc()).limit(1)
-        ).scalar_one_or_none()
+        stmt = select(AgentPreference).where(
+            (AgentPreference.status == "active") | AgentPreference.status.is_(None))
+        if user_id is not None:
+            stmt = stmt.where((AgentPreference.user_id == user_id) |
+                              AgentPreference.user_id.is_(None))
+        row = db.execute(stmt.order_by(AgentPreference.version.desc()).limit(1)
+                         ).scalar_one_or_none()
         return _json(row.content) if row else None
+
+
+def get_latest_preference_version(user_id: int | None = None) -> int:
+    with SessionLocal() as db:
+        stmt = select(AgentPreference.version).where(
+            (AgentPreference.status == "active") | AgentPreference.status.is_(None))
+        if user_id is not None:
+            stmt = stmt.where((AgentPreference.user_id == user_id) | AgentPreference.user_id.is_(None))
+        value = db.execute(stmt.order_by(AgentPreference.version.desc()).limit(1)).scalar_one_or_none()
+        return int(value or 0)
 
 
 def upsert_preference(content: dict, source_review_id: int | None = None,
@@ -1373,17 +1597,25 @@ def upsert_preference(content: dict, source_review_id: int | None = None,
     有效复盘来源默认 pending，由审核采纳后激活；无复盘来源的旧调用默认 active，
     保持历史导入/接口兼容。调用方可显式传 status 覆盖默认值。
     """
+    try:
+        from app.core.auth import current_user_id
+        user_id = current_user_id() or 1
+    except Exception:
+        user_id = 1
     with SessionLocal() as db:
         if status is None:
             status = "active"
             if source_review_id is not None and db.get(ReviewResult, source_review_id) is not None:
                 status = "pending"
         latest = db.execute(
-            select(AgentPreference).order_by(AgentPreference.version.desc()).limit(1)
+            select(AgentPreference).where(
+                (AgentPreference.user_id == user_id) | AgentPreference.user_id.is_(None)
+            ).order_by(AgentPreference.version.desc()).limit(1)
         ).scalar_one_or_none()
         version = (latest.version + 1) if latest else 1
         db.add(AgentPreference(version=version, content=content,
-                               source_review_id=source_review_id, status=status))
+                               source_review_id=source_review_id, status=status,
+                               user_id=user_id))
         db.commit()
 
 
@@ -1471,6 +1703,13 @@ def add_news(stock_code: str, stock_name: str, title: str, content: str,
         db.add(NewsArticle(stock_code=stock_code, stock_name=stock_name, title=title,
                            content=content[:2000], source=source, url=url, published_at=published_at))
         db.commit()
+        upsert_public_fact(
+            "news", source or "news_article", stock_code,
+            published_at or _now().isoformat(timespec="seconds"),
+            {"stock_code": stock_code, "stock_name": stock_name, "title": title,
+             "content": content[:2000], "source": source, "url": url,
+             "published_at": published_at},
+        )
         return True
 
 
@@ -1497,11 +1736,19 @@ def get_recent_news(stock_code: str, days: int = 7) -> list[dict]:
 
 
 def get_trade_profile() -> TradeProfile | None:
-    """读取交易偏好档案（全局单行，id=1）"""
+    """读取当前用户交易偏好档案；关闭多人模式时兼容 legacy id=1。"""
+    try:
+        from app.core.auth import current_user_id
+        user_id = current_user_id() or 1
+    except Exception:
+        user_id = 1
     with SessionLocal() as db:
-        row = db.get(TradeProfile, 1)
+        row = db.execute(select(TradeProfile).where(
+            (TradeProfile.user_id == user_id) | (TradeProfile.id == user_id)
+        ).order_by(TradeProfile.id).limit(1)).scalar_one_or_none()
         if row is None:
-            row = TradeProfile(id=1, version=1, content=_default_profile())
+            row = TradeProfile(id=user_id, user_id=user_id, version=1,
+                               content=_default_profile())
             db.add(row)
             db.commit()
             db.refresh(row)
@@ -1514,11 +1761,18 @@ def get_trade_profile_content() -> dict:
 
 
 def update_trade_profile(content: dict) -> int:
-    """更新偏好档案，version 递增（用于 LLM 缓存失效）"""
+    """更新当前用户偏好档案，version 递增（用于 LLM 缓存失效）。"""
+    try:
+        from app.core.auth import current_user_id
+        user_id = current_user_id() or 1
+    except Exception:
+        user_id = 1
     with SessionLocal() as db:
-        row = db.get(TradeProfile, 1)
+        row = db.execute(select(TradeProfile).where(
+            (TradeProfile.user_id == user_id) | (TradeProfile.id == user_id)
+        ).order_by(TradeProfile.id).limit(1)).scalar_one_or_none()
         if row is None:
-            row = TradeProfile(id=1, version=1, content=content)
+            row = TradeProfile(id=user_id, user_id=user_id, version=1, content=content)
             db.add(row)
         else:
             row.version += 1
@@ -1528,24 +1782,28 @@ def update_trade_profile(content: dict) -> int:
 
 
 def insert_account_baseline(trade_date: str, total_asset: float, available_cash: float,
-                            position_pct: float, source: str = "ocr") -> int:
+                            position_pct: float, source: str = "ocr",
+                            user_id: int | None = None) -> int:
     """保存账户基准快照（人工确认后调用；每次插入一行保留历史，读取取最新）"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
         row = AccountBaseline(trade_date=trade_date, total_asset=total_asset,
                               available_cash=available_cash, position_pct=position_pct,
-                              source=source)
+                              source=source, user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
         return row.id
 
 
-def get_latest_account_baseline() -> dict | None:
+def get_latest_account_baseline(user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """读取最新账户基准快照；无记录返回 None"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        row = db.execute(
-            select(AccountBaseline).order_by(AccountBaseline.id.desc()).limit(1)
-        ).first()
+        stmt = select(AccountBaseline).order_by(AccountBaseline.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AccountBaseline.user_id == user_id)
+        row = db.execute(stmt.limit(1)).first()
         if row is None:
             return None
         r = row[0]
@@ -1559,20 +1817,23 @@ def get_latest_account_baseline() -> dict | None:
 def upsert_account_pnl_snapshot(trade_date: str, ts: str, pnl_yk: float | None = None,
                                 pnl_pct: float | None = None, sh_pct: float | None = None,
                                 chart_data: list | None = None, source: str = "ths",
-                                error: str = "", token_expired: bool = False) -> int:
+                                error: str = "", token_expired: bool = False,
+                                user_id: int | None = None) -> int:
     """按 (trade_date, ts) 幂等 upsert 同花顺盈亏快照；返回行 id"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        row = db.execute(
-            select(AccountPnlSnapshot).where(
+        stmt = select(AccountPnlSnapshot).where(
                 AccountPnlSnapshot.trade_date == trade_date,
                 AccountPnlSnapshot.ts == ts,
             )
-        ).scalar_one_or_none()
+        if user_id is not None:
+            stmt = stmt.where(AccountPnlSnapshot.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             row = AccountPnlSnapshot(
                 trade_date=trade_date, ts=ts, pnl_yk=pnl_yk, pnl_pct=pnl_pct,
                 sh_pct=sh_pct, chart_data=chart_data or [], source=source,
-                error=error, token_expired=token_expired)
+                error=error, token_expired=token_expired, user_id=user_id)
             db.add(row)
         else:
             row.pnl_yk = pnl_yk
@@ -1587,12 +1848,14 @@ def upsert_account_pnl_snapshot(trade_date: str, ts: str, pnl_yk: float | None =
         return row.id
 
 
-def get_latest_account_pnl() -> dict | None:
+def get_latest_account_pnl(user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """读取最新同花顺盈亏快照；无记录返回 None"""
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        row = db.execute(
-            select(AccountPnlSnapshot).order_by(AccountPnlSnapshot.id.desc()).limit(1)
-        ).first()
+        stmt = select(AccountPnlSnapshot).order_by(AccountPnlSnapshot.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AccountPnlSnapshot.user_id == user_id)
+        row = db.execute(stmt.limit(1)).first()
         if row is None:
             return None
         r = row[0]
@@ -1602,13 +1865,17 @@ def get_latest_account_pnl() -> dict | None:
                 "updated_at": str(r.updated_at)}
 
 
-def list_account_pnl_history(days: int = 30) -> list[dict]:
+def list_account_pnl_history(days: int = 30, user_id: int | None = None,
+                             *, is_admin: bool = False) -> list[dict]:
     """近 N 天同花顺盈亏快照历史（按日降序；每行只取核心字段）"""
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
+        stmt = select(AccountPnlSnapshot).where(AccountPnlSnapshot.trade_date >= cutoff)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AccountPnlSnapshot.user_id == user_id)
         rows = db.execute(
-            select(AccountPnlSnapshot)
-            .where(AccountPnlSnapshot.trade_date >= cutoff)
+            stmt
             .order_by(AccountPnlSnapshot.trade_date.desc(), AccountPnlSnapshot.ts.desc())
             .limit(500)
         ).scalars().all()
@@ -1636,23 +1903,39 @@ def get_holding(holding_id: int) -> Holding | None:
         return db.get(Holding, holding_id)
 
 
-def get_active_holding_by_code(stock_code: str) -> Holding | None:
+def get_holding_for_user(holding_id: int, user_id: int, *, is_admin: bool = False) -> Holding | None:
+    if user_id is None:
+        user_id = _context_user_id(1)
+    with SessionLocal() as db:
+        stmt = select(Holding).where(Holding.id == holding_id)
+        if not is_admin:
+            stmt = stmt.where(Holding.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
+def get_active_holding_by_code(stock_code: str, user_id: int | None = None,
+                               *, is_admin: bool = False) -> Holding | None:
     """读取同代码当前唯一有效持仓，防止人工/OCR重复建仓污染生命周期口径。"""
     with SessionLocal() as db:
+        stmt = select(Holding).where(Holding.stock_code == stock_code,
+                                     Holding.status == "holding")
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(Holding.user_id == user_id)
         return db.execute(
-            select(Holding).where(Holding.stock_code == stock_code,
-                                  Holding.status == "holding")
+            stmt
             .order_by(Holding.id.desc()).limit(1)
         ).scalar_one_or_none()
 
 
 def insert_holding(stock_code: str, stock_name: str, entry_date: str, entry_price: float,
                    shares: int, cost: float, stop_loss: float = 0.0, take_profit: float = 0.0,
-                   target_pct: float = 0.0, plan_id: int | None = None, note: str = "") -> int:
+                   target_pct: float = 0.0, plan_id: int | None = None, note: str = "",
+                   user_id: int | None = None) -> int:
     with SessionLocal() as db:
         row = Holding(stock_code=stock_code, stock_name=stock_name, entry_date=entry_date,
                       entry_price=entry_price, shares=shares, cost=cost, stop_loss=stop_loss,
-                      take_profit=take_profit, target_pct=target_pct, plan_id=plan_id, note=note)
+                      take_profit=take_profit, target_pct=target_pct, plan_id=plan_id, note=note,
+                      user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -1713,11 +1996,11 @@ def ensure_opening_trade(holding_row: Holding) -> dict:
 
 
 def add_trade(holding_id: int, stock_code: str, side: str, price: float,
-              shares: int, trade_date: str, note: str = "") -> int:
+              shares: int, trade_date: str, note: str = "", user_id: int | None = None) -> int:
     with SessionLocal() as db:
         row = TradeRecord(holding_id=holding_id, stock_code=stock_code, side=side,
                           price=price, shares=shares, amount=round(price * shares, 2),
-                          trade_date=trade_date, note=note)
+                          trade_date=trade_date, note=note, user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -1739,7 +2022,8 @@ def record_holding_trade(holding_id: int, *, side: str, price: float, shares: in
                          trade_date: str, note: str,
                          before_shares: int | None = None,
                          after_shares: int | None = None,
-                         holding_fields: dict | None = None) -> int:
+                         holding_fields: dict | None = None,
+                         user_id: int | None = None) -> int:
     """事务化持仓操作写入（手动加仓/减仓/清仓/成本修正共用）：
     操作流水 + 持仓字段更新在单 session 一次 commit，失败整体回滚，保证流水与持仓
     状态一致（K223 留痕与事实一致）。仅数据存取，业务计算（加权成本/C3 等）由调用方
@@ -1751,7 +2035,8 @@ def record_holding_trade(holding_id: int, *, side: str, price: float, shares: in
         db.add(TradeRecord(holding_id=holding_id, stock_code=row.stock_code, side=side,
                            price=price, shares=shares, amount=round(price * shares, 2),
                            trade_date=trade_date, note=note,
-                           before_shares=before_shares, after_shares=after_shares))
+                           before_shares=before_shares, after_shares=after_shares,
+                           user_id=user_id if user_id is not None else row.user_id))
         if holding_fields:
             for k, v in holding_fields.items():
                 setattr(row, k, v)
@@ -1760,10 +2045,13 @@ def record_holding_trade(holding_id: int, *, side: str, price: float, shares: in
         return row.id
 
 
-def get_active_holdings() -> list[Holding]:
+def get_active_holdings(user_id: int | None = None, *, is_admin: bool = False) -> list[Holding]:
+    user_id = _context_user_id(user_id)
     with SessionLocal() as db:
-        return list(db.execute(
-            select(Holding).where(Holding.status == "holding")).scalars().all())
+        stmt = select(Holding).where(Holding.status == "holding")
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(Holding.user_id == user_id)
+        return list(db.execute(stmt).scalars().all())
 
 
 def get_trades(holding_id: int) -> list[TradeRecord]:
@@ -1813,12 +2101,16 @@ def get_latest_plan(code: str) -> PositionPlan | None:
             .order_by(PositionPlan.id.desc()).limit(1)).scalar_one_or_none()
 
 
-def get_plan(plan_id: int | None) -> PositionPlan | None:
+def get_plan(plan_id: int | None, user_id: int | None = None,
+             *, is_admin: bool = False) -> PositionPlan | None:
     """按明确版本读取建仓计划。"""
     if not plan_id:
         return None
     with SessionLocal() as db:
-        return db.get(PositionPlan, plan_id)
+        stmt = select(PositionPlan).where(PositionPlan.id == plan_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PositionPlan.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
 
 
 def get_plan_for_entry(stock_code: str, entry_date: str) -> tuple[PositionPlan | None, str]:
@@ -1833,10 +2125,14 @@ def get_plan_for_entry(stock_code: str, entry_date: str) -> tuple[PositionPlan |
         return (plan, "inferred_before_entry") if plan else (None, "missing")
 
 
-def update_plan_status(plan_id: int, status: str) -> dict | None:
+def update_plan_status(plan_id: int, status: str, user_id: int | None = None,
+                       *, is_admin: bool = False) -> dict | None:
     """人工确认建仓计划状态；只改生命周期，不触发交易或持仓变更。"""
     with SessionLocal() as db:
-        row = db.get(PositionPlan, plan_id)
+        stmt = select(PositionPlan).where(PositionPlan.id == plan_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PositionPlan.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return None
         row.status = status
@@ -1874,9 +2170,14 @@ def list_candidates(date: str | None = None, limit: int = 50) -> list[dict]:
 
 def list_traces(code: str | None = None, date: str | None = None,
                 module: str | None = None, limit: int = 50,
-                end_date: str | None = None) -> list[dict]:
+                end_date: str | None = None, user_id: int | None = None,
+                *, is_admin: bool = False) -> list[dict]:
     """推理留痕轻量列表（不含长文本，详情按需单查；L1 缓存 dbq:trace:，写后由
     reasoning_trace._flush 失效）"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return []
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(AiReasoningTrace).order_by(
@@ -1889,6 +2190,8 @@ def list_traces(code: str | None = None, date: str | None = None,
                 stmt = stmt.where(AiReasoningTrace.generate_date <= end_date)
             if module:
                 stmt = stmt.where(AiReasoningTrace.source_module == module)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTrace.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return [{"trace_id": r.trace_id, "stock_code": r.stock_code,
                      "stock_name": r.stock_name, "source_module": r.source_module,
@@ -1897,14 +2200,22 @@ def list_traces(code: str | None = None, date: str | None = None,
                     for r in rows]
 
     return _dbq("trace", {"code": code, "date": date, "module": module,
-                           "limit": limit, "end_date": end_date}, _load)
+                           "limit": limit, "end_date": end_date, "user_id": user_id,
+                           "is_admin": is_admin}, _load)
 
 
-def get_trace(trace_id: int) -> dict | None:
+def get_trace(trace_id: int, user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """推理留痕完整详情（含全部推理分层文本）"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return None
+
     def _load() -> dict | None:
         with SessionLocal() as db:
-            r = db.get(AiReasoningTrace, trace_id)
+            stmt = select(AiReasoningTrace).where(AiReasoningTrace.trace_id == trace_id)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTrace.user_id == user_id)
+            r = db.execute(stmt).scalar_one_or_none()
             if r is None:
                 return None
             return {"trace_id": r.trace_id, "stock_code": r.stock_code,
@@ -1918,12 +2229,18 @@ def get_trace(trace_id: int) -> dict | None:
                     "data_source": r.data_source, "create_time": r.create_time,
                     "ext_info": r.ext_info}
 
-    return _dbq("trace", {"id": trace_id}, _load)
+    return _dbq("trace", {"id": trace_id, "user_id": user_id,
+                           "is_admin": is_admin}, _load)
 
 
 def list_trace_history(code: str | None = None, date: str | None = None,
-                       module: str | None = None, limit: int = 100) -> list[dict]:
+                       module: str | None = None, limit: int = 100,
+                       user_id: int | None = None, *, is_admin: bool = False) -> list[dict]:
     """推理留痕追加历史轻量列表；当前 /traces 投影接口保持最新版本语义。"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return []
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(AiReasoningTraceHistory).order_by(
@@ -1935,6 +2252,8 @@ def list_trace_history(code: str | None = None, date: str | None = None,
                 stmt = stmt.where(AiReasoningTraceHistory.generate_date == date)
             if module:
                 stmt = stmt.where(AiReasoningTraceHistory.source_module == module)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTraceHistory.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return [{"history_id": r.history_id, "stock_code": r.stock_code,
                      "stock_name": r.stock_name, "source_module": r.source_module,
@@ -1943,14 +2262,24 @@ def list_trace_history(code: str | None = None, date: str | None = None,
                      "recorded_at": str(r.recorded_at)} for r in rows]
 
     return _dbq("trace_history",
-                {"code": code, "date": date, "module": module, "limit": limit}, _load)
+                {"code": code, "date": date, "module": module, "limit": limit,
+                 "user_id": user_id, "is_admin": is_admin}, _load)
 
 
-def get_trace_history(history_id: int) -> dict | None:
+def get_trace_history(history_id: int, user_id: int | None = None,
+                      *, is_admin: bool = False) -> dict | None:
     """读取单条推理留痕历史全文；只读，不影响当前投影。"""
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return None
+
     def _load() -> dict | None:
         with SessionLocal() as db:
-            r = db.get(AiReasoningTraceHistory, history_id)
+            stmt = select(AiReasoningTraceHistory).where(
+                AiReasoningTraceHistory.history_id == history_id)
+            if settings.multi_user_enabled and not is_admin:
+                stmt = stmt.where(AiReasoningTraceHistory.user_id == user_id)
+            r = db.execute(stmt).scalar_one_or_none()
             if r is None:
                 return None
             return {"history_id": r.history_id, "stock_code": r.stock_code,
@@ -1964,7 +2293,8 @@ def get_trace_history(history_id: int) -> dict | None:
                     "data_source": r.data_source, "create_time": r.create_time,
                     "ext_info": r.ext_info, "recorded_at": str(r.recorded_at)}
 
-    return _dbq("trace_history", {"id": history_id}, _load)
+    return _dbq("trace_history", {"id": history_id, "user_id": user_id,
+                                   "is_admin": is_admin}, _load)
 
 
 def list_candidate_dates(limit: int = 30) -> list[str]:
@@ -2329,12 +2659,15 @@ def list_scores(code: str | None = None, date: str | None = None, limit: int = 1
     return _dbq("score", {"code": code, "date": date, "limit": limit}, _load)
 
 
-def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
+def list_plans(code: str | None = None, limit: int = 50, user_id: int | None = None,
+               *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(PositionPlan).order_by(PositionPlan.id.desc())
             if code:
                 stmt = stmt.where(PositionPlan.stock_code == code)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(PositionPlan.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
@@ -2350,15 +2683,19 @@ def list_plans(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "supersedes_id": r.supersedes_id,
                                            "created_at": str(r.created_at)} for r in rows])
 
-    return _dbq("plan", {"code": code, "limit": limit}, _load)
+    return _dbq("plan", {"code": code, "limit": limit, "user_id": user_id,
+                           "is_admin": is_admin}, _load)
 
 
-def list_holdings(status: str | None = None) -> list[dict]:
+def list_holdings(status: str | None = None, user_id: int | None = None,
+                  *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(Holding).order_by(Holding.id.desc())
             if status:
                 stmt = stmt.where(Holding.status == status)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(Holding.user_id == user_id)
             rows = db.execute(stmt).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
@@ -2373,14 +2710,18 @@ def list_holdings(status: str | None = None) -> list[dict]:
                                            "audit_status": "not_required",
                                            "created_at": str(r.created_at)} for r in rows])
 
-    return _dbq("holding", {"status": status}, _load)
+    return _dbq("holding", {"status": status, "user_id": user_id,
+                              "is_admin": is_admin}, _load)
 
 
-def list_alerts(limit: int = 100) -> list[dict]:
+def list_alerts(limit: int = 100, user_id: int | None = None,
+                *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
-            rows = db.execute(
-                select(AlertLog).order_by(AlertLog.id.desc()).limit(limit)).scalars().all()
+            stmt = select(AlertLog).order_by(AlertLog.id.desc())
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(AlertLog.user_id == user_id)
+            rows = db.execute(stmt.limit(limit)).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
                                            "alert_type": r.alert_type, "severity": r.severity,
@@ -2389,15 +2730,19 @@ def list_alerts(limit: int = 100) -> list[dict]:
                                            "source": r.source,
                                            "created_at": str(r.created_at)} for r in rows])
 
-    return _dbq("alert", {"limit": limit}, _load)
+    return _dbq("alert", {"limit": limit, "user_id": user_id,
+                            "is_admin": is_admin}, _load)
 
 
-def list_reviews(code: str | None = None, limit: int = 50) -> list[dict]:
+def list_reviews(code: str | None = None, limit: int = 50, user_id: int | None = None,
+                 *, is_admin: bool = False) -> list[dict]:
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(ReviewResult).order_by(ReviewResult.id.desc())
             if code:
                 stmt = stmt.where(ReviewResult.stock_code == code)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(ReviewResult.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
                                            "stock_name": r.stock_name,
@@ -2415,7 +2760,8 @@ def list_reviews(code: str | None = None, limit: int = 50) -> list[dict]:
                                            "created_at": str(r.created_at)}
                                           for r in rows])
 
-    return _dbq("review", {"code": code, "limit": limit}, _load)
+    return _dbq("review", {"code": code, "limit": limit, "user_id": user_id,
+                             "is_admin": is_admin}, _load)
 
 
 # ==================== 独立 AI 模拟账本（严禁写入 Holding/TradeRecord） ====================
@@ -2424,18 +2770,21 @@ def _paper_account_dict(row: PaperAccount) -> dict:
     return {"id": row.id, "name": row.name, "strategy_variant": row.strategy_variant,
             "initial_cash": row.initial_cash, "cash": row.cash, "status": row.status,
             "rule_version": row.rule_version, "model_version": row.model_version,
-            "source_label": row.source_label, "created_at": str(row.created_at),
+            "source_label": row.source_label, "user_id": row.user_id,
+            "created_at": str(row.created_at),
             "updated_at": str(row.updated_at)}
 
 
 def create_paper_account(name: str, initial_cash: float, strategy_variant: str = "current_gate",
-                         rule_version: str = "", model_version: str = "") -> dict:
+                         rule_version: str = "", model_version: str = "",
+                         user_id: int | None = None) -> dict:
     if initial_cash <= 0:
         raise ValueError("模拟账户初始资金必须大于 0")
     with SessionLocal() as db:
         row = PaperAccount(name=name or "AI模拟账户", initial_cash=round(initial_cash, 2),
                            cash=round(initial_cash, 2), strategy_variant=strategy_variant,
-                           rule_version=rule_version, model_version=model_version)
+                           rule_version=rule_version, model_version=model_version,
+                           user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -2447,11 +2796,22 @@ def get_paper_account(account_id: int) -> PaperAccount | None:
         return db.get(PaperAccount, account_id)
 
 
-def list_paper_accounts(status: str | None = None) -> list[dict]:
+def get_paper_account_for_user(account_id: int, user_id: int, *, is_admin: bool = False) -> PaperAccount | None:
+    with SessionLocal() as db:
+        stmt = select(PaperAccount).where(PaperAccount.id == account_id)
+        if not is_admin:
+            stmt = stmt.where(PaperAccount.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
+def list_paper_accounts(status: str | None = None, user_id: int | None = None,
+                        *, is_admin: bool = False) -> list[dict]:
     with SessionLocal() as db:
         stmt = select(PaperAccount).order_by(PaperAccount.id.desc())
         if status:
             stmt = stmt.where(PaperAccount.status == status)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PaperAccount.user_id == user_id)
         return [_paper_account_dict(r) for r in db.execute(stmt).scalars().all()]
 
 
@@ -2499,7 +2859,7 @@ def paper_apply_execution(account_id: int, payload: dict) -> dict:
             PaperExecution.execution_key == key)).scalar_one_or_none()
         if existing is not None:
             return paper_execution_dict(existing)
-        execution = PaperExecution(account_id=account_id, **{
+        execution = PaperExecution(account_id=account_id, user_id=account.user_id, **{
             k: v for k, v in payload.items() if k in {
                 "execution_key", "decision_id", "candidate_id", "score_id", "plan_id",
                 "stock_code", "stock_name", "side", "requested_price", "executed_price",
@@ -2521,7 +2881,8 @@ def paper_apply_execution(account_id: int, payload: dict) -> dict:
                     PaperPosition.account_id == account_id,
                     PaperPosition.stock_code == execution.stock_code)).scalar_one_or_none()
                 if pos is None:
-                    pos = PaperPosition(account_id=account_id, stock_code=execution.stock_code,
+                    pos = PaperPosition(account_id=account_id, user_id=account.user_id,
+                                        stock_code=execution.stock_code,
                                         stock_name=execution.stock_name or execution.stock_code,
                                         plan_id=execution.plan_id, shares=0, available_shares=0,
                                         cost=0.0, avg_price=0.0, high_price=0.0,
@@ -2648,7 +3009,9 @@ def create_paper_context(account_id: int, trade_date: str, mode: str, stock_code
                          stage: str, facts: dict, tool_trace: list | None = None,
                          source_refs: list | None = None) -> int:
     with SessionLocal() as db:
-        row = PaperContext(account_id=account_id, trade_date=trade_date, mode=mode,
+        account = db.get(PaperAccount, account_id)
+        row = PaperContext(account_id=account_id, user_id=account.user_id if account else None,
+                           trade_date=trade_date, mode=mode,
                            stock_code=stock_code or "", stage=stage or "",
                            facts=facts or {}, tool_trace=tool_trace or [],
                            source_refs=source_refs or [])
@@ -2672,7 +3035,9 @@ def list_paper_contexts(account_id: int, limit: int = 100) -> list[dict]:
 def create_paper_web_evidence(account_id: int, trade_date: str, stock_code: str,
                               values: dict) -> int:
     with SessionLocal() as db:
+        account = db.get(PaperAccount, account_id)
         row = PaperWebEvidence(account_id=account_id, trade_date=trade_date,
+                               user_id=account.user_id if account else None,
                                stock_code=stock_code or "", **{
                                    key: values.get(key, "") for key in (
                                        "url", "domain", "title", "excerpt", "published_at",
@@ -2699,7 +3064,9 @@ def list_paper_web_evidence(account_id: int, limit: int = 100) -> list[dict]:
 
 def create_paper_alert(account_id: int, stock_code: str, trade_date: str, values: dict) -> int:
     with SessionLocal() as db:
+        account = db.get(PaperAccount, account_id)
         row = PaperAlert(account_id=account_id, stock_code=stock_code or "",
+                         user_id=account.user_id if account else None,
                          trade_date=trade_date, severity=values.get("severity") or "info",
                          alert_type=values.get("alert_type") or "",
                          message=values.get("message") or "",
@@ -2724,7 +3091,9 @@ def list_paper_alerts(account_id: int, limit: int = 100) -> list[dict]:
 def create_paper_review(account_id: int, stock_code: str, stock_name: str,
                         review_date: str, content: dict, execution_id: int | None = None) -> int:
     with SessionLocal() as db:
+        account = db.get(PaperAccount, account_id)
         row = PaperReview(account_id=account_id, execution_id=execution_id,
+                          user_id=account.user_id if account else None,
                           stock_code=stock_code, stock_name=stock_name,
                           review_date=review_date, content=content or {}, source_type="paper")
         db.add(row)
@@ -2733,13 +3102,25 @@ def create_paper_review(account_id: int, stock_code: str, stock_name: str,
         return row.id
 
 
-def list_paper_reviews(account_id: int | None = None, limit: int = 100) -> list[dict]:
+def get_paper_review_for_user(review_id: int, user_id: int, *, is_admin: bool = False) -> PaperReview | None:
+    with SessionLocal() as db:
+        stmt = select(PaperReview).where(PaperReview.id == review_id)
+        if not is_admin:
+            stmt = stmt.where(PaperReview.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
+def list_paper_reviews(account_id: int | None = None, limit: int = 100,
+                       user_id: int | None = None, *, is_admin: bool = False) -> list[dict]:
     with SessionLocal() as db:
         stmt = select(PaperReview).order_by(PaperReview.id.desc())
         if account_id is not None:
             stmt = stmt.where(PaperReview.account_id == account_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PaperReview.user_id == user_id)
         rows = db.execute(stmt.limit(limit)).scalars().all()
         return [{"id": r.id, "account_id": r.account_id, "execution_id": r.execution_id,
+                 "user_id": r.user_id,
                  "stock_code": r.stock_code, "stock_name": r.stock_name,
                  "review_date": r.review_date, "source_type": r.source_type,
                  "content": r.content or {}, "audit_status": r.audit_status,
@@ -2783,6 +3164,14 @@ def get_review(review_id: int) -> ReviewResult | None:
         return db.get(ReviewResult, review_id)
 
 
+def get_review_for_user(review_id: int, user_id: int, *, is_admin: bool = False) -> ReviewResult | None:
+    with SessionLocal() as db:
+        stmt = select(ReviewResult).where(ReviewResult.id == review_id)
+        if not is_admin:
+            stmt = stmt.where(ReviewResult.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
 def get_review_for_holding_exit(holding_id: int, exit_date: str) -> ReviewResult | None:
     """按持仓周期和离场日读取已有复盘，供复盘任务幂等保护使用。"""
     with SessionLocal() as db:
@@ -2793,25 +3182,32 @@ def get_review_for_holding_exit(holding_id: int, exit_date: str) -> ReviewResult
         ).scalar_one_or_none()
 
 
-def list_sell_decisions(holding_id: int, limit: int = 10) -> list[dict]:
+def list_sell_decisions(holding_id: int, limit: int = 10, user_id: int | None = None,
+                        *, is_admin: bool = False) -> list[dict]:
     with SessionLocal() as db:
-        rows = db.execute(
-            select(SellDecision).where(SellDecision.holding_id == holding_id)
-            .order_by(SellDecision.id.desc()).limit(limit)).scalars().all()
+        stmt = select(SellDecision).where(SellDecision.holding_id == holding_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(SellDecision.user_id == user_id)
+        rows = db.execute(stmt.order_by(SellDecision.id.desc()).limit(limit)).scalars().all()
         return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
-                                       "stock_name": r.stock_name,
-                                       "decision": r.decision,
+                                        "stock_name": r.stock_name,
+                                        "decision": r.decision,
                                        "created_at": str(r.created_at)} for r in rows])
 
 
 # ==================== 私有知识库（人工录入，Agent 启动自动检索注入） ====================
 
-def knowledge_version() -> tuple[int, int]:
+def knowledge_version(user_id: int | None = None) -> tuple[int, int]:
     """知识库变更感知（数量 + 最大ID），供 LLM 缓存键使用"""
+    if user_id is None:
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
     with SessionLocal() as db:
-        count = db.scalar(select(func.count()).select_from(PrivateKnowledge)) or 0
-        max_id = db.scalar(select(func.max(PrivateKnowledge.id))) or 0
-        return int(count), int(max_id)
+        stmt = select(func.count(), func.max(PrivateKnowledge.id)).select_from(PrivateKnowledge)
+        if user_id is not None:
+            stmt = stmt.where((PrivateKnowledge.user_id == user_id) |
+                              PrivateKnowledge.user_id.is_(None))
+        count, max_id = db.execute(stmt).one()
+        return int(count or 0), int(max_id or 0)
 
 
 def add_knowledge(title: str, content: str, agent_tag: str = "all", *,
@@ -2819,14 +3215,16 @@ def add_knowledge(title: str, content: str, agent_tag: str = "all", *,
                   market_scope: str = "all", scenario_tags: list[str] | None = None,
                   evidence_level: str = "unverified", valid_from: datetime | None = None,
                   valid_to: datetime | None = None, status: str = "active",
-                  risk_note: str = "") -> int:
+                  risk_note: str = "", user_id: int | None = None) -> int:
+    if user_id is None:
+        user_id = _context_user_id(1)
     with SessionLocal() as db:
         row = PrivateKnowledge(
             title=title, content=content, agent_tag=agent_tag,
             source_type=source_type, methodology_type=methodology_type,
             market_scope=market_scope, scenario_tags=scenario_tags or [],
             evidence_level=evidence_level, valid_from=valid_from, valid_to=valid_to,
-            status=status, risk_note=risk_note,
+            status=status, risk_note=risk_note, user_id=user_id,
         )
         db.add(row)
         db.commit()
@@ -2836,10 +3234,13 @@ def add_knowledge(title: str, content: str, agent_tag: str = "all", *,
 
 def list_knowledge(agent_tag: str | None = None, *, status: str | None = None,
                    source_type: str | None = None, methodology_type: str | None = None,
-                   market_scope: str | None = None, scenario_tag: str | None = None
+                   market_scope: str | None = None, scenario_tag: str | None = None,
+                   user_id: int | None = None, is_admin: bool = False
                    ) -> list[PrivateKnowledge]:
     with SessionLocal() as db:
         stmt = select(PrivateKnowledge).order_by(PrivateKnowledge.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PrivateKnowledge.user_id == user_id)
         if agent_tag:
             stmt = stmt.where(PrivateKnowledge.agent_tag == agent_tag)
         if status:
@@ -2856,9 +3257,13 @@ def list_knowledge(agent_tag: str | None = None, *, status: str | None = None,
         return rows
 
 
-def delete_knowledge(knowledge_id: int) -> bool:
+def delete_knowledge(knowledge_id: int, user_id: int | None = None,
+                     *, is_admin: bool = False) -> bool:
     with SessionLocal() as db:
-        row = db.get(PrivateKnowledge, knowledge_id)
+        stmt = select(PrivateKnowledge).where(PrivateKnowledge.id == knowledge_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PrivateKnowledge.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return False
         db.delete(row)
@@ -2866,13 +3271,17 @@ def delete_knowledge(knowledge_id: int) -> bool:
         return True
 
 
-def update_knowledge_status(knowledge_id: int, status: str, reason: str = "") -> bool:
+def update_knowledge_status(knowledge_id: int, status: str, reason: str = "",
+                            user_id: int | None = None, *, is_admin: bool = False) -> bool:
     """人工调整知识生命周期；只改状态和留痕，不删除正文，不做自动升级。"""
     allowed = {"active", "shadow", "archived", "expired"}
     if status not in allowed:
         raise ValueError(f"status must be one of {sorted(allowed)}")
     with SessionLocal() as db:
-        row = db.get(PrivateKnowledge, knowledge_id)
+        stmt = select(PrivateKnowledge).where(PrivateKnowledge.id == knowledge_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(PrivateKnowledge.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return False
         row.status = status
@@ -3058,17 +3467,24 @@ def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
                             problem_desc: str = "", rule_text: str = "",
                             expected_effect: str = "", risk_note: str = "",
                             file_path: str = "", insert_position: str = "",
-                            suggestion_source: str = "llm") -> int:
+                            suggestion_source: str = "llm",
+                            user_id: int | None = None) -> int:
+    if user_id is None:
+        user_id = _context_user_id(1)
     with SessionLocal() as db:
+        if review_id:
+            review = db.get(ReviewResult, review_id)
+            if review and review.user_id is not None:
+                user_id = review.user_id
         row = AgentSuggestion(review_id=review_id, target_agent=target_agent, rule_name=rule_name,
                               current_value=current_value, suggested_value=suggested_value,
                               reason=reason, evidence=evidence,
                               target_kind=target_kind, status="pending",
                               rule_type=rule_type, priority=priority,
                               problem_desc=problem_desc, rule_text=rule_text,
-                              expected_effect=expected_effect, risk_note=risk_note,
-                              file_path=file_path, insert_position=insert_position,
-                              suggestion_source=suggestion_source)
+                               expected_effect=expected_effect, risk_note=risk_note,
+                               file_path=file_path, insert_position=insert_position,
+                               suggestion_source=suggestion_source, user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -3080,30 +3496,41 @@ def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
 def insert_audit_log(target_type: str, target_id: int, audit_round: int, verdict: str,
                      confidence: int, support_view: str, dissent_view: str, boundary_cases: str,
                      evidence_refs: list, audit_model: str, reasoning: str,
-                     duration_ms: int) -> int:
+                     duration_ms: int, user_id: int | None = None) -> int:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         row = AuditLog(target_type=target_type, target_id=target_id, round=audit_round,
                        verdict=verdict, confidence=confidence, support_view=support_view,
                        dissent_view=dissent_view, boundary_cases=boundary_cases,
                        evidence_refs=evidence_refs or [], audit_model=audit_model,
-                       reasoning=reasoning or "", duration_ms=duration_ms)
+                       reasoning=reasoning or "", duration_ms=duration_ms,
+                       user_id=owner_id)
         db.add(row)
         db.commit()
         db.refresh(row)
         return row.id
 
 
-def get_audit_log(audit_id: int) -> AuditLog | None:
+def get_audit_log(audit_id: int, user_id: int | None = None) -> AuditLog | None:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        return db.get(AuditLog, audit_id)
+        stmt = select(AuditLog).where(AuditLog.id == audit_id)
+        if owner_id is not None:
+            stmt = stmt.where(AuditLog.user_id == owner_id)
+        return db.execute(stmt).scalar_one_or_none()
 
 
-def get_latest_audit_log_by_target(target_type: str, target_id: int) -> dict | None:
+def get_latest_audit_log_by_target(target_type: str, target_id: int,
+                                   user_id: int | None = None) -> dict | None:
     """按目标查最新一条审核记录（created_at desc；含 dissent_view 完整字段）；无 → None"""
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
+        stmt = select(AuditLog).where(AuditLog.target_type == target_type,
+                                      AuditLog.target_id == target_id)
+        if owner_id is not None:
+            stmt = stmt.where(AuditLog.user_id == owner_id)
         row = db.execute(
-            select(AuditLog).where(AuditLog.target_type == target_type,
-                                   AuditLog.target_id == target_id)
+            stmt
             .order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(1)
         ).scalar_one_or_none()
         if row is None:
@@ -3116,10 +3543,14 @@ def get_latest_audit_log_by_target(target_type: str, target_id: int) -> dict | N
                 "duration_ms": row.duration_ms, "created_at": str(row.created_at)}
 
 
-def update_audit_log_verdict(audit_id: int, verdict: str) -> None:
+def update_audit_log_verdict(audit_id: int, verdict: str, user_id: int | None = None) -> None:
     """人工/应急标绿（批4 confirm-fail 前留位）：仅改 verdict"""
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.get(AuditLog, audit_id)
+        stmt = select(AuditLog).where(AuditLog.id == audit_id)
+        if owner_id is not None:
+            stmt = stmt.where(AuditLog.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return
         row.verdict = verdict
@@ -3127,9 +3558,14 @@ def update_audit_log_verdict(audit_id: int, verdict: str) -> None:
 
 
 def update_agent_suggestion_audit(suggestion_id: int, audit_verdict: str,
-                                  audit_round: int, last_audit_id: int | None) -> None:
+                                  audit_round: int, last_audit_id: int | None,
+                                  user_id: int | None = None) -> None:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.get(AgentSuggestion, suggestion_id)
+        stmt = select(AgentSuggestion).where(AgentSuggestion.id == suggestion_id)
+        if owner_id is not None:
+            stmt = stmt.where(AgentSuggestion.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return
         row.audit_verdict = audit_verdict
@@ -3138,17 +3574,20 @@ def update_agent_suggestion_audit(suggestion_id: int, audit_verdict: str,
         db.commit()
 
 
-def list_agent_suggestions_for_audit(cursor_id: int, limit: int = 50) -> list[AgentSuggestion]:
+def list_agent_suggestions_for_audit(cursor_id: int, limit: int = 50,
+                                     user_id: int | None = None) -> list[AgentSuggestion]:
     """扫描待审/漏审/未完成二审的建议（id > 游标；pass 或 round2-fail 不再返回）"""
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        return list(db.execute(
-            select(AgentSuggestion).where(
+        stmt = select(AgentSuggestion).where(
                 AgentSuggestion.id > cursor_id,
                 or_(AgentSuggestion.audit_verdict == "pending",
                     AgentSuggestion.last_audit_id.is_(None),
                     and_(AgentSuggestion.audit_verdict == "fail",
                          AgentSuggestion.audit_round < 2)))
-            .order_by(AgentSuggestion.id).limit(limit)).scalars().all())
+        if owner_id is not None:
+            stmt = stmt.where(AgentSuggestion.user_id == owner_id)
+        return list(db.execute(stmt.order_by(AgentSuggestion.id).limit(limit)).scalars().all())
 
 
 def get_agent_suggestion(suggestion_id: int) -> AgentSuggestion | None:
@@ -3156,10 +3595,23 @@ def get_agent_suggestion(suggestion_id: int) -> AgentSuggestion | None:
         return db.get(AgentSuggestion, suggestion_id)
 
 
+def get_agent_suggestion_for_user(suggestion_id: int, user_id: int,
+                                  *, is_admin: bool = False) -> AgentSuggestion | None:
+    with SessionLocal() as db:
+        stmt = select(AgentSuggestion).where(AgentSuggestion.id == suggestion_id)
+        if not is_admin:
+            stmt = stmt.where(AgentSuggestion.user_id == user_id)
+        return db.execute(stmt).scalar_one_or_none()
+
+
 def get_agent_suggestions(review_id: int | None = None,
-                          status: str | None = None) -> list[AgentSuggestion]:
+                          status: str | None = None,
+                          user_id: int | None = None,
+                          *, is_admin: bool = False) -> list[AgentSuggestion]:
     with SessionLocal() as db:
         stmt = select(AgentSuggestion).order_by(AgentSuggestion.id.desc())
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(AgentSuggestion.user_id == user_id)
         if review_id is not None:
             stmt = stmt.where(AgentSuggestion.review_id == review_id)
         if status:
@@ -3222,40 +3674,52 @@ def update_agent_suggestion_notes(suggestion_id: int, conflict_note: str = "",
 
 # ==================== 复盘采纳规则（一键采纳自动落地：规则存库 + agent_call 动态注入） ====================
 
-def get_active_rules() -> list[dict]:
+def get_active_rules(user_id: int | None = None) -> list[dict]:
     """生效中规则列表（agent_call 注入数据源；采纳/回滚后 _invalidate 失效）"""
+    if user_id is None:
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
-            rows = db.execute(
-                select(RuleChange).where(RuleChange.status == "active")
-                .order_by(RuleChange.id)).scalars().all()
+            stmt = select(RuleChange).where(RuleChange.status == "active")
+            if user_id is not None:
+                stmt = stmt.where((RuleChange.user_id == user_id) | RuleChange.user_id.is_(None))
+            rows = db.execute(stmt.order_by(RuleChange.id)).scalars().all()
             return [{"id": r.id, "target_agent": r.target_agent, "rule_type": r.rule_type,
-                     "rule_name": r.rule_name, "rule_text": r.rule_text} for r in rows]
+                      "rule_name": r.rule_name, "rule_text": r.rule_text} for r in rows]
 
-    return _dbq("rule_change", {"active": 1}, _load)
+    return _dbq("rule_change", {"active": 1, "user_id": user_id}, _load)
 
 
-def rule_version() -> str:
+def rule_version(user_id: int | None = None) -> str:
     """生效规则内容指纹（count+max_id）→ 入 LLM 缓存键：
     采纳/回滚后指纹变化，当日 LLM 缓存自动失效（同 _knowledge_version 语义）"""
+    if user_id is None:
+        user_id = _context_user_id(1 if settings.multi_user_enabled else None)
+
     def _load() -> list:
         with SessionLocal() as db:
-            cnt = db.execute(select(func.count()).select_from(RuleChange)
-                             .where(RuleChange.status == "active")).scalar() or 0
-            max_id = db.execute(select(func.max(RuleChange.id))).scalar() or 0
+            stmt = select(func.count(), func.max(RuleChange.id)).select_from(RuleChange).where(
+                RuleChange.status == "active")
+            if user_id is not None:
+                stmt = stmt.where((RuleChange.user_id == user_id) | RuleChange.user_id.is_(None))
+            cnt, max_id = db.execute(stmt).one()
             return [{"count": int(cnt), "max_id": int(max_id or 0)}]
 
-    rows = _dbq("rule_change", {"ver": 1}, _load)
+    rows = _dbq("rule_change", {"ver": 1, "user_id": user_id}, _load)
     row = rows[0] if rows else {}
     return f"{row.get('count', 0)}:{row.get('max_id', 0)}"
 
 
 def list_rule_changes(status: str | None = None, target_agent: str | None = None,
-                      suggestion_id: int | None = None, limit: int = 50) -> list[dict]:
+                      suggestion_id: int | None = None, limit: int = 50,
+                      user_id: int | None = None, *, is_admin: bool = False) -> list[dict]:
     """规则变更记录轻量列表（记录页数据源，不含长文本；详情按需单查）"""
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(RuleChange).order_by(RuleChange.id.desc()).limit(limit)
+            if user_id is not None and not is_admin:
+                stmt = stmt.where(RuleChange.user_id == user_id)
             if status:
                 stmt = stmt.where(RuleChange.status == status)
             if target_agent:
@@ -3269,19 +3733,24 @@ def list_rule_changes(status: str | None = None, target_agent: str | None = None
                      "rule_type": r.rule_type, "rule_name": r.rule_name,
                      "rule_text": r.rule_text, "priority": r.priority,
                      "status": r.status, "operator": r.operator,
+                     "user_id": r.user_id,
                      "created_at": str(r.created_at),
                      "rollback_time": r.rollback_time} for r in rows]
 
     return _dbq("rule_change", {"status": status, "agent": target_agent,
-                                "suggestion_id": suggestion_id, "limit": limit}, _load)
+                                "suggestion_id": suggestion_id, "limit": limit,
+                                "user_id": user_id, "admin": is_admin}, _load)
 
 
-def get_rule_change(rule_change_id: int) -> dict | None:
+def get_rule_change(rule_change_id: int, user_id: int | None = None,
+                    *, is_admin: bool = False) -> dict | None:
     """规则变更完整详情（变更前后对比/回滚原因/落地元数据，供记录页展开）"""
     def _load() -> list:
         with SessionLocal() as db:
             r = db.get(RuleChange, rule_change_id)
             if r is None:
+                return []
+            if user_id is not None and not is_admin and r.user_id != user_id:
                 return []
             return [{"id": r.id, "source_suggestion_id": r.source_suggestion_id,
                      "review_id": r.review_id, "stock_code": r.stock_code,
@@ -3292,11 +3761,13 @@ def get_rule_change(rule_change_id: int) -> dict | None:
                      "reason": r.reason, "evidence": r.evidence,
                      "expected_effect": r.expected_effect, "risk_note": r.risk_note,
                      "file_path": r.file_path, "insert_position": r.insert_position,
-                     "status": r.status, "rollback_reason": r.rollback_reason,
-                     "rollback_time": r.rollback_time, "operator": r.operator,
-                     "created_at": str(r.created_at)}]
+                      "status": r.status, "rollback_reason": r.rollback_reason,
+                      "rollback_time": r.rollback_time, "operator": r.operator,
+                      "user_id": r.user_id,
+                      "created_at": str(r.created_at)}]
 
-    rows = _dbq("rule_change", {"detail": rule_change_id}, _load)
+    rows = _dbq("rule_change", {"detail": rule_change_id, "user_id": user_id,
+                                "admin": is_admin}, _load)
     return rows[0] if rows else None
 
 
@@ -3327,6 +3798,7 @@ def adopt_rule_suggestion(suggestion_id: int, operator: str = "") -> int:
             file_path=sug.file_path,
             insert_position=sug.insert_position,
             operator=operator,
+            user_id=sug.user_id or (review.user_id if review else None),
         )
         db.add(change)
         sug.status = "approved"
@@ -3336,10 +3808,14 @@ def adopt_rule_suggestion(suggestion_id: int, operator: str = "") -> int:
         return change.id
 
 
-def rollback_rule_change(rule_change_id: int, reason: str) -> bool:
+def rollback_rule_change(rule_change_id: int, reason: str, user_id: int | None = None,
+                         *, is_admin: bool = False) -> bool:
     """一键回滚：status=active → rolled_back + 原因/时间留痕；返回是否成功"""
     with SessionLocal() as db:
-        row = db.get(RuleChange, rule_change_id)
+        stmt = select(RuleChange).where(RuleChange.id == rule_change_id)
+        if user_id is not None and not is_admin:
+            stmt = stmt.where(RuleChange.user_id == user_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None or row.status != "active":
             return False
         row.status = "rolled_back"
@@ -3695,58 +4171,96 @@ def _artifacts_meta(ref, code, sig, original_ref) -> dict:
             "signal_type": sig, "original_ref": original_ref}
 
 
-def merge_pending_duplicate(task_id, stage, summary, artifacts_ref) -> int | None:
-    """同 hour 桶 (stock_code, signal_type) 已 pending → 合并 count++ 返回行 id；否则 None 不合并"""
+def merge_pending_duplicate(task_id, stage, summary, artifacts_ref, user_id=None) -> int | None:
+    """Merge same-hour pending signal only within the current account."""
+    owner_id = _experience_scope_user(user_id)
     code, sig = _parse_monitor_summary(summary)
     if not code:
         return None
     hour_start = datetime.now().replace(minute=0, second=0, microsecond=0)
     with SessionLocal() as db:
-        stmt = select(PendingExperience).where(
-            PendingExperience.status == "pending",
-            PendingExperience.created_at >= hour_start,
-        ).order_by(PendingExperience.id.desc())
-        for r in db.execute(stmt).scalars().all():
+        stmt = select(PendingExperience).where(PendingExperience.status == "pending", PendingExperience.created_at >= hour_start)
+        if owner_id is not None:
+            stmt = stmt.where(PendingExperience.user_id == owner_id)
+        for r in db.execute(stmt.order_by(PendingExperience.id.desc())).scalars().all():
             r_code, r_sig = _parse_monitor_summary(r.summary)
             if r_code == code and r_sig == sig:
                 meta = _artifacts_meta(r.artifacts_ref, code, sig, str(artifacts_ref or ""))
                 meta["count"] = int(meta.get("count") or 1) + 1
                 meta["last_at"] = datetime.now().isoformat(timespec="seconds")
                 r.artifacts_ref = json.dumps(meta, ensure_ascii=False)
-                db.commit()
-                _invalidate("pending_experience")
+                db.commit(); _invalidate("pending_experience")
                 return r.id
     return None
 
 
-def add_pending_experience(task_id, stage, summary, artifacts_ref) -> int:
-    """热路径经验沉淀写入：同 hour (stock_code, signal_type) 已 pending → 合并 count++；
-    否则单行 INSERT（artifacts_ref 落 JSON 元数据，旧 int 数据读兼容）。失败由调用方静默降级。"""
-    merged = merge_pending_duplicate(task_id, stage, summary, artifacts_ref)
+def add_pending_experience(task_id, stage, summary, artifacts_ref, user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id, for_write=True)
+    merged = merge_pending_duplicate(task_id, stage, summary, artifacts_ref, owner_id)
     if merged:
         return merged
     code, sig = _parse_monitor_summary(summary)
     meta = _artifacts_meta(artifacts_ref, code, sig, str(artifacts_ref or ""))
     with SessionLocal() as db:
-        row = PendingExperience(task_id=task_id, stage=stage, summary=summary,
-                                artifacts_ref=json.dumps(meta, ensure_ascii=False), status="pending")
-        db.add(row)
-        db.commit()
-        _invalidate("pending_experience")
-        return row.id
+        row = PendingExperience(task_id=task_id, stage=stage, summary=summary, artifacts_ref=json.dumps(meta, ensure_ascii=False), status="pending", user_id=owner_id)
+        db.add(row); db.commit(); _invalidate("pending_experience"); return row.id
 
 
-def list_pending_experience(status=None, stage=None, limit=50) -> list:
-    """待处理队列只读列表（最新在前）"""
+def list_pending_experience(status=None, stage=None, limit=50, user_id=None) -> list:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         stmt = select(PendingExperience)
-        if status:
-            stmt = stmt.where(PendingExperience.status == status)
-        if stage:
-            stmt = stmt.where(PendingExperience.stage == stage)
-        stmt = stmt.order_by(PendingExperience.id.desc()).limit(limit)
-        rows = db.execute(stmt).scalars().all()
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        if status: stmt = stmt.where(PendingExperience.status == status)
+        if stage: stmt = stmt.where(PendingExperience.stage == stage)
+        rows = db.execute(stmt.order_by(PendingExperience.id.desc()).limit(limit)).scalars().all()
         return [_pending_row(r) for r in rows]
+
+
+def claim_pending_batch(batch_size=20, user_id=None) -> list:
+    owner_id = _experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(PendingExperience.status == "pending")
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        pending = db.execute(stmt.order_by(PendingExperience.id).limit(batch_size)).scalars().all()
+        claimed = []
+        for row in pending:
+            q = PendingExperience.__table__.update().where(PendingExperience.id == row.id, PendingExperience.status == "pending")
+            if owner_id is not None: q = q.where(PendingExperience.user_id == owner_id)
+            res = db.execute(q.values(status="processing"))
+            if res.rowcount == 1: claimed.append(_pending_row(row))
+        if claimed: db.commit(); _invalidate("pending_experience")
+        return claimed
+
+
+def release_pending(id, error=None, user_id=None) -> None:
+    owner_id = _experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(PendingExperience.id == id)
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
+        if row is None: return
+        row.status = "done"; row.error = error; db.commit(); _invalidate("pending_experience")
+
+
+def watchdog_reset_stale_processing(older_than_hours=2.0, user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id)
+    cutoff = datetime.now() - timedelta(hours=older_than_hours)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(PendingExperience.status == "processing", PendingExperience.created_at < cutoff)
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        rows = db.execute(stmt).scalars().all()
+        for row in rows: row.status = "pending"; row.error = "watchdog_timeout"
+        if rows: db.commit(); _invalidate("pending_experience")
+        return len(rows)
+
+
+def pending_backlog_count(user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt = select(func.count()).select_from(PendingExperience).where(PendingExperience.status == "pending")
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        return db.execute(stmt).scalar_one()
 
 
 def _pending_row(r) -> dict:
@@ -3755,318 +4269,167 @@ def _pending_row(r) -> dict:
                 created_at=str(r.created_at))
 
 
-def claim_pending_batch(batch_size=20) -> list:
-    """原子认领下一批 pending：逐行 UPDATE ... WHERE id=? AND status='pending'（防并发双跑）。
-    返回认领成功行的 dict 列表；并发下重复执行不会重复消费。"""
-    with SessionLocal() as db:
-        pending = db.execute(
-            select(PendingExperience).where(PendingExperience.status == "pending")
-            .order_by(PendingExperience.id).limit(batch_size)).scalars().all()
-        claimed = []
-        for row in pending:
-            res = db.execute(
-                PendingExperience.__table__.update()
-                .where(PendingExperience.id == row.id,
-                       PendingExperience.status == "pending")
-                .values(status="processing"))
-            if res.rowcount == 1:
-                claimed.append(_pending_row(row))
-        if claimed:
-            db.commit()
-            _invalidate("pending_experience")
-        return claimed
-
-
-def release_pending(id, error=None) -> None:
-    """处理完成：标 done + 可选 error（失败也标 done，error 记录原因，不残留 processing）"""
-    with SessionLocal() as db:
-        row = db.execute(select(PendingExperience).where(PendingExperience.id == id)
-                         ).scalar_one_or_none()
-        if row is None:
-            return
-        row.status = "done"
-        row.error = error
-        db.commit()
-        _invalidate("pending_experience")
-
-
-def watchdog_reset_stale_processing(older_than_hours=2.0) -> int:
-    """看门狗：processing 超时（默认 2h）复位为 pending，防 Worker 崩溃卡死队列。返回复位条数"""
-    from datetime import datetime, timedelta
-    cutoff = datetime.now() - timedelta(hours=older_than_hours)
-    with SessionLocal() as db:
-        rows = db.execute(
-            select(PendingExperience).where(
-                PendingExperience.status == "processing",
-                PendingExperience.created_at < cutoff)).scalars().all()
-        for row in rows:
-            row.status = "pending"
-            row.error = "watchdog_timeout"
-        if rows:
-            db.commit()
-            _invalidate("pending_experience")
-        return len(rows)
-
-
-def pending_backlog_count() -> int:
-    """待处理队列积压数（Digest 积压触发判断）"""
-    with SessionLocal() as db:
-        return db.execute(
-            select(func.count()).select_from(PendingExperience)
-            .where(PendingExperience.status == "pending")).scalar_one()
-
-
-def insert_experience(title, body, stage, tags, impact, confidence,
-                      auto_merged=0, source_pending_id=None, status="pending_review") -> int:
-    """插入沉淀经验；FTS 触发器自动同步索引。返回 experience.id"""
+def insert_experience(title, body, stage, tags, impact, confidence, auto_merged=0, source_pending_id=None, status="pending_review", user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id)
     tags_json = json.dumps(tags, ensure_ascii=False) if isinstance(tags, (list, tuple)) else tags
     with SessionLocal() as db:
-        row = Experience(title=title, body=body, stage=stage, tags=tags_json,
-                         impact=impact, confidence=float(confidence),
-                         auto_merged=auto_merged, source_pending_id=source_pending_id,
-                         status=status)
-        db.add(row)
-        db.commit()
-        _invalidate("experience")
-        return row.id
+        if source_pending_id is not None and owner_id is not None:
+            source = db.execute(select(PendingExperience).where(PendingExperience.id == source_pending_id, PendingExperience.user_id == owner_id)).scalar_one_or_none()
+            if source is None: raise LookupError("source pending experience is not owned by current user")
+        row = Experience(title=title, body=body, stage=stage, tags=tags_json, impact=impact, confidence=float(confidence), auto_merged=auto_merged, source_pending_id=source_pending_id, status=status, user_id=owner_id)
+        db.add(row); db.commit(); _invalidate("experience"); return row.id
 
 
-def list_experience(status=None, stage=None, auto_merged=None, limit=50) -> list:
-    """经验库列表（最新在前）"""
+def list_experience(status=None, stage=None, auto_merged=None, limit=50, user_id=None) -> list:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         stmt = select(Experience)
-        if status:
-            stmt = stmt.where(Experience.status == status)
-        if stage:
-            stmt = stmt.where(Experience.stage == stage)
-        if auto_merged is not None:
-            stmt = stmt.where(Experience.auto_merged == auto_merged)
-        stmt = stmt.order_by(Experience.id.desc()).limit(limit)
-        rows = db.execute(stmt).scalars().all()
-        return [_exp_row(r) for r in rows]
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        if status: stmt = stmt.where(Experience.status == status)
+        if stage: stmt = stmt.where(Experience.stage == stage)
+        if auto_merged is not None: stmt = stmt.where(Experience.auto_merged == auto_merged)
+        return [_exp_row(r) for r in db.execute(stmt.order_by(Experience.id.desc()).limit(limit)).scalars().all()]
 
 
-def get_experience(id) -> dict:
-    """单条经验（含来源 pending 摘要，供 UI/审核展示）"""
+def get_experience(id, user_id=None) -> dict | None:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.execute(select(Experience).where(Experience.id == id)).scalar_one_or_none()
-        if row is None:
-            return None
+        stmt = select(Experience).where(Experience.id == id)
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
+        if row is None: return None
         out = _exp_row(row)
         if row.source_pending_id:
-            pend = db.execute(select(PendingExperience).where(
-                PendingExperience.id == row.source_pending_id)).scalar_one_or_none()
-            if pend:
-                out["source_summary"] = pend.summary
-                out["source_task_id"] = pend.task_id
+            stmt = select(PendingExperience).where(PendingExperience.id == row.source_pending_id)
+            if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+            pend = db.execute(stmt).scalar_one_or_none()
+            if pend: out.update(source_summary=pend.summary, source_task_id=pend.task_id)
         return out
 
 
 def _exp_row(r) -> dict:
-    return dict(id=r.id, title=r.title, body=r.body, stage=r.stage, tags=r.tags,
-                impact=r.impact, confidence=r.confidence, auto_merged=r.auto_merged,
-                source_pending_id=r.source_pending_id, status=r.status,
-                created_at=str(r.created_at),
-                last_reviewed_at=str(r.last_reviewed_at) if r.last_reviewed_at else None,
-                hit_count=int(getattr(r, "hit_count", 0) or 0),
-                last_used_at=str(r.last_used_at) if getattr(r, "last_used_at", None) else None,
-                expires_at=str(r.expires_at) if getattr(r, "expires_at", None) else None,
-                curator_note=getattr(r, "curator_note", "") or "")
+    return dict(id=r.id, title=r.title, body=r.body, stage=r.stage, tags=r.tags, impact=r.impact, confidence=r.confidence, auto_merged=r.auto_merged, source_pending_id=r.source_pending_id, status=r.status, created_at=str(r.created_at), last_reviewed_at=str(r.last_reviewed_at) if r.last_reviewed_at else None, hit_count=int(getattr(r, "hit_count", 0) or 0), last_used_at=str(r.last_used_at) if getattr(r, "last_used_at", None) else None, expires_at=str(r.expires_at) if getattr(r, "expires_at", None) else None, curator_note=getattr(r, "curator_note", "") or "")
 
 
-def bump_experience_hits(ids: list[int]) -> int:
-    """经验命中计量：hit_count+1 + last_used_at=now；失败由调用方降级。"""
-    exp_ids = [int(i) for i in ids if i]
-    if not exp_ids:
-        return 0
+def bump_experience_hits(ids: list[int], user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id); exp_ids = [int(i) for i in ids if i]
+    if not exp_ids: return 0
     with SessionLocal() as db:
-        res = db.execute(
-            update(Experience)
-            .where(Experience.id.in_(exp_ids))
-            .values(hit_count=Experience.hit_count + 1, last_used_at=datetime.now())
-        )
-        db.commit()
-        _invalidate("experience")
-        return int(res.rowcount or 0)
+        stmt = update(Experience).where(Experience.id.in_(exp_ids))
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        res = db.execute(stmt.values(hit_count=Experience.hit_count + 1, last_used_at=datetime.now())); db.commit(); _invalidate("experience"); return int(res.rowcount or 0)
 
 
-def list_curator_candidates(status: str = "active", stage: str = "",
-                            older_than_days: int | None = None,
-                            max_hit_count: int | None = None,
-                            max_confidence: float | None = None,
-                            limit: int = 100) -> list[dict]:
-    """只读列出 Memory Curator 候选；不改变任何状态。"""
+def list_curator_candidates(status="active", stage="", older_than_days=None, max_hit_count=None, max_confidence=None, limit=100, user_id=None) -> list[dict]:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         stmt = select(Experience)
-        if status:
-            stmt = stmt.where(Experience.status == status)
-        if stage:
-            stmt = stmt.where(Experience.stage == stage)
-        if older_than_days is not None:
-            cutoff = datetime.now() - timedelta(days=int(older_than_days))
-            stmt = stmt.where(Experience.created_at <= cutoff)
-        if max_hit_count is not None:
-            stmt = stmt.where(Experience.hit_count <= int(max_hit_count))
-        if max_confidence is not None:
-            stmt = stmt.where(Experience.confidence <= float(max_confidence))
-        stmt = stmt.order_by(Experience.created_at, Experience.id).limit(min(max(int(limit), 1), 500))
-        return [_exp_row(r) for r in db.execute(stmt).scalars().all()]
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        if status: stmt = stmt.where(Experience.status == status)
+        if stage: stmt = stmt.where(Experience.stage == stage)
+        if older_than_days is not None: stmt = stmt.where(Experience.created_at <= datetime.now() - timedelta(days=int(older_than_days)))
+        if max_hit_count is not None: stmt = stmt.where(Experience.hit_count <= int(max_hit_count))
+        if max_confidence is not None: stmt = stmt.where(Experience.confidence <= float(max_confidence))
+        return [_exp_row(r) for r in db.execute(stmt.order_by(Experience.created_at, Experience.id).limit(min(max(int(limit),1),500))).scalars().all()]
 
 
-def mark_experience_curated(eid: int, status: str, note: str,
-                            reviewer: str = "auto") -> bool:
-    """策展状态流转；仅归档/过期/提议，写 review_log，不物理删除。"""
-    actions = {
-        "archived": "curator_archive",
-        "expired": "curator_expire",
-        "pending_review": "curator_propose",
-    }
-    if status not in actions:
-        raise ValueError("status must be archived/expired/pending_review")
+def mark_experience_curated(eid, status, note, reviewer="auto", user_id=None) -> bool:
+    owner_id = _experience_scope_user(user_id, for_write=True); actions={"archived":"curator_archive","expired":"curator_expire","pending_review":"curator_propose"}
+    if status not in actions: raise ValueError("status must be archived/expired/pending_review")
     with SessionLocal() as db:
-        row = db.get(Experience, int(eid))
-        if row is None:
-            return False
-        row.status = status
-        row.curator_note = note or ""
-        row.last_reviewed_at = _now()
-        db.add(ReviewLog(experience_id=row.id, action=actions[status],
-                         reviewer=reviewer, note=note or ""))
-        db.commit()
-        _invalidate("experience")
-        _invalidate("review_log")
-        return True
+        stmt=select(Experience).where(Experience.id==int(eid))
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return False
+        row.status=status; row.curator_note=note or ""; row.last_reviewed_at=_now(); db.add(ReviewLog(experience_id=row.id, action=actions[status], reviewer=reviewer, note=note or "", user_id=owner_id)); db.commit(); _invalidate("experience"); _invalidate("review_log"); return True
 
 
-def set_experience_expires_at(eid: int, expires_at: datetime,
-                              note: str = "", reviewer: str = "sir") -> bool:
-    """人工设置单条经验过期时间，保留正文并写 review_log。"""
+def set_experience_expires_at(eid, expires_at, note="", reviewer="sir", user_id=None) -> bool:
+    owner_id=_experience_scope_user(user_id, for_write=True)
     with SessionLocal() as db:
-        row = db.get(Experience, int(eid))
-        if row is None:
-            return False
-        row.expires_at = expires_at
-        row.curator_note = note or row.curator_note or ""
-        row.last_reviewed_at = _now()
-        db.add(ReviewLog(experience_id=row.id, action="curator_set_expiry",
-                         reviewer=reviewer, note=note or str(expires_at)))
-        db.commit()
-        _invalidate("experience")
-        _invalidate("review_log")
-        return True
+        stmt=select(Experience).where(Experience.id==int(eid))
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return False
+        row.expires_at=expires_at; row.curator_note=note or row.curator_note or ""; row.last_reviewed_at=_now(); db.add(ReviewLog(experience_id=row.id, action="curator_set_expiry", reviewer=reviewer, note=note or str(expires_at), user_id=owner_id)); db.commit(); _invalidate("experience"); _invalidate("review_log"); return True
 
 
-def update_experience_status(id, status, reviewer=None, action=None, note=None) -> None:
-    """状态流转 + 写 review_log（同事务）；last_reviewed_at 刷新"""
+def update_experience_status(id, status, reviewer=None, action=None, note=None, user_id=None) -> None:
+    owner_id=_experience_scope_user(user_id, for_write=True)
     with SessionLocal() as db:
-        row = db.execute(select(Experience).where(Experience.id == id)).scalar_one_or_none()
-        if row is None:
+        stmt=select(Experience).where(Experience.id==id)
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return
+        row.status=status; row.last_reviewed_at=_now()
+        if action and reviewer: db.add(ReviewLog(experience_id=id, action=action, reviewer=reviewer, note=note, user_id=owner_id))
+        db.commit(); _invalidate("experience"); _invalidate("review_log")
+
+
+def experience_version(user_id=None) -> str:
+    owner_id=_experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt=select(func.count(), func.max(Experience.id),
+                    func.max(Experience.created_at), func.max(Experience.last_reviewed_at))
+        if owner_id is not None: stmt=stmt.select_from(Experience).where(Experience.user_id==owner_id)
+        else: stmt=stmt.select_from(Experience)
+        count, max_id, created_at, reviewed_at = db.execute(stmt).one()
+        stamp = max(created_at, reviewed_at) if created_at or reviewed_at else "0"
+        return f"e{count}:{max_id or 0}:{stamp}"
+
+
+def write_review_log(experience_id, action, reviewer, note=None, user_id=None) -> None:
+    # strictness_freeze is an explicit system-level event and intentionally
+    # remains unowned; every other review log must belong to an experience owner.
+    owner_id = None if action == "strictness_freeze" else _experience_scope_user(user_id, for_write=True)
+    with SessionLocal() as db:
+        stmt=select(Experience).where(Experience.id==experience_id)
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        exp=db.execute(stmt).scalar_one_or_none()
+        if exp is None and experience_id is not None:
             return
-        row.status = status
-        row.last_reviewed_at = _now()
-        if action and reviewer:
-            db.add(ReviewLog(experience_id=id, action=action, reviewer=reviewer, note=note))
-        db.commit()
-        _invalidate("experience")
-        _invalidate("review_log")
+        if exp is None:
+            db.add(ReviewLog(experience_id=None, action=action, reviewer=reviewer,
+                             note=note, user_id=None))
+            db.commit(); _invalidate("review_log"); return
+        db.add(ReviewLog(experience_id=experience_id, action=action, reviewer=reviewer, note=note, user_id=owner_id)); db.commit(); _invalidate("review_log")
 
 
-def experience_version() -> str:
-    """经验版本感知（e{count}:{max_id}），供 LLM 缓存键追加，经验变更后缓存自动失效"""
+def start_worker_run(user_id=None) -> int:
+    owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
-        count = db.execute(select(func.count()).select_from(Experience)).scalar_one()
-        max_id = db.execute(select(func.max(Experience.id))).scalar_one()
-        return f"e{count}:{max_id or 0}"
+        row=WorkerRun(status="running", user_id=owner_id); db.add(row); db.commit(); return row.id
 
 
-def write_review_log(experience_id, action, reviewer, note=None) -> None:
-    """独立审核留痕（auto_merge/rollback 等）"""
+def finish_worker_run(run_id, processed_count, status, error=None, user_id=None) -> None:
+    owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
-        db.add(ReviewLog(experience_id=experience_id, action=action,
-                         reviewer=reviewer, note=note))
-        db.commit()
-        _invalidate("review_log")
+        stmt=select(WorkerRun).where(WorkerRun.id==run_id)
+        if owner_id is not None: stmt=stmt.where(WorkerRun.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return
+        row.ended_at=_now(); row.processed_count=processed_count; row.status=status; row.error=error; db.commit()
 
 
-def start_worker_run() -> int:
-    """Worker 运行记录开始，返回 run_id"""
+def search_experience(stage=None, tags=None, query=None, k=5, status="active", user_id=None) -> list:
+    owner_id=_experience_scope_user(user_id)
+    return _search_experience_like(stage,tags,query,k,status,owner_id)
+
+
+def _search_experience_like(stage=None, tags=None, query=None, k=5, status="active", user_id=None) -> list:
     with SessionLocal() as db:
-        row = WorkerRun(status="running")
-        db.add(row)
-        db.commit()
-        return row.id
-
-
-def finish_worker_run(run_id, processed_count, status, error=None) -> None:
-    """Worker 运行记录结束（ended_at/processed_count/status/error）"""
-    with SessionLocal() as db:
-        row = db.execute(select(WorkerRun).where(WorkerRun.id == run_id)).scalar_one_or_none()
-        if row is None:
-            return
-        row.ended_at = _now()
-        row.processed_count = processed_count
-        row.status = status
-        row.error = error
-        db.commit()
-
-
-def search_experience(stage=None, tags=None, query=None, k=5, status="active") -> list:
-    """经验检索注入：SQLite 用 FTS5 MATCH（rank 相关度），中文整串匹配差时自动降级 LIKE；
-    MySQL 模式直接 LIKE 检索（标注检索精度降级）。仅取 status 指定的经验。"""
-    if settings.db_backend != "sqlite":
-        return _search_experience_like(stage, tags, query, k, status)
-    if query and str(query).strip():
-        params: dict = {"status": status, "k": int(k)}
-        sql = ("SELECT e.* FROM experience_fts f JOIN experience e ON e.id=f.rowid "
-               "WHERE e.status=:status")
-        if status == "active":
-            sql += " AND (e.expires_at IS NULL OR e.expires_at > :now)"
-            params["now"] = datetime.now()
-        if stage:
-            sql += " AND e.stage=:stage"
-            params["stage"] = stage
-        sql += " AND experience_fts MATCH :query ORDER BY rank LIMIT :k"
-        params["query"] = str(query)
-        try:
-            with SessionLocal() as db:
-                rows = db.execute(text(sql), params).mappings().all()
-                if rows:
-                    return [_exp_map_row(r) for r in rows]
-        except Exception:  # noqa: BLE001 FTS 语法/整串匹配失败 → 降级 LIKE
-            logger.warning("FTS5 检索失败（降级 LIKE）: %s", str(query)[:60])
-    return _search_experience_like(stage, tags, query, k, status)
-
-
-def _search_experience_like(stage=None, tags=None, query=None, k=5, status="active") -> list:
-    """LIKE 兜底检索（FTS 不可用/未命中；MySQL 降级模式）"""
-    with SessionLocal() as db:
-        stmt = select(Experience).where(Experience.status == status)
-        if status == "active":
-            stmt = stmt.where(or_(Experience.expires_at.is_(None),
-                                  Experience.expires_at > datetime.now()))
-        if stage:
-            stmt = stmt.where(Experience.stage == stage)
-        if tags:
-            stmt = stmt.where(Experience.tags.like(f"%{tags}%"))
+        stmt=select(Experience).where(Experience.status==status)
+        if user_id is not None: stmt=stmt.where(Experience.user_id==int(user_id))
+        if status=="active": stmt=stmt.where(or_(Experience.expires_at.is_(None),Experience.expires_at>datetime.now()))
+        if stage: stmt=stmt.where(Experience.stage==stage)
+        if tags: stmt=stmt.where(Experience.tags.like(f"%{tags}%"))
         if query and str(query).strip():
-            kw = f"%{str(query)}%"
-            stmt = stmt.where(Experience.title.like(kw) | Experience.body.like(kw))
-        stmt = stmt.order_by(Experience.id.desc()).limit(k)
-        rows = db.execute(stmt).scalars().all()
-        return [_exp_row(r) for r in rows]
+            kw=f"%{str(query)}%"; stmt=stmt.where(Experience.title.like(kw)|Experience.body.like(kw))
+        return [_exp_row(r) for r in db.execute(stmt.order_by(Experience.id.desc()).limit(k)).scalars().all()]
 
 
 def _exp_map_row(r) -> dict:
-    """FTS JOIN 原始行映射（RowMapping → 统一 dict）"""
-    return dict(id=r["id"], title=r["title"], body=r["body"], stage=r["stage"],
-                tags=r["tags"], impact=r["impact"], confidence=r["confidence"],
-                auto_merged=r["auto_merged"], source_pending_id=r["source_pending_id"],
-                status=r["status"], created_at=str(r["created_at"]),
-                last_reviewed_at=str(r["last_reviewed_at"]) if r["last_reviewed_at"] else None,
-                hit_count=int(r["hit_count"] or 0),
-                last_used_at=str(r["last_used_at"]) if r["last_used_at"] else None,
-                expires_at=str(r["expires_at"]) if r["expires_at"] else None,
-                curator_note=r["curator_note"] or "")
+    return _exp_row(r) if hasattr(r, "__table__") else dict(id=r["id"], title=r["title"], body=r["body"], stage=r["stage"], tags=r["tags"], impact=r["impact"], confidence=r["confidence"], auto_merged=r["auto_merged"], source_pending_id=r["source_pending_id"], status=r["status"], created_at=str(r["created_at"]))
 
 
 # ==================== 经验沉淀设置中心（key-value 热加载） ====================

@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router as api_router
 from app.core.logging import setup_logging
+from app.core.auth import AuthMiddleware
+from app.core.config import validate_multi_user_startup
 from app.db import repo
 from app.db.session import init_db
 from app.scheduler.jobs import start_scheduler, stop_scheduler
@@ -24,6 +26,8 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
+    if not __import__("os").environ.get("PYTEST_CURRENT_TEST"):
+        validate_multi_user_startup()
     init_db()
     repo.seed_default_hot_money_profiles()  # 游资档案种子（幂等，席位名仅作模糊匹配参考）
     start_scheduler()
@@ -55,6 +59,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Stock Agent Decision System", version="1.0.0", lifespan=lifespan)
+app.add_middleware(AuthMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

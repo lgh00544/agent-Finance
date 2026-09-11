@@ -21,6 +21,9 @@ TRANSFER_RATE = 0.00001
 SLIPPAGE_BPS = 5.0
 LIMIT_PCT_DEFAULT = 0.10
 RULE_VERSION = "paper-execution-v1"
+CANDIDATE_POOL_VARIANT = "candidate_pool"
+CANDIDATE_POOL_ALLOCATION = 0.10
+CANDIDATE_POOL_LOT_TOLERANCE = 0.05
 
 
 def _next_date(trade_date: str) -> str:
@@ -181,6 +184,25 @@ def _position_shares(account: dict, plan: dict, price: float, code: str = "") ->
     return shares
 
 
+def _candidate_pool_shares(account: dict, price: float, code: str = "") -> int:
+    """候选池研究账户按初始资金配置候选，兼容一手的最小成交单位。"""
+    reference_cash = _num(account.get("initial_cash")) or _num(account.get("cash"))
+    target = reference_cash * CANDIDATE_POOL_ALLOCATION
+    if target <= 0 or price <= 0:
+        return 0
+    lots = target / price / LOT_SIZE
+    shares = max(0, math.floor(lots) * LOT_SIZE)
+    if shares == 0 and lots >= 1 - CANDIDATE_POOL_LOT_TOLERANCE:
+        shares = LOT_SIZE
+    executed_price = price * (1 + SLIPPAGE_BPS / 10000)
+    while shares >= LOT_SIZE:
+        gross = round(executed_price * shares, 2)
+        if _fees("buy", gross, code)[3] <= _num(account.get("cash")) + 1e-8:
+            break
+        shares -= LOT_SIZE
+    return shares
+
+
 def _payload(account: dict, row: dict, candidate: dict, score: dict | None,
              plan: dict | None, side: str, shares: int, requested_price: float,
              trade_date: str, snapshot: dict, status: str, reason: str = "") -> dict:
@@ -257,7 +279,7 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
         candidates = facts.get("candidates") or {}
         scores = facts.get("scores") or {}
         plans = facts.get("plans") or {}
-    account_dict = {"id": account.id, "cash": account.cash,
+    account_dict = {"id": account.id, "cash": account.cash, "initial_cash": account.initial_cash,
                     "strategy_variant": account.strategy_variant,
                     "rule_version": account.rule_version, "model_version": account.model_version}
     positions = {p["stock_code"]: p for p in repo.list_paper_positions(account_id, status="holding")}
@@ -321,21 +343,24 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
         if live_block:
             payload = _payload(account_dict, row, candidate or {}, score, plan, side, 0, price, trade_date, snapshot, "rejected", live_block)
         elif side == "buy":
-            if not row.get("is_tradeable"):
+            if account_dict["strategy_variant"] != CANDIDATE_POOL_VARIANT and not row.get("is_tradeable"):
                 payload = _payload(account_dict, row, candidate or {}, score, plan, side, 0, price, trade_date, snapshot, "rejected", "not_tradeable")
             elif code in positions:
                 payload = _payload(account_dict, row, candidate or {}, score, plan, side, 0, price, trade_date, snapshot, "rejected", "already_holding")
-            elif not plan or not score or not candidate or price <= 0:
+            elif account_dict["strategy_variant"] != CANDIDATE_POOL_VARIANT and (not plan or not score or not candidate or price <= 0):
                 payload = _payload(account_dict, row, candidate or {}, score, plan, side, 0, price, trade_date, snapshot, "rejected", "plan_or_price_missing")
             else:
-                shares = _position_shares(account_dict, plan, price, code)
+                shares = (_candidate_pool_shares(account_dict, price, code)
+                          if account_dict["strategy_variant"] == CANDIDATE_POOL_VARIANT
+                          else _position_shares(account_dict, plan, price, code))
                 reason = _limit_block(side, code, snapshot)
                 if mode == "live_paper":
-                    from app.services.candidate_tradeable import _zone_bounds
-                    batches = plan.get("batches") or []
-                    bounds = _zone_bounds((batches[0] if batches else {}).get("price_zone") or "")
-                    if not bounds or not bounds[0] <= price <= bounds[1]:
-                        reason = reason or "outside_entry_zone"
+                    if account_dict["strategy_variant"] != CANDIDATE_POOL_VARIANT:
+                        from app.services.candidate_tradeable import _zone_bounds
+                        batches = plan.get("batches") or []
+                        bounds = _zone_bounds((batches[0] if batches else {}).get("price_zone") or "")
+                        if not bounds or not bounds[0] <= price <= bounds[1]:
+                            reason = reason or "outside_entry_zone"
                 if shares < LOT_SIZE:
                     reason = reason or "cash_or_plan_position_too_small"
                 payload = _payload(account_dict, row, candidate or {}, score, plan, side, shares, price, trade_date, snapshot,

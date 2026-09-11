@@ -7,6 +7,9 @@ APScheduler 定时任务（Asia/Shanghai）
 【刚性代码逻辑】只做调度，不包含任何市场判断。
 """
 import logging
+import os
+import socket
+import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -23,7 +26,75 @@ from app.graph import router as graph_router
 logger = get_logger("scheduler")
 
 scheduler: BackgroundScheduler | None = None
+_leader_acquired = False
+_leader_owner = f"{socket.gethostname()}:{os.getpid()}"
+_leader_stop = threading.Event()
+_leader_thread: threading.Thread | None = None
+_leader_standby_thread: threading.Thread | None = None
 
+
+def _leader_ttl_seconds() -> int:
+    return max(30, int(settings.scheduler_leader_ttl_seconds))
+
+
+def _leader_renew_seconds() -> int:
+    return max(5, min(int(settings.scheduler_leader_renew_seconds), _leader_ttl_seconds() // 2))
+
+
+def _leader_renew_loop() -> None:
+    global scheduler, _leader_acquired
+    while not _leader_stop.wait(_leader_renew_seconds()):
+        if not _leader_acquired:
+            return
+        try:
+            ok = cache.renew_lock_owner("scheduler:leader", _leader_owner, _leader_ttl_seconds())
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            logger.error("调度 leader 租约续期失败: %s", exc)
+        if not ok:
+            logger.error("调度 leader 租约丢失，停止本实例 APScheduler")
+            if scheduler is not None:
+                try:
+                    scheduler.shutdown(wait=False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("停止失租调度器失败: %s", exc)
+                scheduler = None
+            _leader_acquired = False
+            _start_leader_standby()
+            return
+
+
+def _leader_standby_loop() -> None:
+    global _leader_acquired
+    while not _leader_stop.wait(max(2, _leader_renew_seconds())):
+        if _leader_acquired:
+            return
+        try:
+            if cache.acquire_lock_owner("scheduler:leader", _leader_owner, _leader_ttl_seconds()):
+                _leader_acquired = True
+                start_scheduler()
+                _start_leader_renewal()
+                logger.info("调度 leader 接管成功 owner=%s", _leader_owner)
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("调度 leader 接管竞争失败: %s", exc)
+
+
+def _start_leader_standby() -> None:
+    global _leader_standby_thread
+    if _leader_stop.is_set() or (_leader_standby_thread and _leader_standby_thread.is_alive()):
+        return
+    _leader_standby_thread = threading.Thread(
+        target=_leader_standby_loop, name="scheduler-leader-standby", daemon=True)
+    _leader_standby_thread.start()
+
+
+def _start_leader_renewal() -> None:
+    global _leader_thread
+    _leader_stop.clear()
+    _leader_thread = threading.Thread(
+        target=_leader_renew_loop, name="scheduler-leader-renew", daemon=True)
+    _leader_thread.start()
 
 def _mark_sector_job(job_key: str, success: bool, error: str | None = None) -> None:
     cache.set(f"job:last_{job_key}", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
@@ -190,7 +261,12 @@ def paper_execution_job() -> None:
         for review in repo.list_paper_reviews(limit=200):
             if review.get("audit_status") == "pending":
                 try:
-                    audit_review(review["id"])
+                    from app.core.auth import reset_user_context, set_user_context
+                    tokens = set_user_context(review.get("user_id") or 1, "admin")
+                    try:
+                        audit_review(review["id"])
+                    finally:
+                        reset_user_context(tokens)
                 except Exception as exc:  # noqa: BLE001 审核失败不伪造通过
                     logger.warning("模拟复盘 AI 审核失败 review#%s: %s", review.get("id"), exc)
         cache.set("job:last_paper_execution", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
@@ -217,11 +293,20 @@ def paper_monitor_job() -> None:
         from app.services import paper_execution, paper_monitor
         for account in repo.list_paper_accounts(status="active"):
             try:
-                paper_execution.run(account["id"], today)
+                from app.core.auth import reset_user_context, set_user_context
+                tokens = set_user_context(account.get("user_id") or 1, "admin")
+                try:
+                    paper_execution.run(account["id"], today)
+                finally:
+                    reset_user_context(tokens)
             except Exception as exc:
                 logger.warning("模拟账户 %s 盘中建仓执行失败: %s", account.get("id"), exc)
             try:
-                paper_monitor.run(account["id"], today)
+                tokens = set_user_context(account.get("user_id") or 1, "admin")
+                try:
+                    paper_monitor.run(account["id"], today)
+                finally:
+                    reset_user_context(tokens)
             except Exception as exc:
                 logger.warning("模拟账户 %s 盘中监控失败: %s", account.get("id"), exc)
         cache.set("job:last_paper_monitor", now.strftime("%Y-%m-%d %H:%M:%S"), 86400)
@@ -246,7 +331,17 @@ def monitor_job() -> None:
         logger.info("monitor 锁被占用，跳过本次")
         return
     try:
-        results = graph_router.run_monitor_all(today)
+        results = []
+        users = repo.list_active_users() if settings.multi_user_enabled else [
+            {"id": None, "role": None}]
+        from app.core.auth import reset_user_context, set_user_context
+        for user in users:
+            tokens = set_user_context(user["id"], user.get("role"))
+            try:
+                results.extend(graph_router.run_monitor_all(
+                    today, user["id"], is_admin=user.get("role") == "admin"))
+            finally:
+                reset_user_context(tokens)
         cache.set("job:last_monitor", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
         if _in_close_check_window(now) and not _in_trading_window(now):
             cache.set(f"job:close_checked:{today}", "1", 86400)
@@ -272,8 +367,20 @@ def portfolio_sentinel_job() -> None:
         logger.info("portfolio_sentinel 锁被占用，跳过本次")
         return
     try:
-        result = graph_router.run_portfolio_sentinel(today)
-        ps = result.get("portfolio_sentinel") or {}
+        users = repo.list_active_users() if settings.multi_user_enabled else [
+            {"id": None, "role": None}]
+        from app.core.auth import reset_user_context, set_user_context
+        ps_rows = []
+        for user in users:
+            tokens = set_user_context(user["id"], user.get("role"))
+            try:
+                result = graph_router.run_portfolio_sentinel(today)
+                ps_rows.append(result.get("portfolio_sentinel") or {})
+            finally:
+                reset_user_context(tokens)
+        ps = {"sector_alerts": sum((p.get("sector_alerts") or [] for p in ps_rows), []),
+              "time_stop_alerts": sum((p.get("time_stop_alerts") or [] for p in ps_rows), []),
+              "skipped": bool(ps_rows) and all(p.get("skipped") for p in ps_rows)}
         if ps.get("skipped"):
             logger.info("组合哨兵跳过（无持仓）: %s", today)
         else:
@@ -500,7 +607,20 @@ def quote_snapshot_refresh_job() -> None:
         return
     try:
         from app.services.quote_snapshot import refresh_quote_snapshot
-        result = refresh_quote_snapshot()
+        users = repo.list_active_users() if settings.multi_user_enabled else [
+            {"id": None, "role": None}]
+        from app.core.auth import reset_user_context, set_user_context
+        results = []
+        for user in users:
+            tokens = set_user_context(user["id"], user.get("role"))
+            try:
+                results.append(refresh_quote_snapshot(
+                    user["id"], is_admin=user.get("role") == "admin"))
+            finally:
+                reset_user_context(tokens)
+        result = {"success": all(r.get("success") for r in results),
+                  "rows": sum(int(r.get("rows") or 0) for r in results),
+                  "source": ",".join(sorted({str(r.get("source") or "") for r in results}))}
         if result.get("success"):
             cache.set("job:last_quote_snapshot_refresh",
                       time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
@@ -599,7 +719,19 @@ def experience_worker_job(force: bool = False) -> None:
     积压 < 阈值或 task_queue 活跃时轻量跳过。异常不外抛（调度线程吞掉告警日志）。"""
     try:
         from app.services.experience_worker import worker_run
-        result = worker_run(force=force)
+        from app.core.auth import reset_user_context, set_user_context
+        users = repo.list_active_users() if settings.multi_user_enabled else [
+            {"id": None, "role": None}]
+        results = []
+        for user in users:
+            tokens = set_user_context(user["id"], user.get("role"))
+            try:
+                results.append(worker_run(force=force, user_id=user["id"]))
+            except Exception as exc:
+                logger.error("经验沉淀 Worker 用户 %s 异常: %s", user["id"], exc)
+            finally:
+                reset_user_context(tokens)
+        result = results
         logger.info("经验沉淀 Worker: %s", result)
     except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
         logger.error("经验沉淀 Worker 异常: %s", exc)
@@ -609,8 +741,20 @@ def audit_pending_job() -> None:
     """通用审核批处理：每日 03:30 低峰扫描待审建议辩证审核（audit_log 落库；首审失败触发 rethink 重审）"""
     try:
         from app.agents.audit import run_pending_audits
-        result = run_pending_audits(cutoff_id=0)
-        errors = result.get("errors") or []
+        from app.core.auth import reset_user_context, set_user_context
+        users = repo.list_active_users() if settings.multi_user_enabled else [
+            {"id": None, "role": None}]
+        results = []
+        for user in users:
+            tokens = set_user_context(user["id"], user.get("role"))
+            try:
+                results.append(run_pending_audits(cutoff_id=0, user_id=user["id"]))
+            except Exception as exc:
+                logger.error("建议辩证审核用户 %s 异常: %s", user["id"], exc)
+            finally:
+                reset_user_context(tokens)
+        result = {"users": results}
+        errors = [e for result in results for e in result.get("errors") or []]
         error_text = "; ".join([f"#{e.get('id')}: {e.get('error')}" for e in errors])[:500]
         cache.set("job:last_audit_pending", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
         cache.set("job:last_audit_pending_error", error_text, 86400)
@@ -658,52 +802,81 @@ def ths_pnl_job() -> None:
         return
     from app.services import ths_pnl
 
-    try:
-        snapshot = ths_pnl.get_snapshot()
-    except Exception as exc:  # noqa: BLE001 采集异常不崩调度，只落 error
-        logger.error("同花顺盈亏采集异常: %s", exc)
-        snapshot = {"error": "采集异常", "token_expired": False}
-    if snapshot.get("error"):
-        logger.warning("同花顺盈亏采集未成功: %s", snapshot["error"])
-    try:
-        repo.upsert_account_pnl_snapshot(
-            trade_date=time.strftime("%Y-%m-%d"), ts=time.strftime("%H:%M:%S"),
-            pnl_yk=snapshot.get("pnl_yk"), pnl_pct=snapshot.get("pnl_pct"),
-            sh_pct=snapshot.get("sh_pct"), chart_data=snapshot.get("chart_data") or [],
-            error=snapshot.get("error") or "", token_expired=snapshot.get("token_expired") or False)
-    except Exception as exc:  # noqa: BLE001 落库失败不阻塞调度
-        logger.error("同花顺盈亏快照落库失败: %s", exc)
+    users = repo.list_active_users() if settings.multi_user_enabled else [
+        {"id": None, "role": None}]
+    from app.core.auth import reset_user_context, set_user_context
+    for user in users:
+        tokens = set_user_context(user["id"], user.get("role"))
+        try:
+            try:
+                snapshot = ths_pnl.get_snapshot()
+            except Exception as exc:  # noqa: BLE001 采集异常不崩调度，只落 error
+                logger.error("同花顺盈亏采集异常: %s", exc)
+                snapshot = {"error": "采集异常", "token_expired": False}
+            if snapshot.get("error"):
+                logger.warning("同花顺盈亏采集未成功: %s", snapshot["error"])
+            repo.upsert_account_pnl_snapshot(
+                trade_date=time.strftime("%Y-%m-%d"), ts=time.strftime("%H:%M:%S"),
+                pnl_yk=snapshot.get("pnl_yk"), pnl_pct=snapshot.get("pnl_pct"),
+                sh_pct=snapshot.get("sh_pct"), chart_data=snapshot.get("chart_data") or [],
+                error=snapshot.get("error") or "",
+                token_expired=snapshot.get("token_expired") or False,
+                user_id=user["id"])
+        except Exception as exc:  # noqa: BLE001 落库失败不阻塞调度
+            logger.error("同花顺盈亏快照落库失败 user=%s: %s", user["id"], exc)
+        finally:
+            reset_user_context(tokens)
 
 
 def feishu_daily_report_job() -> None:
-    """每日收盘日报直发：今日盈亏 + 持仓概览 + 当日候选 + 告警数（只搬运现有服务结果，不新写研判）"""
+    """每日收盘日报直发，按绑定用户分别生成并发送。"""
     if not settings.feishu_daily_report or not _is_trading_day(time.strftime("%Y-%m-%d")):
         return
     from app.services import holding_view, ths_pnl
     from app.services.feishu_sender import send_text
-
-    lines = [f"📊 {time.strftime('%Y-%m-%d')} 收盘日报"]
-    snap = ths_pnl.get_snapshot()
-    lines.append(f"今日盈亏: ¥{snap['pnl_yk']:,.0f}（{snap.get('pnl_pct')}%）"
-                 if snap.get("pnl_yk") is not None else f"今日盈亏: {snap.get('error') or '未接入'}")
-    view = holding_view.build_holding_view()
-    rows = view["rows"]
-    mv = sum(r["market_value"] or 0 for r in rows)
-    pnl = sum(r["pnl_amount"] or 0 for r in rows)
-    lines.append(f"持仓 {len(rows)} 只 | 总市值 ¥{mv:,.0f} | 浮动盈亏 ¥{pnl:,.0f}")
-    cands = repo.list_candidates(time.strftime("%Y-%m-%d"), 5)
-    if cands:
-        lines.append("当日候选: " + "、".join(f"{c['stock_code']} {c['stock_name'] or ''}" for c in cands))
-    alerts = [a for a in repo.list_alerts(50) if str(a.get("created_at", "")).startswith(time.strftime("%Y-%m-%d"))]
-    lines.append(f"今日告警 {len(alerts)} 条")
-    for oid in [s.strip() for s in settings.feishu_admin_open_ids.split(",") if s.strip()]:
-        send_text(oid, "\n".join(lines))
-
+    users = repo.list_active_users() if settings.multi_user_enabled else [
+        {"id": None, "role": None, "feishu_open_id": None}]
+    fallback_ids = [s.strip() for s in settings.feishu_admin_open_ids.split(",") if s.strip()]
+    from app.core.auth import reset_user_context, set_user_context
+    for user in users:
+        tokens = set_user_context(user["id"], user.get("role"))
+        try:
+            lines = [f"📊 {time.strftime('%Y-%m-%d')} 收盘日报"]
+            snap = ths_pnl.get_snapshot()
+            lines.append(f"今日盈亏: ¥{snap['pnl_yk']:,.0f}（{snap.get('pnl_pct')}%）"
+                         if snap.get('pnl_yk') is not None else f"今日盈亏: {snap.get('error') or '未接入'}")
+            view = holding_view.build_holding_view(
+                user["id"], is_admin=user.get("role") == "admin")
+            rows = view["rows"]
+            mv = sum(r["market_value"] or 0 for r in rows)
+            pnl = sum(r["pnl_amount"] or 0 for r in rows)
+            lines.append(f"持仓 {len(rows)} 只 | 总市值 ¥{mv:,.0f} | 浮动盈亏 ¥{pnl:,.0f}")
+            alerts = [a for a in repo.list_alerts(
+                50, user_id=user["id"], is_admin=user.get("role") == "admin")
+                if str(a.get("created_at", "")).startswith(time.strftime("%Y-%m-%d"))]
+            lines.append(f"今日告警 {len(alerts)} 条")
+            recipients = [user.get("feishu_open_id")] if user.get("feishu_open_id") else fallback_ids
+            for oid in [x for x in recipients if x]:
+                send_text(oid, "\n".join(lines))
+        finally:
+            reset_user_context(tokens)
 
 def start_scheduler() -> None:
-    global scheduler
+    global scheduler, _leader_acquired
     if scheduler is not None:
         return
+    if settings.multi_user_enabled:
+        if settings.cache_backend != "redis":
+            logger.error("多人模式拒绝启动调度：必须配置共享 Redis")
+            return
+        if not _leader_acquired and not cache.acquire_lock_owner(
+                "scheduler:leader", _leader_owner, _leader_ttl_seconds()):
+            logger.warning("多人模式当前实例不是调度 leader，跳过 APScheduler")
+            _start_leader_standby()
+            return
+        if not _leader_acquired:
+            _leader_acquired = True
+            _start_leader_renewal()
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     # 工作日 16:00 候选池 T+N 验证（16:10 每日挖掘之前，验证前一日候选）
     scheduler.add_job(track_verify_job, "cron",
@@ -870,10 +1043,14 @@ def start_scheduler() -> None:
 
 
 def stop_scheduler() -> None:
-    global scheduler
+    global scheduler, _leader_acquired
+    _leader_stop.set()
     if scheduler is not None:
         scheduler.shutdown(wait=False)
         scheduler = None
+    if _leader_acquired:
+        cache.release_lock_owner("scheduler:leader", _leader_owner)
+        _leader_acquired = False
 
 
 def job_status() -> list[dict]:
@@ -899,4 +1076,6 @@ def job_status() -> list[dict]:
     out.append({"id": "last_sector_daily", "name": "最近板块轮动日快照", "next_run": cache.get("job:last_sector_daily")})
     out.append({"id": "last_audit_pending", "name": "最近建议辩证审核", "next_run": cache.get("job:last_audit_pending"),
                 "error": cache.get("job:last_audit_pending_error")})
+    out.append({"id": "scheduler_leader", "name": "调度 leader",
+                "next_run": cache.get_lock_owner("scheduler:leader") or ""})
     return out

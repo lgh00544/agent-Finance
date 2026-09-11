@@ -219,13 +219,17 @@ def _snapshot_age_seconds(snapshot: dict | None) -> float | None:
         return None
 
 
-def refresh_snapshot_if_needed(force: bool = False) -> dict | None:
+def refresh_snapshot_if_needed(force: bool = False, user_id: int | None = None,
+                               *, is_admin: bool = False) -> dict | None:
     """按需实时读取凭证并落库，返回最新快照。
 
     普通 GET 仅在无快照、快照超过 10 分钟或上次为 token 失效时触发；
     手动刷新 force=True 可绕过年龄判断。30 秒冷却 + 锁避免页面轮询造成重复请求。
     """
-    latest = repo.get_latest_account_pnl()
+    try:
+        latest = repo.get_latest_account_pnl(user_id, is_admin=is_admin)
+    except TypeError:
+        latest = repo.get_latest_account_pnl()
     age = _snapshot_age_seconds(latest)
     needs_refresh = (
         force
@@ -236,13 +240,18 @@ def refresh_snapshot_if_needed(force: bool = False) -> dict | None:
     )
     if not needs_refresh:
         return latest
-    if not force and cache.get(_REFRESH_COOLDOWN_KEY):
+    cooldown_key = f"{_REFRESH_COOLDOWN_KEY}:{user_id or 'default'}"
+    lock_key = f"{_REFRESH_LOCK}:{user_id or 'default'}"
+    if not force and cache.get(cooldown_key):
         return latest
-    if not cache.acquire_lock(_REFRESH_LOCK, ttl_seconds=60):
+    if not cache.acquire_lock(lock_key, ttl_seconds=60):
         return latest
     try:
-        if not force and cache.get(_REFRESH_COOLDOWN_KEY):
-            return repo.get_latest_account_pnl()
+        if not force and cache.get(cooldown_key):
+            try:
+                return repo.get_latest_account_pnl(user_id, is_admin=is_admin)
+            except TypeError:
+                return repo.get_latest_account_pnl()
         snapshot = get_snapshot()
         now = datetime.now(_CST)
         repo.upsert_account_pnl_snapshot(
@@ -254,11 +263,15 @@ def refresh_snapshot_if_needed(force: bool = False) -> dict | None:
             chart_data=snapshot.get("chart_data") or [],
             error=snapshot.get("error") or "",
             token_expired=snapshot.get("token_expired") or False,
+            user_id=user_id,
         )
-        cache.set(_REFRESH_COOLDOWN_KEY, str(time.time()), _REFRESH_COOLDOWN_SECONDS)
-        return repo.get_latest_account_pnl()
+        cache.set(cooldown_key, str(time.time()), _REFRESH_COOLDOWN_SECONDS)
+        try:
+            return repo.get_latest_account_pnl(user_id, is_admin=is_admin)
+        except TypeError:
+            return repo.get_latest_account_pnl()
     except Exception as exc:  # noqa: BLE001 页面刷新失败仍返回旧快照
         logger.warning("同花顺实时刷新失败: %s", exc)
         return latest
     finally:
-        cache.release_lock(_REFRESH_LOCK)
+        cache.release_lock(lock_key)

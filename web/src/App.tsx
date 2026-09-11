@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react'
 import { Spin } from 'antd'
 import { Routes, Route } from 'react-router-dom'
 import { AppShell } from '@/components/layout/AppShell'
+import { AuthGate } from '@/components/AuthGate'
 
 // 13 页懒加载（路由级代码分割；AppShell 布局保持静态首屏加载）
 const OverviewPage = lazy(() => import('@/pages/OverviewPage'))
@@ -33,9 +34,10 @@ function PageLoading() {
 /** 13 条路由（全部懒加载；通配 * 兜底系统概览） */
 export default function App() {
   return (
-    <Suspense fallback={<PageLoading />}>
-      <Routes>
-        <Route path="/" element={<AppShell />}>
+    <AuthGate>
+      <Suspense fallback={<PageLoading />}>
+        <Routes>
+          <Route path="/" element={<AppShell />}>
           <Route index element={<OverviewPage />} />
           <Route path="market-intel" element={<MarketIntelPage />} />
           <Route path="news-sector" element={<NewsSectorPage />} />
@@ -53,8 +55,9 @@ export default function App() {
           <Route path="profile" element={<ProfilePage />} />
           <Route path="system-map" element={<SystemMapPage />} />
           <Route path="*" element={<OverviewPage />} />
-        </Route>
-      </Routes>
-    </Suspense>
+          </Route>
+        </Routes>
+      </Suspense>
+    </AuthGate>
   )
 }
