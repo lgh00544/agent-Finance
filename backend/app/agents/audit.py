@@ -93,14 +93,18 @@ def _call_with_timeout(fn, timeout_seconds: int, *args):
 
 
 def run_pending_audits(cutoff_id: int = 0, last_scanned_id: int | None = None,
-                       limit: int = 50) -> dict:
+                       limit: int = 50, user_id: int | None = None) -> dict:
     """批量扫描待审建议辩证审核（幂等：pass/round2-fail 不再自动重审）。
     单条 fail/异常/超时隔离：不中断整批；round2 仍 fail → 定格不再第 3 轮。"""
     from app.core.auth import current_user_id
-    owner_id = current_user_id()
-    if owner_id is None:
+    owner_id = user_id if user_id is not None else current_user_id()
+    if owner_id is None and not settings.multi_user_enabled:
+        owner_id = None
+    elif owner_id is None:
         raise RuntimeError("audit batch requires authenticated user context")
-    cursor_key = f"audit_cursor.u{owner_id}.last_id"
+    if user_id is not None and user_id != current_user_id():
+        raise PermissionError("audit context cannot process another user's suggestions")
+    cursor_key = f"audit_cursor.u{owner_id}.last_id" if owner_id is not None else "audit_cursor.last_id"
     cursor = max(cutoff_id or 0, int(repo.get_config(cursor_key) or 0),
                  last_scanned_id or 0)
     rows = repo.list_agent_suggestions_for_audit(cursor, limit, user_id=owner_id)

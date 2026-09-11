@@ -746,7 +746,7 @@ def audit_pending_job() -> None:
         for user in users:
             tokens = set_user_context(user["id"], user.get("role"))
             try:
-                results.append(run_pending_audits(cutoff_id=0))
+                results.append(run_pending_audits(cutoff_id=0, user_id=user["id"]))
             finally:
                 reset_user_context(tokens)
         result = {"users": results}
