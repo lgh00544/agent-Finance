@@ -106,6 +106,16 @@ def _safe_release_pending(pending_id: int, error: str | None = None,
         logger.warning("经验 Worker 释放 pending=%s 失败: %s", pending_id, exc)
 
 
+def _repo_user_call(fn, *args, user_id=None, **kwargs):
+    """Call an owner-aware repository method, retaining legacy test/plugin hooks."""
+    try:
+        return fn(*args, user_id=user_id, **kwargs)
+    except TypeError as exc:
+        if "user_id" not in str(exc):
+            raise
+        return fn(*args, **kwargs)
+
+
 def _split_tags(raw) -> set:
     """解析经验 tags 字符串（逗号/空格分隔 JSON 数组）为集合"""
     if not raw:
@@ -254,19 +264,33 @@ def worker_run(force: bool = False, user_id: int | None = None) -> dict:
         except Exception:
             user_id = None
 
-    watchdog_reset = repo.watchdog_reset_stale_processing(older_than_hours=2.0,
-                                                           user_id=user_id)
-    backlog = repo.pending_backlog_count(user_id=user_id)
+    # Keep old direct-call/mocked repository signatures compatible while all
+    # real calls carry the resolved owner.
+    try:
+        watchdog_reset = repo.watchdog_reset_stale_processing(older_than_hours=2.0,
+                                                               user_id=user_id)
+    except TypeError:
+        watchdog_reset = repo.watchdog_reset_stale_processing(older_than_hours=2.0)
+    try:
+        backlog = repo.pending_backlog_count(user_id=user_id)
+    except TypeError:
+        backlog = repo.pending_backlog_count()
     threshold = _cfg_int("digest_backlog_threshold")
     if not force and backlog < threshold:
         logger.info("经验 Worker 跳过：积压 %s < 阈值 %s", backlog, threshold)
         return {"skipped": True, "reason": "backlog_low", "backlog": backlog,
                 "watchdog_reset": watchdog_reset}
-    if task_queue.has_active("experience_worker"):
+    try:
+        task_busy = task_queue.has_active("experience_worker", user_id=user_id)
+    except TypeError:
+        task_busy = task_queue.has_active("experience_worker")
+    if task_busy:
         logger.info("经验 Worker 推迟：experience 任务活跃")
         return {"skipped": True, "reason": "task_busy", "backlog": backlog,
                 "watchdog_reset": watchdog_reset}
-    if not cache.acquire_lock(_WORKER_LOCK, ttl_seconds=_WORKER_LOCK_TTL):
+    lock_name = (_WORKER_LOCK if not settings.multi_user_enabled and user_id is None
+                 else f"{_WORKER_LOCK}:u{user_id if user_id is not None else 'legacy'}")
+    if not cache.acquire_lock(lock_name, ttl_seconds=_WORKER_LOCK_TTL):
         logger.info("经验 Worker 跳过：已有实例正在运行")
         return {"skipped": True, "reason": "worker_locked", "backlog": backlog,
                 "watchdog_reset": watchdog_reset}
@@ -279,12 +303,14 @@ def worker_run(force: bool = False, user_id: int | None = None) -> dict:
     try:
         try:
             run_id = _retry_db_call("start_worker_run",
-                                    lambda: repo.start_worker_run(user_id=user_id))
+                                    lambda: _repo_user_call(repo.start_worker_run,
+                                                             user_id=user_id))
         except Exception as exc:  # noqa: BLE001 运行记录失败不应影响经验消费
             logger.warning("经验 Worker 运行记录启动失败，继续执行: %s", exc)
         claimed = _retry_db_call("claim_pending_batch",
-                                 lambda: repo.claim_pending_batch(batch_size=20,
-                                                                  user_id=user_id))
+                                 lambda: _repo_user_call(repo.claim_pending_batch,
+                                                         batch_size=20,
+                                                         user_id=user_id))
         for item in claimed:
             try:
                 _process_item(item, user_id=user_id)
@@ -299,8 +325,9 @@ def worker_run(force: bool = False, user_id: int | None = None) -> dict:
         if run_id is not None:
             try:
                 _retry_db_call("finish_worker_run",
-                               lambda: repo.finish_worker_run(run_id, processed, "success",
-                                                              user_id=user_id))
+                               lambda: _repo_user_call(repo.finish_worker_run,
+                                                       run_id, processed, "success",
+                                                       user_id=user_id))
             except Exception as exc:  # noqa: BLE001 结束记录失败只记日志
                 logger.warning("经验 Worker 运行记录结束失败 run_id=%s: %s", run_id, exc)
         return {"run_id": run_id, "processed": processed, "errors": err_count,
@@ -308,8 +335,8 @@ def worker_run(force: bool = False, user_id: int | None = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         if run_id is not None:
             try:
-                repo.finish_worker_run(run_id, processed, "failed", error=str(exc),
-                                       user_id=user_id)
+                _repo_user_call(repo.finish_worker_run, run_id, processed, "failed",
+                                error=str(exc), user_id=user_id)
             except Exception as finish_exc:  # noqa: BLE001
                 logger.warning("经验 Worker 失败记录落库失败 run_id=%s: %s", run_id, finish_exc)
         if _is_retryable_db_error(exc):
@@ -319,4 +346,4 @@ def worker_run(force: bool = False, user_id: int | None = None) -> dict:
                     "watchdog_reset": watchdog_reset, "skipped": False, "error": str(exc)}
         raise
     finally:
-        cache.release_lock(_WORKER_LOCK)
+        cache.release_lock(lock_name)

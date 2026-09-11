@@ -106,6 +106,23 @@ def get_user_by_credentials(username: str, password: str) -> dict | None:
                 "is_active": row.is_active, "feishu_open_id": row.feishu_open_id}
 
 
+def change_user_password(user_id: int, current_password: str, new_password: str) -> bool:
+    """Verify the current secret, rotate the hash, and revoke all old sessions."""
+    from app.core.auth import hash_password, verify_password
+    with SessionLocal() as db:
+        row = db.execute(select(User).where(User.id == int(user_id),
+                                            User.is_active.is_(True))).scalar_one_or_none()
+        if row is None or not verify_password(current_password, row.password_hash):
+            return False
+        row.password_hash = hash_password(new_password)
+        db.query(UserSession).filter(UserSession.user_id == row.id,
+                                     UserSession.revoked_at.is_(None)).update(
+                                         {UserSession.revoked_at: _now()},
+                                         synchronize_session=False)
+        db.commit()
+        return True
+
+
 def get_user_by_feishu_open_id(open_id: str) -> dict | None:
     """Resolve a Feishu sender to an application user without trusting message payloads."""
     if not open_id:
@@ -4178,7 +4195,7 @@ def merge_pending_duplicate(task_id, stage, summary, artifacts_ref, user_id=None
 
 
 def add_pending_experience(task_id, stage, summary, artifacts_ref, user_id=None) -> int:
-    owner_id = _experience_scope_user(user_id)
+    owner_id = _experience_scope_user(user_id, for_write=True)
     merged = merge_pending_duplicate(task_id, stage, summary, artifacts_ref, owner_id)
     if merged:
         return merged
@@ -4317,7 +4334,7 @@ def list_curator_candidates(status="active", stage="", older_than_days=None, max
 
 
 def mark_experience_curated(eid, status, note, reviewer="auto", user_id=None) -> bool:
-    owner_id = _experience_scope_user(user_id); actions={"archived":"curator_archive","expired":"curator_expire","pending_review":"curator_propose"}
+    owner_id = _experience_scope_user(user_id, for_write=True); actions={"archived":"curator_archive","expired":"curator_expire","pending_review":"curator_propose"}
     if status not in actions: raise ValueError("status must be archived/expired/pending_review")
     with SessionLocal() as db:
         stmt=select(Experience).where(Experience.id==int(eid))
@@ -4328,7 +4345,7 @@ def mark_experience_curated(eid, status, note, reviewer="auto", user_id=None) ->
 
 
 def set_experience_expires_at(eid, expires_at, note="", reviewer="sir", user_id=None) -> bool:
-    owner_id=_experience_scope_user(user_id)
+    owner_id=_experience_scope_user(user_id, for_write=True)
     with SessionLocal() as db:
         stmt=select(Experience).where(Experience.id==int(eid))
         if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
@@ -4338,7 +4355,7 @@ def set_experience_expires_at(eid, expires_at, note="", reviewer="sir", user_id=
 
 
 def update_experience_status(id, status, reviewer=None, action=None, note=None, user_id=None) -> None:
-    owner_id=_experience_scope_user(user_id)
+    owner_id=_experience_scope_user(user_id, for_write=True)
     with SessionLocal() as db:
         stmt=select(Experience).where(Experience.id==id)
         if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
@@ -4359,7 +4376,9 @@ def experience_version(user_id=None) -> str:
 
 
 def write_review_log(experience_id, action, reviewer, note=None, user_id=None) -> None:
-    owner_id=_experience_scope_user(user_id)
+    # strictness_freeze is an explicit system-level event and intentionally
+    # remains unowned; every other review log must belong to an experience owner.
+    owner_id = None if action == "strictness_freeze" else _experience_scope_user(user_id, for_write=True)
     with SessionLocal() as db:
         stmt=select(Experience).where(Experience.id==experience_id)
         if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)

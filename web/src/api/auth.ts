@@ -20,3 +20,5 @@ export const login = (username: string, password: string): Promise<LoginResult> 
   post('/auth/login', { username, password })
 export const register = (username: string, password: string): Promise<LoginResult> =>
   post('/auth/register', { username, password })
+export const changePassword = (current_password: string, new_password: string): Promise<{ ok: boolean; message: string }> =>
+  post('/auth/password', { current_password, new_password })

@@ -87,6 +87,11 @@ class LoginBody(BaseModel):
     password: str
 
 
+class PasswordChangeBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
 class UserCreateBody(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=256)
@@ -131,6 +136,17 @@ def auth_register(body: LoginBody):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {**user, "access_token": issue_token(user["id"]), "token_type": "bearer"}
+
+
+@router.post("/auth/password")
+def auth_change_password(body: PasswordChangeBody):
+    """Rotate the signed-in user's password; old bearer sessions are revoked."""
+    user_id = require_user()
+    if body.current_password == body.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
+    if not repo.change_user_password(user_id, body.current_password, body.new_password):
+        raise HTTPException(status_code=400, detail="当前密码不正确")
+    return {"ok": True, "message": "密码已修改，请使用新密码重新登录"}
 
 
 @router.post("/auth/users")

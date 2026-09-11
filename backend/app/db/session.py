@@ -505,12 +505,12 @@ def _ensure_reasoning_trace_user_scope() -> None:
 
     _add_columns(engine, "ai_reasoning_trace", {"user_id": "INTEGER NULL"})
     with engine.begin() as conn:
-        conn.exec_driver_sql(
+        conn.execute(text(
             "UPDATE ai_reasoning_trace SET user_id = :user_id WHERE user_id IS NULL",
-            {"user_id": default_id})
-        conn.exec_driver_sql(
+        ), {"user_id": default_id})
+        conn.execute(text(
             "UPDATE ai_reasoning_trace_history SET user_id = :user_id WHERE user_id IS NULL",
-            {"user_id": default_id})
+        ), {"user_id": default_id})
         rows = list(conn.exec_driver_sql("SHOW INDEX FROM ai_reasoning_trace"))
         index_columns: dict[str, list[tuple[int, str]]] = {}
         for row in rows:
