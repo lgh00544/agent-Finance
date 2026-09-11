@@ -20,6 +20,11 @@ AUDIT_ITEM_TIMEOUT_SECONDS = 90
 
 def collect_audit(suggestion) -> dict:
     """聚合单条待审建议 → 审核输入（只读，不改任何字段）"""
+    from app.core.auth import current_user_id
+    owner_id = current_user_id()
+    if settings.multi_user_enabled and (owner_id is None or
+                                        getattr(suggestion, "user_id", None) != owner_id):
+        raise PermissionError("建议不属于当前账号")
     fields = (
         "id", "review_id", "target_agent", "target_kind", "rule_type", "priority",
         "rule_name", "current_value", "suggested_value", "rule_text", "problem_desc",
@@ -68,6 +73,10 @@ def llm_re_audit(suggestion, dissent_view: str) -> AuditOutput:
 def _persist(suggestion, audit_round: int, out: AuditOutput, duration_ms: int) -> int:
     """落 audit_log + 原表 3 个 audit 字段（reasoning 存 LLM 原始 JSON 全文）"""
     from app.core.auth import current_user_id
+    owner_id = current_user_id()
+    if settings.multi_user_enabled and (owner_id is None or
+                                        getattr(suggestion, "user_id", None) != owner_id):
+        raise PermissionError("建议不属于当前账号")
     log_id = repo.insert_audit_log(
         target_type="agent_suggestion", target_id=suggestion.id, audit_round=audit_round,
         verdict=out.verdict, confidence=out.confidence,
@@ -75,9 +84,10 @@ def _persist(suggestion, audit_round: int, out: AuditOutput, duration_ms: int) -
         boundary_cases=out.boundary_cases, evidence_refs=list(out.evidence_refs or []),
         audit_model=settings.deepseek_reasoning_model,
         reasoning=json.dumps(out.model_dump(), ensure_ascii=False, default=str),
-        duration_ms=duration_ms, user_id=current_user_id())
+        duration_ms=duration_ms, user_id=owner_id)
     repo.update_agent_suggestion_audit(suggestion.id, audit_verdict=out.verdict,
-                                       audit_round=audit_round, last_audit_id=log_id)
+                                       audit_round=audit_round, last_audit_id=log_id,
+                                       user_id=owner_id)
     return log_id
 
 
@@ -157,7 +167,7 @@ def trigger_audit_for_suggestion(suggestion_id: int) -> dict:
     if owner_id is None:
         raise RuntimeError("audit requires authenticated user context")
     s = repo.get_agent_suggestion_for_user(suggestion_id, owner_id, is_admin=False)
-    if s is None:
+    if s is None or (settings.multi_user_enabled and getattr(s, "user_id", None) != owner_id):
         raise LookupError("建议不存在")
     verdict = s.audit_verdict or "pending"
     if verdict not in ("pending", "fail"):

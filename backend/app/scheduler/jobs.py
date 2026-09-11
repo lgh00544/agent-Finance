@@ -727,6 +727,8 @@ def experience_worker_job(force: bool = False) -> None:
             tokens = set_user_context(user["id"], user.get("role"))
             try:
                 results.append(worker_run(force=force, user_id=user["id"]))
+            except Exception as exc:
+                logger.error("经验沉淀 Worker 用户 %s 异常: %s", user["id"], exc)
             finally:
                 reset_user_context(tokens)
         result = results
@@ -747,6 +749,8 @@ def audit_pending_job() -> None:
             tokens = set_user_context(user["id"], user.get("role"))
             try:
                 results.append(run_pending_audits(cutoff_id=0, user_id=user["id"]))
+            except Exception as exc:
+                logger.error("建议辩证审核用户 %s 异常: %s", user["id"], exc)
             finally:
                 reset_user_context(tokens)
         result = {"users": results}
