@@ -23,11 +23,15 @@ $env:REDIS_DB = '15'
 $env:REDIS_NAMESPACE = 'stock-agent:multi-user'
 $env:QDRANT_MODE = 'server'
 $env:SYNC_ON_START = 'false'
+$env:VITE_API_PROXY = "http://127.0.0.1:$Port"
 $env:VITE_API_PROXY = 'http://localhost:8100'
 if (-not (Test-NetConnection 127.0.0.1 -Port 6379 -InformationLevel Quiet -WarningAction SilentlyContinue)) { throw 'Redis is not listening on 6379' }
 if (-not (Test-NetConnection 127.0.0.1 -Port 6333 -InformationLevel Quiet -WarningAction SilentlyContinue)) { throw 'Qdrant is not listening on 6333' }
 $old = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
 foreach ($processId in $old) { if ($processId -ne $PID) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } }
 Start-Process -FilePath $Python -ArgumentList '-m','uvicorn','app.main:app','--app-dir',(Join-Path $Root 'backend'),'--host','127.0.0.1','--port',"$Port" -WorkingDirectory $Root -WindowStyle Hidden
-Start-Process -FilePath 'pnpm' -ArgumentList 'dev','--host','0.0.0.0' -WorkingDirectory (Join-Path $Root 'web')
+$pnpm = (Get-Command pnpm.cmd -ErrorAction SilentlyContinue).Source
+if (-not $pnpm) { $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source }
+if (-not $pnpm) { throw '未找到 pnpm，请先运行 setup_new_machine.bat' }
+Start-Process -FilePath $pnpm -ArgumentList 'dev','--host','0.0.0.0' -WorkingDirectory (Join-Path $Root 'web')
 Write-Host "Multi-user backend: http://127.0.0.1:$Port; frontend: http://127.0.0.1:5173" -ForegroundColor Green
