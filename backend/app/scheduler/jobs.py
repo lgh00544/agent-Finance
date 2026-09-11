@@ -719,7 +719,17 @@ def experience_worker_job(force: bool = False) -> None:
     积压 < 阈值或 task_queue 活跃时轻量跳过。异常不外抛（调度线程吞掉告警日志）。"""
     try:
         from app.services.experience_worker import worker_run
-        result = worker_run(force=force)
+        from app.core.auth import reset_user_context, set_user_context
+        users = repo.list_active_users() if settings.multi_user_enabled else [
+            {"id": None, "role": None}]
+        results = []
+        for user in users:
+            tokens = set_user_context(user["id"], user.get("role"))
+            try:
+                results.append(worker_run(force=force, user_id=user["id"]))
+            finally:
+                reset_user_context(tokens)
+        result = results
         logger.info("经验沉淀 Worker: %s", result)
     except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
         logger.error("经验沉淀 Worker 异常: %s", exc)
@@ -729,8 +739,18 @@ def audit_pending_job() -> None:
     """通用审核批处理：每日 03:30 低峰扫描待审建议辩证审核（audit_log 落库；首审失败触发 rethink 重审）"""
     try:
         from app.agents.audit import run_pending_audits
-        result = run_pending_audits(cutoff_id=0)
-        errors = result.get("errors") or []
+        from app.core.auth import reset_user_context, set_user_context
+        users = repo.list_active_users() if settings.multi_user_enabled else [
+            {"id": None, "role": None}]
+        results = []
+        for user in users:
+            tokens = set_user_context(user["id"], user.get("role"))
+            try:
+                results.append(run_pending_audits(cutoff_id=0))
+            finally:
+                reset_user_context(tokens)
+        result = {"users": results}
+        errors = [e for result in results for e in result.get("errors") or []]
         error_text = "; ".join([f"#{e.get('id')}: {e.get('error')}" for e in errors])[:500]
         cache.set("job:last_audit_pending", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
         cache.set("job:last_audit_pending_error", error_text, 86400)

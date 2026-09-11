@@ -28,6 +28,20 @@ PRIVATE_TABLES = (
     "paper_alert",
 )
 
+# Experience history is private queue/context and must be assigned to the
+# bootstrap owner.  Review/audit logs are handled separately below because
+# explicitly system-scoped rows (no private target) intentionally retain NULL.
+EXPERIENCE_PRIVATE_TABLES = (
+    "pending_experience", "experience", "worker_run",
+)
+TARGET_SCOPED_AUDIT_TYPES = {
+    "agent_suggestion": "agent_suggestion",
+    "pending_experience": "pending_experience",
+    "experience": "experience",
+    "rule_change": "rule_change",
+    "review_result": "review_result",
+}
+
 
 def _backup(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +111,14 @@ def _verify(staged: Path, source_counts: dict[str, int], username: str) -> dict[
         if user != (1, username, "admin"):
             raise RuntimeError(f"legacy owner bootstrap failed: {user!r}")
         owned: dict[str, int] = {}
-        for table in PRIVATE_TABLES:
+        table_names = {
+            row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        for table in (*PRIVATE_TABLES, *EXPERIENCE_PRIVATE_TABLES):
+            if table not in table_names:
+                continue
             columns = {row[1] for row in db.execute(f'PRAGMA table_info("{table}")')}
             if "user_id" not in columns:
                 raise RuntimeError(f"missing user_id on private table: {table}")
@@ -108,6 +129,52 @@ def _verify(staged: Path, source_counts: dict[str, int], username: str) -> dict[
             if wrong:
                 raise RuntimeError(f"ownership backfill failed: {table} has {wrong} invalid rows")
             owned[table] = count
+
+        # Linked review logs inherit their experience owner.  Rows without an
+        # experience_id are explicit system scope and may remain NULL.
+        if "review_log" in table_names and "experience" in table_names:
+            invalid_review = db.execute("""
+                SELECT COUNT(*)
+                FROM review_log AS r
+                LEFT JOIN experience AS e ON e.id = r.experience_id
+                WHERE r.experience_id IS NOT NULL
+                  AND (e.id IS NULL OR r.user_id IS NULL OR r.user_id != 1)
+            """).fetchone()[0]
+            if invalid_review:
+                raise RuntimeError(
+                    f"review ownership backfill failed: {invalid_review} linked rows")
+            owned["review_log_linked"] = db.execute(
+                "SELECT COUNT(*) FROM review_log WHERE experience_id IS NOT NULL"
+            ).fetchone()[0]
+
+        # Audit ownership is derived from the target object.  Unknown target
+        # types and missing targets remain NULL so system records cannot leak.
+        if "audit_log" in table_names:
+            for target_type, target_table in TARGET_SCOPED_AUDIT_TYPES.items():
+                if target_table not in table_names:
+                    continue
+                invalid_audit = db.execute("""
+                    SELECT COUNT(*)
+                    FROM audit_log AS a
+                    JOIN {target_table} AS t ON t.id = a.target_id
+                    WHERE a.target_type = ?
+                      AND (t.user_id IS NULL OR a.user_id IS NULL OR a.user_id != t.user_id)
+                """.format(target_table=target_table), (target_type,)).fetchone()[0]
+                if invalid_audit:
+                    raise RuntimeError(
+                        f"audit ownership backfill failed: {target_type} has {invalid_audit} rows")
+            unknown_owned = db.execute("""
+                SELECT COUNT(*) FROM audit_log
+                WHERE target_type NOT IN ({types}) AND user_id IS NOT NULL
+            """.format(types=", ".join("?" for _ in TARGET_SCOPED_AUDIT_TYPES)),
+                tuple(TARGET_SCOPED_AUDIT_TYPES),
+            ).fetchone()[0]
+            if unknown_owned:
+                raise RuntimeError(
+                    f"system audit ownership leak: {unknown_owned} unknown-target rows")
+            owned["audit_log_scoped"] = db.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE user_id IS NOT NULL"
+            ).fetchone()[0]
         return owned
     finally:
         db.close()

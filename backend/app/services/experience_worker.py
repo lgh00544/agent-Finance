@@ -98,9 +98,10 @@ def _retry_db_call(label: str, fn):
         raise last_exc
 
 
-def _safe_release_pending(pending_id: int, error: str | None = None) -> None:
+def _safe_release_pending(pending_id: int, error: str | None = None,
+                          user_id: int | None = None) -> None:
     try:
-        repo.release_pending(pending_id, error=error)
+        repo.release_pending(pending_id, error=error, user_id=user_id)
     except Exception as exc:  # noqa: BLE001 释放失败只记日志，不反噬主流程
         logger.warning("经验 Worker 释放 pending=%s 失败: %s", pending_id, exc)
 
@@ -148,7 +149,8 @@ def _llm_extract(system: str, user: str, schema) -> BaseModel:
     return llm_call_json(system, user, schema, model_level=ModelLevel.LIGHT)
 
 
-def route_draft(draft: ExperienceDraft, pending_id: int) -> dict:
+def route_draft(draft: ExperienceDraft, pending_id: int,
+                user_id: int | None = None) -> dict:
     """分层分流（四态落库）：
     - impact=high → pending_review（高影响硬闸门，M3 两步确认，无自动绕过）；
     - impact=low 且 confidence≥阈值 且无冲突 且自动合并开关开 → active + auto_merged=1 + review_log(auto)；
@@ -163,38 +165,42 @@ def route_draft(draft: ExperienceDraft, pending_id: int) -> dict:
     if draft.impact == "high":
         eid = repo.insert_experience(draft.title, draft.body, draft.stage, draft.tags,
                                      "high", draft.confidence, auto_merged=0,
-                                     source_pending_id=pending_id, status="pending_review")
+                                     source_pending_id=pending_id, status="pending_review",
+                                     user_id=user_id)
         return {"status": "pending_review", "eid": eid, "reason": "impact=high 硬闸门（M3）"}
 
     if auto_merge_on and draft.confidence >= threshold:
-        conflict = _conflict_check(draft)
+        conflict = _conflict_check(draft, user_id=user_id)
         if not conflict["conflict"]:
             eid = repo.insert_experience(draft.title, draft.body, draft.stage, draft.tags,
                                          "low", draft.confidence, auto_merged=1,
-                                         source_pending_id=pending_id, status="active")
+                                         source_pending_id=pending_id, status="active",
+                                         user_id=user_id)
             repo.write_review_log(eid, "auto_merge", "auto",
-                                  note=f"conf={draft.confidence:.2f}")
+                                  note=f"conf={draft.confidence:.2f}", user_id=user_id)
             return {"status": "active", "eid": eid, "auto_merged": 1,
                     "reason": "低影响自动合并（conf≥阈值且无冲突）"}
         # 冲突 → Digest（落 pending_review 行，M2 可人工过目/驳回）
         eid = repo.insert_experience(draft.title, draft.body, draft.stage, draft.tags,
                                      draft.impact, draft.confidence, auto_merged=0,
-                                     source_pending_id=pending_id, status="pending_review")
+                                     source_pending_id=pending_id, status="pending_review",
+                                     user_id=user_id)
         return {"status": "pending_review", "eid": eid,
                 "reason": f"冲突（{conflict['reason']}），转 Digest 人工过目"}
 
     eid = repo.insert_experience(draft.title, draft.body, draft.stage, draft.tags,
                                  draft.impact, draft.confidence, auto_merged=0,
-                                 source_pending_id=pending_id, status="pending_review")
+                                 source_pending_id=pending_id, status="pending_review",
+                                 user_id=user_id)
     return {"status": "pending_review", "eid": eid, "reason": "Digest 待审核（低置信/开关关）"}
 
 
-def _conflict_check(draft: ExperienceDraft) -> dict:
+def _conflict_check(draft: ExperienceDraft, user_id: int | None = None) -> dict:
     """两段式冲突判定：
     ① 代码层：同 stage 的 active 经验，tags 有交集的优先（候选过滤）；
     ② LLM 层：ROUTE_PROMPT 附候选列表，判定结论是否相反（代码不做语义判断）。
     LLM 判定失败视为有冲突，转人工审核（fail-closed），记录告警。"""
-    cands = repo.search_experience(stage=draft.stage, k=5)
+    cands = repo.search_experience(stage=draft.stage, k=5, user_id=user_id)
     if not cands:
         return {"conflict": False, "reason": "无同阶段候选经验"}
     draft_tags = _split_tags(draft.tags)
@@ -217,7 +223,7 @@ def _conflict_check(draft: ExperienceDraft) -> dict:
         return {"conflict": True, "reason": "冲突判定失败，转人工审核"}
 
 
-def _process_item(item: dict) -> None:
+def _process_item(item: dict, user_id: int | None = None) -> None:
     """逐条：LLM 抽取（llm_call_json 内置重试/降级）→ worth 判断 → 分层分流 → release_pending"""
     pending_id = item["id"]
     user = json.dumps({"task_id": item["task_id"], "stage": item["stage"],
@@ -227,23 +233,30 @@ def _process_item(item: dict) -> None:
         draft = _llm_extract(experience_prompt.EXTRACT_SYSTEM, user, ExperienceDraft)
     except Exception as exc:  # noqa: BLE001 抽取失败标 done+error，不残留 processing
         logger.warning("经验抽取失败 pending=%s: %s", pending_id, exc)
-        _safe_release_pending(pending_id, error=f"extract_failed: {exc}")
+        _safe_release_pending(pending_id, error=f"extract_failed: {exc}", user_id=user_id)
         return
     if not draft.worth:
-        _safe_release_pending(pending_id, error=None)  # 无经验，正常完成
+        _safe_release_pending(pending_id, error=None, user_id=user_id)  # 无经验，正常完成
         return
-    result = route_draft(draft, pending_id)
+    result = route_draft(draft, pending_id, user_id=user_id)
     logger.info("经验分流 pending=%s → %s（%s）", pending_id, result["status"],
                 result.get("reason", ""))
-    _safe_release_pending(pending_id, error=None)
+    _safe_release_pending(pending_id, error=None, user_id=user_id)
 
 
-def worker_run(force: bool = False) -> dict:
+def worker_run(force: bool = False, user_id: int | None = None) -> dict:
     """Worker 主流程（供调度/手动触发；force=True 时忽略积压门直接执行）"""
     from app.services import task_queue
+    if user_id is None:
+        try:
+            from app.core.auth import current_user_id
+            user_id = current_user_id()
+        except Exception:
+            user_id = None
 
-    watchdog_reset = repo.watchdog_reset_stale_processing(older_than_hours=2.0)
-    backlog = repo.pending_backlog_count()
+    watchdog_reset = repo.watchdog_reset_stale_processing(older_than_hours=2.0,
+                                                           user_id=user_id)
+    backlog = repo.pending_backlog_count(user_id=user_id)
     threshold = _cfg_int("digest_backlog_threshold")
     if not force and backlog < threshold:
         logger.info("经验 Worker 跳过：积压 %s < 阈值 %s", backlog, threshold)
@@ -265,24 +278,29 @@ def worker_run(force: bool = False) -> dict:
     sleep_sec = _cfg_float("worker_sleep_sec")
     try:
         try:
-            run_id = _retry_db_call("start_worker_run", repo.start_worker_run)
+            run_id = _retry_db_call("start_worker_run",
+                                    lambda: repo.start_worker_run(user_id=user_id))
         except Exception as exc:  # noqa: BLE001 运行记录失败不应影响经验消费
             logger.warning("经验 Worker 运行记录启动失败，继续执行: %s", exc)
-        claimed = _retry_db_call("claim_pending_batch", lambda: repo.claim_pending_batch(batch_size=20))
+        claimed = _retry_db_call("claim_pending_batch",
+                                 lambda: repo.claim_pending_batch(batch_size=20,
+                                                                  user_id=user_id))
         for item in claimed:
             try:
-                _process_item(item)
+                _process_item(item, user_id=user_id)
                 processed += 1
             except Exception as exc:  # noqa: BLE001 单条异常不中断批次
                 err_count += 1
                 logger.error("经验处理异常 pending=%s: %s", item.get("id"), exc)
-                _safe_release_pending(item["id"], error=f"process_error: {exc}")
+                _safe_release_pending(item["id"], error=f"process_error: {exc}",
+                                      user_id=user_id)
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
         if run_id is not None:
             try:
                 _retry_db_call("finish_worker_run",
-                               lambda: repo.finish_worker_run(run_id, processed, "success"))
+                               lambda: repo.finish_worker_run(run_id, processed, "success",
+                                                              user_id=user_id))
             except Exception as exc:  # noqa: BLE001 结束记录失败只记日志
                 logger.warning("经验 Worker 运行记录结束失败 run_id=%s: %s", run_id, exc)
         return {"run_id": run_id, "processed": processed, "errors": err_count,
@@ -290,7 +308,8 @@ def worker_run(force: bool = False) -> dict:
     except Exception as exc:  # noqa: BLE001
         if run_id is not None:
             try:
-                repo.finish_worker_run(run_id, processed, "failed", error=str(exc))
+                repo.finish_worker_run(run_id, processed, "failed", error=str(exc),
+                                       user_id=user_id)
             except Exception as finish_exc:  # noqa: BLE001
                 logger.warning("经验 Worker 失败记录落库失败 run_id=%s: %s", run_id, finish_exc)
         if _is_retryable_db_error(exc):

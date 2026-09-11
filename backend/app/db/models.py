@@ -562,6 +562,7 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
     __table_args__ = (
         Index("ix_audit_target", "target_type", "target_id"),
+        Index("ix_audit_user_target", "user_id", "target_type", "target_id"),
         Index("ix_audit_verdict", "verdict"),
         Index("ix_audit_created", "created_at"),
     )
@@ -580,6 +581,8 @@ class AuditLog(Base):
     reasoning: Mapped[str] = mapped_column(Text, default="")           # LLM 原始 JSON 全文
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    # NULL is reserved for explicitly system-scoped audits with no private target.
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class RuleChange(Base):
@@ -775,6 +778,7 @@ class PendingExperience(Base):
     __tablename__ = "pending_experience"
     __table_args__ = (
         Index("ix_pending_status_id", "status", "id"),   # 认领批次按状态+ID 顺序
+        Index("ix_pending_user_status_id", "user_id", "status", "id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -785,6 +789,7 @@ class PendingExperience(Base):
     artifacts_ref: Mapped[str | None] = mapped_column(Text)          # 产物引用（记录 ID，非全文）
     status: Mapped[str] = mapped_column(String(12), default="pending")
     error: Mapped[str | None] = mapped_column(Text)                  # Worker 失败原因（done+error 表示）
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class Experience(Base):
@@ -794,6 +799,8 @@ class Experience(Base):
     __table_args__ = (
         Index("ix_experience_status_stage", "status", "stage"),
         Index("ix_experience_stage_id", "stage", "id"),
+        Index("ix_experience_user_status_stage", "user_id", "status", "stage"),
+        Index("ix_experience_user_stage_id", "user_id", "stage", "id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -813,6 +820,7 @@ class Experience(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     curator_note: Mapped[str] = mapped_column(Text, default="")
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class ReviewLog(Base):
@@ -820,6 +828,7 @@ class ReviewLog(Base):
     __tablename__ = "review_log"
     __table_args__ = (
         Index("ix_reviewlog_exp", "experience_id"),
+        Index("ix_reviewlog_user_exp", "user_id", "experience_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -829,11 +838,14 @@ class ReviewLog(Base):
     reviewer: Mapped[str] = mapped_column(String(16))                # sir/auto
     at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     note: Mapped[str | None] = mapped_column(Text)
+    # NULL is reserved for explicit system actions such as strictness_freeze.
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class WorkerRun(Base):
     """Worker 运行记录（每次消费批次的开始/结束/处理数/状态）"""
     __tablename__ = "worker_run"
+    __table_args__ = (Index("ix_worker_run_user_status", "user_id", "status"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -841,6 +853,7 @@ class WorkerRun(Base):
     processed_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(12), default="running")  # running/success/failed
     error: Mapped[str | None] = mapped_column(Text)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class ExperienceConfig(Base):

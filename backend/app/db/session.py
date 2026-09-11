@@ -10,7 +10,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
@@ -169,6 +169,7 @@ def init_db() -> dict:
         _ensure_user_columns()
         _ensure_account_pnl_user_index()
         _ensure_reasoning_trace_user_scope()
+        experience_ownership = _ensure_experience_audit_user_scope()
         knowledge = _ensure_knowledge_hit_columns()
         experience = _ensure_experience_curator_columns()
     except Exception as exc:  # noqa: BLE001 startup must expose migration failures
@@ -188,17 +189,23 @@ def init_db() -> dict:
         "status": "ok",
         **identity,
         "initialized_at": datetime.now().isoformat(timespec="seconds"),
-        "migrations": {"knowledge": knowledge, "experience": experience},
+        "migrations": {
+            "knowledge": knowledge,
+            "experience": experience,
+            "experience_ownership": experience_ownership,
+        },
     }
     logger.info(
         "数据库初始化/迁移完成 backend=%s database=%s knowledge_added=%s "
-        "knowledge_existing=%s experience_added=%s experience_existing=%s",
+        "knowledge_existing=%s experience_added=%s experience_existing=%s "
+        "experience_ownership_columns_added=%s",
         identity.get("backend"),
         identity.get("database") or identity.get("sqlite_path_digest"),
         len(knowledge["added"]),
         len(knowledge["existing"]),
         len(experience["added"]),
         len(experience["existing"]),
+        sum(len(result["added"]) for result in experience_ownership["columns"].values()),
     )
     return _LAST_INIT_DB_RESULT
 
@@ -310,10 +317,113 @@ def _ensure_user_columns() -> None:
                 except Exception:
                     if engine.dialect.name != "sqlite":
                         raise
-            conn.exec_driver_sql(
-                f"UPDATE {table} SET user_id = :user_id WHERE user_id IS NULL",
+            conn.execute(
+                text(f"UPDATE {table} SET user_id = :user_id WHERE user_id IS NULL"),
                 {"user_id": default_id},
             )
+
+
+def _ensure_index(eng, table: str, name: str, columns: tuple[str, ...]) -> str:
+    """Create a named index once on SQLite or MySQL without replacing existing data."""
+    column_sql = ", ".join(columns)
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            before = {
+                str(row[1]) for row in conn.exec_driver_sql(f"PRAGMA index_list({table})")
+            }
+            conn.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column_sql})")
+            return "existing" if name in before else "added"
+        existing = {
+            str(row[2]) for row in conn.exec_driver_sql(f"SHOW INDEX FROM {table}")
+        }
+        if name in existing:
+            return "existing"
+        conn.exec_driver_sql(f"ALTER TABLE {table} ADD INDEX {name} ({column_sql})")
+        return "added"
+
+
+def _ensure_experience_audit_user_scope(eng=None, default_user_id: int | None = None) -> dict:
+    """Scope private experience history to one account and retain only explicit system logs.
+
+    Experience records and worker execution history are private.  Review/audit rows
+    inherit ownership only from a known private target; rows without such a target
+    stay NULL as system scope instead of being exposed as an account record.
+    """
+    eng = eng or engine
+    if default_user_id is None:
+        from app.db import repo
+        default_user_id = repo.ensure_default_user()
+
+    columns = {
+        table: _add_columns(eng, table, {"user_id": "INTEGER NULL"})
+        for table in (
+            "pending_experience", "experience", "review_log", "worker_run", "audit_log",
+        )
+    }
+    with eng.begin() as conn:
+        for table in ("pending_experience", "experience", "worker_run"):
+            conn.execute(text(
+                f"UPDATE {table} SET user_id = :user_id WHERE user_id IS NULL"),
+                {"user_id": int(default_user_id)},
+            )
+
+        # Only experience-linked review rows have a private owner.  System actions
+        # without an experience_id deliberately retain NULL ownership.
+        conn.execute(text("""
+            UPDATE review_log
+            SET user_id = (
+                SELECT owner_row.user_id
+                FROM experience AS owner_row
+                WHERE owner_row.id = review_log.experience_id
+            )
+            WHERE review_log.user_id IS NULL
+              AND review_log.experience_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM experience AS owner_row
+                WHERE owner_row.id = review_log.experience_id
+                  AND owner_row.user_id IS NOT NULL
+            )
+        """))
+
+        # Audit ownership is derived only for supported account-scoped targets.
+        # Unknown target types remain system scope and must not inherit a default user.
+        for target_type, table in (
+            ("agent_suggestion", "agent_suggestion"),
+            ("pending_experience", "pending_experience"),
+            ("experience", "experience"),
+            ("rule_change", "rule_change"),
+            ("review_result", "review_result"),
+        ):
+            conn.execute(text(f"""
+                UPDATE audit_log
+                SET user_id = (
+                    SELECT owner_row.user_id
+                    FROM {table} AS owner_row
+                    WHERE owner_row.id = audit_log.target_id
+                )
+                WHERE audit_log.user_id IS NULL
+                  AND audit_log.target_type = :target_type
+                  AND EXISTS (
+                    SELECT 1 FROM {table} AS owner_row
+                    WHERE owner_row.id = audit_log.target_id
+                      AND owner_row.user_id IS NOT NULL
+                  )
+            """), {"target_type": target_type})
+
+    index_specs = (
+        ("pending_experience", "ix_pending_user_status_id", ("user_id", "status", "id")),
+        ("experience", "ix_experience_user_status_stage", ("user_id", "status", "stage")),
+        ("experience", "ix_experience_user_stage_id", ("user_id", "stage", "id")),
+        ("review_log", "ix_reviewlog_user_exp", ("user_id", "experience_id")),
+        ("worker_run", "ix_worker_run_user_status", ("user_id", "status")),
+        ("audit_log", "ix_audit_user_target", ("user_id", "target_type", "target_id")),
+    )
+    indexes = {
+        name: _ensure_index(eng, table, name, index_columns)
+        for table, name, index_columns in index_specs
+    }
+    return {"columns": columns, "indexes": indexes}
 
 
 def _ensure_reasoning_trace_user_scope() -> None:
@@ -374,11 +484,11 @@ def _ensure_reasoning_trace_user_scope() -> None:
                 conn.exec_driver_sql("ALTER TABLE ai_reasoning_trace_scoped RENAME TO ai_reasoning_trace")
             elif "user_id" not in trace_columns:
                 _add_column(conn, "ai_reasoning_trace", "user_id", "INTEGER NULL")
-            conn.exec_driver_sql(
-                "UPDATE ai_reasoning_trace SET user_id = :user_id WHERE user_id IS NULL",
+            conn.execute(text(
+                "UPDATE ai_reasoning_trace SET user_id = :user_id WHERE user_id IS NULL"),
                 {"user_id": default_id})
-            conn.exec_driver_sql(
-                "UPDATE ai_reasoning_trace_history SET user_id = :user_id WHERE user_id IS NULL",
+            conn.execute(text(
+                "UPDATE ai_reasoning_trace_history SET user_id = :user_id WHERE user_id IS NULL"),
                 {"user_id": default_id})
             for statement in (
                 "CREATE INDEX IF NOT EXISTS ix_ai_reasoning_trace_user_id ON ai_reasoning_trace (user_id)",

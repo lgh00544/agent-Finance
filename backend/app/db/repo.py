@@ -40,6 +40,22 @@ from app.services import reasoning_trace, task_queue
 logger = logging.getLogger(__name__)
 
 
+def _experience_scope_user(user_id: int | None = None) -> int | None:
+    """Return explicit/request owner for private experience data; fail closed in multi-user mode."""
+    if user_id is not None:
+        return int(user_id)
+    try:
+        from app.core.auth import current_user_id
+        current = current_user_id()
+    except Exception:
+        current = None
+    if current is not None:
+        return int(current)
+    if settings.multi_user_enabled:
+        raise RuntimeError("experience data requires an authenticated user context")
+    return None
+
+
 def _json(value: Any) -> Any:
     return value if value is not None else None
 
@@ -3463,30 +3479,41 @@ def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
 def insert_audit_log(target_type: str, target_id: int, audit_round: int, verdict: str,
                      confidence: int, support_view: str, dissent_view: str, boundary_cases: str,
                      evidence_refs: list, audit_model: str, reasoning: str,
-                     duration_ms: int) -> int:
+                     duration_ms: int, user_id: int | None = None) -> int:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         row = AuditLog(target_type=target_type, target_id=target_id, round=audit_round,
                        verdict=verdict, confidence=confidence, support_view=support_view,
                        dissent_view=dissent_view, boundary_cases=boundary_cases,
                        evidence_refs=evidence_refs or [], audit_model=audit_model,
-                       reasoning=reasoning or "", duration_ms=duration_ms)
+                       reasoning=reasoning or "", duration_ms=duration_ms,
+                       user_id=owner_id)
         db.add(row)
         db.commit()
         db.refresh(row)
         return row.id
 
 
-def get_audit_log(audit_id: int) -> AuditLog | None:
+def get_audit_log(audit_id: int, user_id: int | None = None) -> AuditLog | None:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        return db.get(AuditLog, audit_id)
+        stmt = select(AuditLog).where(AuditLog.id == audit_id)
+        if owner_id is not None:
+            stmt = stmt.where(AuditLog.user_id == owner_id)
+        return db.execute(stmt).scalar_one_or_none()
 
 
-def get_latest_audit_log_by_target(target_type: str, target_id: int) -> dict | None:
+def get_latest_audit_log_by_target(target_type: str, target_id: int,
+                                   user_id: int | None = None) -> dict | None:
     """按目标查最新一条审核记录（created_at desc；含 dissent_view 完整字段）；无 → None"""
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
+        stmt = select(AuditLog).where(AuditLog.target_type == target_type,
+                                      AuditLog.target_id == target_id)
+        if owner_id is not None:
+            stmt = stmt.where(AuditLog.user_id == owner_id)
         row = db.execute(
-            select(AuditLog).where(AuditLog.target_type == target_type,
-                                   AuditLog.target_id == target_id)
+            stmt
             .order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(1)
         ).scalar_one_or_none()
         if row is None:
@@ -3499,10 +3526,14 @@ def get_latest_audit_log_by_target(target_type: str, target_id: int) -> dict | N
                 "duration_ms": row.duration_ms, "created_at": str(row.created_at)}
 
 
-def update_audit_log_verdict(audit_id: int, verdict: str) -> None:
+def update_audit_log_verdict(audit_id: int, verdict: str, user_id: int | None = None) -> None:
     """人工/应急标绿（批4 confirm-fail 前留位）：仅改 verdict"""
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.get(AuditLog, audit_id)
+        stmt = select(AuditLog).where(AuditLog.id == audit_id)
+        if owner_id is not None:
+            stmt = stmt.where(AuditLog.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return
         row.verdict = verdict
@@ -3510,9 +3541,14 @@ def update_audit_log_verdict(audit_id: int, verdict: str) -> None:
 
 
 def update_agent_suggestion_audit(suggestion_id: int, audit_verdict: str,
-                                  audit_round: int, last_audit_id: int | None) -> None:
+                                  audit_round: int, last_audit_id: int | None,
+                                  user_id: int | None = None) -> None:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.get(AgentSuggestion, suggestion_id)
+        stmt = select(AgentSuggestion).where(AgentSuggestion.id == suggestion_id)
+        if owner_id is not None:
+            stmt = stmt.where(AgentSuggestion.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
         if row is None:
             return
         row.audit_verdict = audit_verdict
@@ -3521,17 +3557,20 @@ def update_agent_suggestion_audit(suggestion_id: int, audit_verdict: str,
         db.commit()
 
 
-def list_agent_suggestions_for_audit(cursor_id: int, limit: int = 50) -> list[AgentSuggestion]:
+def list_agent_suggestions_for_audit(cursor_id: int, limit: int = 50,
+                                     user_id: int | None = None) -> list[AgentSuggestion]:
     """扫描待审/漏审/未完成二审的建议（id > 游标；pass 或 round2-fail 不再返回）"""
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        return list(db.execute(
-            select(AgentSuggestion).where(
+        stmt = select(AgentSuggestion).where(
                 AgentSuggestion.id > cursor_id,
                 or_(AgentSuggestion.audit_verdict == "pending",
                     AgentSuggestion.last_audit_id.is_(None),
                     and_(AgentSuggestion.audit_verdict == "fail",
                          AgentSuggestion.audit_round < 2)))
-            .order_by(AgentSuggestion.id).limit(limit)).scalars().all())
+        if owner_id is not None:
+            stmt = stmt.where(AgentSuggestion.user_id == owner_id)
+        return list(db.execute(stmt.order_by(AgentSuggestion.id).limit(limit)).scalars().all())
 
 
 def get_agent_suggestion(suggestion_id: int) -> AgentSuggestion | None:
@@ -4115,58 +4154,96 @@ def _artifacts_meta(ref, code, sig, original_ref) -> dict:
             "signal_type": sig, "original_ref": original_ref}
 
 
-def merge_pending_duplicate(task_id, stage, summary, artifacts_ref) -> int | None:
-    """同 hour 桶 (stock_code, signal_type) 已 pending → 合并 count++ 返回行 id；否则 None 不合并"""
+def merge_pending_duplicate(task_id, stage, summary, artifacts_ref, user_id=None) -> int | None:
+    """Merge same-hour pending signal only within the current account."""
+    owner_id = _experience_scope_user(user_id)
     code, sig = _parse_monitor_summary(summary)
     if not code:
         return None
     hour_start = datetime.now().replace(minute=0, second=0, microsecond=0)
     with SessionLocal() as db:
-        stmt = select(PendingExperience).where(
-            PendingExperience.status == "pending",
-            PendingExperience.created_at >= hour_start,
-        ).order_by(PendingExperience.id.desc())
-        for r in db.execute(stmt).scalars().all():
+        stmt = select(PendingExperience).where(PendingExperience.status == "pending", PendingExperience.created_at >= hour_start)
+        if owner_id is not None:
+            stmt = stmt.where(PendingExperience.user_id == owner_id)
+        for r in db.execute(stmt.order_by(PendingExperience.id.desc())).scalars().all():
             r_code, r_sig = _parse_monitor_summary(r.summary)
             if r_code == code and r_sig == sig:
                 meta = _artifacts_meta(r.artifacts_ref, code, sig, str(artifacts_ref or ""))
                 meta["count"] = int(meta.get("count") or 1) + 1
                 meta["last_at"] = datetime.now().isoformat(timespec="seconds")
                 r.artifacts_ref = json.dumps(meta, ensure_ascii=False)
-                db.commit()
-                _invalidate("pending_experience")
+                db.commit(); _invalidate("pending_experience")
                 return r.id
     return None
 
 
-def add_pending_experience(task_id, stage, summary, artifacts_ref) -> int:
-    """热路径经验沉淀写入：同 hour (stock_code, signal_type) 已 pending → 合并 count++；
-    否则单行 INSERT（artifacts_ref 落 JSON 元数据，旧 int 数据读兼容）。失败由调用方静默降级。"""
-    merged = merge_pending_duplicate(task_id, stage, summary, artifacts_ref)
+def add_pending_experience(task_id, stage, summary, artifacts_ref, user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id)
+    merged = merge_pending_duplicate(task_id, stage, summary, artifacts_ref, owner_id)
     if merged:
         return merged
     code, sig = _parse_monitor_summary(summary)
     meta = _artifacts_meta(artifacts_ref, code, sig, str(artifacts_ref or ""))
     with SessionLocal() as db:
-        row = PendingExperience(task_id=task_id, stage=stage, summary=summary,
-                                artifacts_ref=json.dumps(meta, ensure_ascii=False), status="pending")
-        db.add(row)
-        db.commit()
-        _invalidate("pending_experience")
-        return row.id
+        row = PendingExperience(task_id=task_id, stage=stage, summary=summary, artifacts_ref=json.dumps(meta, ensure_ascii=False), status="pending", user_id=owner_id)
+        db.add(row); db.commit(); _invalidate("pending_experience"); return row.id
 
 
-def list_pending_experience(status=None, stage=None, limit=50) -> list:
-    """待处理队列只读列表（最新在前）"""
+def list_pending_experience(status=None, stage=None, limit=50, user_id=None) -> list:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         stmt = select(PendingExperience)
-        if status:
-            stmt = stmt.where(PendingExperience.status == status)
-        if stage:
-            stmt = stmt.where(PendingExperience.stage == stage)
-        stmt = stmt.order_by(PendingExperience.id.desc()).limit(limit)
-        rows = db.execute(stmt).scalars().all()
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        if status: stmt = stmt.where(PendingExperience.status == status)
+        if stage: stmt = stmt.where(PendingExperience.stage == stage)
+        rows = db.execute(stmt.order_by(PendingExperience.id.desc()).limit(limit)).scalars().all()
         return [_pending_row(r) for r in rows]
+
+
+def claim_pending_batch(batch_size=20, user_id=None) -> list:
+    owner_id = _experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(PendingExperience.status == "pending")
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        pending = db.execute(stmt.order_by(PendingExperience.id).limit(batch_size)).scalars().all()
+        claimed = []
+        for row in pending:
+            q = PendingExperience.__table__.update().where(PendingExperience.id == row.id, PendingExperience.status == "pending")
+            if owner_id is not None: q = q.where(PendingExperience.user_id == owner_id)
+            res = db.execute(q.values(status="processing"))
+            if res.rowcount == 1: claimed.append(_pending_row(row))
+        if claimed: db.commit(); _invalidate("pending_experience")
+        return claimed
+
+
+def release_pending(id, error=None, user_id=None) -> None:
+    owner_id = _experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(PendingExperience.id == id)
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
+        if row is None: return
+        row.status = "done"; row.error = error; db.commit(); _invalidate("pending_experience")
+
+
+def watchdog_reset_stale_processing(older_than_hours=2.0, user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id)
+    cutoff = datetime.now() - timedelta(hours=older_than_hours)
+    with SessionLocal() as db:
+        stmt = select(PendingExperience).where(PendingExperience.status == "processing", PendingExperience.created_at < cutoff)
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        rows = db.execute(stmt).scalars().all()
+        for row in rows: row.status = "pending"; row.error = "watchdog_timeout"
+        if rows: db.commit(); _invalidate("pending_experience")
+        return len(rows)
+
+
+def pending_backlog_count(user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt = select(func.count()).select_from(PendingExperience).where(PendingExperience.status == "pending")
+        if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+        return db.execute(stmt).scalar_one()
 
 
 def _pending_row(r) -> dict:
@@ -4175,318 +4252,162 @@ def _pending_row(r) -> dict:
                 created_at=str(r.created_at))
 
 
-def claim_pending_batch(batch_size=20) -> list:
-    """原子认领下一批 pending：逐行 UPDATE ... WHERE id=? AND status='pending'（防并发双跑）。
-    返回认领成功行的 dict 列表；并发下重复执行不会重复消费。"""
-    with SessionLocal() as db:
-        pending = db.execute(
-            select(PendingExperience).where(PendingExperience.status == "pending")
-            .order_by(PendingExperience.id).limit(batch_size)).scalars().all()
-        claimed = []
-        for row in pending:
-            res = db.execute(
-                PendingExperience.__table__.update()
-                .where(PendingExperience.id == row.id,
-                       PendingExperience.status == "pending")
-                .values(status="processing"))
-            if res.rowcount == 1:
-                claimed.append(_pending_row(row))
-        if claimed:
-            db.commit()
-            _invalidate("pending_experience")
-        return claimed
-
-
-def release_pending(id, error=None) -> None:
-    """处理完成：标 done + 可选 error（失败也标 done，error 记录原因，不残留 processing）"""
-    with SessionLocal() as db:
-        row = db.execute(select(PendingExperience).where(PendingExperience.id == id)
-                         ).scalar_one_or_none()
-        if row is None:
-            return
-        row.status = "done"
-        row.error = error
-        db.commit()
-        _invalidate("pending_experience")
-
-
-def watchdog_reset_stale_processing(older_than_hours=2.0) -> int:
-    """看门狗：processing 超时（默认 2h）复位为 pending，防 Worker 崩溃卡死队列。返回复位条数"""
-    from datetime import datetime, timedelta
-    cutoff = datetime.now() - timedelta(hours=older_than_hours)
-    with SessionLocal() as db:
-        rows = db.execute(
-            select(PendingExperience).where(
-                PendingExperience.status == "processing",
-                PendingExperience.created_at < cutoff)).scalars().all()
-        for row in rows:
-            row.status = "pending"
-            row.error = "watchdog_timeout"
-        if rows:
-            db.commit()
-            _invalidate("pending_experience")
-        return len(rows)
-
-
-def pending_backlog_count() -> int:
-    """待处理队列积压数（Digest 积压触发判断）"""
-    with SessionLocal() as db:
-        return db.execute(
-            select(func.count()).select_from(PendingExperience)
-            .where(PendingExperience.status == "pending")).scalar_one()
-
-
-def insert_experience(title, body, stage, tags, impact, confidence,
-                      auto_merged=0, source_pending_id=None, status="pending_review") -> int:
-    """插入沉淀经验；FTS 触发器自动同步索引。返回 experience.id"""
+def insert_experience(title, body, stage, tags, impact, confidence, auto_merged=0, source_pending_id=None, status="pending_review", user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id)
     tags_json = json.dumps(tags, ensure_ascii=False) if isinstance(tags, (list, tuple)) else tags
     with SessionLocal() as db:
-        row = Experience(title=title, body=body, stage=stage, tags=tags_json,
-                         impact=impact, confidence=float(confidence),
-                         auto_merged=auto_merged, source_pending_id=source_pending_id,
-                         status=status)
-        db.add(row)
-        db.commit()
-        _invalidate("experience")
-        return row.id
+        if source_pending_id is not None and owner_id is not None:
+            source = db.execute(select(PendingExperience).where(PendingExperience.id == source_pending_id, PendingExperience.user_id == owner_id)).scalar_one_or_none()
+            if source is None: raise LookupError("source pending experience is not owned by current user")
+        row = Experience(title=title, body=body, stage=stage, tags=tags_json, impact=impact, confidence=float(confidence), auto_merged=auto_merged, source_pending_id=source_pending_id, status=status, user_id=owner_id)
+        db.add(row); db.commit(); _invalidate("experience"); return row.id
 
 
-def list_experience(status=None, stage=None, auto_merged=None, limit=50) -> list:
-    """经验库列表（最新在前）"""
+def list_experience(status=None, stage=None, auto_merged=None, limit=50, user_id=None) -> list:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         stmt = select(Experience)
-        if status:
-            stmt = stmt.where(Experience.status == status)
-        if stage:
-            stmt = stmt.where(Experience.stage == stage)
-        if auto_merged is not None:
-            stmt = stmt.where(Experience.auto_merged == auto_merged)
-        stmt = stmt.order_by(Experience.id.desc()).limit(limit)
-        rows = db.execute(stmt).scalars().all()
-        return [_exp_row(r) for r in rows]
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        if status: stmt = stmt.where(Experience.status == status)
+        if stage: stmt = stmt.where(Experience.stage == stage)
+        if auto_merged is not None: stmt = stmt.where(Experience.auto_merged == auto_merged)
+        return [_exp_row(r) for r in db.execute(stmt.order_by(Experience.id.desc()).limit(limit)).scalars().all()]
 
 
-def get_experience(id) -> dict:
-    """单条经验（含来源 pending 摘要，供 UI/审核展示）"""
+def get_experience(id, user_id=None) -> dict | None:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.execute(select(Experience).where(Experience.id == id)).scalar_one_or_none()
-        if row is None:
-            return None
+        stmt = select(Experience).where(Experience.id == id)
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        row = db.execute(stmt).scalar_one_or_none()
+        if row is None: return None
         out = _exp_row(row)
         if row.source_pending_id:
-            pend = db.execute(select(PendingExperience).where(
-                PendingExperience.id == row.source_pending_id)).scalar_one_or_none()
-            if pend:
-                out["source_summary"] = pend.summary
-                out["source_task_id"] = pend.task_id
+            stmt = select(PendingExperience).where(PendingExperience.id == row.source_pending_id)
+            if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
+            pend = db.execute(stmt).scalar_one_or_none()
+            if pend: out.update(source_summary=pend.summary, source_task_id=pend.task_id)
         return out
 
 
 def _exp_row(r) -> dict:
-    return dict(id=r.id, title=r.title, body=r.body, stage=r.stage, tags=r.tags,
-                impact=r.impact, confidence=r.confidence, auto_merged=r.auto_merged,
-                source_pending_id=r.source_pending_id, status=r.status,
-                created_at=str(r.created_at),
-                last_reviewed_at=str(r.last_reviewed_at) if r.last_reviewed_at else None,
-                hit_count=int(getattr(r, "hit_count", 0) or 0),
-                last_used_at=str(r.last_used_at) if getattr(r, "last_used_at", None) else None,
-                expires_at=str(r.expires_at) if getattr(r, "expires_at", None) else None,
-                curator_note=getattr(r, "curator_note", "") or "")
+    return dict(id=r.id, title=r.title, body=r.body, stage=r.stage, tags=r.tags, impact=r.impact, confidence=r.confidence, auto_merged=r.auto_merged, source_pending_id=r.source_pending_id, status=r.status, created_at=str(r.created_at), last_reviewed_at=str(r.last_reviewed_at) if r.last_reviewed_at else None, hit_count=int(getattr(r, "hit_count", 0) or 0), last_used_at=str(r.last_used_at) if getattr(r, "last_used_at", None) else None, expires_at=str(r.expires_at) if getattr(r, "expires_at", None) else None, curator_note=getattr(r, "curator_note", "") or "")
 
 
-def bump_experience_hits(ids: list[int]) -> int:
-    """经验命中计量：hit_count+1 + last_used_at=now；失败由调用方降级。"""
-    exp_ids = [int(i) for i in ids if i]
-    if not exp_ids:
-        return 0
+def bump_experience_hits(ids: list[int], user_id=None) -> int:
+    owner_id = _experience_scope_user(user_id); exp_ids = [int(i) for i in ids if i]
+    if not exp_ids: return 0
     with SessionLocal() as db:
-        res = db.execute(
-            update(Experience)
-            .where(Experience.id.in_(exp_ids))
-            .values(hit_count=Experience.hit_count + 1, last_used_at=datetime.now())
-        )
-        db.commit()
-        _invalidate("experience")
-        return int(res.rowcount or 0)
+        stmt = update(Experience).where(Experience.id.in_(exp_ids))
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        res = db.execute(stmt.values(hit_count=Experience.hit_count + 1, last_used_at=datetime.now())); db.commit(); _invalidate("experience"); return int(res.rowcount or 0)
 
 
-def list_curator_candidates(status: str = "active", stage: str = "",
-                            older_than_days: int | None = None,
-                            max_hit_count: int | None = None,
-                            max_confidence: float | None = None,
-                            limit: int = 100) -> list[dict]:
-    """只读列出 Memory Curator 候选；不改变任何状态。"""
+def list_curator_candidates(status="active", stage="", older_than_days=None, max_hit_count=None, max_confidence=None, limit=100, user_id=None) -> list[dict]:
+    owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         stmt = select(Experience)
-        if status:
-            stmt = stmt.where(Experience.status == status)
-        if stage:
-            stmt = stmt.where(Experience.stage == stage)
-        if older_than_days is not None:
-            cutoff = datetime.now() - timedelta(days=int(older_than_days))
-            stmt = stmt.where(Experience.created_at <= cutoff)
-        if max_hit_count is not None:
-            stmt = stmt.where(Experience.hit_count <= int(max_hit_count))
-        if max_confidence is not None:
-            stmt = stmt.where(Experience.confidence <= float(max_confidence))
-        stmt = stmt.order_by(Experience.created_at, Experience.id).limit(min(max(int(limit), 1), 500))
-        return [_exp_row(r) for r in db.execute(stmt).scalars().all()]
+        if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
+        if status: stmt = stmt.where(Experience.status == status)
+        if stage: stmt = stmt.where(Experience.stage == stage)
+        if older_than_days is not None: stmt = stmt.where(Experience.created_at <= datetime.now() - timedelta(days=int(older_than_days)))
+        if max_hit_count is not None: stmt = stmt.where(Experience.hit_count <= int(max_hit_count))
+        if max_confidence is not None: stmt = stmt.where(Experience.confidence <= float(max_confidence))
+        return [_exp_row(r) for r in db.execute(stmt.order_by(Experience.created_at, Experience.id).limit(min(max(int(limit),1),500))).scalars().all()]
 
 
-def mark_experience_curated(eid: int, status: str, note: str,
-                            reviewer: str = "auto") -> bool:
-    """策展状态流转；仅归档/过期/提议，写 review_log，不物理删除。"""
-    actions = {
-        "archived": "curator_archive",
-        "expired": "curator_expire",
-        "pending_review": "curator_propose",
-    }
-    if status not in actions:
-        raise ValueError("status must be archived/expired/pending_review")
+def mark_experience_curated(eid, status, note, reviewer="auto", user_id=None) -> bool:
+    owner_id = _experience_scope_user(user_id); actions={"archived":"curator_archive","expired":"curator_expire","pending_review":"curator_propose"}
+    if status not in actions: raise ValueError("status must be archived/expired/pending_review")
     with SessionLocal() as db:
-        row = db.get(Experience, int(eid))
-        if row is None:
-            return False
-        row.status = status
-        row.curator_note = note or ""
-        row.last_reviewed_at = _now()
-        db.add(ReviewLog(experience_id=row.id, action=actions[status],
-                         reviewer=reviewer, note=note or ""))
-        db.commit()
-        _invalidate("experience")
-        _invalidate("review_log")
-        return True
+        stmt=select(Experience).where(Experience.id==int(eid))
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return False
+        row.status=status; row.curator_note=note or ""; row.last_reviewed_at=_now(); db.add(ReviewLog(experience_id=row.id, action=actions[status], reviewer=reviewer, note=note or "", user_id=owner_id)); db.commit(); _invalidate("experience"); _invalidate("review_log"); return True
 
 
-def set_experience_expires_at(eid: int, expires_at: datetime,
-                              note: str = "", reviewer: str = "sir") -> bool:
-    """人工设置单条经验过期时间，保留正文并写 review_log。"""
+def set_experience_expires_at(eid, expires_at, note="", reviewer="sir", user_id=None) -> bool:
+    owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.get(Experience, int(eid))
-        if row is None:
-            return False
-        row.expires_at = expires_at
-        row.curator_note = note or row.curator_note or ""
-        row.last_reviewed_at = _now()
-        db.add(ReviewLog(experience_id=row.id, action="curator_set_expiry",
-                         reviewer=reviewer, note=note or str(expires_at)))
-        db.commit()
-        _invalidate("experience")
-        _invalidate("review_log")
-        return True
+        stmt=select(Experience).where(Experience.id==int(eid))
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return False
+        row.expires_at=expires_at; row.curator_note=note or row.curator_note or ""; row.last_reviewed_at=_now(); db.add(ReviewLog(experience_id=row.id, action="curator_set_expiry", reviewer=reviewer, note=note or str(expires_at), user_id=owner_id)); db.commit(); _invalidate("experience"); _invalidate("review_log"); return True
 
 
-def update_experience_status(id, status, reviewer=None, action=None, note=None) -> None:
-    """状态流转 + 写 review_log（同事务）；last_reviewed_at 刷新"""
+def update_experience_status(id, status, reviewer=None, action=None, note=None, user_id=None) -> None:
+    owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
-        row = db.execute(select(Experience).where(Experience.id == id)).scalar_one_or_none()
-        if row is None:
+        stmt=select(Experience).where(Experience.id==id)
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return
+        row.status=status; row.last_reviewed_at=_now()
+        if action and reviewer: db.add(ReviewLog(experience_id=id, action=action, reviewer=reviewer, note=note, user_id=owner_id))
+        db.commit(); _invalidate("experience"); _invalidate("review_log")
+
+
+def experience_version(user_id=None) -> str:
+    owner_id=_experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt=select(func.count(), func.max(Experience.id))
+        if owner_id is not None: stmt=stmt.select_from(Experience).where(Experience.user_id==owner_id)
+        else: stmt=stmt.select_from(Experience)
+        count,max_id=db.execute(stmt).one(); return f"e{count}:{max_id or 0}"
+
+
+def write_review_log(experience_id, action, reviewer, note=None, user_id=None) -> None:
+    owner_id=_experience_scope_user(user_id)
+    with SessionLocal() as db:
+        stmt=select(Experience).where(Experience.id==experience_id)
+        if owner_id is not None: stmt=stmt.where(Experience.user_id==owner_id)
+        exp=db.execute(stmt).scalar_one_or_none()
+        if exp is None and experience_id is not None:
             return
-        row.status = status
-        row.last_reviewed_at = _now()
-        if action and reviewer:
-            db.add(ReviewLog(experience_id=id, action=action, reviewer=reviewer, note=note))
-        db.commit()
-        _invalidate("experience")
-        _invalidate("review_log")
+        if exp is None:
+            db.add(ReviewLog(experience_id=None, action=action, reviewer=reviewer,
+                             note=note, user_id=None))
+            db.commit(); _invalidate("review_log"); return
+        db.add(ReviewLog(experience_id=experience_id, action=action, reviewer=reviewer, note=note, user_id=owner_id)); db.commit(); _invalidate("review_log")
 
 
-def experience_version() -> str:
-    """经验版本感知（e{count}:{max_id}），供 LLM 缓存键追加，经验变更后缓存自动失效"""
+def start_worker_run(user_id=None) -> int:
+    owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
-        count = db.execute(select(func.count()).select_from(Experience)).scalar_one()
-        max_id = db.execute(select(func.max(Experience.id))).scalar_one()
-        return f"e{count}:{max_id or 0}"
+        row=WorkerRun(status="running", user_id=owner_id); db.add(row); db.commit(); return row.id
 
 
-def write_review_log(experience_id, action, reviewer, note=None) -> None:
-    """独立审核留痕（auto_merge/rollback 等）"""
+def finish_worker_run(run_id, processed_count, status, error=None, user_id=None) -> None:
+    owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
-        db.add(ReviewLog(experience_id=experience_id, action=action,
-                         reviewer=reviewer, note=note))
-        db.commit()
-        _invalidate("review_log")
+        stmt=select(WorkerRun).where(WorkerRun.id==run_id)
+        if owner_id is not None: stmt=stmt.where(WorkerRun.user_id==owner_id)
+        row=db.execute(stmt).scalar_one_or_none()
+        if row is None:return
+        row.ended_at=_now(); row.processed_count=processed_count; row.status=status; row.error=error; db.commit()
 
 
-def start_worker_run() -> int:
-    """Worker 运行记录开始，返回 run_id"""
+def search_experience(stage=None, tags=None, query=None, k=5, status="active", user_id=None) -> list:
+    owner_id=_experience_scope_user(user_id)
+    return _search_experience_like(stage,tags,query,k,status,owner_id)
+
+
+def _search_experience_like(stage=None, tags=None, query=None, k=5, status="active", user_id=None) -> list:
     with SessionLocal() as db:
-        row = WorkerRun(status="running")
-        db.add(row)
-        db.commit()
-        return row.id
-
-
-def finish_worker_run(run_id, processed_count, status, error=None) -> None:
-    """Worker 运行记录结束（ended_at/processed_count/status/error）"""
-    with SessionLocal() as db:
-        row = db.execute(select(WorkerRun).where(WorkerRun.id == run_id)).scalar_one_or_none()
-        if row is None:
-            return
-        row.ended_at = _now()
-        row.processed_count = processed_count
-        row.status = status
-        row.error = error
-        db.commit()
-
-
-def search_experience(stage=None, tags=None, query=None, k=5, status="active") -> list:
-    """经验检索注入：SQLite 用 FTS5 MATCH（rank 相关度），中文整串匹配差时自动降级 LIKE；
-    MySQL 模式直接 LIKE 检索（标注检索精度降级）。仅取 status 指定的经验。"""
-    if settings.db_backend != "sqlite":
-        return _search_experience_like(stage, tags, query, k, status)
-    if query and str(query).strip():
-        params: dict = {"status": status, "k": int(k)}
-        sql = ("SELECT e.* FROM experience_fts f JOIN experience e ON e.id=f.rowid "
-               "WHERE e.status=:status")
-        if status == "active":
-            sql += " AND (e.expires_at IS NULL OR e.expires_at > :now)"
-            params["now"] = datetime.now()
-        if stage:
-            sql += " AND e.stage=:stage"
-            params["stage"] = stage
-        sql += " AND experience_fts MATCH :query ORDER BY rank LIMIT :k"
-        params["query"] = str(query)
-        try:
-            with SessionLocal() as db:
-                rows = db.execute(text(sql), params).mappings().all()
-                if rows:
-                    return [_exp_map_row(r) for r in rows]
-        except Exception:  # noqa: BLE001 FTS 语法/整串匹配失败 → 降级 LIKE
-            logger.warning("FTS5 检索失败（降级 LIKE）: %s", str(query)[:60])
-    return _search_experience_like(stage, tags, query, k, status)
-
-
-def _search_experience_like(stage=None, tags=None, query=None, k=5, status="active") -> list:
-    """LIKE 兜底检索（FTS 不可用/未命中；MySQL 降级模式）"""
-    with SessionLocal() as db:
-        stmt = select(Experience).where(Experience.status == status)
-        if status == "active":
-            stmt = stmt.where(or_(Experience.expires_at.is_(None),
-                                  Experience.expires_at > datetime.now()))
-        if stage:
-            stmt = stmt.where(Experience.stage == stage)
-        if tags:
-            stmt = stmt.where(Experience.tags.like(f"%{tags}%"))
+        stmt=select(Experience).where(Experience.status==status)
+        if user_id is not None: stmt=stmt.where(Experience.user_id==int(user_id))
+        if status=="active": stmt=stmt.where(or_(Experience.expires_at.is_(None),Experience.expires_at>datetime.now()))
+        if stage: stmt=stmt.where(Experience.stage==stage)
+        if tags: stmt=stmt.where(Experience.tags.like(f"%{tags}%"))
         if query and str(query).strip():
-            kw = f"%{str(query)}%"
-            stmt = stmt.where(Experience.title.like(kw) | Experience.body.like(kw))
-        stmt = stmt.order_by(Experience.id.desc()).limit(k)
-        rows = db.execute(stmt).scalars().all()
-        return [_exp_row(r) for r in rows]
+            kw=f"%{str(query)}%"; stmt=stmt.where(Experience.title.like(kw)|Experience.body.like(kw))
+        return [_exp_row(r) for r in db.execute(stmt.order_by(Experience.id.desc()).limit(k)).scalars().all()]
 
 
 def _exp_map_row(r) -> dict:
-    """FTS JOIN 原始行映射（RowMapping → 统一 dict）"""
-    return dict(id=r["id"], title=r["title"], body=r["body"], stage=r["stage"],
-                tags=r["tags"], impact=r["impact"], confidence=r["confidence"],
-                auto_merged=r["auto_merged"], source_pending_id=r["source_pending_id"],
-                status=r["status"], created_at=str(r["created_at"]),
-                last_reviewed_at=str(r["last_reviewed_at"]) if r["last_reviewed_at"] else None,
-                hit_count=int(r["hit_count"] or 0),
-                last_used_at=str(r["last_used_at"]) if r["last_used_at"] else None,
-                expires_at=str(r["expires_at"]) if r["expires_at"] else None,
-                curator_note=r["curator_note"] or "")
+    return _exp_row(r) if hasattr(r, "__table__") else dict(id=r["id"], title=r["title"], body=r["body"], stage=r["stage"], tags=r["tags"], impact=r["impact"], confidence=r["confidence"], auto_merged=r["auto_merged"], source_pending_id=r["source_pending_id"], status=r["status"], created_at=str(r["created_at"]))
 
 
 # ==================== 经验沉淀设置中心（key-value 热加载） ====================

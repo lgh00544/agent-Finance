@@ -2505,7 +2505,8 @@ class ExperienceExpireBody(BaseModel):
 @router.get("/experience/pending")
 def experience_pending(status: str | None = None, stage: str | None = None, limit: int = 50):
     """M1 沉淀队列（只读看板；pending 灰·processing 蓝·done 绿，按阶段筛选）"""
-    return repo.list_pending_experience(status=status, stage=stage, limit=limit)
+    return repo.list_pending_experience(status=status, stage=stage, limit=limit,
+                                        user_id=_request_user_id())
 
 
 @router.post("/experience/worker/run")
@@ -2518,13 +2519,15 @@ def experience_worker_run():
 def experience_list(status: str | None = None, stage: str | None = None,
                     auto_merged: int | None = None, limit: int = 100):
     """M4 经验库列表（按状态/阶段/自动合并筛选）"""
-    return repo.list_experience(status=status, stage=stage, auto_merged=auto_merged, limit=limit)
+    return repo.list_experience(status=status, stage=stage, auto_merged=auto_merged,
+                                limit=limit, user_id=_request_user_id())
 
 
 @router.get("/experience/search")
 def experience_search(stage: str | None = None, query: str | None = None, k: int = 5):
     """经验检索（FTS5/LIKE，仅 active；供 M4 搜索框与注入联查）"""
-    return repo.search_experience(stage=stage, query=query, k=k)
+    return repo.search_experience(stage=stage, query=query, k=k,
+                                  user_id=_request_user_id())
 
 @router.get("/experience/config")
 def experience_config_get():
@@ -2536,6 +2539,8 @@ def experience_config_get():
 @router.post("/experience/config")
 def experience_config_set(body: ExperienceConfigBody):
     """M5 设置写入（key-value 热加载，无需重启；key 须为 DEFAULTS 已知项）"""
+    if settings.multi_user_enabled and not _is_admin():
+        raise HTTPException(status_code=403, detail="仅管理员可修改经验 Worker 配置")
     from app.services.experience_worker import DEFAULTS
     invalid = [k for k in body.config if k not in DEFAULTS]
     if invalid:
@@ -2553,7 +2558,8 @@ def experience_curator_candidates(status: str = "active", stage: str | None = No
                                   limit: int = 100):
     return repo.list_curator_candidates(
         status=status, stage=stage or "", older_than_days=older_than_days,
-        max_hit_count=max_hit_count, max_confidence=max_confidence, limit=limit)
+        max_hit_count=max_hit_count, max_confidence=max_confidence, limit=limit,
+        user_id=_request_user_id())
 
 
 @router.post("/experience/curator/run")
@@ -2562,12 +2568,13 @@ def experience_curator_run(body: MemoryCuratorRunBody | None = None):
     if not body.dry_run and not body.confirm:
         raise HTTPException(status_code=400, detail="dry_run=False 时必须 confirm=True")
     from app.services.memory_curator import run_curator
-    return run_curator(dry_run=body.dry_run, limit=body.limit)
+    return run_curator(dry_run=body.dry_run, limit=body.limit,
+                       user_id=_request_user_id())
 
 
 @router.post("/experience/{eid}/expire")
 def experience_expire(eid: int, body: ExperienceExpireBody):
-    item = repo.get_experience(eid)
+    item = repo.get_experience(eid, user_id=_request_user_id())
     if item is None:
         raise HTTPException(status_code=404, detail="经验不存在")
     if body.status:
@@ -2575,7 +2582,8 @@ def experience_expire(eid: int, body: ExperienceExpireBody):
             raise HTTPException(status_code=400, detail="status 仅支持 expired/archived")
         action_status = body.status
         try:
-            ok = repo.mark_experience_curated(eid, action_status, body.note or "人工策展")
+            ok = repo.mark_experience_curated(eid, action_status, body.note or "人工策展",
+                                              user_id=_request_user_id())
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not ok:
@@ -2583,7 +2591,9 @@ def experience_expire(eid: int, body: ExperienceExpireBody):
         return {"id": eid, "status": action_status}
     if body.expires_at is None:
         raise HTTPException(status_code=400, detail="需提供 expires_at 或 status")
-    ok = repo.set_experience_expires_at(eid, body.expires_at, body.note or "人工设置过期时间")
+    ok = repo.set_experience_expires_at(eid, body.expires_at,
+                                        body.note or "人工设置过期时间",
+                                        user_id=_request_user_id())
     if not ok:
         raise HTTPException(status_code=404, detail="经验不存在")
     return {"id": eid, "expires_at": body.expires_at}
@@ -2592,7 +2602,7 @@ def experience_expire(eid: int, body: ExperienceExpireBody):
 @router.get("/experience/{eid}")
 def experience_detail(eid: int):
     """单条经验（含来源 pending 摘要）"""
-    item = repo.get_experience(eid)
+    item = repo.get_experience(eid, user_id=_request_user_id())
     if item is None:
         raise HTTPException(status_code=404, detail="经验不存在")
     return item
@@ -2601,7 +2611,7 @@ def experience_detail(eid: int):
 @router.post("/experience/{eid}/review")
 def experience_review(eid: int, body: ExperienceReviewBody):
     """M2/M3 审核：approve→active；reject→rejected（原因必填留痕）。仅 pending_review 可操作。"""
-    item = repo.get_experience(eid)
+    item = repo.get_experience(eid, user_id=_request_user_id())
     if item is None:
         raise HTTPException(status_code=404, detail="经验不存在")
     if item["status"] != "pending_review":
@@ -2609,13 +2619,15 @@ def experience_review(eid: int, body: ExperienceReviewBody):
                             detail=f"仅待审核条目可审核（当前 {item['status']}）")
     if body.action == "approve":
         repo.update_experience_status(eid, "active", reviewer="sir",
-                                      action="approve", note=body.note or "")
+                                      action="approve", note=body.note or "",
+                                      user_id=_request_user_id())
         return {"id": eid, "status": "active"}
     if body.action == "reject":
         if not (body.note or "").strip():
             raise HTTPException(status_code=400, detail="驳回必须填写原因（留痕可追溯）")
         repo.update_experience_status(eid, "rejected", reviewer="sir",
-                                      action="reject", note=body.note)
+                                      action="reject", note=body.note,
+                                      user_id=_request_user_id())
         return {"id": eid, "status": "rejected"}
     raise HTTPException(status_code=400, detail="action 仅支持 approve/reject")
 
@@ -2624,12 +2636,13 @@ def experience_review(eid: int, body: ExperienceReviewBody):
 def experience_rollback(eid: int):
     """M4 回滚：仅「已生效且自动合并」可回滚 → rolled_back + review_log(rollback)；
     回滚后 status 过滤使检索不再命中（误合并可恢复）。"""
-    item = repo.get_experience(eid)
+    item = repo.get_experience(eid, user_id=_request_user_id())
     if item is None:
         raise HTTPException(status_code=404, detail="经验不存在")
     if item["status"] != "active" or item["auto_merged"] != 1:
         raise HTTPException(status_code=409,
                             detail="仅「已生效且自动合并」的经验可回滚（误合并恢复入口）")
     repo.update_experience_status(eid, "rolled_back", reviewer="sir",
-                                  action="rollback", note="M4 人工回滚")
+                                  action="rollback", note="M4 人工回滚",
+                                  user_id=_request_user_id())
     return {"id": eid, "status": "rolled_back"}

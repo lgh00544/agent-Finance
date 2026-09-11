@@ -101,7 +101,7 @@ def _duplicate_actions(items: list[dict], threshold: float) -> list[dict]:
     return actions
 
 
-def run_curator(dry_run: bool = True, limit: int = 100) -> dict:
+def run_curator(dry_run: bool = True, limit: int = 100, user_id: int | None = None) -> dict:
     if not _cfg_bool("memory_curator_enabled"):
         return {"dry_run": dry_run, "skipped": True, "reason": "disabled", "actions": []}
 
@@ -112,7 +112,7 @@ def run_curator(dry_run: bool = True, limit: int = 100) -> dict:
     stale_hits = _cfg_int("memory_stale_hit_threshold")
     duplicate_similarity = _cfg_float("memory_duplicate_similarity")
 
-    active = repo.list_curator_candidates(status="active", limit=limit)
+    active = repo.list_curator_candidates(status="active", limit=limit, user_id=user_id)
     actions: list[dict] = []
     planned_ids: set[int] = set()
     for item in active:
@@ -128,7 +128,8 @@ def run_curator(dry_run: bool = True, limit: int = 100) -> dict:
 
     stale = repo.list_curator_candidates(
         status="active", older_than_days=retention_days,
-        max_hit_count=stale_hits, max_confidence=low_confidence, limit=limit)
+        max_hit_count=stale_hits, max_confidence=low_confidence, limit=limit,
+        user_id=user_id)
     for item in stale:
         if int(item["id"]) in planned_ids:
             continue
@@ -147,19 +148,22 @@ def run_curator(dry_run: bool = True, limit: int = 100) -> dict:
     if not dry_run:
         for action in actions:
             if action["action"] == "expire":
-                if repo.mark_experience_curated(action["id"], "expired", action["reason"]):
+                if repo.mark_experience_curated(action["id"], "expired", action["reason"],
+                                                user_id=user_id):
                     executed += 1
             elif action["action"] == "archive":
-                if repo.mark_experience_curated(action["id"], "archived", action["reason"]):
+                if repo.mark_experience_curated(action["id"], "archived", action["reason"],
+                                                user_id=user_id):
                     executed += 1
             elif action["action"] == "propose_summary":
                 eid = repo.insert_experience(
                     action["title"], action["body"], action["stage"], action["tags"],
                     "low", 0.0, auto_merged=0, source_pending_id=None,
-                    status="pending_review")
+                    status="pending_review", user_id=user_id)
                 repo.mark_experience_curated(
                     eid, "pending_review",
-                    f"duplicate_summary source_ids={action['source_ids']} similarity={action['similarity']}")
+                    f"duplicate_summary source_ids={action['source_ids']} similarity={action['similarity']}",
+                    user_id=user_id)
                 action["id"] = eid
                 executed += 1
 

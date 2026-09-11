@@ -217,14 +217,17 @@ def experience_section(agent: str) -> str:
     stage_map = {"discover": "选股", "score": "选股", "position": "建仓",
                  "monitor": "持仓", "sell": "持仓", "review": "持仓"}
     try:
-        items = repo.search_experience(stage=stage_map.get(agent, "选股"), k=5)
+        from app.core.auth import current_user_id
+        items = repo.search_experience(stage=stage_map.get(agent, "选股"), k=5,
+                                       user_id=current_user_id())
     except Exception as exc:  # noqa: BLE001 经验检索失败不阻塞主链路
         logger.warning("经验检索注入失败: %s", exc)
         return ""
     if not items:
         return ""
     try:
-        repo.bump_experience_hits([int(it["id"]) for it in items if it.get("id")])
+        repo.bump_experience_hits([int(it["id"]) for it in items if it.get("id")],
+                                  user_id=current_user_id())
     except Exception as exc:  # noqa: BLE001 经验计量失败不阻塞主链路
         logger.warning("经验命中计量失败（降级跳过）: %s", exc)
     lines = []
