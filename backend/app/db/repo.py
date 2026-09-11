@@ -4374,7 +4374,9 @@ def experience_version(user_id=None) -> str:
         if owner_id is not None: stmt=stmt.select_from(Experience).where(Experience.user_id==owner_id)
         else: stmt=stmt.select_from(Experience)
         count, max_id, created_at, reviewed_at = db.execute(stmt).one()
-        stamp = max(created_at, reviewed_at) if created_at or reviewed_at else "0"
+        # SQLite/MySQL may return NULL for either timestamp; compare only present values.
+        stamps = [value for value in (created_at, reviewed_at) if value is not None]
+        stamp = max(stamps) if stamps else "0"
         return f"e{count}:{max_id or 0}:{stamp}"
 
 

@@ -1,15 +1,16 @@
 @echo off
 rem ============================================================
-rem  run_dev.bat  -  本地启动：先同步云端到本地，再起服务
-rem  用法：双击本文件，或命令行运行 run_dev.bat
-rem  效果：启动 backend + React 前端（web/，Vite dev 5173），启动前自动 sync_manager backup
-rem         （云端 TiDB 最新数据拉到本地 data/dev.db，含自动快照备份）
-rem  说明：同步失败不阻塞启动（本地有旧快照可读，会提示但继续）
-rem  开关：.env 里 SYNC_ON_START=false 时跳过同步直接启动
-rem  注意：Streamlit（8501）已退役，旧启动入口已注释，不再执行
+rem  旧版单用户入口已停用。正式版本为多人认证版。
+rem  请运行 start_multi_user.ps1（或 setup_new_machine.bat）。
+rem  保留此文件仅用于避免旧快捷方式失效时误启动单用户同步流程。
 rem ============================================================
-setlocal
-cd /d "%~dp0"
+echo [已停用] run_dev.bat 是旧版单用户启动入口。
+echo 请改用：powershell -ExecutionPolicy Bypass -File "%~dp0start_multi_user.ps1"
+exit /b 2
+
+rem 以下旧实现故意保留在文件中，便于历史回退，不会被执行。
+rem setlocal
+rem cd /d "%~dp0"
 
 set PY=%~dp0.venv\Scripts\python.exe
 rem set ST=D:\space\self\self\.venv\Scripts\streamlit.exe   (Streamlit 已退役，不再启动)
