@@ -24,7 +24,6 @@ $env:REDIS_NAMESPACE = 'stock-agent:multi-user'
 $env:QDRANT_MODE = 'server'
 $env:SYNC_ON_START = 'false'
 $env:VITE_API_PROXY = "http://127.0.0.1:$Port"
-$env:VITE_API_PROXY = 'http://localhost:8100'
 if (-not (Test-NetConnection 127.0.0.1 -Port 6379 -InformationLevel Quiet -WarningAction SilentlyContinue)) { throw 'Redis is not listening on 6379' }
 if (-not (Test-NetConnection 127.0.0.1 -Port 6333 -InformationLevel Quiet -WarningAction SilentlyContinue)) { throw 'Qdrant is not listening on 6333' }
 $old = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
