@@ -58,6 +58,7 @@ const NAV_GROUPS: Array<{
       { path: '/experience', label: '经验沉淀', icon: <ExperimentOutlined /> },
       { path: '/profile', label: '个人交易偏好', icon: <UserOutlined /> },
       { path: '/system-map', label: '系统治理', icon: <PartitionOutlined /> },
+      { path: '/factor-ic', label: '因子 IC 回测', icon: <LineChartOutlined /> },
     ],
   },
 ]

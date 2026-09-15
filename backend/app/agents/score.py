@@ -11,9 +11,11 @@ import time
 from app.agents.common import (ModelLevel, agent_call, agentic_call,
                                summarize_agentic_trace)
 from app.agents.agentic_tools import _AGENTIC_TOOL_NOTE
+from app.factors import factor_registry
+from app.factors.data_adapter import DataAdapter
 from agent_prompts import score_prompt
 from app.agents.schemas import PrefilterOutput, ScoreOutput
-from app.core.config import settings
+from app.core.config import FACTOR_REGISTRY_VERSION, settings
 from app.datasource.base import DataSource
 from app.datasource.fallback import get_datasource
 from app.db import repo
@@ -152,12 +154,32 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 游资聚合失败不阻塞打分
         logger.warning("游资聚合失败（降级跳过）: %s", exc)
 
+    adapter = DataAdapter(
+        source=source, code=code, kline=kline, indicators=indicators,
+        financial=fin_rows, fund_flow=ff_rows, news=news_rows, sectors=industry_rows,
+        hot_money=hm_agg, extra={"trade_date": today},
+    )
+    factor_lines = []
+    factor_started = time.perf_counter()
+    for definition in factor_registry.list_active():
+        try:
+            result = definition.func(adapter, code)
+        except Exception as exc:  # noqa: BLE001 因子失败只标缺失，不阻塞主链
+            logger.warning("因子 %s 计算失败，标记缺失: %s", definition.id, exc)
+            from app.services.factor_registry import FactorResult
+            result = FactorResult(value=None, reason=f"data_missing:{definition.id}")
+        quantile = f"{result.quantile:g}" if result.quantile is not None else "N/A"
+        factor_lines.append(f"{definition.id}: value={result.value} (行业前{quantile}%) | {result.reason}")
+    logger.debug("因子细分 %s（%.1fms）:\n%s", code,
+                 (time.perf_counter() - factor_started) * 1000, "\n".join(factor_lines))
+
     state["basic_info"] = {"stock_code": code, "trade_date": today,
                            "industry_spot": industry_rows}
     state["tech_index"] = indicators
     state["finance_data"] = fin_rows
     state["news_report"] = news_rows
     state["fund_flow_rows"] = ff_rows
+    state["factor_details"] = factor_lines
     state["hot_money"] = hm_agg
     state["risk_notice"] = []
 
@@ -229,6 +251,19 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     except Exception as exc:  # noqa: BLE001 周期复利失败跳过注入，不阻塞打分
         logger.warning("周期复利读取失败（跳过注入）: %s", exc)
 
+    market_condition_weights = None
+    market_condition_weight_reason = ""
+    market_condition_weight_context = None
+    try:
+        from app.services.market_condition_aware_weight import (
+            build_weight_context, resolve_weights,
+        )
+        market_condition = repo.get_latest_market_condition()
+        market_condition_weights, market_condition_weight_reason = resolve_weights(market_condition)
+        market_condition_weight_context = build_weight_context(market_condition)
+    except Exception as exc:  # noqa: BLE001 权重读取失败不阻塞评分
+        logger.warning("动态因子权重获取失败（降级跳过）: %s", exc)
+
     state["discover_context"] = discover_ctx
     state["market_intel_summary"] = intel_summary
     state["regime_context"] = regime_context
@@ -236,6 +271,9 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     state["distribution_phase_context"] = distribution_phase_context
     state["capital_view_context"] = capital_view_context
     state["cycle_attribution"] = cycle_attribution
+    state["market_condition_weights"] = market_condition_weights
+    state["market_condition_weight_reason"] = market_condition_weight_reason
+    state["market_condition_weight_context"] = market_condition_weight_context
     state["trace"] = [*state.get("trace", []),
                       f"聚合完成: K线{len(kline)}行 财务{len(fin_rows)}期 资金流{len(ff_rows)}日 新闻{len(news_rows)}条"]
     return state
@@ -258,6 +296,7 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "财务指标": state.get("finance_data") or [],
         "资金流向": state.get("fund_flow_rows") or [],
         "新闻公告": state.get("news_report") or [],
+        "细分因子明细": state.get("factor_details") or [],
         "行业板块行情": (state.get("basic_info") or {}).get("industry_spot", [])[:15],
         # 游资聚合（阶段3）：口径后缀字段 lhb_1d_net_buy/lhb_3d_net_buy，无数据 None
         "游资聚合": state.get("hot_money"),
@@ -269,7 +308,7 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "cycle_attribution": state.get("cycle_attribution"),
     }
 
-    score_cache_key = f"{code}:{today}:v4:h{repo.hot_money_fingerprint()}"
+    score_cache_key = f"{code}:{today}:v4:f{FACTOR_REGISTRY_VERSION}:h{repo.hot_money_fingerprint()}"
     score_user_prompt = score_prompt.build_user_prompt(
         _compact(data_pack), preference_text,
         discover_context=state.get("discover_context") or "",
@@ -278,6 +317,8 @@ def llm_score(state: StockAgentState) -> StockAgentState:
     )
     if state.get("regime_context"):
         score_user_prompt = f"{score_user_prompt}\n\n{state['regime_context']}"
+    if state.get("market_condition_weight_context"):
+        score_user_prompt = f"{score_user_prompt}\n\n{state['market_condition_weight_context']}"
     agentic_trace: dict = {}
     if settings.agentic_enable:
         output, agentic_trace = agentic_call(
