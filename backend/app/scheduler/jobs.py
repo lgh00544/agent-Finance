@@ -182,6 +182,15 @@ def market_intel_job() -> None:
         logger.error("市场研判定时任务失败: %s", exc)
 
 
+def run_factor_ic_backtest_job() -> None:
+    """每月因子 IC 回测；失败只记日志，不阻塞其他调度任务。"""
+    try:
+        from app.services.factor_ic import run_factor_ic_backtest_job as run_backtest
+        logger.info("因子 IC 月度回测完成: %s", run_backtest())
+    except Exception as exc:  # noqa: BLE001 回测失败不阻塞调度
+        logger.error("因子 IC 月度回测失败: %s", exc)
+
+
 def pre_market_screen_job() -> None:
     """盘前快筛（工作日 9:25 集合竞价撮合完成后）：交易日校验 + 防重锁 300s。
     检测最近一批候选的竞价异常（大幅低开/高开/可能停牌），异常逐条落库 + 合并一条飞书；
@@ -903,6 +912,9 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=16, minute=20,
                       id="market_intel", name="市场研判",
                       replace_existing=True, misfire_grace_time=3600)
+    scheduler.add_job(run_factor_ic_backtest_job, "cron", day=1, hour=2, minute=0,
+                      id="factor_ic_backtest", name="因子 IC 月度回测",
+                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
     # 工作日 16:30 游资胜率迭代（daily_discover/market_intel 之后；归一化匹配收信号）
     scheduler.add_job(hot_money_win_rate_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=30,

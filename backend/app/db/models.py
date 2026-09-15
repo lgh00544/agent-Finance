@@ -865,6 +865,29 @@ class ExperienceConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class FactorIcHistory(Base):
+    """月度因子 IC/IR 回测历史，仅供验证与展示。"""
+    __tablename__ = "factor_ic_history"
+    __table_args__ = (
+        UniqueConstraint("factor_id", "period", name="uq_factor_ic_factor_period"),
+        Index("ix_factor_ic_period", "period"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    factor_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    factor_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    period: Mapped[str] = mapped_column(String(7), nullable=False)
+    ic: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ir: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hit_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    abs_ic: Mapped[float] = mapped_column(Float, default=0.0)
+    rank_in_category: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(24), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class SectorSnapshot(Base):
     """首页今日热门板块快照（5 分钟一次落库；首页只读）
 
