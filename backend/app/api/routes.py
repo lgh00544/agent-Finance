@@ -612,6 +612,11 @@ class CodeBody(BaseModel):
     stock_name: str = ""
 
 
+class FactorCandidateProposeBody(BaseModel):
+    context: str = Field(default="", max_length=8000)
+    limit: int = Field(default=5, ge=3, le=5)
+
+
 @router.post("/jobs/discover/run")
 def run_discover_job():
     """手动触发每日挖掘（异步提交：discover → 候选打分 全流程后台执行）"""
@@ -651,6 +656,12 @@ def market_intel_dates(limit: int = 30):
     return repo.list_market_intel_dates(limit)
 
 
+@router.post("/factor-candidates/propose")
+def propose_factor_candidates(body: FactorCandidateProposeBody):
+    """人工触发候选因子提议；LLM 结果只进入 pending 候选池。"""
+    require_write_access()
+    from app.services.factor_candidate import propose
+    return propose(body.context, body.limit)
 # ================= 板块轮动（sector_rotation：状态机 + 归因子 Agent + 手动触发） =================
 
 @router.post("/market/sector-rotation/run")

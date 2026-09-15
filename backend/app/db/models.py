@@ -888,6 +888,30 @@ class FactorIcHistory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class FactorCandidate(Base):
+    """候选因子提议与人工启用状态。"""
+    __tablename__ = "factor_candidate"
+    __table_args__ = (
+        UniqueConstraint("candidate_id", name="uq_factor_candidate_id"),
+        Index("ix_factor_candidate_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(16), nullable=False, default="主线")
+    hypothesis: Mapped[str] = mapped_column(Text, default="")
+    formula: Mapped[str] = mapped_column(Text, default="")
+    data_requirements: Mapped[list] = mapped_column(SafeJSON, default=list)
+    expected_edge: Mapped[str] = mapped_column(Text, default="")
+    risk_note: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(48), default="candidate_factor_proposer")
+    validation_result: Mapped[dict] = mapped_column(SafeJSON, default=dict)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
 class SectorSnapshot(Base):
     """首页今日热门板块快照（5 分钟一次落库；首页只读）
 

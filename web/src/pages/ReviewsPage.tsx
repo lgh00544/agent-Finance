@@ -22,8 +22,9 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { get } from '@/api/client'
+import { proposeFactorCandidates, type FactorCandidate } from '@/api/factors'
 import { portfolioAttribution, reviews, stockCycleAttribution } from '@/api/reviews'
 import { candidateTradeable } from '@/api/candidates'
 import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion, reReviewSuggestion, ruleChanges } from '@/api/suggestions'
@@ -60,6 +61,31 @@ function CompareBox({ title, value }: { title: string; value: unknown }) {
         {textVal(value)}
       </Typography.Paragraph>
     </Card>
+  )
+}
+
+function FactorCandidates() {
+  const { message } = App.useApp()
+  const [rows, setRows] = useState<FactorCandidate[]>([])
+  const mutation = useMutation({
+    mutationFn: () => proposeFactorCandidates(),
+    onSuccess: (data) => { setRows(data); message.success(`已生成 ${data.length} 个候选因子`) },
+    onError: (error) => message.error(error instanceof Error ? error.message : '候选因子提议失败'),
+  })
+  return (
+    <Space orientation="vertical" style={{ width: '100%' }}>
+      <Button type="primary" loading={mutation.isPending} onClick={() => mutation.mutate()}>
+        AI 提议候选因子
+      </Button>
+      <Table<FactorCandidate> rowKey="candidate_id" size="small" dataSource={rows}
+        columns={[
+          { title: 'ID', dataIndex: 'candidate_id', width: 90 },
+          { title: '名称', dataIndex: 'name', width: 150 },
+          { title: '分类', dataIndex: 'category', width: 90 },
+          { title: '假设', dataIndex: 'hypothesis' },
+          { title: '状态', dataIndex: 'status', width: 90 },
+        ]} pagination={{ pageSize: 5 }} />
+    </Space>
   )
 }
 
@@ -1495,7 +1521,8 @@ function DailySummary() {
 export function ReviewsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const requestedTab = searchParams.get('tab')
-  const activeTab = requestedTab && ['attr', 'reviews', 'track', 'sug'].includes(requestedTab) ? requestedTab : 'attr'
+  const activeTab = requestedTab && ['attr', 'reviews', 'track', 'sug', 'factor_candidates'].includes(requestedTab)
+    ? requestedTab : 'attr'
   return (
     <div>
       <Alert type="info" showIcon style={{ marginBottom: 12 }}
@@ -1505,6 +1532,7 @@ export function ReviewsPage() {
         { key: 'reviews', label: '每日复盘报告', children: <ReviewsList /> },
         { key: 'track', label: '选股效果验证', children: <TrackVerify /> },
         { key: 'sug', label: '策略闭环建议', children: <Suggestions /> },
+        { key: 'factor_candidates', label: '候选因子', children: <FactorCandidates /> },
       ]} />
       <DailySummary />
     </div>
