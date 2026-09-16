@@ -296,9 +296,21 @@ def _ensure_account_pnl_user_index() -> None:
 
 
 def _ensure_user_columns() -> None:
-    """给既有私有表增加可空归属列，并把旧数据归档到默认用户。"""
+    """给既有私有表增加可空归属列，并把旧数据归档到默认用户。
+    对 account_pnl_snapshot 特判：先删 NULL 行中与已有 user_id 行冲突的（避免回填撞 UNIQUE）。"""
     from app.db import repo
     default_id = repo.ensure_default_user()
+    # account_pnl_snapshot 在加 UNIQUE 后，user_id=NULL 的行与 user_id=1 已存在行
+    # 在 (user_id, trade_date, ts) 上可能撞约束，必须先清掉这些 NULL 行再回填。
+    # 该清理为方言无关的标准 SQL：SQLite 同样会撞 uq_account_pnl_user_date_ts，故不设方言守卫。
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM account_pnl_snapshot WHERE user_id IS NULL "
+                 "AND (trade_date, ts) IN ("
+                 "  SELECT trade_date, ts FROM account_pnl_snapshot WHERE user_id = :uid"
+                 ")"),
+            {"uid": default_id},
+        )
     tables = (
         "position_plan", "holding", "trade_record", "alert_log", "review_result",
         "agent_preference", "sys_trade_profile", "private_knowledge", "sell_decision",
