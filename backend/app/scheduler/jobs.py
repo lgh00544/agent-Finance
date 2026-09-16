@@ -870,6 +870,25 @@ def feishu_daily_report_job() -> None:
         finally:
             reset_user_context(tokens)
 
+
+def signal_scan_job() -> None:
+    """买卖点信号全市场扫描（工作日 16:50 收盘后）；非交易日直接返回，不产生任何记录。"""
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        logger.info("今天 %s 非交易日，跳过买卖点信号扫描", today)
+        return
+    if not cache.acquire_lock("signal_scan", ttl_seconds=3600):
+        logger.info("signal_scan 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.signal_scan import scan_signal_triggers
+        logger.info("买卖点信号扫描完成: %s", scan_signal_triggers(today))
+    except Exception as exc:  # noqa: BLE001 调度任务整体容错
+        logger.error("买卖点信号扫描失败: %s", exc)
+    finally:
+        cache.release_lock("signal_scan")
+
+
 def start_scheduler() -> None:
     global scheduler, _leader_acquired
     if scheduler is not None:
@@ -912,6 +931,11 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=16, minute=20,
                       id="market_intel", name="市场研判",
                       replace_existing=True, misfire_grace_time=3600)
+    # 工作日 16:50 买卖点信号全市场扫描（批 1 只攒数据，不进任何 Agent、不触发交易动作）
+    scheduler.add_job(signal_scan_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=50,
+                      id="signal_scan", name="买卖点信号扫描",
+                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
     scheduler.add_job(run_factor_ic_backtest_job, "cron", day=1, hour=2, minute=0,
                       id="factor_ic_backtest", name="因子 IC 月度回测",
                       replace_existing=True, misfire_grace_time=3600, max_instances=1)

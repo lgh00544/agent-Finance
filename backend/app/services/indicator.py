@@ -54,6 +54,34 @@ def rolling_extreme(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=window).max()
 
 
+def boll(close: pd.Series, window: int = 20, num_std: float = 2.0):
+    """布林带：返回 (中轨, 上轨, 下轨, %B)；中轨复用 sma，标准差用总体口径 ddof=0"""
+    middle = sma(close, window)
+    std = close.rolling(window=window, min_periods=window).std(ddof=0)
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    pctb = (close - lower) / (upper - lower).replace(0, np.nan)
+    return middle, upper, lower, pctb
+
+
+def kdj(high: pd.Series, low: pd.Series, close: pd.Series,
+        n: int = 9, k_period: int = 3, d_period: int = 3):
+    """KDJ：返回 (K, D, J)；窗口内最高=最低时 RSV 补 50（对齐 rsi 的 fillna(50.0) 口径）"""
+    low_n = low.rolling(window=n, min_periods=n).min()
+    high_n = high.rolling(window=n, min_periods=n).max()
+    rsv = ((close - low_n) / (high_n - low_n).replace(0, np.nan) * 100).fillna(50.0)
+    k = rsv.ewm(alpha=1 / k_period, adjust=False).mean()
+    d = k.ewm(alpha=1 / d_period, adjust=False).mean()
+    return k, d, 3 * k - 2 * d
+
+
+def donchian(high: pd.Series, low: pd.Series, window: int = 20):
+    """唐奇安通道：返回前 window 根 K 线的 (上轨, 下轨)，不含当日 → 突破判定无未来函数"""
+    upper = rolling_extreme(high.shift(1), window)
+    lower = -rolling_extreme(-low.shift(1), window)
+    return upper, lower
+
+
 def _last(df: pd.DataFrame, col: str, n: int = 1) -> float:
     vals = df[col].dropna()
     if len(vals) < n:

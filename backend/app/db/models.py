@@ -1525,3 +1525,33 @@ class CapitalStats(Base):
     raw_json: Mapped[dict] = mapped_column(SafeJSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SignalTrigger(Base):
+    """买卖点信号触发记录：只攒数据不出结论，绝不触发任何交易动作。
+    (trade_date, stock_code, signal_id) 唯一；收益字段批 1 全留 NULL 由批 2 回填（K227 缺数据不编造）。"""
+    __tablename__ = "signal_trigger"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "stock_code", "signal_id", name="uq_signal_trigger_identity"),
+        Index("ix_signal_trigger_signal_date", "signal_id", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    signal_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    direction: Mapped[str] = mapped_column(String(4), default="")
+    trigger_close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exec_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    limit_up: Mapped[int] = mapped_column(Integer, default=0)
+    is_st: Mapped[int] = mapped_column(Integer, default=0)
+    ret_5: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ret_10: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ret_20: Mapped[float | None] = mapped_column(Float, nullable=True)
+    excess_10: Mapped[float | None] = mapped_column(Float, nullable=True)
+    excess_20: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_profit_20: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown_20: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dedup: Mapped[int] = mapped_column(Integer, default=0)
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
