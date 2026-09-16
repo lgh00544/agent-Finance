@@ -22,9 +22,8 @@ def main(candidate_ids: list[str] | None = None) -> list[dict]:
     init_db()
     source = get_datasource()
     ends = _month_ends(source)
-    universe = source.fetch_spot_universe()
-    codes = universe["code"].astype(str).str.zfill(6).tolist() if "code" in universe else []
-    records = factor_ic.collect_month_records(source, ends, codes)
+    codes = factor_ic.select_universe_codes(source.fetch_spot_universe())
+    records = factor_ic.collect_month_records(source, ends, codes, 900)
     pending = factor_candidate.get_pending_for_sir()
     wanted = set(candidate_ids or [row["candidate_id"] for row in pending])
     output = []

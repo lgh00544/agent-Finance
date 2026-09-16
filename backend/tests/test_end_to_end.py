@@ -1,5 +1,7 @@
 import importlib.util
+from pathlib import Path
 
+import pandas as pd
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -8,9 +10,12 @@ from sqlalchemy.pool import StaticPool
 from app.db.models import Base, FactorCandidate
 from app.services import factor_candidate
 
+_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _load(name):
-    path = f"backend/scripts/{name}.py"
+    # 基于 __file__ 定位仓库根：pytest 在仓库根或 backend/ 下执行均可用
+    path = _ROOT / "backend" / "scripts" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -48,7 +53,7 @@ def test_validate_script_marks_uncomputable_candidate(db, monkeypatch):
         session.add(FactorCandidate(candidate_id="fc01", name="候选", status="pending"))
         session.commit()
     monkeypatch.setattr(script, "init_db", lambda: None)
-    source = type("Source", (), {"fetch_spot_universe": lambda self: {"code": []}})()
+    source = type("Source", (), {"fetch_spot_universe": lambda self: pd.DataFrame({"code": []})})()
     monkeypatch.setattr(script, "get_datasource", lambda: source)
     monkeypatch.setattr(script, "_month_ends", lambda source: [])
     monkeypatch.setattr(script.factor_ic, "collect_month_records", lambda *args: {})

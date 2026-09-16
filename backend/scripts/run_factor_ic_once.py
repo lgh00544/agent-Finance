@@ -16,7 +16,8 @@ def main() -> dict:
     init_db()
     result = factor_ic.run_factor_ic_backtest_job(months=36)
     rows = factor_ic.list_history(limit=500)
-    periods = sorted({row["period"] for row in rows})
+    # 最新月可能因 20 日前瞻收益尚未走完而无样本，摘要须取「最近一个有样本的月」
+    periods = sorted({row["period"] for row in rows if row["sample_size"]})
     latest = [row for row in rows if periods and row["period"] == periods[-1]]
     latest.sort(key=lambda row: (row["ic"] is None, -(row["ic"] or 0), row["factor_id"]))
     weak = [row["factor_id"] for row in latest if row["status"] == "deprecated_candidate"]

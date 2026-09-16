@@ -1,8 +1,11 @@
 """因子 IC 月度回测：只读行情，结果写入独立历史表。"""
+import logging
+import time
 from datetime import datetime, timedelta
 from math import isfinite
 
 import numpy as np
+import pandas as pd
 from sqlalchemy import select
 
 try:
@@ -16,7 +19,13 @@ from app.db.session import SessionLocal
 from app.factors import factor_registry
 from app.factors.data_adapter import DataAdapter, num
 
+logger = logging.getLogger(__name__)
+
 FORWARD_DAYS, ROLLING_MONTHS, MIN_SAMPLE = 20, 3, 100
+# 全市场 5000+ 只 × 单只 20s+ 日K ≈ 11 小时，单次回测不可行：
+# 按代码等距抽样到 UNIVERSE_LIMIT 只，并设墙钟预算，超预算即停并落库已采部分。
+UNIVERSE_LIMIT = 300
+COLLECT_BUDGET_SECONDS = 1800
 
 
 def _rank(values):
@@ -78,37 +87,85 @@ def run_backtest(month_records: dict[str, list[dict]], definitions=None) -> list
                            "hit_rate": sum(v > 0 for v in valid) / len(valid) if valid else 0.0,
                            "sample_size": current["sample_size"], "abs_ic": abs(current["ic"] or 0),
                            "rank_in_category": 0,
-                           "status": judge_status([m["ic"] for m in history])})
+                           "status": judge_status([m["ic"] for m in history
+                                                   if m["sample_size"] >= MIN_SAMPLE])})
     for period in periods:
         groups = {}
         for row in (r for r in output if r["period"] == period):
             groups.setdefault(row["category"], []).append(row)
         for group in groups.values():
-            for rank, row in enumerate(sorted(group, key=lambda r: (-r["abs_ic"], r["factor_id"])), 1):
+            # 样本不足 MIN_SAMPLE 的因子不参与排名：样本过小时 ±1.0 的伪 IC 会抢占榜首
+            ranked = sorted((row for row in group if row["sample_size"] >= MIN_SAMPLE),
+                            key=lambda row: (-row["abs_ic"], row["factor_id"]))
+            for rank, row in enumerate(ranked, 1):
                 row["rank_in_category"] = rank
     return output
 
 
 def _month_ends(calendar: list[str], months: int) -> list[str]:
+    # 交易日历含未来日期（如 2026-12-31），未来月份无行情可采，须先剔除再取最近 N 个月
+    today = datetime.now().strftime("%Y-%m-%d")
+    days = [value for value in sorted({str(item)[:10] for item in calendar}) if value <= today]
+    if not days:
+        return []
     latest = {}
-    for value in sorted(str(item)[:10] for item in calendar):
+    for value in days:
         latest[value[:7]] = value
-    return list(latest.values())[-months:]
+    # 尾部钳制：月末之后不足 FORWARD_DAYS 个交易日的期次，前瞻收益尚未走完、IC 恒为 NULL
+    ends = [end for end in latest.values() if sum(1 for day in days if day > end) >= FORWARD_DAYS]
+    return ends[-months:]
 
 
-def collect_month_records(source, month_ends: list[str], codes: list[str]) -> dict[str, list[dict]]:
+def select_universe_codes(universe, limit: int = UNIVERSE_LIMIT) -> list[str]:
+    """全市场快照 → 确定性抽样股票池：按代码排序等距取样，跨板块均匀且可复现。"""
+    if universe is None or not hasattr(universe, "columns") or "code" not in universe.columns:
+        return []
+    codes = sorted({str(code).strip().zfill(6) for code in universe["code"].dropna()})
+    if limit and len(codes) > limit:
+        step = len(codes) / limit
+        codes = [codes[int(index * step)] for index in range(limit)]
+    return codes
+
+
+def _fetch_once(source, method: str, *args):
+    """取一次外挂数据；失败/空返回空表，交给 adapter 缓存，避免按 (票,月) 反复重试失败请求。"""
+    try:
+        value = getattr(source, method)(*args)
+    except Exception as exc:  # noqa: BLE001 数据源异常类型繁多，统一降级为空表
+        logger.debug("因子回测外挂数据 %s%s 失败: %s", method, args, exc)
+        return pd.DataFrame()
+    return value if value is not None else pd.DataFrame()
+
+
+def collect_month_records(source, month_ends: list[str], codes: list[str],
+                          budget_seconds: float | None = COLLECT_BUDGET_SECONDS) -> dict[str, list[dict]]:
     records = {d[:7]: [] for d in month_ends}
-    if not month_ends:
+    if not month_ends or not codes:
         return records
+    started = time.monotonic()
     start = (datetime.strptime(month_ends[0], "%Y-%m-%d") - timedelta(days=45)).strftime("%Y-%m-%d")
     end = (datetime.strptime(month_ends[-1], "%Y-%m-%d") + timedelta(days=45)).strftime("%Y-%m-%d")
     definitions = factor_registry.list_active()
+    sectors = _fetch_once(source, "fetch_industry_spot")  # 全市场板块：整跑共用一份
+    attempted = 0
     for code in codes:
+        # 墙钟护栏：超预算即停，保证任务必定结束并落库已采数据（不出现「跑不完 → 数据空」）
+        if budget_seconds and attempted and time.monotonic() - started > budget_seconds:
+            logger.warning("因子 IC 采集超墙钟预算 %.0fs：已尝试 %d/%d 只，停止并落库已采部分",
+                           budget_seconds, attempted, len(codes))
+            break
+        attempted += 1
         try:
             kline = source.fetch_daily_kline(code, start, end)
             if kline is None or kline.empty or not {"date", "close"}.issubset(kline.columns):
                 continue
             kline = kline.sort_values("date").reset_index(drop=True)
+            # 外挂数据每票只取一次（36 个月快照共用一份）；quote 置空：
+            # 实时快照对历史月份属前视数据，且单次可达 88s（全市场快照兜底）。
+            aux = {"quote": {}, "sectors": sectors,
+                   "financial": _fetch_once(source, "fetch_financial", code),
+                   "fund_flow": _fetch_once(source, "fetch_fund_flow", code),
+                   "news": _fetch_once(source, "fetch_news", code)}
             for snapshot in month_ends:
                 hits = kline.index[kline["date"].astype(str).str[:10] == snapshot].tolist()
                 if not hits or hits[0] + FORWARD_DAYS >= len(kline):
@@ -119,7 +176,7 @@ def collect_month_records(source, month_ends: list[str], codes: list[str]) -> di
                     continue
                 history = kline.iloc[:i + 1]
                 adapter = DataAdapter(source=source, code=code, kline=history, indicators={
-                    "latest_close": close, "ma20": history["close"].tail(20).mean() if i >= 19 else None})
+                    "latest_close": close, "ma20": history["close"].tail(20).mean() if i >= 19 else None}, **aux)
                 values = {}
                 for definition in definitions:
                     try:
@@ -154,10 +211,15 @@ def persist_history(rows: list[dict]) -> int:
 def run_factor_ic_backtest_job(months: int = 36) -> dict:
     source = get_datasource()
     ends = _month_ends(source.fetch_trade_calendar(), months)
-    universe = source.fetch_spot_universe()
-    codes = universe["code"].astype(str).str.zfill(6).tolist() if universe is not None and "code" in universe else []
-    return {"months": len(ends), "codes": len(codes),
-            "rows": persist_history(run_backtest(collect_month_records(source, ends, codes)))}
+    codes = select_universe_codes(source.fetch_spot_universe())
+    records = collect_month_records(source, ends, codes)
+    results = run_backtest(records)
+    persisted = persist_history(results)
+    samples = [row["sample_size"] for row in results]
+    return {"months": len(ends), "codes": len(codes), "rows": persisted,
+            "collected_codes": len({r["code"] for group in records.values() for r in group}),
+            "max_sample": max(samples) if samples else 0,
+            "reason": None if codes else "全市场快照为空（非交易日或数据源降级），股票池为 0，未采集"}
 
 
 def list_history(factor_id_filter: str = "", period: str = "", limit: int = 50) -> list[dict]:
