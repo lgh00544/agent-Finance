@@ -34,3 +34,6 @@ export interface FactorCandidate {
 
 export const proposeFactorCandidates = (context = '', limit = 5): Promise<FactorCandidate[]> =>
   post('/factor-candidates/propose', { context, limit })
+
+export const getPendingCandidates = (limit = 50): Promise<FactorCandidate[]> =>
+  get('/factor-candidates/pending', { limit })

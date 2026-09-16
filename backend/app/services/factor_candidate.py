@@ -53,6 +53,17 @@ def propose(context: str = "", limit: int = 5) -> list[dict]:
         return [_row(row) for row in rows]
 
 
+def get_pending_for_sir(limit: int = 50) -> list[dict]:
+    """返回待人工拍板的候选因子。"""
+    limit = max(1, min(int(limit), 100))
+    with SessionLocal() as db:
+        rows = db.scalars(
+            select(FactorCandidate).where(FactorCandidate.status == "pending")
+            .order_by(FactorCandidate.created_at.desc()).limit(limit)
+        ).all()
+        return [_row(row) for row in rows]
+
+
 def validate(candidate_id: str | int, month_records: dict[str, list[dict]] | None = None) -> dict:
     """取最近 24 个月样本外回测，结果只写验证字段。"""
     with SessionLocal() as db:
