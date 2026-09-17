@@ -2,6 +2,7 @@
 
 import pandas as pd
 
+from app.datasource import akshare_source
 from app.datasource.akshare_source import (AkshareSource, _FINANCIAL_SINA_COLS,
                                           _FINANCIAL_THS_COLS, _normalize_financial)
 
@@ -59,3 +60,27 @@ def test_sina_numeric_values_and_missing_markers_remain_compatible():
     assert out.iloc[0]["profit_yoy"] == -2.5
     assert out.to_dict(orient="records")[1]["profit_yoy"] is None
     assert out.to_dict(orient="records")[1]["gross_margin"] is None
+
+
+def test_financial_fallback_calls_sina_with_symbol_kwarg(monkeypatch):
+    """主路径（同花顺）失败降级新浪须用 symbol=：写成 stock= 会 TypeError（akshare 1.18.81 签名）。"""
+    source = AkshareSource()
+    captured, seen = {}, {}
+
+    def fake_fetch(scope, func_name, call, ttl_seconds, fallback=None, normalize=None, **kwargs):
+        captured["fallback"] = fallback
+        return pd.DataFrame()
+
+    def fake_sina(symbol="600004", start_year="1900"):  # 与 akshare 实际签名一致
+        seen["symbol"] = symbol
+        return pd.DataFrame([{"日期": "2026-06-30", "净资产收益率(%)": "3.0%",
+                              "净利润增长率(%)": "5.0%"}])
+
+    monkeypatch.setattr(source, "_fetch", fake_fetch)
+    monkeypatch.setattr(akshare_source.ak, "stock_financial_analysis_indicator", fake_sina)
+
+    source.fetch_financial("600150")
+    result = captured["fallback"]()
+
+    assert seen["symbol"] == "600150"
+    assert not result.empty and "净资产收益率(%)" in result.columns
