@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from app.factors import factor_registry
-from app.factors.data_adapter import DataAdapter
+from app.factors.data_adapter import DataAdapter, latest
 
 
 def _adapter(**overrides):
@@ -68,6 +68,20 @@ def test_quantile_is_derived_from_peer_values():
     result = factor_registry.get("f09").func(
         _adapter(extra={"quantile_values": {"f09": [10, 20, 30]}}), "600000")
     assert result.quantile == pytest.approx(66.67)
+
+
+def test_latest_picks_newest_by_date_not_position():
+    """「最新一期」按日期字段最大值判定：降序（数据源实际）/升序/无日期字段三种输入。"""
+    older = {"report_date": "2001-03-31", "roe": None}
+    newer = {"report_date": "2026-06-30", "roe": 4.69}
+    assert latest([newer, older])["roe"] == 4.69     # 降序：数据源实际序，不可取 [-1]
+    assert latest([older, newer])["roe"] == 4.69      # 升序
+    assert latest([]) == {}
+    # 资金流用 date 字段，同样是「最新在前」
+    assert latest([{"date": "2026-04-17", "main_net_inflow": 1},
+                   {"date": "2026-04-30", "main_net_inflow": 2}])["main_net_inflow"] == 2
+    # 无可用日期字段（如 sector_rows 板块快照）→ 保留原行为 items[-1]
+    assert latest([{"board_name": "甲"}, {"board_name": "乙"}])["board_name"] == "乙"
 
 
 def test_data_adapter_accepts_dataframes():

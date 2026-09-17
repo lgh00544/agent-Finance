@@ -21,8 +21,19 @@ def rows(value: Any) -> list[dict]:
     return [r for r in (value or []) if isinstance(r, dict)]
 
 
-def latest(items: list[dict]) -> dict:
-    return items[-1] if items else {}
+def latest(items: list[dict], date_keys: tuple[str, ...] = ("report_date", "date")) -> dict:
+    """取最新一期：以行内日期字段的最大值为准，不依赖列表位置。
+
+    各数据源返回顺序并不统一（实查 financial / fund 均为「最新在前」降序），
+    沿用 items[-1] 会取到最旧一期：f11/f18-f21 曾因此在读 2001 年财报、roe 恒为 None。
+    rows 无可用日期字段时（如 sector_rows 的板块快照，源本身只有板块名/涨跌幅等、
+    没有日期列）保留原行为 items[-1]，不静默改取 [0]。
+    """
+    if not items:
+        return {}
+    dated = [(str(row.get(key)).strip(), row) for row in items for key in date_keys
+             if str(row.get(key) or "").strip()]
+    return max(dated, key=lambda pair: pair[0])[1] if dated else items[-1]
 
 
 def factor(value: Any, reason: str = "ok", quantile: float | None = None) -> FactorResult:

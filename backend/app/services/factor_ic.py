@@ -13,6 +13,7 @@ try:
 except ImportError:
     spearmanr = None
 
+from app.core.config import settings
 from app.datasource.fallback import get_datasource
 from app.db.models import FactorIcHistory
 from app.db.session import SessionLocal
@@ -25,7 +26,10 @@ FORWARD_DAYS, ROLLING_MONTHS, MIN_SAMPLE = 20, 3, 100
 # 全市场 5000+ 只 × 单只 20s+ 日K ≈ 11 小时，单次回测不可行：
 # 按代码等距抽样到 UNIVERSE_LIMIT 只，并设墙钟预算，超预算即停并落库已采部分。
 UNIVERSE_LIMIT = 300
-COLLECT_BUDGET_SECONDS = 1800
+# 墙钟预算由「单只耗时上限 × 目标只数」推导（与 UNIVERSE_LIMIT 解耦，不独立硬编码）：
+# 采不满 MIN_SAMPLE 会让已有效的 ir 被 upsert 回 NULL，故按目标样本数反推预算。
+COLLECT_TARGET_SAMPLES = settings.factor_ic_target_samples
+COLLECT_BUDGET_SECONDS = int(COLLECT_TARGET_SAMPLES * settings.factor_ic_seconds_per_code)
 
 
 def _rank(values):
@@ -138,8 +142,13 @@ def _fetch_once(source, method: str, *args):
 
 
 def collect_month_records(source, month_ends: list[str], codes: list[str],
-                          budget_seconds: float | None = COLLECT_BUDGET_SECONDS) -> dict[str, list[dict]]:
+                          budget_seconds: float | None = COLLECT_BUDGET_SECONDS,
+                          stats: dict | None = None) -> dict[str, list[dict]]:
+    """stats 为可选出参：回填 attempted / budget_exhausted / elapsed，供调用方判断是否采满。"""
     records = {d[:7]: [] for d in month_ends}
+    if stats is not None:
+        stats["budget_exhausted"] = False
+        stats["attempted"] = 0
     if not month_ends or not codes:
         return records
     started = time.monotonic()
@@ -151,6 +160,8 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
     for code in codes:
         # 墙钟护栏：超预算即停，保证任务必定结束并落库已采数据（不出现「跑不完 → 数据空」）
         if budget_seconds and attempted and time.monotonic() - started > budget_seconds:
+            if stats is not None:
+                stats["budget_exhausted"] = True
             logger.warning("因子 IC 采集超墙钟预算 %.0fs：已尝试 %d/%d 只，停止并落库已采部分",
                            budget_seconds, attempted, len(codes))
             break
@@ -187,6 +198,9 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
                                                "forward_return": future / close - 1})
         except Exception:
             continue
+    if stats is not None:
+        stats["attempted"] = attempted
+        stats["elapsed"] = round(time.monotonic() - started, 1)
     return records
 
 
@@ -208,18 +222,37 @@ def persist_history(rows: list[dict]) -> int:
     return len(rows)
 
 
+def _job_reason(codes: list[str], collected: int, max_sample: int, stats: dict) -> str | None:
+    """采集不达标时给出可定位原因（预算不足 / 数据源降级）；达标返回 None。"""
+    if not codes:
+        return "全市场快照为空（非交易日或数据源降级），股票池为 0，未采集"
+    if max_sample >= MIN_SAMPLE:
+        return None
+    if stats.get("budget_exhausted"):
+        return ("预算不足：%.0fs 内尝试 %d/%d 只、实采 %d 只，未达 MIN_SAMPLE=%d；"
+                "请调高 factor_ic_target_samples 或 factor_ic_seconds_per_code"
+                % (COLLECT_BUDGET_SECONDS, stats.get("attempted", 0), len(codes), collected, MIN_SAMPLE))
+    return "数据源降级：股票池 %d 只、预算未耗尽但仅采到 %d 只，未达 MIN_SAMPLE=%d" % (
+        len(codes), collected, MIN_SAMPLE)
+
+
 def run_factor_ic_backtest_job(months: int = 36) -> dict:
     source = get_datasource()
     ends = _month_ends(source.fetch_trade_calendar(), months)
     codes = select_universe_codes(source.fetch_spot_universe())
-    records = collect_month_records(source, ends, codes)
+    stats: dict = {}
+    records = collect_month_records(source, ends, codes, COLLECT_BUDGET_SECONDS, stats=stats)
     results = run_backtest(records)
     persisted = persist_history(results)
     samples = [row["sample_size"] for row in results]
+    collected = len({r["code"] for group in records.values() for r in group})
+    max_sample = max(samples) if samples else 0
     return {"months": len(ends), "codes": len(codes), "rows": persisted,
-            "collected_codes": len({r["code"] for group in records.values() for r in group}),
-            "max_sample": max(samples) if samples else 0,
-            "reason": None if codes else "全市场快照为空（非交易日或数据源降级），股票池为 0，未采集"}
+            "collected_codes": collected, "max_sample": max_sample,
+            "target_samples": COLLECT_TARGET_SAMPLES, "budget_seconds": COLLECT_BUDGET_SECONDS,
+            "budget_exhausted": bool(stats.get("budget_exhausted")),
+            "sufficient": max_sample >= MIN_SAMPLE,
+            "reason": _job_reason(codes, collected, max_sample, stats)}
 
 
 def list_history(factor_id_filter: str = "", period: str = "", limit: int = 50) -> list[dict]:

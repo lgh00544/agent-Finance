@@ -1004,7 +1004,7 @@ class AkshareSource(DataSource):
         def primary():
             return self._call_with_timeout(ak.stock_financial_abstract_ths, symbol=code, indicator="按单季度")
         def fallback():
-            return self._call_with_timeout(ak.stock_financial_analysis_indicator, stock=code)
+            return self._call_with_timeout(ak.stock_financial_analysis_indicator, symbol=code)
         # v2 cache namespace invalidates pre-fix rows that contained only
         # report_date while retaining all unrelated datasource caches.
         df = self._fetch(f"fin:v2:{code}", "fin", primary, ttl_seconds=86400, fallback=fallback,

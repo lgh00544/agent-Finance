@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[2]  # backend/
 PROJECT_DIR = ROOT_DIR.parent                     # D:\self
+FACTOR_REGISTRY_VERSION = "v1"
 
 
 class Settings(BaseSettings):
@@ -233,6 +234,12 @@ class Settings(BaseSettings):
 
     # ---------- 向量库 ----------
     qdrant_compression: bool = True  # 本地文件模式默认启用标量量化压缩，减少向量库磁盘占用
+
+    # ---------- 因子 IC 月度回测采集（cron 每月 1 日 02:00 跑）----------
+    # 样本须达 MIN_SAMPLE=100 才有有效 IC/IR；采不满会把已修好的 ir 回退为 NULL。
+    # 墙钟预算不单独硬编码，由「单只耗时上限 × 目标只数」推导（见 services/factor_ic.py）。
+    factor_ic_target_samples: int = 150       # 目标采样只数（≥ MIN_SAMPLE=100，留网络抖动余量）
+    factor_ic_seconds_per_code: float = 30.0  # 单只采集耗时上限（秒）：日K+外挂数据实测 7~63s
 
     # ---------- 派生路径 ----------
     @property
