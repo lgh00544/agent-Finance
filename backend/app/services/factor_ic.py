@@ -14,6 +14,7 @@ except ImportError:
     spearmanr = None
 
 from app.core.config import settings
+from app.datasource.base import DataSourceError
 from app.datasource.fallback import get_datasource
 from app.db.models import FactorIcHistory
 from app.db.session import SessionLocal
@@ -222,8 +223,27 @@ def persist_history(rows: list[dict]) -> int:
     return len(rows)
 
 
-def _job_reason(codes: list[str], collected: int, max_sample: int, stats: dict) -> str | None:
-    """采集不达标时给出可定位原因（预算不足 / 数据源降级）；达标返回 None。"""
+_CONN_ERROR_KW = ("proxy", "connection", "max retries", "getaddrinfo", "name resolution",
+                  "remote end closed", "timed out")
+
+
+def _classify_error(exc: Exception) -> str:
+    """取数异常分类：timeout（硬超时）/ connection（DNS·代理·连接被拒）/ unexpected（其余）。"""
+    if isinstance(exc, DataSourceError) and "超时" in str(exc):
+        return "timeout"
+    text = "%s %s" % (type(exc).__name__, exc)
+    return "connection" if any(k in text.lower() for k in _CONN_ERROR_KW) else "unexpected"
+
+
+def _job_reason(codes: list[str], collected: int, max_sample: int, stats: dict, *,
+                error_kind: str = "", error_msg: str = "") -> str | None:
+    """给出去定位的原因（取数异常 / 预算不足 / 数据源降级）；达标返回 None。"""
+    if error_kind == "timeout":
+        return "取数超时：%s —— 单次调用硬超时触发，数据源无响应，可重试" % error_msg
+    if error_kind == "connection":
+        return "取数连接失败（DNS/代理/连接被拒）：%s —— 数据源降级，可稍后重试" % error_msg
+    if error_kind:
+        return "取数异常（非网络原因，疑为代码或数据格式问题，需排查）：%s" % error_msg
     if not codes:
         return "全市场快照为空（非交易日或数据源降级），股票池为 0，未采集"
     if max_sample >= MIN_SAMPLE:
@@ -238,12 +258,24 @@ def _job_reason(codes: list[str], collected: int, max_sample: int, stats: dict) 
 
 def run_factor_ic_backtest_job(months: int = 36) -> dict:
     source = get_datasource()
-    ends = _month_ends(source.fetch_trade_calendar(), months)
-    codes = select_universe_codes(source.fetch_spot_universe())
     stats: dict = {}
-    records = collect_month_records(source, ends, codes, COLLECT_BUDGET_SECONDS, stats=stats)
-    results = run_backtest(records)
-    persisted = persist_history(results)
+    ends: list[str] = []
+    codes: list[str] = []
+    try:
+        ends = _month_ends(source.fetch_trade_calendar(), months)
+        codes = select_universe_codes(source.fetch_spot_universe())
+        records = collect_month_records(source, ends, codes, COLLECT_BUDGET_SECONDS, stats=stats)
+        results = run_backtest(records)
+        persisted = persist_history(results)
+    except Exception as exc:  # noqa: BLE001 取数异常转结构化结果，避免 cron/脚本裸崩
+        error_kind = _classify_error(exc)
+        logger.warning("因子 IC 回测取数失败（%s）：%s", error_kind, exc)
+        return {"months": len(ends), "codes": len(codes), "rows": 0, "collected_codes": 0,
+                "max_sample": 0, "target_samples": COLLECT_TARGET_SAMPLES,
+                "budget_seconds": COLLECT_BUDGET_SECONDS,
+                "budget_exhausted": bool(stats.get("budget_exhausted")),
+                "sufficient": False, "error_kind": error_kind,
+                "reason": _job_reason([], 0, 0, stats, error_kind=error_kind, error_msg=str(exc))}
     samples = [row["sample_size"] for row in results]
     collected = len({r["code"] for group in records.values() for r in group})
     max_sample = max(samples) if samples else 0
@@ -251,7 +283,7 @@ def run_factor_ic_backtest_job(months: int = 36) -> dict:
             "collected_codes": collected, "max_sample": max_sample,
             "target_samples": COLLECT_TARGET_SAMPLES, "budget_seconds": COLLECT_BUDGET_SECONDS,
             "budget_exhausted": bool(stats.get("budget_exhausted")),
-            "sufficient": max_sample >= MIN_SAMPLE,
+            "sufficient": max_sample >= MIN_SAMPLE, "error_kind": None,
             "reason": _job_reason(codes, collected, max_sample, stats)}
 
 

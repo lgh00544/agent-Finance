@@ -29,4 +29,7 @@ def main() -> dict:
 
 
 if __name__ == "__main__":
-    print(json.dumps(main(), ensure_ascii=False, default=str, indent=2))
+    payload = main()
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+    # 取数异常时打印结构化结果（而非裸 traceback）并仍以 1 退出，供 cron 定位
+    raise SystemExit(1 if payload["job"].get("error_kind") else 0)

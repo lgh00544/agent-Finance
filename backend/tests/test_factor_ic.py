@@ -2,6 +2,7 @@ import types
 
 import pandas as pd
 
+from app.datasource.base import DataSourceError
 from app.services import factor_ic
 from app.services.factor_ic import calc_ic, calc_ir, judge_status, run_backtest
 from app.services.factor_registry import FactorDef
@@ -67,3 +68,42 @@ def test_job_flags_budget_shortfall_as_insufficient(monkeypatch):
     assert out["max_sample"] < factor_ic.MIN_SAMPLE
     assert out["collected_codes"] < out["codes"]
     assert "预算不足" in out["reason"]
+
+
+def _failing_source(error):
+    """取数即抛出指定异常的替身；异常类型与文案决定 _classify_error 走哪个分支。"""
+    class Source:
+        def fetch_trade_calendar(self):
+            raise error
+
+    return Source()
+
+
+def _job_with_failing_source(monkeypatch, error):
+    monkeypatch.setattr(factor_ic, "get_datasource", lambda: _failing_source(error))
+    return factor_ic.run_factor_ic_backtest_job(months=1)
+
+
+def test_job_returns_structured_reason_on_timeout(monkeypatch):
+    """取数硬超时须返回结构化 dict（error_kind=timeout），不得抛异常。"""
+    out = _job_with_failing_source(
+        monkeypatch, DataSourceError("数据源 tool_trade_date_hist_sina 超时 5s 无返回"))
+    assert out["error_kind"] == "timeout"
+    assert out["rows"] == 0 and out["sufficient"] is False
+    assert "超时" in out["reason"]
+
+
+def test_job_returns_structured_reason_on_connection_failure(monkeypatch):
+    """连接/DNS 失败须归类为 connection，文案与超时不同，且不抛异常。"""
+    out = _job_with_failing_source(
+        monkeypatch, DataSourceError("数据源 spot_em 失败: Max retries ... getaddrinfo failed"))
+    assert out["error_kind"] == "connection"
+    assert "连接失败" in out["reason"] and "超时" not in out["reason"]
+
+
+def test_job_returns_structured_reason_on_unexpected_error(monkeypatch):
+    """非网络异常（如 RuntimeError）须归类为 unexpected，文案指向「需排查」且不串类。"""
+    out = _job_with_failing_source(monkeypatch, RuntimeError("板块字段解析失败"))
+    assert out["error_kind"] == "unexpected"
+    assert "需排查" in out["reason"]
+    assert "超时" not in out["reason"] and "连接失败" not in out["reason"]
