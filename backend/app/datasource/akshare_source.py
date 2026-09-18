@@ -14,11 +14,15 @@ Akshare 数据源实现（东财为主，新浪降级）
   - Redis/内存缓存按接口设置 TTL，避免高频请求触发限流
 """
 import hashlib
+import inspect
 import json
 import logging
 import random
 import re
+import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Callable
@@ -332,6 +336,20 @@ def _market_of(code: str) -> str:
     if code.startswith(("4", "8", "9")):
         return "bj"
     return "sz"
+
+
+def _accepts_timeout(func: Callable) -> bool:
+    """该接口是否显式接受 timeout 关键字参数。
+
+    预判签名可避免用 except TypeError 兜底：那会把接口内部抛出的 TypeError 一并吞掉。
+    取不到签名（内置/无签名 callable）时按「不接受」处理，走兜底硬超时路径。
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return "timeout" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 class AkshareSource(DataSource):
@@ -1171,11 +1189,37 @@ class AkshareSource(DataSource):
         return dates
 
     def _call_with_timeout(self, func: Callable, *args, **kwargs):
-        """优先传 timeout，接口签名不支持时降级不带超时调用"""
-        try:
+        """带硬超时调用：签名接受 timeout 的直接透传；不接受的走兜底硬超时。
+
+        兜底路径同时用「socket 默认超时（对新建连接生效）+ 线程等待上限」，
+        保证调用方在 datasource_timeout+1 秒内必定返回或抛错。
+
+        【已知折衷】兜底路径超时后，工作线程可能仍在后台阻塞且**无法强杀**
+        （Python 无法中断阻塞中的线程），只是调用方不再等待它 —— 本方法保证的是
+        「调用方有限时间内结束」，而非回收该线程。finally 已 shutdown(wait=False)，
+        执行器不会泄漏；但仍阻塞的 worker 会存活到该次调用返回为止。
+
+        【并发副作用（已知，保留）】socket.setdefaulttimeout 是**进程级**设置：兜底调用
+        执行期间，其他线程**新建且未显式指定超时**的连接会继承 datasource_timeout。可能
+        受影响的并发链路：APScheduler 定时任务、FastAPI 请求线程、discover/router 的并行
+        打分池、以及其中的 LLM(openai) 外呼。finally 会恢复原值，但并发窗口内仍有影响。
+        因 func 是任意 akshare 可调用对象、由其内部自行建连，无法用非全局手段等价替代。
+        """
+        if _accepts_timeout(func):
             return func(*args, **kwargs, timeout=settings.datasource_timeout)
-        except TypeError:
-            return func(*args, **kwargs)
+        previous = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(settings.datasource_timeout)
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(func, *args, **kwargs)
+            return future.result(timeout=settings.datasource_timeout + 1)
+        except FuturesTimeout:
+            raise DataSourceError(
+                "数据源 %s 超时 %ss 无返回" % (getattr(func, "__name__", func),
+                                              settings.datasource_timeout)) from None
+        finally:
+            socket.setdefaulttimeout(previous)
+            pool.shutdown(wait=False)
 
 
 def get_datasource() -> DataSource:
