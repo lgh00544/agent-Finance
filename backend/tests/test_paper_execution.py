@@ -234,6 +234,23 @@ def test_live_buy_missing_facts_is_rejected_and_audited(monkeypatch):
         "technical_kline", "news_announcement"}
 
 
+def test_live_buy_without_market_sync_is_rejected(monkeypatch):
+    account = repo.create_paper_account("实时市况闸门账户", 100_000, "candidate_pool")
+    monkeypatch.setattr(paper_execution, "_live_quote_block", lambda *_: "")
+    today = paper_execution.date.today().isoformat()
+    facts = {**_facts(), "mode": "live_paper", "market_context": {"status": "unavailable"},
+             "contexts": {"688901": {"facts": {
+                 "get_daily_kline": {"rows": [{"close": 10}]},
+                 "get_news": {"news": []}}}}}
+    out = paper_execution.run(account["id"], today, facts=facts,
+                              quote_facts={"688901": {"price": 10, "volume": 1000,
+                                                       "change_pct": 0, "fact_as_of": today}})
+    event = out["executions"][0]
+    assert event["status"] == "rejected"
+    assert event["reject_reason"] == "live_buy_facts_missing"
+    assert event["metadata"]["live_buy_gate"]["missing"] == ["market_context"]
+
+
 def test_candidate_pool_uses_candidate_universe_for_non_tradeable_grade():
     account = repo.create_paper_account("候选池全集测试", 100_000, "candidate_pool")
     facts = _facts(price=10.0)

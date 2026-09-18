@@ -110,7 +110,7 @@ def account_view(account_id: int, refresh: bool = True) -> dict:
     account = repo.get_paper_account(account_id)
     if account is None:
         raise ValueError("模拟账户不存在")
-    refresh_result = refresh_account(account_id) if refresh else None
+    refresh_result = refresh_account(account_id) if refresh and account.status != "archived" else None
     positions = repo.list_paper_positions(account_id, status="holding")
     quotes = {row["stock_code"]: row for row in repo.list_paper_quotes(account_id, None)}
     missing = [pos["stock_code"] for pos in positions if quote_state(quotes.get(pos["stock_code"], {})) != "ok"]

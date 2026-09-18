@@ -466,6 +466,8 @@ def _live_buy_gate(snapshot: dict, context: dict, market_context: dict,
     """校验 live_paper 买入所需的最新只读事实；缺失时只阻断 paper 买入。"""
     context_facts = context.get("facts") if isinstance(context, dict) else {}
     context_facts = context_facts if isinstance(context_facts, dict) else {}
+    if not context_facts and isinstance(context, dict):
+        context_facts = context
     missing: list[str] = []
     price = _snapshot_price(snapshot)
     fact_as_of = str(snapshot.get("fact_as_of") or snapshot.get("quote_time") or snapshot.get("time") or "")
@@ -478,7 +480,11 @@ def _live_buy_gate(snapshot: dict, context: dict, market_context: dict,
     news_items = news.get("news", news.get("rows", [])) if isinstance(news, dict) else None
     if not isinstance(news, dict) or news.get("error") or not isinstance(news_items, list):
         missing.append("news_announcement")
-    if not isinstance(market_context, dict) or not market_context:
+    market_ready = isinstance(market_context, dict) and bool(market_context)
+    if market_ready and market_context.get("status") in {"unavailable", "error"}:
+        market_ready = any(market_context.get(key) not in (None, "", [])
+                           for key in ("band", "total_score", "dims", "benchmark_change_pct", "breadth"))
+    if not market_ready:
         missing.append("market_context")
     context_hash = context.get("content_hash") if isinstance(context, dict) else ""
     if not context_hash:
