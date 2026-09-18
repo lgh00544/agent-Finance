@@ -131,11 +131,12 @@ function PositionCard({ pos, onKline, onDetail }: { pos: PaperPosition; onKline:
   const changePct = Number.isFinite(rawChange) ? rawChange : Number.isFinite(price) && avg > 0 ? (price / avg - 1) * 100 : NaN
   const reference = isReferenceQuote(pos)
   const tone = Number.isFinite(changePct) ? trendColor(changePct) : Number.isFinite(numeric(pos.pnl_pct)) ? trendColor(numeric(pos.pnl_pct)) : undefined
-  const toneTag = Number.isFinite(changePct) ? trendTag(changePct) : trendTag(numeric(pos.pnl_pct))
+  const changeTag = trendTag(changePct)
+  const pnlTag = trendTag(numeric(pos.pnl_pct))
   return <Card size="small" style={{ height: '100%' }} styles={{ body: { minHeight: 208 } }}>
     <Space orientation="vertical" size={12} style={{ width: '100%' }}>
       <div><Space size={6} wrap><Text strong style={{ fontSize: 16 }}>{pos.stock_code}</Text><Text strong style={{ fontSize: 16 }}>{pos.stock_name ?? pos.name ?? '—'}</Text>{reference ? <Tag color="orange">参考行情</Tag> : null}</Space><div><Text type="secondary" style={{ fontSize: 12 }}>{quoteSource(pos.quote_source)} · {label(pos.quote_status)} · 建仓 {timeText(pos.opened_trade_date)}</Text></div></div>
-      <div><Text type="secondary" style={{ fontSize: 12 }}>{reference ? '最后价格' : '现价'}</Text><div style={{ fontSize: 26, fontWeight: 600, lineHeight: 1.25, color: tone }}>{valuationMoney(pos.current_price)}</div><Space size={4} wrap style={{ marginTop: 4 }}><Tag color={toneTag}>涨跌 {pct(changePct)}</Tag><Tag color={toneTag}>浮动盈亏 {valuationMoney(pos.pnl_amount)}（{pct(pos.pnl_pct)}）</Tag></Space></div>
+      <div><Text type="secondary" style={{ fontSize: 12 }}>{reference ? '最后价格' : '现价'}</Text><div style={{ fontSize: 26, fontWeight: 600, lineHeight: 1.25, color: tone }}>{valuationMoney(pos.current_price)}</div><Space size={4} wrap style={{ marginTop: 4 }}><Tag color={changeTag}>涨跌 {pct(changePct)}</Tag><Tag color={pnlTag}>浮动盈亏 {valuationMoney(pos.pnl_amount)}（{pct(pos.pnl_pct)}）</Tag></Space></div>
       <Space size={[12, 4]} wrap>
         <Text type="secondary">持仓 / 可卖：{number(pos.shares)} / {number(pos.available_shares)}</Text>
         <Text type="secondary">成本价：{money(pos.avg_price)}</Text>
