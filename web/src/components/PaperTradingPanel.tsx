@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Alert, App, Button, Card, Col, DatePicker, Descriptions, Drawer, Empty, Form, Input,
-  InputNumber, Modal, Row, Segmented, Select, Space, Statistic, Table, Tag, Tabs, Typography,
+  InputNumber, Modal, Row, Segmented, Select, Space, Statistic, Table, Tag, Tabs, Tooltip, Typography,
 } from 'antd'
 import { InboxOutlined, PauseOutlined, PlayCircleOutlined, PlusOutlined, RadarChartOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -153,37 +153,37 @@ function FactDetails({ value, depth = 0 }: { value: unknown; depth?: number }) {
   if (typeof value === 'boolean') return <span>{value ? '是' : '否'}</span>
   if (typeof value !== 'object') {
     const text = String(value)
-    return <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{labels[text] ?? text}</span>
+    return <Text style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{labels[text] ?? text}</Text>
   }
   if (depth > 3) return <Text type="secondary">已保存详细证据</Text>
-  if (Array.isArray(value)) return value.length ? <Space orientation="vertical" style={{ width: '100%' }} size={8}>
+  if (Array.isArray(value)) return value.length ? <Space orientation="vertical" style={{ width: '100%' }} size={6}>
     {value.slice(0, 8).map((item, index) => <div key={index}><FactDetails value={item} depth={depth + 1} /></div>)}
     {value.length > 8 ? <Text type="secondary">共 {value.length} 条，展示最近取出的前 8 条</Text> : null}
   </Space> : <Text type="secondary">暂无记录</Text>
-  return <Descriptions size="small" column={1} items={Object.entries(value).map(([key, item], index) => ({
-    key: `${key}-${index}`, label: fieldLabels[key] ?? labels[key] ?? (/[\u3400-\u9fff]/.test(key) ? key : '补充资料'),
+  return <Descriptions size="small" column={{ xs: 1, sm: 2, md: 3 }} styles={{ label: { width: 120 } }} items={Object.entries(value).map(([key, item], index) => ({
+    key: `${key}-${index}`, label: fieldLabels[key] ?? labels[key] ?? (/[\u3400-\u9fff]/.test(key) ? key : '其他字段'),
     children: key === 'url' && safeUrl(item) ? <Link href={safeUrl(item)} target="_blank" rel="noopener noreferrer">查看原文</Link> : <FactDetails value={item} depth={depth + 1} />,
   }))} />
 }
 
 function ContextDetails({ context }: { context: PaperContext }) {
   const tools = context.tool_trace ?? []
-  return <div style={{ padding: '8px 12px', overflowWrap: 'anywhere' }}>
-    <Descriptions size="small" column={{ xs: 1, sm: 2 }} items={[
+  return <div style={{ padding: '8px 12px', overflowWrap: 'anywhere', background: 'var(--bg-input)' }}>
+    <Descriptions size="small" column={{ xs: 1, sm: 2, md: 3 }} styles={{ label: { width: 120 } }} items={[
       { label: '事实时点', children: timeText(context.facts?.fact_as_of) },
       { label: '来源证据', children: `${context.source_refs?.length ?? 0} 条` },
     ]} />
-    <Table size="small" rowKey={(_, index) => String(index)} pagination={false} dataSource={tools} scroll={{ x: 500 }} columns={[
-      { title: '工具', dataIndex: 'tool', render: (v: unknown) => label(v, '补充数据工具') },
-      { title: '结果', dataIndex: 'status', render: statusTag },
-      { title: '资料摘要', render: (_: unknown, row: PaperToolTrace) => {
+    <Table size="small" rowKey={(_, index) => String(index)} pagination={false} dataSource={tools} scroll={{ x: 760 }} columns={[
+      { title: '工具', dataIndex: 'tool', width: 110, render: (v: unknown) => label(v, '补充数据工具') },
+      { title: '结果', dataIndex: 'status', width: 90, render: statusTag },
+      { title: '资料摘要', width: 320, render: (_: unknown, row: PaperToolTrace) => {
         const fact = (context.facts?.[row.tool ?? ''] ?? row.result) as Record<string, unknown> | undefined
         const values = fact && Object.values(fact).find(Array.isArray)
         return row.error || fact?.error ? label(row.error || fact?.error, '数据请求失败')
-          : Array.isArray(values) ? `${values.length} 条记录` : label(fact?.note, '证据已记录')
+          : Array.isArray(values) ? <Tooltip title={String(fact?.note || '证据已记录')}>{`${values.length} 条`}</Tooltip> : label(fact?.note, '证据已记录')
       } },
     ]} expandable={{ expandedRowRender: (row) => <FactDetails value={context.facts?.[row.tool ?? ''] ?? row.result ?? row.error} /> }} locale={{ emptyText: '没有工具调用记录' }} />
-    {context.stage === 'monitor' ? <FactDetails value={{ '监控结论': context.facts?.monitor, '卖出研判': context.facts?.sell }} /> : null}
+    {context.stage === 'monitor' ? <Card size="small" title="监控结论 / 卖出研判"><FactDetails value={{ '监控结论': context.facts?.monitor, '卖出研判': context.facts?.sell }} /></Card> : null}
   </div>
 }
 
@@ -266,20 +266,20 @@ export function PaperTradingPanel() {
   const openDetail = (row: PaperPosition, focusKline = false) => { setKlineFocus(focusKline); setDetailPosition(row) }
   const closeDetail = () => { setDetailPosition(null); setKlineFocus(false) }
   const executionColumns = [
-    { title: '日期 / 事实时点', dataIndex: 'trade_date', render: (v: unknown, row: PaperExecution) => <Space orientation="vertical" size={0}><span>{timeText(v)}</span><Text type="secondary">{timeText(row.fact_as_of)}</Text>{modeTag(row.mode ?? row.metadata?.mode ?? row.metadata_json?.mode)}</Space> },
-    { title: '标的', key: 'stock', render: (_: unknown, row: PaperExecution) => `${row.stock_code ?? '—'} ${row.stock_name ?? ''}` },
-    { title: '方向', dataIndex: 'side', render: (v: unknown) => label(v) },
-    { title: '状态', dataIndex: 'status', render: (v: unknown, row: PaperExecution) => <Space orientation="vertical" size={0}>{statusTag(v)}{v !== 'filled' && row.reject_reason ? <Text type="secondary">{label(row.reject_reason, '成交约束未通过')}</Text> : null}</Space> },
-    { title: '数量 / 成交价', key: 'fill', render: (_: unknown, row: PaperExecution) => `${number(row.shares)} / ${money(row.executed_price)}` },
-    { title: '费用', key: 'fees', render: (_: unknown, row: PaperExecution) => money(Number(row.commission ?? 0) + Number(row.stamp_tax ?? 0) + Number(row.transfer_fee ?? 0)) },
+    { title: '日期 / 事实时点', dataIndex: 'trade_date', width: 150, render: (v: unknown, row: PaperExecution) => <Space orientation="vertical" size={0}><span>{timeText(v)}</span><Text type="secondary">{timeText(row.fact_as_of)}</Text>{modeTag(row.mode ?? row.metadata?.mode ?? row.metadata_json?.mode)}</Space> },
+    { title: '标的', key: 'stock', width: 110, render: (_: unknown, row: PaperExecution) => `${row.stock_code ?? '—'} ${row.stock_name ?? ''}` },
+    { title: '方向', dataIndex: 'side', width: 80, render: (v: unknown) => label(v) },
+    { title: '状态', dataIndex: 'status', width: 110, render: (v: unknown, row: PaperExecution) => <Space orientation="vertical" size={0}>{statusTag(v)}{v !== 'filled' && row.reject_reason ? <Text type="secondary">{label(row.reject_reason, '成交约束未通过')}</Text> : null}</Space> },
+    { title: '数量 / 成交价', key: 'fill', width: 140, render: (_: unknown, row: PaperExecution) => `${number(row.shares)} / ${money(row.executed_price)}` },
+    { title: '费用', key: 'fees', width: 100, render: (_: unknown, row: PaperExecution) => money(Number(row.commission ?? 0) + Number(row.stamp_tax ?? 0) + Number(row.transfer_fee ?? 0)) },
   ]
   const contextColumns = [
-    { title: '记录', dataIndex: 'id', render: (value: number) => `#${value}` },
-    { title: '交易日期', dataIndex: 'trade_date' }, { title: '标的', dataIndex: 'stock_code' },
-    { title: '研究模式', dataIndex: 'mode', render: modeTag },
-    { title: '工具结果', render: (_: unknown, row: PaperContext) => { const trace = row.tool_trace ?? []; return `已完成 ${trace.filter((item) => item.status === 'ok').length} / ${trace.length} 项` } },
-    { title: '联网来源', render: (_: unknown, row: PaperContext) => `${row.source_refs?.filter((ref) => ref.type === 'web').length ?? 0} 条` },
-    { title: '记录时间', dataIndex: 'created_at', render: timeText },
+    { title: '记录', dataIndex: 'id', width: 80, render: (value: number) => `#${value}` },
+    { title: '交易日期', dataIndex: 'trade_date', width: 110 }, { title: '标的', dataIndex: 'stock_code', width: 100 },
+    { title: '研究模式', dataIndex: 'mode', width: 110, render: modeTag },
+    { title: '工具结果', width: 140, render: (_: unknown, row: PaperContext) => { const trace = row.tool_trace ?? []; return `已完成 ${trace.filter((item) => item.status === 'ok').length} / ${trace.length} 项` } },
+    { title: '联网来源', width: 90, render: (_: unknown, row: PaperContext) => `${row.source_refs?.filter((ref) => ref.type === 'web').length ?? 0} 条` },
+    { title: '记录时间', dataIndex: 'created_at', width: 150, render: timeText },
   ]
   const evidenceColumns = [
     { title: '标的 / 日期', render: (_: unknown, row: PaperWebEvidence) => <Space orientation="vertical" size={0}><span>{row.stock_code || '账户研究'}</span><Text type="secondary">{row.trade_date}</Text></Space> },
@@ -338,10 +338,10 @@ export function PaperTradingPanel() {
             <Col key={pos.id} xs={24} md={12} xl={8}><PositionCard pos={pos} onKline={(row) => openDetail(row, true)} onDetail={(row) => openDetail(row)} /></Col>
           ))}</Row>
         ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无模拟持仓" /> },
-        { key: 'executions', label: '模拟流水', children: <Table size="small" rowKey="id" loading={executionsQuery.isLoading} columns={executionColumns} dataSource={executionsQuery.data ?? []} pagination={{ pageSize: 8 }} scroll={{ x: 880 }} locale={{ emptyText: '暂无模拟成交或拒绝记录' }} /> },
+        { key: 'executions', label: '模拟流水', children: <Table size="small" rowKey="id" loading={executionsQuery.isLoading} columns={executionColumns} dataSource={executionsQuery.data ?? []} pagination={{ pageSize: 8 }} scroll={{ x: 1000 }} locale={{ emptyText: '暂无模拟成交或拒绝记录' }} /> },
         { key: 'contexts', label: '研究上下文', children: <>
           {focusedContextId != null ? <Space style={{ marginBottom: 8 }}><Text type="secondary">当前查看记录 #{focusedContextId}</Text><Button size="small" onClick={() => setFocusedContextId(undefined)}>查看全部</Button></Space> : null}
-          <Table size="small" rowKey="id" loading={contextsQuery.isLoading} columns={contextColumns} dataSource={(contextsQuery.data ?? []).filter((row) => focusedContextId == null || row.id === focusedContextId)} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} expandable={{ expandedRowRender: (row) => <ContextDetails context={row} />, ...(focusedContextId != null ? { expandedRowKeys: [focusedContextId] } : {}) }} locale={{ emptyText: focusedContextId == null ? '暂无模拟研究记录' : '此记录不在最近研究列表中' }} />
+          <Table size="small" rowKey="id" loading={contextsQuery.isLoading} columns={contextColumns} dataSource={(contextsQuery.data ?? []).filter((row) => focusedContextId == null || row.id === focusedContextId)} pagination={{ pageSize: 8 }} scroll={{ x: 880 }} expandable={{ expandedRowRender: (row) => <ContextDetails context={row} />, ...(focusedContextId != null ? { expandedRowKeys: [focusedContextId] } : {}) }} locale={{ emptyText: focusedContextId == null ? '暂无模拟研究记录' : '此记录不在最近研究列表中' }} />
         </> },
         { key: 'evidence', label: '联网证据', children: <Table size="small" rowKey="id" loading={evidenceQuery.isLoading} columns={evidenceColumns} dataSource={evidenceQuery.data ?? []} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} expandable={{ expandedRowRender: (row) => <div style={{ overflowWrap: 'anywhere' }}><Paragraph>{row.excerpt || label(row.error, '暂无可读摘要')}</Paragraph><Descriptions size="small" column={1} items={[{ label: '事实时点', children: timeText(row.fact_as_of) }, { label: '内容指纹', children: row.content_hash || '未生成' }]} /></div> }} locale={{ emptyText: '暂无联网证据' }} /> },
         { key: 'alerts', label: '模拟告警', children: <Table size="small" rowKey="id" loading={alertsQuery.isLoading} columns={alertColumns} dataSource={alertsQuery.data ?? []} pagination={{ pageSize: 8 }} scroll={{ x: 800 }} locale={{ emptyText: '暂无模拟告警' }} /> },

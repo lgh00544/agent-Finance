@@ -15,6 +15,7 @@ type KlineChartProps = {
   days?: number
   height?: number
 }
+type KlineResponse = { klines: Array<Record<string, unknown>>; status?: string; detail?: string }
 
 const anchorLabels: Record<AnchorKind, { label: string; color: string }> = {
   select: { label: '选中日', color: '#3b82f6' },
@@ -51,18 +52,22 @@ export function KlineChart({ code, name, anchorDate, anchorKind, days = 60, heig
   const anchor = anchorLabels[anchorKind]
   const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['kline-chart', code, anchorDate, days],
-    queryFn: () => get<{ klines: Array<Record<string, unknown>> }>(`/kline/${code}`, {
+    queryFn: () => get<KlineResponse>(`/kline/${code}`, {
       start: shiftDate(anchorDate, -Math.max(1, Math.floor(days / 2))),
       end: shiftDate(anchorDate, Math.max(1, Math.floor(days / 2))),
     }),
     enabled: !!code && !!anchorDate,
+    staleTime: 5 * 60_000,
     retry: 0,
   })
   const title = `${code} ${name || ''} K线 · ${anchorDate} ±${days}日`
   if (isLoading) return <Card size="small" title={title}><Skeleton active paragraph={{ rows: 6 }} /></Card>
   if (isError) return <Card size="small" title={title}><ErrorCard title="K线加载失败" message={error instanceof Error ? error.message : '无法读取 K 线'} onRetry={() => refetch()} /></Card>
   const rows = normalize(data?.klines ?? [])
-  if (!rows.length) return <Card size="small" title={title}><EmptyState text="该股 K 线缺失，请检查是否在交易时段外或后端接口" /></Card>
+  if (!rows.length) {
+    if (data?.status === 'upstream_error') return <Card size="small" title={title}><ErrorCard title="上游行情源暂时不可用" message="东财/新浪均失败，已重试仍失败，请稍后点重试" detail={data.detail} onRetry={() => refetch()} /></Card>
+    return <Card size="small" title={title}><EmptyState text="该股在所选窗口内无交易日数据" /></Card>
+  }
   const dates = rows.map((r) => r.date)
   const option: EChartsOption = {
     animation: false,

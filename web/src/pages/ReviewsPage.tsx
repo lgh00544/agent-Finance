@@ -24,7 +24,7 @@ import {
 } from 'antd'
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { get } from '@/api/client'
-import { proposeFactorCandidates, type FactorCandidate } from '@/api/factors'
+import { getPendingCandidates, proposeFactorCandidates, type FactorCandidate } from '@/api/factors'
 import { portfolioAttribution, reviews, stockCycleAttribution } from '@/api/reviews'
 import { candidateTradeable } from '@/api/candidates'
 import { agentSuggestions, approveSuggestion, adoptSuggestion, rejectSuggestion, reReviewSuggestion, ruleChanges } from '@/api/suggestions'
@@ -66,10 +66,15 @@ function CompareBox({ title, value }: { title: string; value: unknown }) {
 
 function FactorCandidates() {
   const { message } = App.useApp()
-  const [rows, setRows] = useState<FactorCandidate[]>([])
+  const qc = useQueryClient()
+  const [selected, setSelected] = useState<FactorCandidate | null>(null)
+  const { data: rows, isLoading } = useQuery({ queryKey: ['factor-candidates-pending'], queryFn: () => getPendingCandidates() })
   const mutation = useMutation({
     mutationFn: () => proposeFactorCandidates(),
-    onSuccess: (data) => { setRows(data); message.success(`已生成 ${data.length} 个候选因子`) },
+    onSuccess: (data) => {
+      message.success(`已生成 ${data.length} 个候选因子`)
+      qc.invalidateQueries({ queryKey: ['factor-candidates-pending'] })
+    },
     onError: (error) => message.error(error instanceof Error ? error.message : '候选因子提议失败'),
   })
   return (
@@ -77,14 +82,33 @@ function FactorCandidates() {
       <Button type="primary" loading={mutation.isPending} onClick={() => mutation.mutate()}>
         AI 提议候选因子
       </Button>
-      <Table<FactorCandidate> rowKey="candidate_id" size="small" dataSource={rows}
+      <Table<FactorCandidate> rowKey={(r) => String(r.id ?? r.candidate_id)} size="small" dataSource={rows ?? []} loading={isLoading}
         columns={[
           { title: 'ID', dataIndex: 'candidate_id', width: 90 },
           { title: '名称', dataIndex: 'name', width: 150 },
           { title: '分类', dataIndex: 'category', width: 90 },
           { title: '假设', dataIndex: 'hypothesis' },
           { title: '状态', dataIndex: 'status', width: 90 },
-        ]} pagination={{ pageSize: 5 }} />
+          { title: '操作', width: 80, render: (_, r) => <Button size="small" type="link" onClick={() => setSelected(r)}>详情</Button> },
+        ]} pagination={{ pageSize: 5 }} locale={{ emptyText: '暂无待审核候选因子；点击上方按钮提议，或在下方状态筛选查看已启用因子' }} />
+      <Drawer title={selected ? `${selected.candidate_id} ${selected.name}` : '候选因子详情'} open={!!selected} onClose={() => setSelected(null)} width={620} destroyOnHidden>
+        {selected && (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Descriptions size="small" column={1} items={[
+              { label: '分类', children: selected.category },
+              { label: '假设', children: selected.hypothesis },
+              { label: '状态', children: selected.status },
+              { label: '公式', children: selected.formula },
+              { label: '数据需求', children: (selected.data_requirements || []).join(', ') },
+              { label: '预期边', children: selected.expected_edge },
+              { label: '风险说明', children: selected.risk_note },
+            ]} />
+            <Card size="small" title="验证结果" style={{ background: 'var(--bg-input)' }}>
+              <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: 0 }}>{JSON.stringify(selected.validation_result ?? {}, null, 2)}</pre>
+            </Card>
+          </Space>
+        )}
+      </Drawer>
     </Space>
   )
 }
