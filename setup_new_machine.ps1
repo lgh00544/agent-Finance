@@ -24,6 +24,7 @@ $QdrantZip = Join-Path $RuntimeRoot 'qdrant.zip'
 $QdrantVersion = 'v1.19.1'
 $QdrantSha256 = '9b6f69bd85f6abed4bc13f943099f55c6ffd55f5dd90388635320d8fbb569eb0'
 $QdrantUrl = "https://github.com/qdrant/qdrant/releases/download/$QdrantVersion/qdrant-x86_64-pc-windows-msvc.zip"
+$PreferredPythonVersion = '3.13'
 
 function Write-Step([string]$Message) { Write-Host "`n== $Message ==" -ForegroundColor Cyan }
 function Fail([string]$Message) { throw $Message }
@@ -32,6 +33,11 @@ function Invoke-Native([string]$File, [string[]]$Args) {
     if ($LASTEXITCODE -ne 0) { Fail "命令失败（$LASTEXITCODE）：$File $($Args -join ' ')" }
 }
 function Test-Command([string]$Name) { return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue) }
+function Refresh-Path() {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = "$machine;$user"
+}
 function Test-Port([int]$Port) {
     try { return [bool](Test-NetConnection 127.0.0.1 -Port $Port -InformationLevel Quiet -WarningAction SilentlyContinue) }
     catch { return $false }
@@ -78,29 +84,50 @@ if (-not (Test-Command 'winget') -and -not $SkipPackageInstall) {
     Fail '未找到 winget。请先安装 Windows App Installer，或使用 -SkipPackageInstall 并手动准备 Python、Node.js、Git。'
 }
 if (-not $SkipPackageInstall) {
-    Ensure-WingetPackage 'Python.Python.3.14' 'Python 3.14'
+    Ensure-WingetPackage 'Python.Python.3.13' 'Python 3.13'
     Ensure-WingetPackage 'OpenJS.NodeJS.LTS' 'Node.js LTS'
     Ensure-WingetPackage 'Git.Git' 'Git'
     if ($Mode -eq 'MultiUser') { Ensure-WingetPackage 'Redis.Redis' 'Redis' }
+    Refresh-Path
 }
+Refresh-Path
 
-$python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $python) { $python = Get-Command py -ErrorAction SilentlyContinue }
-if (-not $python) { Fail '未找到 Python。请重新打开终端后重试。' }
-$pythonCommand = $python.Source
-if ($python.Name -eq 'py.exe') { $pythonArgs = @('-3.14') } else { $pythonArgs = @() }
+$python = Get-Command py -ErrorAction SilentlyContinue
+if ($python) {
+    $pythonCommand = $python.Source
+    $pythonArgs = @("-$PreferredPythonVersion")
+} else {
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { Fail '未找到 Python。请重新打开终端后重试。' }
+    $pythonCommand = $python.Source
+    $pythonArgs = @()
+}
+function Read-EnvValue([string]$Path, [string]$Name) {
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    $prefix = "^\s*#?\s*$([regex]::Escape($Name))=(.*)$"
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match $prefix) { return $matches[1].Trim().Trim("'").Trim('"') }
+    }
+    return ''
+}
 $version = (& $pythonCommand @pythonArgs --version 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $version -notmatch "Python $PreferredPythonVersion(\.|$)") {
+    Fail "需要 Python $PreferredPythonVersion；当前无法找到对应版本。请重新打开终端后重试。"
+}
 Write-Host "使用 $version"
 
 Write-Step '创建 Python 虚拟环境并安装依赖'
 if (-not (Test-Path $VenvPython)) { Invoke-Native $pythonCommand ($pythonArgs + @('-m', 'venv', (Join-Path $ProjectRoot '.venv'))) }
-Invoke-Native $VenvPython @('-m', 'pip', 'install', '--upgrade', 'pip')
-Invoke-Native $VenvPython @('-m', 'pip', 'install', '-r', (Join-Path $ProjectRoot 'backend\requirements.txt'))
+& $VenvPython -m pip --version 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) { Invoke-Native $VenvPython @('-m', 'ensurepip', '--upgrade', '--default-pip') }
+Invoke-Native $VenvPython @('-m', 'pip', 'install', '--upgrade', '--no-cache-dir', 'pip')
+Invoke-Native $VenvPython @('-m', 'pip', 'install', '--no-cache-dir', '-r', (Join-Path $ProjectRoot 'backend\requirements.txt'))
 
 Write-Step '安装前端依赖'
 if (-not (Test-Command 'pnpm')) {
     if (-not (Test-Command 'npm')) { Fail '未找到 npm。请重新打开终端后重试。' }
     Invoke-Native 'npm' @('install', '--global', 'pnpm')
+    Refresh-Path
 }
 Push-Location (Join-Path $ProjectRoot 'web')
 try {
@@ -112,10 +139,13 @@ Write-Step '初始化配置文件'
 $envPath = Join-Path $ProjectRoot '.env'
 if (-not (Test-Path $envPath)) { Copy-Item (Join-Path $ProjectRoot '.env.example') $envPath }
 if ($Mode -eq 'MultiUser') {
+    if (-not $MysqlHost) { $MysqlHost = Read-EnvValue $envPath 'MYSQL_HOST' }
     if (-not $MysqlHost) { $MysqlHost = Read-Host 'TiDB/MySQL 主机地址' }
+    if (-not $MysqlUser) { $MysqlUser = Read-EnvValue $envPath 'MYSQL_USER' }
     if (-not $MysqlUser) { $MysqlUser = Read-Host 'TiDB/MySQL 用户名' }
+    if (-not $MysqlPassword) { $MysqlPassword = Read-EnvValue $envPath 'MYSQL_ROOT_PASSWORD' }
     $MysqlPassword = Read-Secret 'TiDB/MySQL 密码' $MysqlPassword
-    $authPassword = Read-Secret 'lugenghua 登录密码（至少 8 位）'
+    $authPassword = Read-Secret 'lugenghua 登录密码（至少 8 位）' (Read-EnvValue $envPath 'AUTH_DEFAULT_PASSWORD')
     if ($authPassword.Length -lt 8) { Fail '登录密码至少需要 8 位。' }
     Set-EnvValue $envPath 'APP_ENV' 'dev'
     Set-EnvValue $envPath 'MULTI_USER_ENABLED' 'true'
@@ -134,14 +164,14 @@ if ($Mode -eq 'MultiUser') {
     Set-EnvValue $envPath 'MYSQL_DATABASE' $MysqlDatabase
     Set-EnvValue $envPath 'AUTH_DEFAULT_USERNAME' $Username
     Set-EnvValue $envPath 'AUTH_DEFAULT_PASSWORD' $authPassword
-    if (-not $DeepseekApiKey) { $DeepseekApiKey = Read-Secret 'DeepSeek API Key（可留空）' }
+    if (-not $DeepseekApiKey) { $DeepseekApiKey = Read-Secret 'DeepSeek API Key（可留空）' (Read-EnvValue $envPath 'DEEPSEEK_API_KEY') }
     if ($DeepseekApiKey) { Set-EnvValue $envPath 'DEEPSEEK_API_KEY' $DeepseekApiKey }
 } else {
     Set-EnvValue $envPath 'MULTI_USER_ENABLED' 'false'
     Set-EnvValue $envPath 'DB_BACKEND' 'sqlite'
     Set-EnvValue $envPath 'CACHE_BACKEND' 'memory'
     Set-EnvValue $envPath 'QDRANT_MODE' 'local'
-    if (-not $DeepseekApiKey) { $DeepseekApiKey = Read-Secret 'DeepSeek API Key（可留空）' }
+    if (-not $DeepseekApiKey) { $DeepseekApiKey = Read-Secret 'DeepSeek API Key（可留空）' (Read-EnvValue $envPath 'DEEPSEEK_API_KEY') }
     if ($DeepseekApiKey) { Set-EnvValue $envPath 'DEEPSEEK_API_KEY' $DeepseekApiKey }
 }
 Write-Host "配置已写入 .env（密码和密钥不显示）"
@@ -201,7 +231,7 @@ finally { Pop-Location }
 if ($Start) {
     Write-Step '启动项目'
     if ($Mode -eq 'MultiUser') { & (Join-Path $ProjectRoot 'start_multi_user.ps1') }
-    else { & (Join-Path $ProjectRoot 'run_dev.bat') }
+    else { & (Join-Path $ProjectRoot 'start_single_user.ps1') }
 } else {
     Write-Host "`n初始化完成。启动多人版：powershell -ExecutionPolicy Bypass -File .\start_multi_user.ps1" -ForegroundColor Green
     Write-Host '浏览器地址：http://127.0.0.1:5173'
