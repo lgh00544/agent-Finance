@@ -63,6 +63,38 @@ export interface MarketConditionInfo {
   [k: string]: unknown
 }
 
+// ===== 美股隔夜因子 =====
+export interface OvernightFactorDetail {
+  symbol?: string
+  name?: string
+  price?: number | null
+  change_pct?: number | null
+  [k: string]: unknown
+}
+export interface OvernightFactor {
+  trade_date?: string
+  factor_value?: number | null
+  /** 档位：低开 / 偏空 / 噪声区 / 偏多 / 高开 */
+  band?: string
+  /** 预测方向：低开 / 高开 / 不押注 */
+  prediction?: string
+  /** 上涨家数（0-10） */
+  up_count?: number | null
+  stocks_detail?: OvernightFactorDetail[]
+  /** 开盘校验：实际缺口（%），未校验为 null */
+  actual_gap?: number | null
+  /** 开盘校验：预测是否命中，未校验为 null */
+  is_correct?: boolean | null
+  notes?: string
+  created_at?: string
+  [k: string]: unknown
+}
+export interface OvernightFactorResponse {
+  latest?: OvernightFactor | null
+  history?: OvernightFactor[]
+  [k: string]: unknown
+}
+
 // ===== 候选审计底稿（批次4 前端审计卡片）：A 层可建仓判定 / 拒判明细，只读展示 =====
 export interface AuditDecision {
   key?: string

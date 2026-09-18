@@ -33,7 +33,7 @@ from app.db.models import (
     SectorNewsAIInterpret, SectorNewsArticle, SectorNewsFeedback, SectorNewsShadowVerify,
     SectorRegimeForecast,
     SellDecision, StockCandidate, StockScore, TradeProfile,
-    TradeRecord, WorkerRun, _now, DistributionPhaseLog, User, UserSession,
+    TradeRecord, UsOvernightFactor, WorkerRun, _now, DistributionPhaseLog, User, UserSession,
     PublicFactSnapshot,
 )
 from app.db.session import SessionLocal
@@ -416,6 +416,70 @@ def get_prev_market_condition() -> dict | None:
         return {"trade_date": row.trade_date, "total_score": row.total_score,
                 "band": band, "cap": row.cap, "dims": row.dims,
                 "summary": row.summary, "created_at": str(row.created_at)}
+
+
+# ==================== 美股隔夜因子（只读观察因子） ====================
+
+def upsert_us_overnight_factor(trade_date: str, factor_value: float, band: str,
+                               prediction: str, up_count: int, stocks_detail: list,
+                               actual_gap: float | None = None,
+                               is_correct: bool | None = None,
+                               notes: str | None = None) -> None:
+    """upsert 美股隔夜因子（trade_date 唯一键：已存在则更新，不存在则新建）。
+
+    actual_gap / is_correct / notes 仅非 None 才写入（防校验回写抹掉采集备注、
+    防重跑覆盖已回填的开盘缺口；对齐 upsert_market_condition 的 next_day 防覆盖风格）。"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(UsOvernightFactor).where(UsOvernightFactor.trade_date == trade_date)
+        ).scalar_one_or_none()
+        if row is None:
+            row = UsOvernightFactor(trade_date=trade_date)
+            db.add(row)
+        row.factor_value, row.band, row.prediction, row.up_count = (
+            factor_value, band, prediction, up_count)
+        row.stocks_detail = stocks_detail
+        if actual_gap is not None:
+            row.actual_gap = actual_gap
+        if is_correct is not None:
+            row.is_correct = is_correct
+        if notes is not None:
+            row.notes = notes
+        db.commit()
+
+
+def _us_overnight_factor_to_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "trade_date": row.trade_date,
+        "factor_value": row.factor_value,
+        "band": row.band,
+        "prediction": row.prediction,
+        "up_count": row.up_count,
+        "stocks_detail": row.stocks_detail or [],
+        "actual_gap": row.actual_gap,
+        "is_correct": row.is_correct,
+        "notes": row.notes,
+        "created_at": str(row.created_at),
+    }
+
+
+def get_latest_us_overnight_factor() -> dict | None:
+    """最新一条美股隔夜因子（全部字段，stocks_detail 原样返回）"""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(UsOvernightFactor).order_by(UsOvernightFactor.trade_date.desc()).limit(1)
+        ).scalar_one_or_none()
+        return _us_overnight_factor_to_dict(row) if row is not None else None
+
+
+def get_us_overnight_factor_history(limit: int = 10) -> list[dict]:
+    """最近 N 条美股隔夜因子历史（按 trade_date 倒序）"""
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(UsOvernightFactor).order_by(UsOvernightFactor.trade_date.desc()).limit(limit)
+        ).scalars().all()
+        return [_us_overnight_factor_to_dict(r) for r in rows]
 
 
 def upsert_sector_snapshot(rows: list[dict]) -> int:

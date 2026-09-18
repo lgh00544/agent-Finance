@@ -153,6 +153,25 @@ class MarketCondition(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class UsOvernightFactor(Base):
+    """美股隔夜因子（只读观察因子，不参与现有决策链路）：
+    21:30 采集美股涨跌幅等权平均分档落库，次日 9:35 校验开盘缺口写台账"""
+    __tablename__ = "us_overnight_factor"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_us_overnight_factor_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)  # 预测对应的A股交易日 YYYY-MM-DD
+    factor_value: Mapped[float] = mapped_column(Float, default=0.0)  # 等权平均涨跌幅 %
+    band: Mapped[str] = mapped_column(String(20), default="")        # 低开/偏空/噪声区/偏多/高开
+    prediction: Mapped[str] = mapped_column(String(20), default="")  # 低开/高开/不押注
+    up_count: Mapped[int] = mapped_column(Integer, default=0)        # 上涨美股只数
+    stocks_detail: Mapped[list] = mapped_column(SafeJSON, default=list)  # [{symbol, name, change_pct}]
+    actual_gap: Mapped[float | None] = mapped_column(Float, nullable=True)      # 上证指数开盘缺口 %（校验回填）
+    is_correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)     # 缺口方向与预测是否一致
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)       # 备注（假信号降权提示等）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class MarketIntel(Base):
     """市场研判底座（每日收盘后 1 次 + 手动入口）：阶段定性/核心矛盾/风险偏好/量能信号/
     操作含义/次日盯盘点，作为全部 agent 的参考维度注入（只新增表，不迁移不改旧表）"""

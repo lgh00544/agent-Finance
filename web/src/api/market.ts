@@ -5,6 +5,7 @@ import type {
   MarketDiagnosticsInfo,
   MarketConditionInfo,
   MarketIntelInfo,
+  OvernightFactorResponse,
   RegimeViewInfo,
   SectorNextHotInfo,
   SectorPattern,
@@ -62,3 +63,6 @@ export const runSectorForecastVerify = (forecastDate?: string): Promise<SyncRunR
 /** GET /api/market/sector-next-hot（旧轮动归因长跑的快速替代） */
 export const sectorNextHot = (date?: string, limit = 10): Promise<SectorNextHotInfo> =>
   get('/market/sector-next-hot', { ...(date ? { date } : {}), limit })
+
+/** GET /api/overnight-factor（美股隔夜因子：最新 + 历史） */
+export const fetchOvernightFactor = (): Promise<OvernightFactorResponse> => get('/overnight-factor')

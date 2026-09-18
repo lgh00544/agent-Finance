@@ -936,6 +936,20 @@ def market_condition():
     return {**row, "strictness": _day_strictness(str(td)) if td else None}
 
 
+@router.get("/overnight-factor")
+def overnight_factor(limit: int = 10):
+    """美股隔夜因子（只读观察因子，不参与现有决策）：
+    latest 含全部字段（stocks_detail 原样返回），history 默认最近 10 条；
+    limit 最大 50，越界自动收敛；无数据时 latest=None、history=[]，前端降级。"""
+    from app.services import overnight_factor as of_service
+
+    limit = max(1, min(int(limit), 50))
+    return {
+        "latest": of_service.get_latest(),
+        "history": of_service.get_history(limit),
+    }
+
+
 # ================= 市场概览（顶部状态栏 / 首页热门板块，只读聚合） =================
 @router.get("/market/indices")
 def market_indices():
