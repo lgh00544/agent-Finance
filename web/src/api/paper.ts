@@ -6,6 +6,8 @@ export interface PaperQuoteState {
   quote_source?: string
   quote_time?: string
   quote_status?: string
+  quote_reference_only?: boolean
+  quote_notice?: string
   quote_error?: string
   quote_errors?: string[]
   missing_reason?: string
@@ -15,7 +17,7 @@ export interface PaperQuoteState {
 export interface PaperAccount {
   id: number
   name?: string
-  status?: 'active' | 'paused' | string
+  status?: 'active' | 'paused' | 'archived' | string
   strategy_variant?: string
   initial_cash?: number
   cash?: number
@@ -158,7 +160,8 @@ export interface PaperReview {
   [key: string]: unknown
 }
 
-export const paperAccounts = () => get<PaperAccount[]>('/paper/accounts')
+export const paperAccounts = (params?: { include_archived?: boolean; status?: string }) =>
+  get<PaperAccount[]>('/paper/accounts', params)
 export const createPaperAccount = (body: { name: string; initial_cash: number }) =>
   post<PaperAccount>('/paper/accounts', body)
 export const paperSummary = (accountId: number) =>
@@ -181,6 +184,8 @@ export const refreshPaperQuotes = (accountId: number) =>
   post<PaperSummary>(`/paper/accounts/${accountId}/quotes/refresh`)
 export const setPaperAccountStatus = (accountId: number, status: 'active' | 'paused') =>
   post(`/paper/accounts/${accountId}/status`, { status })
+export const archivePaperAccount = (accountId: number, reason?: string) =>
+  post<PaperAccount>(`/paper/accounts/${accountId}/archive`, reason ? { reason } : undefined)
 export const paperReviews = (accountId?: number) =>
   get<PaperReview[]>('/paper/reviews', accountId == null ? undefined : { account_id: accountId })
 export const runPaper = (accountId: number, tradeDate?: string) =>
