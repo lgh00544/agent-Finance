@@ -198,11 +198,12 @@ def run_win_rate_iteration(price_lookup=None) -> dict:
                     current_value=sug["current_value"],
                     suggested_value=sug["suggested_value"],
                     reason=sug["reason"], evidence=sug["evidence"],
-                    target_kind=sug["target_kind"])
-                suggestions.append({"id": sid, "actor_name": profile["actor_name"],
-                                    "rule_name": sug["rule_name"],
-                                    "current_value": sug["current_value"],
-                                    "suggested_value": sug["suggested_value"]})
+                    target_kind=sug["target_kind"], dedupe=True)
+                if sid:
+                    suggestions.append({"id": sid, "actor_name": profile["actor_name"],
+                                        "rule_name": sug["rule_name"],
+                                        "current_value": sug["current_value"],
+                                        "suggested_value": sug["suggested_value"]})
         except Exception as exc:  # noqa: BLE001 单游资统计失败不阻断整体
             errors.append({"actor_name": profile.get("actor_name"), "error": str(exc)})
             logger.warning("游资胜率统计失败 %s: %s", profile.get("actor_name"), exc)

@@ -5,6 +5,7 @@ ReviewAgent 卖出复盘 - LangGraph 节点
 流转：collect_review → llm_review；建议驳回后由 llm_rethink_suggestion 驱动重思考迭代
 """
 import logging
+import json
 import time
 from datetime import date
 from hashlib import md5
@@ -39,6 +40,24 @@ def _day_text(value: object, fallback: str = "") -> str:
 def _in_period(value: object, start_date: str, end_date: str) -> bool:
     day = _day_text(value)
     return bool(day) and start_date <= day <= end_date
+
+
+def _active_rule_context() -> str:
+    """把全部目标 Agent 的生效规则作为去重/归因材料提供给 ReviewAgent。"""
+    try:
+        rules = repo.get_active_rules()
+    except Exception as exc:  # noqa: BLE001 规则读取失败不阻塞复盘主链路
+        logger.warning("复盘读取生效规则失败（跳过规则去重材料）: %s", exc)
+        return ""
+    if not rules:
+        return ""
+    return (
+        "\n\n【各目标 Agent 已生效规则（仅用于去重与归因）】\n"
+        + json.dumps(
+            [{"target_agent": r.get("target_agent"), "rule_name": r.get("rule_name"),
+              "rule_text": r.get("rule_text")} for r in rules],
+            ensure_ascii=False)
+    )
 
 
 def collect_review(state: StockAgentState) -> StockAgentState:
@@ -258,14 +277,13 @@ def llm_review(state: StockAgentState) -> StockAgentState:
                           f"复盘已存在: review_id={existing.id}，跳过重复生成"]
         return state
 
-    import json
-
     # 历史驳回记录注入：反映用户真实偏好，避免再次提出同类建议
     reject_section = review_prompt.build_reject_history_section(
         repo.get_review_reject_history(code, limit=10))
     review_data = "【复盘数据】（客观数值与原始记录）\n" + json.dumps(data, ensure_ascii=False, default=str)
     if reject_section:
         review_data += "\n\n" + reject_section
+    review_data += _active_rule_context()
 
     output = agent_call(
         agent="review",
@@ -293,15 +311,16 @@ def llm_review(state: StockAgentState) -> StockAgentState:
     # （v2 一键采纳落地信息随建议持久化：rule_text/rule_type/priority/落地元数据）
     suggestion_count = 0
     for item in output.agent_suggestions:
-        repo.insert_agent_suggestion(
+        sid = repo.insert_agent_suggestion(
             review_id, item.target_agent, item.rule_name,
             item.current_value, item.suggested_value, item.reason, item.evidence,
             target_kind=item.target_kind,
             rule_type=item.rule_type, priority=item.priority,
             problem_desc=item.problem_desc, rule_text=item.rule_text,
             expected_effect=item.expected_effect, risk_note=item.risk_note,
-            file_path=item.file_path, insert_position=item.insert_position)
-        suggestion_count += 1
+            file_path=item.file_path, insert_position=item.insert_position,
+            dedupe=True)
+        suggestion_count += int(bool(sid))
     # 游资复盘闭环留痕：失败标的回溯游资信号结论（source_module='hot_money_review'，
     # 只留痕不改任何配置；无游资信号可回溯时 LLM 输出 null 跳过）
     hm_reviewed = False
@@ -339,6 +358,7 @@ def llm_rethink_suggestion(review_id: int, reject_reason: str) -> dict:
         "feedback": row.feedback,
         "suggest_iteration": row.suggest_iteration,
     }, ensure_ascii=False, default=str)
+    original_text += _active_rule_context()
 
     output = agent_call(
         agent="review",

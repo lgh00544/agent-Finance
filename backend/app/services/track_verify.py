@@ -844,9 +844,12 @@ def generate_suggestions(stats: dict, anomalies: list[dict],
             problem_desc=item.problem_desc, rule_text=item.rule_text,
             expected_effect=item.expected_effect, risk_note=item.risk_note,
             file_path=item.file_path, insert_position=item.insert_position,
-            suggestion_source="llm")
-        inserted.append({"id": sid, "rule_name": item.rule_name,
-                         "suggestion_source": "llm"})
+            suggestion_source="llm", dedupe=True)
+        if sid:
+            inserted.append({"id": sid, "rule_name": item.rule_name,
+                             "suggestion_source": "llm"})
+        else:
+            deduped += 1
 
     fallbacks: list[dict] = []
     # 证据不足主动不提案、或建议已存在，都不是生成失败。
@@ -864,9 +867,12 @@ def generate_suggestions(stats: dict, anomalies: list[dict],
                 problem_desc=tpl["problem_desc"], rule_text=tpl["rule_text"],
                 expected_effect=tpl["expected_effect"], risk_note=tpl["risk_note"],
                 file_path=tpl["file_path"], insert_position=tpl["insert_position"],
-                suggestion_source="template")
-            fallbacks.append({"id": sid, "rule_name": tpl["rule_name"],
-                              "suggestion_source": "template"})
+                suggestion_source="template", dedupe=True)
+            if sid:
+                fallbacks.append({"id": sid, "rule_name": tpl["rule_name"],
+                                  "suggestion_source": "template"})
+            else:
+                deduped += 1
     return {"suggestions": inserted, "fallbacks": fallbacks,
             "deduped": deduped, "blocked_unvalidated": blocked_unvalidated,
             "summary_note": summary_note}
@@ -1053,9 +1059,13 @@ def run_verify_chain(backfill: bool = False, price_lookup=None, llm_call=None) -
                     problem_desc=tpl["problem_desc"], rule_text=tpl["rule_text"],
                     expected_effect=tpl["expected_effect"], risk_note=tpl["risk_note"],
                     file_path=tpl["file_path"], insert_position=tpl["insert_position"],
-                    suggestion_source="template")
-                cal_inserted.append({"id": sid, "rule_name": tpl["rule_name"],
-                                     "suggestion_source": "template"})
+                    suggestion_source="template", dedupe=True)
+                if sid:
+                    cal_inserted.append({"id": sid, "rule_name": tpl["rule_name"],
+                                         "suggestion_source": "template"})
+                else:
+                    result.setdefault("suggestions", {}).setdefault("deduped", 0)
+                    result["suggestions"]["deduped"] += 1
             if llm_call is None and cal_inserted:
                 result["factor_audit"] = auto_audit_generated_suggestions(
                     {"suggestions": cal_inserted, "fallbacks": []})

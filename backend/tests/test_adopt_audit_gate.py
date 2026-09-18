@@ -5,13 +5,17 @@ from fastapi import HTTPException
 from app.api.routes import (
     AdoptSuggestionBody,
     ApproveSuggestionBody,
+    ManualAuditSuggestionBody,
     adopt_agent_suggestion,
     adopt_review_suggestion,
     approve_agent_suggestion,
+    manual_audit_agent_suggestion,
 )
 from app.db import repo
 from app.db.models import AgentSuggestion, RuleChange
 from app.db.session import SessionLocal, init_db
+from app.core import auth
+from app.core.config import settings
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -106,6 +110,51 @@ def test_override_with_reason_is_allowed_and_recorded():
     assert result["adopted"] is True
     note = repo.get_agent_suggestion(sid).conflict_note
     assert "审核 override" in note and "本轮观察" in note
+
+
+def test_manual_audit_passes_ai_fail_without_auto_adopting():
+    sid = _make_suggestion(audit_verdict="fail", rule_name="批5人工通过偏好")
+    result = manual_audit_agent_suggestion(
+        sid, ManualAuditSuggestionBody(action="pass", reason="人工复核后决定保留，先观察后续效果"))
+    row = repo.get_agent_suggestion(sid)
+    assert result["status"] == "pending"
+    assert row.status == "pending" and row.audit_verdict == "pass"
+    assert repo.get_audit_log(row.last_audit_id).audit_model == "human"
+
+
+def test_manual_audit_fails_ai_fail_and_ends_queue():
+    sid = _make_suggestion(audit_verdict="fail", rule_name="批5人工驳回偏好")
+    result = manual_audit_agent_suggestion(
+        sid, ManualAuditSuggestionBody(action="fail", reason="人工复核后确认依据不足，不采纳"))
+    row = repo.get_agent_suggestion(sid)
+    assert result["status"] == "rejected"
+    assert row.status == "rejected" and row.reject_reason == "人工复核后确认依据不足，不采纳"
+
+
+def test_manual_audit_rejects_another_users_suggestion(monkeypatch):
+    sid = _make_suggestion(audit_verdict="fail")
+    monkeypatch.setattr(settings, "multi_user_enabled", True)
+    token = auth._current_user_id.set(9102)
+    role_token = auth._current_user_role.set("researcher")
+    try:
+        with pytest.raises(HTTPException) as exc:
+            manual_audit_agent_suggestion(
+                sid, ManualAuditSuggestionBody(action="pass", reason="ownership test"))
+        assert exc.value.status_code == 404
+        assert repo.get_agent_suggestion(sid).audit_verdict == "fail"
+    finally:
+        auth._current_user_id.reset(token)
+        auth._current_user_role.reset(role_token)
+
+
+def test_suggestion_deduplication_is_scoped_to_owner(monkeypatch):
+    monkeypatch.setattr(settings, "multi_user_enabled", True)
+    args = (0, "score", "owner scoped suggestion", "old", "new", "reason", "evidence")
+    first = repo.insert_agent_suggestion(*args, user_id=9101, dedupe=True)
+    other = repo.insert_agent_suggestion(*args, user_id=9102, dedupe=True)
+    repeated = repo.insert_agent_suggestion(*args, user_id=9101, dedupe=True)
+    assert first and other and first != other
+    assert repeated == 0
 
 
 def test_legacy_review_adopt_is_marked_without_audit_claim():
