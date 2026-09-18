@@ -1,5 +1,6 @@
 """模拟账本最小闭环：规则在代码层验证，且不污染真实 Holding。"""
 import pytest
+import pandas as pd
 
 from app.db import repo
 from app.db.models import Holding
@@ -54,6 +55,17 @@ def test_paper_limit_up_and_idempotency():
     assert result["executions"][0]["reject_reason"] == "limit_up"
     again = paper_execution.run(account["id"], "2026-09-10", facts=facts)
     assert again["executions"][0]["id"] == result["executions"][0]["id"]
+
+
+def test_candidate_pool_variant_fills_without_plan_or_tradeable_gate():
+    account = repo.create_paper_account("候选池研究账户", 33_960.64, "candidate_pool")
+    facts = _facts(price=34.4)
+    facts["tradeable"][0]["is_tradeable"] = 0
+    facts["plans"] = {}
+    result = paper_execution.run(account["id"], "2026-09-10", facts=facts)
+    assert result["filled"] == 1
+    assert result["executions"][0]["strategy_variant"] == "candidate_pool"
+    assert result["executions"][0]["shares"] == 100
 
 
 def test_paper_future_fact_is_rejected():
@@ -143,3 +155,119 @@ def test_live_market_closed_is_not_filled(monkeypatch):
                                  quote_facts={"688901": {"price": 10}})
     assert result["filled"] == 0
     assert result["executions"][0]["reject_reason"] == "market_closed"
+
+
+def test_live_paper_records_latest_market_context(monkeypatch):
+    account = repo.create_paper_account("最新市况留痕测试", 100_000)
+    monkeypatch.setattr(repo, "get_latest_market_condition", lambda: {
+        "trade_date": "2026-09-08", "total_score": 45, "band": "进取期",
+        "cap": 30, "dims": {"breadth": 9}, "summary": "上涨扩散",
+    })
+    monkeypatch.setattr(paper_execution, "_live_quote_block", lambda *_: "")
+    facts = {**_facts(), "mode": "live_paper",
+             "contexts": {"688901": {"id": 123, "facts": {"fact_as_of": "2026-09-08"}}}}
+    out = paper_execution.run(account["id"], "2026-09-08", facts=facts,
+                              quote_facts={"688901": {"price": 10, "change_pct": 0,
+                                                       "volume": 1000,
+                                                       "fact_as_of": "2026-09-08"}})
+    assert out["market_context"]["total_score"] == 45
+    assert out["executions"][0]["metadata"]["facts"]["market_context"]["band"] == "进取期"
+
+
+def test_paper_market_sync_adds_relative_strength_only_on_live_rotation(monkeypatch):
+    from app.datasource import fallback
+
+    class Source:
+        def fetch_index_spot(self):
+            return pd.DataFrame({"code": ["sh000001", "sz399001"], "change_pct": [1.0, 1.2]})
+
+        def fetch_spot_universe(self):
+            return pd.DataFrame({"code": ["600001", "600002"], "price": [10.0, 8.0],
+                                 "change_pct": [2.0, 1.3]})
+
+    monkeypatch.setattr(fallback, "get_datasource", lambda: Source())
+    today = paper_execution.date.today().isoformat()
+    rows, context = paper_execution._paper_market_sync(
+        today, [],
+        {"600001": {"stock_name": "强势股"}, "600002": {"stock_name": "普通股"}},
+        {"600001": {"id": 1}, "600002": {"id": 2}},
+    )
+    assert [row["stock_code"] for row in rows] == ["600001"]
+    assert context["status"] == "rotation_candidates"
+
+
+def test_paper_market_sync_freezes_historical_facts():
+    rows, context = paper_execution._paper_market_sync(
+        "2026-09-08", [], {"600001": {}}, {"600001": {"id": 1}})
+    assert rows == []
+    assert context["status"] == "historical_or_frozen"
+
+
+def test_live_buy_gate_records_missing_facts_without_touching_replay():
+    missing, metadata = paper_execution._live_buy_gate(
+        {"price": 10, "fact_as_of": "2026-09-18"},
+        {"facts": {"get_daily_kline": {"rows": [{"close": 10}]},
+                   "get_news": {"news": []}}},
+        {"band": "进取期"}, "2026-09-18")
+    assert missing == []
+    assert metadata["live_buy_gate"]["fact_as_of"] == "2026-09-18"
+    missing, metadata = paper_execution._live_buy_gate(
+        {"price": 10, "fact_as_of": "2026-09-18"}, {}, {}, "2026-09-18")
+    assert set(missing) == {"technical_kline", "news_announcement", "market_context"}
+    assert metadata["live_buy_gate"]["context_hash"]
+
+
+def test_live_buy_missing_facts_is_rejected_and_audited(monkeypatch):
+    account = repo.create_paper_account("实时复核闸门账户", 100_000, "candidate_pool")
+    monkeypatch.setattr(paper_execution, "_live_quote_block", lambda *_: "")
+    today = paper_execution.date.today().isoformat()
+    facts = {**_facts(), "mode": "live_paper", "market_context": {"band": "进取期"},
+             "contexts": {"688901": {"id": 123, "facts": {"fact_as_of": today}}}}
+    out = paper_execution.run(
+        account["id"], today, facts=facts,
+        quote_facts={"688901": {"price": 10, "volume": 1000,
+                                 "change_pct": 0, "fact_as_of": today}})
+    event = out["executions"][0]
+    assert event["status"] == "rejected"
+    assert event["reject_reason"] == "live_buy_facts_missing"
+    assert set(event["metadata"]["live_buy_gate"]["missing"]) == {
+        "technical_kline", "news_announcement"}
+
+
+def test_candidate_pool_uses_candidate_universe_for_non_tradeable_grade():
+    account = repo.create_paper_account("候选池全集测试", 100_000, "candidate_pool")
+    facts = _facts(price=10.0)
+    facts["tradeable"] = []
+    result = paper_execution.run(account["id"], "2026-09-12", facts=facts)
+    assert result["filled"] == 1
+    assert result["executions"][0]["shares"] == 1000
+    position = repo.list_paper_positions(account["id"])[0]
+    assert position["metadata"]["control_plan"]["version"] == "candidate-pool-control-v1"
+
+
+def test_candidate_pool_lifecycle_control_and_review():
+    account = repo.create_paper_account("候选池生命周期测试", 100_000, "candidate_pool")
+
+    opened = paper_execution.run(account["id"], "2026-09-08", facts=_facts(price=10.0))
+    assert opened["filled"] == 1
+    assert opened["executions"][0]["side"] == "buy"
+
+    added = paper_execution.run(account["id"], "2026-09-09", facts=_facts(price=10.5))
+    assert added["filled"] == 1
+    assert added["executions"][0]["side"] == "buy"
+    assert added["executions"][0]["metadata"]["lifecycle_reason"] == "candidate_pool_add"
+
+    first_take = paper_execution.run(account["id"], "2026-09-10", facts=_facts(price=10.81))
+    assert first_take["filled"] == 1
+    assert first_take["executions"][0]["side"] == "sell"
+    assert first_take["executions"][0]["shares"] == 500
+
+    trailing = paper_execution.run(account["id"], "2026-09-11", facts=_facts(price=10.1))
+    assert trailing["filled"] == 1
+    assert trailing["executions"][0]["metadata"]["lifecycle_reason"] == "trailing_stop"
+    assert repo.list_paper_positions(account["id"])[0]["status"] == "exited"
+    reviews = repo.list_paper_reviews(account["id"])
+    assert reviews and reviews[0]["execution_id"] == trailing["executions"][0]["id"]
+
+    again = paper_execution.run(account["id"], "2026-09-11", facts=_facts(price=10.1))
+    assert again["filled"] == 0

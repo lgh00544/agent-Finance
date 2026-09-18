@@ -70,6 +70,8 @@ def run(account_id: int, trade_date: str, *, mode: str = "live_paper",
     if mode == "historical_replay" and not isinstance(historical_facts, dict):
         raise ValueError("历史监控需要调用方提供冻结事实")
     account = repo.get_paper_account(account_id)
+    if account is not None and account.status == "archived":
+        raise ValueError("模拟账户已归档，禁止监控")
     if account is None or account.status != "active":
         raise ValueError("模拟账户不存在或未启用")
     if mode == "live_paper":

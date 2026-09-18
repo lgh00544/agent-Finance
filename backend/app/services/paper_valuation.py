@@ -27,6 +27,8 @@ def _safe_price(value):
 def quote_state(item: dict, now: datetime | None = None) -> str:
     if _safe_price(item.get("price")) is None:
         return "unavailable"
+    if item.get("quote_reference_only"):
+        return "stale"
     raw = str(item.get("quote_time") or item.get("time") or "").strip()
     try:
         stamp = datetime.fromisoformat(raw)
@@ -50,7 +52,8 @@ def fetch_quotes(codes: list[str]) -> tuple[dict, list[str]]:
             raw = getattr(ds, method, lambda _: {})(missing)
             for code, item in (raw or {}).items():
                 if code in codes and isinstance(item, dict) and _safe_price(item.get("price")) is not None:
-                    if code not in quotes or quote_state(item) == "ok":
+                    if (code not in quotes or quote_state(item) == "ok" or
+                            quote_state(quotes[code]) == "time_unknown" and quote_state(item) == "stale"):
                         quotes[code] = {**item, "source": item.get("source") or method}
             if not raw:
                 errors.append(f"{method}: 行情源返回空数据")
@@ -61,7 +64,8 @@ def fetch_quotes(codes: list[str]) -> tuple[dict, list[str]]:
             continue
         try:
             item = getattr(ds, "fetch_spot_quote", lambda _code: {})(code)
-            if item and _safe_price(item.get("price")) is not None:
+            if (item and _safe_price(item.get("price")) is not None and
+                    (quote_state(item) == "ok" or quote_state(quotes.get(code, {})) not in {"ok", "stale"})):
                 quotes[code] = {**item, "source": item.get("source") or "spot_quote"}
         except Exception as exc:
             errors.append(f"{code}: {str(exc)[:100]}")
@@ -79,8 +83,7 @@ def refresh_account(account_id: int) -> dict:
         quotes, errors = fetch_quotes(codes)
     except Exception as exc:  # noqa: BLE001
         logger.warning("模拟行情数据源初始化失败: %s", exc)
-        return {"account_id": account_id, "source": "none", "rows": 0,
-                "quote_time": time.strftime("%Y-%m-%d %H:%M:%S"), "errors": [str(exc)[:200]]}
+        quotes, errors = {}, [str(exc)[:200]]
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     sources = sorted({str(q.get("source") or "unknown") for q in quotes.values()})
@@ -90,12 +93,13 @@ def refresh_account(account_id: int) -> dict:
     for pos in positions:
         code = pos["stock_code"]
         item = quotes.get(code)
+        fact_time = str((item or {}).get("quote_time") or (item or {}).get("time") or "")
         rows.append({"stock_code": code, "stock_name": pos.get("stock_name") or code,
                      "price": _safe_price((item or {}).get("price")),
                      "change_pct": (item or {}).get("change_pct"),
                      "source": (item or {}).get("source") or source,
-                     "quote_time": str((item or {}).get("time") or (item or {}).get("quote_time") or ""),
-                     "fact_as_of": now, "status": quote_state(item or {}), "snapshot": item or {},
+                     "quote_time": fact_time,
+                     "fact_as_of": fact_time, "status": quote_state(item or {}), "snapshot": item or {},
                      "error": "" if quote_state(item or {}) == "ok" else "行情缺失、过期或未提供事实时间"})
     written = repo.upsert_paper_quotes(account_id, rows)
     return {"account_id": account_id, "source": source, "rows": written,
@@ -109,6 +113,8 @@ def account_view(account_id: int, refresh: bool = True) -> dict:
     refresh_result = refresh_account(account_id) if refresh else None
     positions = repo.list_paper_positions(account_id, status="holding")
     quotes = {row["stock_code"]: row for row in repo.list_paper_quotes(account_id, None)}
+    missing = [pos["stock_code"] for pos in positions if quote_state(quotes.get(pos["stock_code"], {})) != "ok"]
+    references = repo.last_valid_paper_quotes(account_id, quotes, missing)
     output = []
     market_value = 0.0
     pnl_amount = 0.0
@@ -116,7 +122,12 @@ def account_view(account_id: int, refresh: bool = True) -> dict:
     for pos in positions:
         quote = quotes.get(pos["stock_code"], {})
         status = quote_state(quote)
-        price = _safe_price(quote.get("price")) if status == "ok" else None
+        reference_only = status != "ok" and pos["stock_code"] in references
+        if reference_only:
+            quote = {**quote, **references[pos["stock_code"]]}
+            status = "stale"
+        notice = "行情已过期，仅供参考" if reference_only else ""
+        price = _safe_price(quote.get("price")) if status == "ok" or reference_only else None
         shares = int(pos.get("shares") or 0)
         avg = float(pos.get("avg_price") or 0)
         mv = pnl = pnl_pct = None
@@ -133,21 +144,27 @@ def account_view(account_id: int, refresh: bool = True) -> dict:
                        "quote_source": quote.get("source"),
                        "quote_time": quote.get("quote_time"),
                        "quote_status": status, "quote_error": quote.get("error") or "",
-                       "fact_as_of": quote.get("fact_as_of")})
+                       "quote_reference_only": reference_only, "quote_notice": notice,
+                       "fact_as_of": quote.get("quote_time")})
     market_value_out = round(market_value, 2) if known else None
     equity = round(float(account.cash) + market_value, 2) if known else None
     pnl_out = round(equity - float(account.initial_cash), 2) if equity is not None else None
     pnl_pct = round(pnl_out / float(account.initial_cash) * 100, 2) \
         if known and float(account.initial_cash) > 0 else None
+    reference_only = any(row["quote_reference_only"] for row in output)
+    fact_times = [row["fact_as_of"] for row in output if row["current_price"] is not None and row["fact_as_of"]]
+    fact_as_of = min(fact_times, key=lambda stamp: datetime.fromisoformat(stamp).timestamp()) if fact_times else None
+    sources = sorted({str(row["quote_source"] or "unknown") for row in output if row["current_price"] is not None})
     return {"account_id": account_id, "cash": account.cash,
             "initial_cash": account.initial_cash, "market_value": market_value_out,
             "equity": equity, "pnl_amount": pnl_out, "pnl_pct": pnl_pct,
             "unrealized_pnl": round(pnl_amount, 2) if known else None,
             "position_count": len(output), "positions": output,
-            "valuation_as_of": (refresh_result or {}).get("quote_time") or
-                               datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "quote_source": (refresh_result or {}).get("source") or "snapshot",
-            "quote_status": "ok" if known else "partial_or_unavailable",
+            "valuation_as_of": fact_as_of, "fact_as_of": fact_as_of,
+            "quote_source": sources[0] if len(sources) == 1 else "mixed" if sources else "none",
+            "quote_status": ("stale" if reference_only else "ok") if known else "partial_or_unavailable",
+            "quote_reference_only": reference_only,
+            "quote_notice": "行情已过期，仅供参考" if reference_only else "",
             "quote_errors": (refresh_result or {}).get("errors") or [],
             "execution_mode": "paper", "source_label": "AI模拟",
             "real_assets_separate": True}
