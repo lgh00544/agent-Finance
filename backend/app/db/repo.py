@@ -2,9 +2,11 @@
 数据仓库层：Agent 落库/读取的统一入口（幂等 upsert）
 【刚性代码逻辑】只做数据存取，不含任何市场判断。
 """
+import difflib
 import hashlib
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -2508,22 +2510,32 @@ def list_track_verify(select_date: str = "", start_date: str = "", end_date: str
                  "rating": rating, "finished": is_finished, "limit": limit}, _load)
 
 
-def fetch_daily_kline(code: str, start_date: str, end_date: str) -> list[dict]:
-    """单股日K（透传 datasource；供 kline 接口/多日盈亏曲线渲染；纯数据无判断）。
-    失败返回空列表（不抛，单标的行情缺失不阻塞）。"""
+KLINE_DETAIL_LIMIT = 200
+
+
+def fetch_daily_kline_detail(code: str, start_date: str, end_date: str) -> dict:
+    """单股日K + 失败原因透传（供 kline 接口区分上游故障与真无数据；纯数据无判断）。
+    返回 {"rows": [...], "status": "ok"|"empty"|"upstream_error", "detail": str}。"""
+    if not start_date or not end_date:
+        return {"rows": [], "status": "empty", "detail": "缺少 start/end 查询区间"}
     try:
         from app.datasource.fallback import get_datasource
         df = get_datasource().fetch_daily_kline(code, start_date, end_date)
-        if df is None or df.empty:
-            return []
-        out = []
-        for _, r in df.iterrows():
-            out.append({"date": str(r.get("date") or "")[:10], "open": r.get("open"),
-                        "high": r.get("high"), "low": r.get("low"), "close": r.get("close"),
-                        "volume": r.get("volume")})
-        return out
-    except Exception:  # noqa: BLE001 单股行情失败降级空列表
-        return []
+    except Exception as exc:  # noqa: BLE001 上游失败只透传原因，不改变采集刚性逻辑
+        detail = f"{exc.__class__.__name__}: {' '.join(str(exc).split())}"
+        return {"rows": [], "status": "upstream_error", "detail": detail[:KLINE_DETAIL_LIMIT]}
+    if df is None or df.empty:
+        return {"rows": [], "status": "empty", "detail": ""}
+    rows = [{"date": str(r.get("date") or "")[:10], "open": r.get("open"),
+             "high": r.get("high"), "low": r.get("low"), "close": r.get("close"),
+             "volume": r.get("volume")} for _, r in df.iterrows()]
+    return {"rows": rows, "status": "ok", "detail": ""}
+
+
+def fetch_daily_kline(code: str, start_date: str, end_date: str) -> list[dict]:
+    """单股日K（透传 datasource；供 kline 接口/多日盈亏曲线渲染；纯数据无判断）。
+    失败返回空列表（不抛，单标的行情缺失不阻塞）。"""
+    return fetch_daily_kline_detail(code, start_date, end_date)["rows"]
 
 
 def list_track_verify_dates(limit: int = 30) -> list[str]:
@@ -2599,6 +2611,49 @@ def has_pending_suggestion(rule_name: str, target_agent: str) -> bool:
                    AgentSuggestion.target_agent == target_agent,
                    AgentSuggestion.status == "pending")
         ).scalar_one() > 0
+
+
+def has_similar_suggestion(rule_name: str, target_agent: str,
+                           rule_text: str = "", target_kind: str = "prompt",
+                           suggested_value: str = "", user_id: int | None = None) -> bool:
+    """拦截同目标 Agent 的重复/近似建议；驳回项允许重新提出修订版。"""
+    def norm(value: str) -> str:
+        return re.sub(r"[\W_]+", "", str(value or "").lower(), flags=re.UNICODE)
+
+    name = norm(rule_name)
+    text_value = norm(rule_text)
+    owner_id = _experience_scope_user(user_id)
+    with SessionLocal() as db:
+        suggestions = select(AgentSuggestion.rule_name, AgentSuggestion.rule_text,
+                   AgentSuggestion.target_kind, AgentSuggestion.suggested_value)
+        suggestions = suggestions.where(AgentSuggestion.target_agent == target_agent,
+                                        AgentSuggestion.status.in_(("pending", "approved")))
+        rules = select(RuleChange.rule_name, RuleChange.rule_text).where(
+                   RuleChange.status == "active",
+                   or_(RuleChange.target_agent.in_((target_agent, "all")),
+                       RuleChange.target_agent.is_(None)))
+        if owner_id is not None:
+            suggestions = suggestions.where(AgentSuggestion.user_id == owner_id)
+            rules = rules.where(or_(RuleChange.user_id == owner_id, RuleChange.user_id.is_(None)))
+        rows = db.execute(suggestions).all()
+        rows += [(*row, "prompt", "") for row in db.execute(rules).all()]
+    for old_name, old_text, old_kind, old_value in rows:
+        old_name = norm(old_name)
+        old_text = norm(old_text)
+        if target_kind == "profile":
+            current = norm(f"{name}{suggested_value}")
+            previous = norm(f"{old_name}{old_value}")
+            if current and previous and difflib.SequenceMatcher(
+                    None, current, previous).ratio() >= 0.92:
+                return True
+            continue
+        if name and old_name and (name == old_name or
+                                  difflib.SequenceMatcher(None, name, old_name).ratio() >= 0.82):
+            return True
+        if text_value and old_text and difflib.SequenceMatcher(
+                None, text_value, old_text).ratio() >= 0.86:
+            return True
+    return False
 
 
 def _backfill_stock_names(rows: list[dict]) -> list[dict]:
@@ -2805,11 +2860,13 @@ def get_paper_account_for_user(account_id: int, user_id: int, *, is_admin: bool 
 
 
 def list_paper_accounts(status: str | None = None, user_id: int | None = None,
-                        *, is_admin: bool = False) -> list[dict]:
+                        *, is_admin: bool = False, include_archived: bool = False) -> list[dict]:
     with SessionLocal() as db:
         stmt = select(PaperAccount).order_by(PaperAccount.id.desc())
         if status:
             stmt = stmt.where(PaperAccount.status == status)
+        elif not include_archived:
+            stmt = stmt.where(PaperAccount.status != "archived")
         if user_id is not None and not is_admin:
             stmt = stmt.where(PaperAccount.user_id == user_id)
         return [_paper_account_dict(r) for r in db.execute(stmt).scalars().all()]
@@ -2819,10 +2876,43 @@ def update_paper_account_status(account_id: int, status: str) -> dict | None:
     if status not in ("active", "paused"):
         raise ValueError("模拟账户状态仅支持 active/paused")
     with SessionLocal() as db:
-        row = db.get(PaperAccount, account_id)
+        row = db.execute(select(PaperAccount).where(
+            PaperAccount.id == account_id).with_for_update()).scalar_one_or_none()
         if row is None:
             return None
+        if row.status == "archived":
+            raise ValueError("模拟账户已归档，不能恢复运行")
         row.status = status
+        db.commit()
+        return _paper_account_dict(row)
+
+
+def archive_paper_account(account_id: int, *, actor_user_id: int | None = None,
+                          reason: str = "") -> dict | None:
+    """先暂停再逻辑归档；账户锁与成交共用，审计和状态在同一事务提交。"""
+    with SessionLocal() as db:
+        row = db.execute(select(PaperAccount).where(
+            PaperAccount.id == account_id).with_for_update()).scalar_one_or_none()
+        if row is None:
+            return None
+        if row.status == "archived":
+            return _paper_account_dict(row)
+        previous_status = row.status
+        row.status = "paused"
+        db.flush()
+        for action, before, after in (("pause_before_archive", previous_status, "paused"),
+                                      ("archive", "paused", "archived")):
+            db.add(AuditLog(
+                target_type="paper_account", target_id=account_id, user_id=row.user_id,
+                round=1, verdict="pass", audit_model="human", confidence=0,
+                support_view=reason.strip() or "用户确认归档模拟账户",
+                dissent_view="", boundary_cases="仅模拟账户逻辑归档，保留全部历史记录",
+                evidence_refs=[f"paper_account:{account_id}"],
+                reasoning=json.dumps({"action": action, "previous_status": before,
+                                      "status": after, "actor_user_id": actor_user_id,
+                                      "reason": reason.strip()}, ensure_ascii=False),
+                duration_ms=0))
+        row.status = "archived"
         db.commit()
         return _paper_account_dict(row)
 
@@ -2830,6 +2920,10 @@ def update_paper_account_status(account_id: int, status: str) -> dict | None:
 def release_paper_t1(account_id: int, trade_date: str) -> int:
     """新交易日开始释放前一交易日以前买入的股数，幂等。"""
     with SessionLocal() as db:
+        account = db.execute(select(PaperAccount).where(
+            PaperAccount.id == account_id).with_for_update()).scalar_one_or_none()
+        if account is None or account.status != "active":
+            return 0
         rows = db.execute(select(PaperPosition).where(
             PaperPosition.account_id == account_id, PaperPosition.status == "holding",
             PaperPosition.opened_trade_date < trade_date)).scalars().all()
@@ -2843,6 +2937,33 @@ def release_paper_t1(account_id: int, trade_date: str) -> int:
         return changed
 
 
+def update_paper_position_state(account_id: int, stock_code: str, *, metadata: dict | None = None,
+                                  high_price: float | None = None, stop_loss: float | None = None,
+                                  take_profit: float | None = None) -> bool:
+    """更新 paper 仓位的计划快照和生命周期状态，不触及真实持仓。"""
+    with SessionLocal() as db:
+        account = db.execute(select(PaperAccount).where(
+            PaperAccount.id == account_id).with_for_update()).scalar_one_or_none()
+        if account is None or account.status != "active":
+            return False
+        row = db.execute(select(PaperPosition).where(
+            PaperPosition.account_id == account_id,
+            PaperPosition.stock_code == stock_code,
+            PaperPosition.status == "holding")).scalar_one_or_none()
+        if row is None:
+            return False
+        if metadata is not None:
+            row.metadata_json = metadata
+        if high_price is not None:
+            row.high_price = max(float(row.high_price or 0), float(high_price))
+        if stop_loss is not None:
+            row.stop_loss = float(stop_loss or 0)
+        if take_profit is not None:
+            row.take_profit = float(take_profit or 0)
+        db.commit()
+        return True
+
+
 def paper_apply_execution(account_id: int, payload: dict) -> dict:
     """原子写入模拟流水并更新独立现金/持仓；execution_key 提供幂等保护。"""
     key = str(payload.get("execution_key") or "").strip()
@@ -2853,6 +2974,8 @@ def paper_apply_execution(account_id: int, payload: dict) -> dict:
         account = db.execute(select(PaperAccount).where(PaperAccount.id == account_id).with_for_update()).scalar_one_or_none()
         if account is None:
             raise ValueError("模拟账户不存在")
+        if account.status == "archived":
+            raise ValueError("模拟账户已归档，禁止成交")
         if account.status != "active":
             raise ValueError("模拟账户已暂停")
         existing = db.execute(select(PaperExecution).where(
@@ -2890,7 +3013,9 @@ def paper_apply_execution(account_id: int, payload: dict) -> dict:
                                         take_profit=float((payload.get("metadata_json") or {}).get("take_profit") or 0))
                     db.add(pos)
                 elif pos.status == "holding" and pos.shares:
-                    raise ValueError("模拟持仓已存在，禁止并发重复买入")
+                    if (payload.get("metadata_json") or {}).get("lifecycle_action") != "add":
+                        raise ValueError("模拟持仓已存在，禁止并发重复买入")
+                    pos.plan_id = execution.plan_id or pos.plan_id
                 else:
                     pos.opened_trade_date = execution.trade_date
                     pos.available_shares = 0
@@ -2899,13 +3024,22 @@ def paper_apply_execution(account_id: int, payload: dict) -> dict:
                     pos.plan_id = execution.plan_id
                     pos.stop_loss = float((payload.get("metadata_json") or {}).get("stop_loss") or 0)
                     pos.take_profit = float((payload.get("metadata_json") or {}).get("take_profit") or 0)
+                    pos.metadata_json = payload.get("metadata_json") or {}
                 old_cost = pos.cost or 0.0
                 pos.shares += execution.shares
                 pos.available_shares += 0
                 pos.cost = round(old_cost + execution.total_amount, 2)
                 pos.avg_price = round(pos.cost / pos.shares, 4) if pos.shares else 0.0
                 pos.opened_trade_date = pos.opened_trade_date or execution.trade_date
-                pos.high_price = max(pos.high_price or 0, execution.executed_price or 0)
+                pos.high_price = max(pos.high_price or 0, execution.executed_price or 0,
+                                     float((payload.get("metadata_json") or {}).get("high_price") or 0))
+                incoming_meta = payload.get("metadata_json") or {}
+                if incoming_meta:
+                    pos.metadata_json = incoming_meta
+                    if "stop_loss" in incoming_meta:
+                        pos.stop_loss = float(incoming_meta.get("stop_loss") or 0)
+                    if "take_profit" in incoming_meta:
+                        pos.take_profit = float(incoming_meta.get("take_profit") or 0)
                 pos.status = "holding"
             elif side == "sell":
                 pos = db.execute(select(PaperPosition).where(
@@ -2966,6 +3100,27 @@ def list_paper_executions(account_id: int, limit: int = 200) -> list[dict]:
         return [paper_execution_dict(r) for r in rows]
 
 
+def _paper_quote_fact(item: dict | None) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    raw_time = str(item.get("quote_time") or item.get("time") or "").strip()
+    try:
+        price = float(item.get("price"))
+        stamp = datetime.fromisoformat(raw_time)
+        if not 0 < price < float("inf") or len(raw_time) <= 10 or stamp > datetime.now(stamp.tzinfo):
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return {key: item.get(key) for key in ("stock_code", "stock_name", "change_pct", "source")} | {
+        "price": price, "quote_time": raw_time, "fact_as_of": raw_time,
+    }
+
+
+def _latest_paper_quote(*items: dict | None) -> dict | None:
+    valid = [fact for item in items if (fact := _paper_quote_fact(item))]
+    return max(valid, key=lambda fact: datetime.fromisoformat(fact["quote_time"]).timestamp()) if valid else None
+
+
 def upsert_paper_quotes(account_id: int, rows: list[dict]) -> int:
     """幂等写入模拟账户专用行情快照。"""
     if not rows:
@@ -2982,10 +3137,18 @@ def upsert_paper_quotes(account_id: int, rows: list[dict]) -> int:
             if row is None:
                 row = PaperQuoteSnapshot(account_id=account_id, stock_code=code)
                 db.add(row)
+            previous = {key: getattr(row, key) for key in (
+                "stock_code", "stock_name", "price", "change_pct", "source", "quote_time")}
+            last_valid = _latest_paper_quote(
+                (row.snapshot or {}).get("last_valid_quote"), previous, item)
             for key in ("stock_name", "price", "change_pct", "source", "quote_time",
-                        "fact_as_of", "status", "error", "snapshot"):
+                        "fact_as_of", "status", "error"):
                 if key in item:
                     setattr(row, key, item.get(key))
+            snapshot = dict(item.get("snapshot") or {})
+            if last_valid:
+                snapshot["last_valid_quote"] = last_valid
+            row.snapshot = snapshot
             row.updated_at = _now()
             count += 1
         db.commit()
@@ -3003,6 +3166,35 @@ def list_paper_quotes(account_id: int, within_minutes: int | None = 10) -> list[
                  "source": r.source, "quote_time": r.quote_time, "fact_as_of": r.fact_as_of,
                  "status": r.status, "error": r.error, "updated_at": str(r.updated_at)}
                 for r in rows]
+
+
+def last_valid_paper_quotes(account_id: int, quotes: dict[str, dict], stock_codes: list[str]) -> dict[str, dict]:
+    """Read reference facts only; replay executions and synthetic fill prices are excluded."""
+    result = {}
+    for code in stock_codes:
+        row = quotes.get(code) or {}
+        fact = _latest_paper_quote(row.get("last_valid_quote"), row)
+        if fact:
+            result[code] = fact
+    if not stock_codes:
+        return result
+    # Existing accounts may have lost their quote cache before preservation was added.
+    with SessionLocal() as db:
+        rows = db.execute(select(PaperExecution.stock_code, PaperExecution.metadata_json).where(
+            PaperExecution.account_id == account_id,
+            PaperExecution.stock_code.in_(stock_codes))).all()
+        for code, metadata in rows:
+            metadata = metadata or {}
+            if metadata.get("mode") != "live_paper":
+                continue
+            facts = metadata.get("facts") or {}
+            quote = facts.get("quote") or metadata.get("quote_snapshot") or {}
+            if not isinstance(quote, dict) or not quote.get("source"):
+                continue
+            fact = _latest_paper_quote(result.get(code), quote)
+            if fact:
+                result[code] = fact
+    return result
 
 
 def create_paper_context(account_id: int, trade_date: str, mode: str, stock_code: str,
@@ -3468,7 +3660,8 @@ def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
                             expected_effect: str = "", risk_note: str = "",
                             file_path: str = "", insert_position: str = "",
                             suggestion_source: str = "llm",
-                            user_id: int | None = None) -> int:
+                            user_id: int | None = None,
+                            dedupe: bool = False) -> int:
     if user_id is None:
         user_id = _context_user_id(1)
     with SessionLocal() as db:
@@ -3476,6 +3669,11 @@ def insert_agent_suggestion(review_id: int, target_agent: str, rule_name: str,
             review = db.get(ReviewResult, review_id)
             if review and review.user_id is not None:
                 user_id = review.user_id
+        if dedupe and has_similar_suggestion(
+                rule_name, target_agent, rule_text, target_kind, suggested_value,
+                user_id=user_id if settings.multi_user_enabled else None):
+            logger.info("跳过重复/近似建议：%s/%s", target_agent, rule_name)
+            return 0
         row = AgentSuggestion(review_id=review_id, target_agent=target_agent, rule_name=rule_name,
                               current_value=current_value, suggested_value=suggested_value,
                               reason=reason, evidence=evidence,
@@ -3580,6 +3778,7 @@ def list_agent_suggestions_for_audit(cursor_id: int, limit: int = 50,
     owner_id = _experience_scope_user(user_id)
     with SessionLocal() as db:
         stmt = select(AgentSuggestion).where(
+                AgentSuggestion.status == "pending",
                 AgentSuggestion.id > cursor_id,
                 or_(AgentSuggestion.audit_verdict == "pending",
                     AgentSuggestion.last_audit_id.is_(None),

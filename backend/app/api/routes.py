@@ -656,12 +656,28 @@ def market_intel_dates(limit: int = 30):
     return repo.list_market_intel_dates(limit)
 
 
+@router.get("/factor-ic-history")
+def factor_ic_history(factor_id: str = "", period: str = "", limit: int = 50):
+    """读取因子 IC 历史；仅返回回测事实，不改变评分或规则。"""
+    from app.services.factor_ic import list_history
+    return list_history(factor_id, period, limit)
+
+
 @router.post("/factor-candidates/propose")
 def propose_factor_candidates(body: FactorCandidateProposeBody):
     """人工触发候选因子提议；LLM 结果只进入 pending 候选池。"""
     require_write_access()
     from app.services.factor_candidate import propose
     return propose(body.context, body.limit)
+
+
+@router.get("/factor-candidates/pending")
+def factor_candidates_pending(limit: int = 50):
+    """待人工拍板的候选因子列表；纯读，不改状态。"""
+    from app.services.factor_candidate import get_pending_for_sir
+    return get_pending_for_sir(limit)
+
+
 # ================= 板块轮动（sector_rotation：状态机 + 归因子 Agent + 手动触发） =================
 
 @router.post("/market/sector-rotation/run")
@@ -1016,7 +1032,7 @@ class AccountBaselineBody(BaseModel):
 class PaperAccountBody(BaseModel):
     name: str = Field(default="AI模拟账户", max_length=64)
     initial_cash: float = Field(gt=0, description="模拟初始资金（元）")
-    strategy_variant: str = Field(default="current_gate", description="只支持已有规则的 current_gate")
+    strategy_variant: str = Field(default="current_gate", description="current_gate 或 candidate_pool")
     rule_version: str = Field(default="")
     model_version: str = Field(default="")
 
@@ -1030,6 +1046,10 @@ class PaperRunBody(BaseModel):
 
 class PaperStatusBody(BaseModel):
     status: str = Field(description="active/paused")
+
+
+class PaperArchiveBody(BaseModel):
+    reason: str = Field(default="", max_length=500)
 
 
 class PaperContextBody(BaseModel):
@@ -1073,17 +1093,18 @@ def save_account_baseline(body: AccountBaselineBody):
 
 # ================= AI 模拟账本（与真实 Holding/TradeRecord 完全隔离） =================
 @router.get("/paper/accounts")
-def paper_accounts():
+def paper_accounts(include_archived: bool = False, status: str | None = None):
     return [{**row, "execution_mode": "paper", "source_label": "AI模拟"}
             for row in repo.list_paper_accounts(
-                user_id=_request_user_id(), is_admin=current_user_role() == "admin")]
+                user_id=_request_user_id(), is_admin=current_user_role() == "admin",
+                include_archived=include_archived, status=status)]
 
 
 @router.post("/paper/accounts")
 def paper_account_create(body: PaperAccountBody):
-    if body.strategy_variant != "current_gate":
+    if body.strategy_variant not in {"current_gate", "candidate_pool"}:
         raise HTTPException(status_code=400,
-                            detail="初版模拟只执行现有 current_gate，不允许借模拟入口改规则")
+                            detail="模拟策略仅支持 current_gate 或 candidate_pool")
     try:
         row = repo.create_paper_account(body.name, body.initial_cash, body.strategy_variant,
                                         body.rule_version, body.model_version,
@@ -1111,6 +1132,16 @@ def paper_account_status(account_id: int, body: PaperStatusBody):
         result = repo.update_paper_account_status(account_id, body.status)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return {**result, "execution_mode": "paper", "source_label": "AI模拟"}
+
+
+@router.post("/paper/accounts/{account_id}/archive")
+def paper_account_archive(account_id: int, body: PaperArchiveBody | None = None):
+    _paper_account_for_request(account_id)
+    result = repo.archive_paper_account(
+        account_id, actor_user_id=_request_user_id(), reason=body.reason if body else "")
     if result is None:
         raise HTTPException(status_code=404, detail="模拟账户不存在")
     return {**result, "execution_mode": "paper", "source_label": "AI模拟"}
@@ -1657,6 +1688,11 @@ class ApproveSuggestionBody(BaseModel):
     override_reason: str = Field(default="", description="override 审核闸门的人工理由")
 
 
+class ManualAuditSuggestionBody(BaseModel):
+    action: str = Field(description="人工最终裁决：pass=通过，fail=不通过")
+    reason: str = Field(min_length=1, description="人工最终裁决理由")
+
+
 @router.post("/reviews/{rid}/adopt")
 def adopt_review_suggestion(rid: int):
     """采纳复盘反馈。
@@ -1682,7 +1718,7 @@ def adopt_review_suggestion(rid: int):
             "field": suggestion.get("field") if suggestion else None,
             "version": version,
             "legacy_adopt": True,
-            "warning": "该入口是人工显式采纳；规则类建议仍请使用 AI 审核后的 agent-suggestion 入口"}
+            "warning": "该入口是人工显式采纳，不具备 AI 审核结论；规则类建议仍请使用 AI 审核后的 agent-suggestion 入口"}
 
 
 @router.post("/reviews/{rid}/reject")
@@ -1865,6 +1901,9 @@ def list_agent_suggestions(status: Optional[str] = None, target_agent: Optional[
              "audit_verdict": getattr(s, "audit_verdict", None) or "",
              "audit_round": getattr(s, "audit_round", 0) or 0,
              "last_audit_id": getattr(s, "last_audit_id", None),
+             "audit_source": ("human" if (s.last_audit_id and
+                             getattr(repo.get_audit_log(s.last_audit_id), "audit_model", "") == "human")
+                              else "ai"),
              "created_at": str(s.created_at)} for s in suggestions]
 
 
@@ -1884,6 +1923,42 @@ def re_audit_suggestion(suggestion_id: int):
     """手动触发单条建议 AI 审核；提交后台任务，不在 HTTP 请求里等待 LLM。"""
     _require_owned_agent_suggestion(suggestion_id)
     return _submit_task("audit_one", {"suggestion_id": suggestion_id})
+
+
+def _record_manual_suggestion_audit(suggestion, verdict: str, reason: str) -> int:
+    """记录人工最终裁决；不直接落地规则，采纳仍走既有人工入口。"""
+    owner_id = suggestion.user_id or _request_user_id()
+    audit_round = max(1, int(getattr(suggestion, "audit_round", 0) or 0))
+    if verdict == "fail":
+        audit_round = max(2, audit_round)
+    log_id = repo.insert_audit_log(
+        target_type="agent_suggestion", target_id=suggestion.id,
+        audit_round=audit_round, verdict=verdict, confidence=0,
+        support_view=reason if verdict == "pass" else "人工复核后不采纳该建议",
+        dissent_view=reason if verdict == "fail" else "人工复核后接受该建议，AI 未通过意见不构成最终否决",
+        boundary_cases="人工最终裁决，后续效果仍需观察",
+        evidence_refs=[], audit_model="human", reasoning=f"人工最终裁决：{reason}", duration_ms=0,
+        user_id=owner_id)
+    repo.update_agent_suggestion_audit(suggestion.id, verdict, audit_round, log_id, user_id=owner_id)
+    return log_id
+
+
+@router.post("/agent-suggestions/{sid}/manual-audit")
+def manual_audit_agent_suggestion(sid: int, body: ManualAuditSuggestionBody):
+    """人工最终裁决 AI 结果：通过后等待采纳，驳回后结束建议。"""
+    require_write_access()
+    suggestion = _require_owned_agent_suggestion(sid)
+    if suggestion.status != "pending":
+        raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
+    action = body.action.strip().lower()
+    if action not in ("pass", "fail"):
+        raise HTTPException(status_code=400, detail="action 仅支持 pass/fail")
+    reason = body.reason.strip()
+    _record_manual_suggestion_audit(suggestion, action, reason)
+    if action == "fail":
+        repo.update_agent_suggestion_status(sid, "rejected", reason=reason)
+    return {"audited": True, "suggestion_id": sid, "audit_verdict": action,
+            "audit_source": "human", "status": "rejected" if action == "fail" else "pending"}
 
 
 def _coerce_value(raw: str):
@@ -1933,6 +2008,7 @@ def reject_agent_suggestion(sid: int, body: RejectSuggestionBody | None = None):
     if suggestion.status != "pending":
         raise HTTPException(status_code=400, detail=f"该建议已处理（{suggestion.status}）")
     reason = (body.reason if body else "") or ""
+    _record_manual_suggestion_audit(suggestion, "fail", reason.strip() or "人工驳回该建议")
     repo.update_agent_suggestion_status(sid, "rejected", reason=reason)
     return {"rejected": True, "suggestion_id": sid, "reason": reason}
 
@@ -2254,10 +2330,11 @@ def portfolio_daily_summary(days: int = 30):
 
 @router.get("/kline/{stock_code}")
 def kline(stock_code: str, start: str = "", end: str = ""):
-    """单股日K（透传 datasource fetch_daily_kline；多日盈亏曲线渲染用）。start/end 缺省返回空 klines"""
-    if not start or not end:
-        return {"code": stock_code, "klines": []}
-    return {"code": stock_code, "klines": repo.fetch_daily_kline(stock_code, start, end)}
+    """单股日K（透传 datasource fetch_daily_kline；多日盈亏曲线渲染用）。start/end 缺省返回空 klines。
+    只增 status/detail 两个字段区分上游故障与真无数据，klines 与既有字段逐字不变。"""
+    result = repo.fetch_daily_kline_detail(stock_code, start, end)
+    return {"code": stock_code, "klines": result["rows"],
+            "status": result["status"], "detail": result["detail"]}
 
 
 # ================= 游资追踪（游资档案 / 龙虎榜流水 / 留痕 / 权重迭代） =================
