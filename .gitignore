@@ -60,3 +60,13 @@ SYNC_ON_START_PROMPT.md
 web/node_modules/
 web/dist/
 web/.env.local
+
+# ===== 补充忽略（2026-09-18 追加，不改动上方规则）=====
+# 后端/前端 dev 运行日志（含轮转副本）
+*-dev.stderr*.log
+*-dev.stdout*.log
+# 本地运行产物
+storage/
+.qdrant-initialized
+# 批次证据目录（临时留痕，不入库）
+.workbuddy/batch*_evidence_*/
