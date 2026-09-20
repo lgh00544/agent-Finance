@@ -6,6 +6,9 @@
 5. 统计快照结构
 """
 import logging
+import socket
+import threading
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -314,3 +317,80 @@ def test_quote_snapshot_stale_returns_none():
          "updated_at": "2020-01-01 00:00:00"}])
     assert repo.get_quote_snapshot(within_minutes=10) is None
     repo.upsert_quote_snapshot([])  # 清表，避免污染后续
+
+
+def test_call_with_timeout_bounds_blocking_interface(monkeypatch):
+    """不接受 timeout 的接口阻塞时必须被硬超时截断（否则采集可永久挂起）。"""
+    monkeypatch.setattr(settings, "datasource_timeout", 1)
+    release = threading.Event()
+
+    def blocking(symbol):  # 无 timeout 参数；用 Event 阻塞（_isolate 已把 time.sleep 置空）
+        release.wait(30)
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(DataSourceError):
+            AkshareSource()._call_with_timeout(blocking, "600000")
+        assert time.monotonic() - started < 3  # 阈值 1s + 余量
+    finally:
+        release.set()  # 放行后台线程，避免 pytest 退出时被 join 拖住
+
+
+def test_call_with_timeout_does_not_swallow_internal_type_error():
+    """接受 timeout 的接口内部抛 TypeError 时必须冒泡。
+
+    旧实现用 except TypeError 兜底，会把这种内部错误当成「不支持 timeout」而改用
+    不带 timeout 重调一次 —— 若重调成功，错误就被静默吞掉（此处替身即如此）。
+    """
+    def flaky(symbol, timeout=None):
+        if timeout is not None:
+            raise TypeError("内部类型错误")
+        return "swallowed"
+
+    with pytest.raises(TypeError, match="内部类型错误"):
+        AkshareSource()._call_with_timeout(flaky, "600000")
+
+
+def test_call_with_timeout_still_passes_timeout_when_supported():
+    """能接受 timeout 的接口仍走原路径，透传 datasource_timeout（未改正常路径）。"""
+    seen = {}
+
+    def ok(symbol, timeout=None):
+        seen["timeout"] = timeout
+        return "ok"
+
+    assert AkshareSource()._call_with_timeout(ok, "600000") == "ok"
+    assert seen["timeout"] == settings.datasource_timeout
+
+
+def test_call_with_timeout_shuts_pool_and_restores_socket_timeout(monkeypatch):
+    """兜底超时后不得留下副作用：socket 默认超时恢复原值，本次执行器已 shutdown(wait=False)。"""
+    monkeypatch.setattr(settings, "datasource_timeout", 1)
+    original = socket.getdefaulttimeout()
+    release = threading.Event()
+    shut = []
+    real_pool = akshare_source.ThreadPoolExecutor
+
+    def spy_pool(*args, **kwargs):
+        pool = real_pool(*args, **kwargs)
+        real_shutdown = pool.shutdown
+
+        def wrapped(**kw):
+            shut.append(kw.get("wait"))
+            return real_shutdown(**kw)
+
+        pool.shutdown = wrapped  # 记录 shutdown 调用及其 wait 参数
+        return pool
+
+    monkeypatch.setattr(akshare_source, "ThreadPoolExecutor", spy_pool)
+
+    def blocking(symbol):
+        release.wait(30)
+
+    try:
+        with pytest.raises(DataSourceError):
+            AkshareSource()._call_with_timeout(blocking, "600000")
+        assert shut == [False]                      # 执行器已释放，未等待阻塞线程
+        assert socket.getdefaulttimeout() == original  # 全局超时已还原
+    finally:
+        release.set()  # 放行后台线程
