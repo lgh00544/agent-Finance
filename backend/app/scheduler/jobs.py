@@ -889,6 +889,30 @@ def signal_scan_job() -> None:
         cache.release_lock("signal_scan")
 
 
+def kline_ingest_job() -> None:
+    """本地日线仓库增量（工作日 16:25）；非交易日直接返回，除权票当场重建历史段。"""
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        logger.info("今天 %s 非交易日，跳过本地日线增量", today)
+        return
+    if not cache.acquire_lock("kline_ingest", ttl_seconds=3600):
+        logger.info("kline_ingest 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.kline_backfill import backfill
+        from app.services.kline_ingest import ingest_today
+        summary = ingest_today(today)
+        if summary.get("ex_div_codes"):
+            rebuilt = backfill(summary["ex_div_codes"], rebuild=True)
+            summary["rebuilt"] = {"codes": len(summary["ex_div_codes"]), "ok": rebuilt["ok"],
+                                  "failed": rebuilt["failed"]}
+        logger.info("本地日线增量完成: %s", summary)
+    except Exception as exc:  # noqa: BLE001 调度任务整体容错
+        logger.error("本地日线增量失败: %s", exc)
+    finally:
+        cache.release_lock("kline_ingest")
+
+
 def start_scheduler() -> None:
     global scheduler, _leader_acquired
     if scheduler is not None:
@@ -931,6 +955,11 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour=16, minute=20,
                       id="market_intel", name="市场研判",
                       replace_existing=True, misfire_grace_time=3600)
+    # 工作日 16:25 本地日线仓库增量（批量快照落当日 bar；16:50 扫描只读本地，批 1.5 容量修复）
+    scheduler.add_job(kline_ingest_job, "cron",
+                      day_of_week="mon-fri", hour=16, minute=25,
+                      id="kline_ingest", name="本地日线增量",
+                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
     # 工作日 16:50 买卖点信号全市场扫描（批 1 只攒数据，不进任何 Agent、不触发交易动作）
     scheduler.add_job(signal_scan_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=50,

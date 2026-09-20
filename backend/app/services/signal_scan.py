@@ -1,5 +1,6 @@
 """买卖点信号全市场扫描：只攒数据，不发通知、不进 Agent、不触发任何交易动作。"""
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from datetime import datetime, timedelta
@@ -53,14 +54,40 @@ def _load_keys(trade_date: str) -> tuple[set, set]:
             {(code, sig) for day, code, sig in rows if day != trade_date})
 
 
-def _scan_one(item: dict, ctx: dict) -> tuple[list[dict], int]:
-    """单只票：拉一次日线 → 算一次快照 → 跑全部信号；异常只计数，不抛出、不阻断。"""
-    code, rows = item["code"], []
+def _local_kline(code: str, ctx: dict):
+    """本地日线仓库优先（批1.5）：不足 MIN_BARS 即返回 None，交回远端路径。"""
     try:
-        kline = ctx["source"].fetch_daily_kline(code, ctx["start"], ctx["end"])
-    except Exception as exc:  # noqa: BLE001 单只失败留空，不阻断批
-        logger.warning("信号扫描日线获取失败 %s: %s", code, exc)
-        return rows, 1
+        from app.services import kline_store
+        if not kline_store.has_enough(code, MIN_BARS):
+            return None
+        return kline_store.load_frame(code, ctx["start"], ctx["end"])
+    except Exception as exc:  # noqa: BLE001 本地库异常不阻断扫描
+        logger.warning("本地日线读取失败 %s: %s", code, exc)
+        return None
+
+
+def _bump(ctx: dict, key: str) -> None:
+    """本地/远端取材计数（ctx 未带计数器时静默跳过，保持外部干跑工具可用）"""
+    counters, lock = ctx.get("counters"), ctx.get("lock")
+    if counters is None or lock is None:
+        return
+    with lock:
+        counters[key] += 1
+
+
+def _scan_one(item: dict, ctx: dict) -> tuple[list[dict], int]:
+    """单只票：本地仓库优先 → 缺则远端 → 算一次快照 → 跑全部信号；异常只计数、不阻断。"""
+    code, rows = item["code"], []
+    kline = _local_kline(code, ctx)
+    if kline is not None:
+        _bump(ctx, "local")
+    else:
+        _bump(ctx, "remote")  # 计入「仍需远端」的尝试（成败都算，用于核实本地覆盖率）
+        try:
+            kline = ctx["source"].fetch_daily_kline(code, ctx["start"], ctx["end"])
+        except Exception as exc:  # noqa: BLE001 单只失败留空，不阻断批
+            logger.warning("信号扫描日线获取失败 %s: %s", code, exc)
+            return rows, 1
     if kline is None or len(kline) < MIN_BARS or "close" not in getattr(kline, "columns", []):
         return rows, 0
     if "date" in kline.columns:
@@ -166,6 +193,7 @@ def scan_signal_triggers(trade_date: str | None = None) -> dict:
         "trade_date": day, "defs": list_all(), "source": source, "today": today_keys,
         "start": (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=_LOOKBACK_DAYS)).strftime("%Y-%m-%d"),
         "end": day, "cooldown": cooldown_keys,
+        "lock": threading.Lock(), "counters": {"local": 0, "remote": 0},
     }
     records = errors = dropped = 0
     reason = "ok"
@@ -190,6 +218,7 @@ def scan_signal_triggers(trade_date: str | None = None) -> dict:
         logger.info("信号扫描批次 %d~%d 命中 %d 条，累计落库 %d 条",
                     offset, offset + len(batch), len(rows), records)
     summary = {"trade_date": day, "universe": len(universe), "records": records, "errors": errors,
-               "dropped": dropped, "reason": reason}
+               "dropped": dropped, "reason": reason,
+               "local_bars": ctx["counters"]["local"], "remote_bars": ctx["counters"]["remote"]}
     logger.info("信号扫描结束 %s: %s", day, summary)
     return summary
