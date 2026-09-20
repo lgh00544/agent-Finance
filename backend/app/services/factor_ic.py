@@ -209,6 +209,11 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
 def persist_history(rows: list[dict]) -> int:
     if not rows:
         return 0
+    # 批次级护栏：全批零样本（未采到任何样本）时不触库；只要任一行 sample_size>0，
+    # 仍按原行为整批落库（保留「预算耗尽/部分采集也要留下已采数据」的既有语义）。
+    if not any((row.get("sample_size") or 0) > 0 for row in rows):
+        logger.warning("因子 IC 落库跳过：批次 %d 行全部 sample_size=0，未触库", len(rows))
+        return 0
     with SessionLocal() as db:
         keys = {(r["factor_id"], r["period"]) for r in rows}
         existing = {(r.factor_id, r.period): r for r in db.execute(select(FactorIcHistory)).scalars()
@@ -273,6 +278,15 @@ def run_factor_ic_backtest_job(months: int = 36) -> dict:
         ends = _month_ends(source.fetch_trade_calendar(), months)
         codes = select_universe_codes(source.fetch_spot_universe())
         records = collect_month_records(source, ends, codes, COLLECT_BUDGET_SECONDS, stats=stats)
+        if not any(records.values()):  # 零采集早退：零样本批次不得写入 factor_ic_history
+            logger.warning("因子 IC 回测零采集：股票池 %d 只、期次 %d 个，跳过回测与落库",
+                           len(codes), len(ends))
+            return {"months": len(ends), "codes": len(codes), "rows": 0, "collected_codes": 0,
+                    "max_sample": 0, "target_samples": COLLECT_TARGET_SAMPLES,
+                    "budget_seconds": COLLECT_BUDGET_SECONDS,
+                    "budget_exhausted": bool(stats.get("budget_exhausted")),
+                    "sufficient": False, "error_kind": None, "skipped": True,
+                    "reason": _job_reason(codes, 0, 0, stats)}
         results = run_backtest(records)
         persisted = persist_history(results)
     except Exception as exc:  # noqa: BLE001 取数异常转结构化结果，避免 cron/脚本裸崩

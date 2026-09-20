@@ -164,3 +164,46 @@ def test_integration_hard_timeout_survives_retry_wrapper(monkeypatch):
     assert factor_ic._classify_error(err2) == "timeout"
     reason2 = factor_ic._job_reason([], 0, 0, {}, error_kind="timeout", error_msg=str(err2))
     assert reason2 and "取数超时" in reason2
+
+
+def test_job_skips_backtest_and_persist_when_zero_collection(monkeypatch):
+    """零采集批次必须早退：不得调用 run_backtest / persist_history（防写坏 factor_ic_history）。"""
+    calls: list[str] = []
+
+    class Source:
+        def fetch_trade_calendar(self):
+            return pd.bdate_range("2026-01-01", "2026-09-18").strftime("%Y-%m-%d").tolist()
+
+        def fetch_spot_universe(self):
+            return pd.DataFrame()  # 非交易日：全市场快照为空 → codes 为空
+
+    monkeypatch.setattr(factor_ic, "get_datasource", lambda: Source())
+    monkeypatch.setattr(factor_ic, "run_backtest", lambda records: calls.append("run_backtest") or [])
+    monkeypatch.setattr(factor_ic, "persist_history",
+                        lambda rows: calls.append("persist_history") or len(rows))
+
+    out = factor_ic.run_factor_ic_backtest_job(months=3)
+    assert calls == []
+    assert out["rows"] == 0
+    assert out["skipped"] is True
+    assert out["sufficient"] is False
+    assert "未采集" in out["reason"]
+
+
+def test_persist_skips_all_zero_sample_batch(monkeypatch):
+    """整批零样本必须被批次级护栏拦下：SessionLocal 不许被进入（证明未触库）。"""
+    entered: list[bool] = []
+
+    class BoomSession:
+        def __enter__(self):
+            entered.append(True)
+            raise AssertionError("全批零样本不应触库")
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(factor_ic, "SessionLocal", lambda: BoomSession())
+    rows = [{"factor_id": f"f{index:02d}", "period": "2026-08", "sample_size": 0, "ic": None}
+            for index in range(3)]
+    assert factor_ic.persist_history(rows) == 0
+    assert entered == []
