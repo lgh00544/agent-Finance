@@ -107,3 +107,11 @@ def test_job_returns_structured_reason_on_unexpected_error(monkeypatch):
     assert out["error_kind"] == "unexpected"
     assert "需排查" in out["reason"]
     assert "超时" not in out["reason"] and "连接失败" not in out["reason"]
+
+
+def test_job_classifies_wrapped_timeout_message_as_timeout(monkeypatch):
+    """消息内嵌 TimeoutError() 的 DataSourceError 也须判为 timeout（防单独上线时 timeout 分支失效）。"""
+    out = _job_with_failing_source(
+        monkeypatch, DataSourceError("数据源 spot_universe 重试失败: TimeoutError()"))
+    assert out["error_kind"] == "timeout"
+    assert "超时" in out["reason"] and "连接失败" not in out["reason"]

@@ -6,6 +6,7 @@ from math import isfinite
 
 import numpy as np
 import pandas as pd
+import requests
 from sqlalchemy import select
 
 try:
@@ -224,15 +225,20 @@ def persist_history(rows: list[dict]) -> int:
 
 
 _CONN_ERROR_KW = ("proxy", "connection", "max retries", "getaddrinfo", "name resolution",
-                  "remote end closed", "timed out")
+                  "remote end closed", "timeout", "timed out")
+_TIMEOUT_KW = ("timeout", "timed out")
 
 
 def _classify_error(exc: Exception) -> str:
     """取数异常分类：timeout（硬超时）/ connection（DNS·代理·连接被拒）/ unexpected（其余）。"""
+    if isinstance(exc, (TimeoutError, requests.Timeout)):
+        return "timeout"
     if isinstance(exc, DataSourceError) and "超时" in str(exc):
         return "timeout"
-    text = "%s %s" % (type(exc).__name__, exc)
-    return "connection" if any(k in text.lower() for k in _CONN_ERROR_KW) else "unexpected"
+    text = ("%s %s" % (type(exc).__name__, exc)).lower()
+    if any(k in text for k in _TIMEOUT_KW):
+        return "timeout"
+    return "connection" if any(k in text for k in _CONN_ERROR_KW) else "unexpected"
 
 
 def _job_reason(codes: list[str], collected: int, max_sample: int, stats: dict, *,
