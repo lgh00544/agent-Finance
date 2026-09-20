@@ -26,6 +26,31 @@
 
 ---
 
+# 提交门禁（每次 commit 前强制，2026-09-20 起）
+
+> 背景：同类「提交清单遗漏」已连续发生 **5 次**，其中依赖遗漏 3 次（`app/factors/`、`factor_registry.py`、`config.py` 致 HEAD import 崩）、
+> 测试遗漏 2 次（`test_financial_normalization.py`、`test_datasource_stability.py` 致 HEAD 零回归守卫）。
+> 光靠「人工列清单」无效 —— **必须用机制验证**。
+
+**commit 前逐条执行，任一不过即停：**
+
+1. **列清单不得靠关键词 grep**。「改了哪些文件」必须按**依赖闭包**推：改动的模块 + 它 import 的模块 + **配套测试文件**。
+2. **干净副本导入验证**（挡依赖遗漏）：
+   ```
+   mkdir -p <临时目录> && git archive HEAD | tar -x -C <临时目录>
+   cd <临时目录> && PYTHONPATH=<临时目录>/backend python -c "import app.main; print('APP_MAIN_IMPORT_OK')"
+   ```
+   必须打印 `APP_MAIN_IMPORT_OK`。⚠️ 在工作区跑 import 会**假绿**（未跟踪文件就在磁盘上），不算数。
+3. **干净副本测试数验证**（挡测试遗漏 —— 第 2 条验证不了这个，测试不参与 import）：
+   在干净副本上跑与工作区**同一批** pytest 文件，**用例数必须与工作区一致**。
+   例：工作区 `test_datasource_stability` 20 例，HEAD 版必须也是 20 例；若 HEAD 只有 16 例 → **必有 4 个测试没提交**。
+4. 验证完删除临时目录。
+5. 报告里须并列：`git show --name-only HEAD` 的文件数 + 上述两项门禁的实测输出。
+
+**为什么这两条是硬门禁**：5 次同类问题中，第 2 条能挡住前 3 次，第 3 条能挡住后 2 次 —— 两条合起来覆盖全部 5 次。
+
+---
+
 ## 项目改动边界（铁律，动手前先核对）
 
 1. **前端只改 React `web/src/`，不动 Streamlit `streamlit/pages/`**。例外仅三种：①后端 API 变更致旧版报错阻塞 ②sir 显式点名 ③React 侧功能尚未迁移。**后端 / 数据 / Agent / 交易规则改动只动后端**，两端共同消费，不重复实现。
