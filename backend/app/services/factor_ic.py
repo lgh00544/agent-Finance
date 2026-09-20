@@ -224,6 +224,8 @@ def persist_history(rows: list[dict]) -> int:
     return len(rows)
 
 
+# 判定顺序锁定：消息级 timeout（_TIMEOUT_KW）必须先于 connection 关键词路（_CONN_ERROR_KW）——
+# 两表都含 "timeout"/"timed out"，顺序颠倒会把超时消息误判成 connection。
 _CONN_ERROR_KW = ("proxy", "connection", "max retries", "getaddrinfo", "name resolution",
                   "remote end closed", "timeout", "timed out")
 _TIMEOUT_KW = ("timeout", "timed out")

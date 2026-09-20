@@ -1,7 +1,11 @@
+import threading
 import types
 
 import pandas as pd
+import pytest
 
+from app.core.config import settings
+from app.datasource.akshare_source import AkshareSource
 from app.datasource.base import DataSourceError
 from app.services import factor_ic
 from app.services.factor_ic import calc_ic, calc_ir, judge_status, run_backtest
@@ -115,3 +119,48 @@ def test_job_classifies_wrapped_timeout_message_as_timeout(monkeypatch):
         monkeypatch, DataSourceError("数据源 spot_universe 重试失败: TimeoutError()"))
     assert out["error_kind"] == "timeout"
     assert "超时" in out["reason"] and "连接失败" not in out["reason"]
+
+
+def test_integration_hard_timeout_survives_retry_wrapper(monkeypatch):
+    """A→B 集成：真实硬超时的 DataSourceError 经 _call_with_retry 包装后仍判 timeout。
+
+    两阶段各自独立 Event —— 共用同一 Event 时第二阶段阻塞函数会立刻返回，超时根本不触发（假阴性）。
+    """
+    monkeypatch.setattr(settings, "datasource_timeout", 2)
+    monkeypatch.setattr(settings, "datasource_retry_times", 0)
+    monkeypatch.setattr(settings, "datasource_retry_delay", 0)
+    src = AkshareSource()
+
+    phase1_release = threading.Event()
+
+    def blocking_phase1(symbol):  # 不接受 timeout 参数；靠 Event 阻塞触发硬超时
+        phase1_release.wait(30)
+
+    try:
+        with pytest.raises(DataSourceError) as excinfo1:
+            src._call_with_timeout(blocking_phase1, "600000")
+    finally:
+        phase1_release.set()  # 放行后台线程，避免退出时被 join 拖住
+    err1 = excinfo1.value
+    assert isinstance(err1, DataSourceError)
+    assert factor_ic._classify_error(err1) == "timeout"
+    reason1 = factor_ic._job_reason([], 0, 0, {}, error_kind="timeout", error_msg=str(err1))
+    assert reason1 and "取数超时" in reason1
+
+    phase2_release = threading.Event()
+
+    def blocking_phase2(symbol):
+        phase2_release.wait(30)
+
+    def call():
+        return src._call_with_timeout(blocking_phase2, "600000")
+
+    try:
+        with pytest.raises(DataSourceError) as excinfo2:
+            src._call_with_retry("probe_kline", call, None)
+    finally:
+        phase2_release.set()
+    err2 = excinfo2.value
+    assert factor_ic._classify_error(err2) == "timeout"
+    reason2 = factor_ic._job_reason([], 0, 0, {}, error_kind="timeout", error_msg=str(err2))
+    assert reason2 and "取数超时" in reason2
