@@ -207,3 +207,119 @@ def test_persist_skips_all_zero_sample_batch(monkeypatch):
             for index in range(3)]
     assert factor_ic.persist_history(rows) == 0
     assert entered == []
+
+
+def _frame(start="2026-06-01", end="2026-09-15"):
+    dates = pd.bdate_range(start, end).strftime("%Y-%m-%d").tolist()
+    return pd.DataFrame({"date": dates, "open": 1.0, "high": 1.0, "low": 1.0,
+                         "close": [float(i + 1) for i in range(len(dates))], "volume": 100.0})
+
+
+def _stub_store(monkeypatch, frame=None, error=None):
+    """替身本地仓库：按需返回整段 frame / 空 / 混口径异常，并记录回写行。"""
+    writes: list[dict] = []
+
+    class Store:
+        class MixedAdjustError(ValueError):
+            pass
+
+        @staticmethod
+        def load_frame(code, start, end):
+            if error is not None:
+                raise error
+            return None if frame is None else frame.copy()
+
+        @staticmethod
+        def upsert_bars(rows):
+            writes.extend(rows)
+            return len(rows)
+
+    monkeypatch.setattr(factor_ic, "kline_store", Store)
+    return writes
+
+
+class _LocalOnlySource:
+    """本地库已覆盖时，任何远端日K调用都算失败。"""
+
+    def fetch_daily_kline(self, *args, **kwargs):
+        raise AssertionError("本地库已覆盖区间时不得回退远端")
+
+    def fetch_industry_spot(self):
+        return None
+
+    def fetch_financial(self, code):
+        return None
+
+    def fetch_fund_flow(self, code):
+        return None
+
+    def fetch_news(self, code):
+        return None
+
+
+def test_local_kline_used_when_window_covered(monkeypatch):
+    _stub_store(monkeypatch, _frame())
+    out = factor_ic._local_kline("600000", "2026-06-16", "2026-09-14")
+    assert out is not None and not out.empty and {"date", "close"}.issubset(out.columns)
+
+
+def test_local_kline_falls_back_when_window_head_missing(monkeypatch):
+    """区间首段缺失（回补未完成/新股）时必须回退远端，不能用半段历史算 IC。"""
+    _stub_store(monkeypatch, _frame("2026-08-01", "2026-09-15"))
+    assert factor_ic._local_kline("600000", "2026-06-16", "2026-09-14") is None
+
+
+def test_local_kline_falls_back_on_mixed_adjust(monkeypatch):
+    class Store:
+        class MixedAdjustError(ValueError):
+            pass
+
+        @staticmethod
+        def load_frame(code, start, end):
+            raise Store.MixedAdjustError("mixed")
+
+    monkeypatch.setattr(factor_ic, "kline_store", Store)
+    assert factor_ic._local_kline("600000", "2026-06-16", "2026-09-14") is None
+
+
+def test_collect_prefers_local_warehouse_and_covers_every_code(monkeypatch):
+    """命中本地库时不得回退远端；并发采集须覆盖全部代码且预算未耗尽。"""
+    _stub_store(monkeypatch, _frame())
+    monkeypatch.setattr(factor_ic.factor_registry, "list_active", lambda: [_definition("f01")])
+    stats: dict = {}
+    records = factor_ic.collect_month_records(
+        _LocalOnlySource(), ["2026-07-31"], ["600000", "000001", "600002"], 60, stats=stats)
+    assert stats["attempted"] == 3
+    assert stats["budget_exhausted"] is False
+    assert sorted(row["code"] for row in records["2026-07"]) == ["000001", "600000", "600002"]
+
+
+def test_collect_falls_back_to_remote_when_local_missing(monkeypatch):
+    """本地无覆盖时必须回退远端日K（本地化只是加速，不得改变数据来源语义）。"""
+    calls: list[str] = []
+    writes = _stub_store(monkeypatch, None)
+    monkeypatch.setattr(factor_ic.factor_registry, "list_active", lambda: [_definition("f01")])
+
+    class Source:
+        def fetch_daily_kline(self, code, start, end):
+            calls.append(code)
+            return _frame()
+
+        def fetch_industry_spot(self):
+            return None
+
+        def fetch_financial(self, code):
+            return None
+
+        def fetch_fund_flow(self, code):
+            return None
+
+        def fetch_news(self, code):
+            return None
+
+    records = factor_ic.collect_month_records(Source(), ["2026-07-31"], ["600000", "000001"], 60, stats={})
+    assert sorted(calls) == ["000001", "600000"]
+    assert len(records["2026-07"]) == 2
+    # 首轮远端取数须回写本地仓库（下一轮同票才能走本地）
+    assert {row["stock_code"] for row in writes} == {"600000", "000001"}
+    assert all(row["adjust"] == "qfq" and row["trade_date"] for row in writes)

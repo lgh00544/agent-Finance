@@ -1,6 +1,8 @@
 """因子 IC 月度回测：只读行情，结果写入独立历史表。"""
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from math import isfinite
 
@@ -21,6 +23,7 @@ from app.db.models import FactorIcHistory
 from app.db.session import SessionLocal
 from app.factors import factor_registry
 from app.factors.data_adapter import DataAdapter, num
+from app.services import kline_store
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,14 @@ UNIVERSE_LIMIT = 300
 # 采不满 MIN_SAMPLE 会让已有效的 ir 被 upsert 回 NULL，故按目标样本数反推预算。
 COLLECT_TARGET_SAMPLES = settings.factor_ic_target_samples
 COLLECT_BUDGET_SECONDS = int(COLLECT_TARGET_SAMPLES * settings.factor_ic_seconds_per_code)
+# 采集并发：单票含 4 次串行外呼（日K+财务/资金/新闻），串行 300 票必超预算；
+# 只并行「票与票之间」，票内顺序与产物不变。源站反爬与 socket 全局超时副作用见
+# akshare_source._call_with_timeout 文档，故不取更高并发。
+COLLECT_WORKERS = 4
+# 本地日线仓库优先的覆盖容差（自然日）：首根 ≤ start+FIRST 且末根 ≥ min(end,今天)-LAST
+# 才采用本地序列；新股/停牌/回补未完成一律回退远端，宁慢不错。
+LOCAL_KLINE_FIRST_TOLERANCE_DAYS = 20
+LOCAL_KLINE_LAST_TOLERANCE_DAYS = 10
 
 
 def _rank(values):
@@ -143,10 +154,63 @@ def _fetch_once(source, method: str, *args):
     return value if value is not None else pd.DataFrame()
 
 
+def _shift_date(date: str, days: int) -> str:
+    """自然日平移（本地库覆盖判定用）"""
+    return (datetime.strptime(str(date)[:10], "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _local_kline(code: str, start: str, end: str):
+    """本地日线仓库优先：仅当 [start, end] 首尾均被覆盖时采用，否则返回 None 由调用方回退远端。
+
+    覆盖容差见 LOCAL_KLINE_*：用以区分「回补未完成」与「该票本就短历史」——新股/长期停牌会判为
+    未覆盖而回退远端。宁慢不错：绝不用半段历史算 IC。
+    """
+    try:
+        frame = kline_store.load_frame(code, start, end)
+    except kline_store.MixedAdjustError:
+        return None
+    except Exception:  # noqa: BLE001 本地库缺表/被锁等一律回退远端
+        return None
+    if frame is None or frame.empty or not {"date", "close"}.issubset(frame.columns):
+        return None
+    dates = [str(value)[:10] for value in frame["date"].tolist()]
+    if dates[0] > _shift_date(start, LOCAL_KLINE_FIRST_TOLERANCE_DAYS):
+        return None
+    tail = min(str(end)[:10], datetime.now().strftime("%Y-%m-%d"))
+    if dates[-1] < _shift_date(tail, -LOCAL_KLINE_LAST_TOLERANCE_DAYS):
+        return None
+    return frame
+
+
+def _warm_local(code: str, kline) -> None:
+    """把远端取到的日K回写本地仓库（best-effort）：首轮付远端成本，后续轮次直接走本地。
+
+    只写 qfq 口径（与 fetch_daily_kline 默认口径一致）；本地加速失败绝不影响回测结果。
+    """
+    try:
+        rows = []
+        for rec in kline.to_dict("records"):
+            close = rec.get("close")
+            if close is None or close != close:  # NaN 行跳过
+                continue
+            rows.append({"stock_code": code, "trade_date": str(rec.get("date"))[:10],
+                         "open": rec.get("open"), "high": rec.get("high"), "low": rec.get("low"),
+                         "close": close, "volume": rec.get("volume"), "amount": rec.get("amount"),
+                         "source": "factor_ic", "adjust": "qfq"})
+        if rows:
+            kline_store.upsert_bars(rows)
+    except Exception:  # noqa: BLE001 本地加速失败不得影响回测
+        pass
+
+
 def collect_month_records(source, month_ends: list[str], codes: list[str],
                           budget_seconds: float | None = COLLECT_BUDGET_SECONDS,
                           stats: dict | None = None) -> dict[str, list[dict]]:
-    """stats 为可选出参：回填 attempted / budget_exhausted / elapsed，供调用方判断是否采满。"""
+    """stats 为可选出参：回填 attempted / budget_exhausted / elapsed，供调用方判断是否采满。
+
+    采集按票并发（COLLECT_WORKERS）：只并行「票与票之间」，票内 4 次外呼顺序与产物不变；
+    本地日线仓库覆盖区间时优先读本地（kline_store），否则回退远端。
+    """
     records = {d[:7]: [] for d in month_ends}
     if stats is not None:
         stats["budget_exhausted"] = False
@@ -154,24 +218,29 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
     if not month_ends or not codes:
         return records
     started = time.monotonic()
+    deadline = started + budget_seconds if budget_seconds else None
     start = (datetime.strptime(month_ends[0], "%Y-%m-%d") - timedelta(days=45)).strftime("%Y-%m-%d")
     end = (datetime.strptime(month_ends[-1], "%Y-%m-%d") + timedelta(days=45)).strftime("%Y-%m-%d")
     definitions = factor_registry.list_active()
     sectors = _fetch_once(source, "fetch_industry_spot")  # 全市场板块：整跑共用一份
-    attempted = 0
-    for code in codes:
-        # 墙钟护栏：超预算即停，保证任务必定结束并落库已采数据（不出现「跑不完 → 数据空」）
-        if budget_seconds and attempted and time.monotonic() - started > budget_seconds:
-            if stats is not None:
-                stats["budget_exhausted"] = True
-            logger.warning("因子 IC 采集超墙钟预算 %.0fs：已尝试 %d/%d 只，停止并落库已采部分",
-                           budget_seconds, attempted, len(codes))
-            break
-        attempted += 1
+    guard = threading.Lock()
+    state = {"attempted": 0, "stopped": False}
+
+    def _one(code: str) -> None:
+        # 墙钟护栏：超预算即不再开新票，保证任务必定结束并落库已采数据（不出现「跑不完 → 数据空」）
+        with guard:
+            if deadline and time.monotonic() > deadline:
+                state["stopped"] = True
+                return
+            state["attempted"] += 1
         try:
-            kline = source.fetch_daily_kline(code, start, end)
+            kline = _local_kline(code, start, end)
+            if kline is None:
+                kline = source.fetch_daily_kline(code, start, end)
+                if kline is not None and not kline.empty:
+                    _warm_local(code, kline)  # 首轮回写本地，下一轮同票即走本地序列
             if kline is None or kline.empty or not {"date", "close"}.issubset(kline.columns):
-                continue
+                return
             kline = kline.sort_values("date").reset_index(drop=True)
             # 外挂数据每票只取一次（36 个月快照共用一份）；quote 置空：
             # 实时快照对历史月份属前视数据，且单次可达 88s（全市场快照兜底）。
@@ -179,6 +248,7 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
                    "financial": _fetch_once(source, "fetch_financial", code),
                    "fund_flow": _fetch_once(source, "fetch_fund_flow", code),
                    "news": _fetch_once(source, "fetch_news", code)}
+            rows: list[tuple] = []
             for snapshot in month_ends:
                 hits = kline.index[kline["date"].astype(str).str[:10] == snapshot].tolist()
                 if not hits or hits[0] + FORWARD_DAYS >= len(kline):
@@ -196,13 +266,27 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
                         values[definition.id] = definition.func(adapter, code).value
                     except Exception:
                         values[definition.id] = None
-                records[snapshot[:7]].append({"code": code, "factor_values": values,
-                                               "forward_return": future / close - 1})
+                rows.append((snapshot[:7], {"code": code, "factor_values": values,
+                                            "forward_return": future / close - 1}))
+            for period, row in rows:  # list.append 原子：并发追加不同月份列表安全
+                records[period].append(row)
         except Exception:
-            continue
+            return
+
+    workers = max(1, min(int(COLLECT_WORKERS), len(codes)))
+    if workers == 1:
+        for code in codes:
+            _one(code)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_one, codes))
+    if state["stopped"]:
+        logger.warning("因子 IC 采集超墙钟预算 %.0fs：已尝试 %d/%d 只，停止并落库已采部分",
+                       budget_seconds, state["attempted"], len(codes))
     if stats is not None:
-        stats["attempted"] = attempted
+        stats["attempted"] = state["attempted"]
         stats["elapsed"] = round(time.monotonic() - started, 1)
+        stats["budget_exhausted"] = bool(state["stopped"])
     return records
 
 
