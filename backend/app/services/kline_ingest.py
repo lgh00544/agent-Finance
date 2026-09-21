@@ -56,7 +56,7 @@ def fetch_snapshot(codes: list[str], batch: int = DEFAULT_BATCH, timeout: int = 
     return out, errors
 
 
-def parse_bar(code: str, fields: list[str], fallback_date: str) -> dict | None:
+def parse_bar(code: str, fields: list[str], fallback_date: str, name: str = "") -> dict | None:
     """快照字段 → 日线 bar；价格全 0/空（停牌或无效）返回 None"""
     def num(idx: int):
         try:
@@ -70,7 +70,8 @@ def parse_bar(code: str, fields: list[str], fallback_date: str) -> dict | None:
     trade_date = (fields[_F["date"]] or fallback_date).strip() or fallback_date
     return {"stock_code": code, "trade_date": trade_date, "open": open_ or close, "high": num(_F["high"]) or close,
             "low": num(_F["low"]) or close, "close": close, "volume": num(_F["volume"]),
-            "amount": num(_F["amount"]), "source": "hq_snapshot", "adjust": "none"}
+            "amount": num(_F["amount"]), "stock_name": name,
+            "source": "hq_snapshot", "adjust": "none"}
 
 
 def ingest_today(trade_date: str | None = None, codes: list[str] | None = None,
@@ -82,11 +83,15 @@ def ingest_today(trade_date: str | None = None, codes: list[str] | None = None,
     started = time.time()
     summary = {"trade_date": trade_date or "", "batches": 0, "bars": 0, "skipped": 0,
                "ex_div_codes": [], "errors": [], "seconds": 0.0, "reason": ""}
+    names: dict = {}
     if not codes:
         try:
             from app.datasource.fallback import get_datasource
             spot = get_datasource().fetch_spot_universe()
-            codes = [str(c) for c in spot["code"].tolist()] if spot is not None and not spot.empty else []
+            if spot is not None and not spot.empty:
+                codes = [str(c) for c in spot["code"].tolist()]
+                if "name" in spot.columns:
+                    names = {str(r["code"]): str(r.get("name") or "") for r in spot.to_dict("records")}
         except Exception as exc:  # noqa: BLE001 股票池失败：不落任何行
             summary["reason"] = "error:universe"
             summary["errors"].append(f"{type(exc).__name__}: {str(exc)[:80]}")
@@ -107,10 +112,11 @@ def ingest_today(trade_date: str | None = None, codes: list[str] | None = None,
         if fields is None:
             skipped += 1
             continue
-        bar = parse_bar(code, fields, fallback_date)
+        bar = parse_bar(code, fields, fallback_date, name=names.get(code, ""))
         if bar is None:
             skipped += 1
             continue
+        bar["adjust"] = store.series_adjust(code, path) or bar["adjust"]
         bars.append(bar)
         prev = store.prev_close(code, bar["trade_date"], path)
         if prev and prev > 0:
@@ -120,7 +126,10 @@ def ingest_today(trade_date: str | None = None, codes: list[str] | None = None,
                 pre_close = 0.0
             if pre_close > 0 and abs(pre_close - prev) / prev > EX_DIV_TOL:
                 ex_div.append(code)
-    written = store.upsert_bars(bars, path)
+    # 除权票：**不落当日 bar**（其原始收盘与 qfq 历史不同基准），等重建完成后由回补整段写入，
+    # 避免「重建前窗口」里出现口径混用的序列被扫描读到。
+    ex_div_set = set(ex_div)
+    written = store.upsert_bars([b for b in bars if b["stock_code"] not in ex_div_set], path)
     summary.update(bars=written, skipped=skipped, ex_div_codes=ex_div,
                    trade_date=(bars[0]["trade_date"] if bars else summary["trade_date"]))
     summary["reason"] = "ok"

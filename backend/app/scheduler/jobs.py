@@ -889,6 +889,52 @@ def signal_scan_job() -> None:
         cache.release_lock("signal_scan")
 
 
+MIN_KLINE_BARS_FOR_BACKFILL = 250
+
+
+def kline_backfill_job() -> None:
+    """夜间本地日线历史回补（逐夜分批，可中断续跑）；不占 16:50 扫描窗口。
+
+    只写本地 SQLite；每夜最多 settings.kline_backfill_batch_limit 只（断点靠本地库自身状态）。"""
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        logger.info("今天 %s 非交易日，跳过夜间日线回补", today)
+        return
+    if not cache.acquire_lock("kline_backfill", ttl_seconds=6 * 3600):
+        logger.info("kline_backfill 锁被占用，跳过本次")
+        return
+    try:
+        from app.services import kline_store
+        from app.services.kline_backfill import backfill
+
+        from app.services.kline_backfill import pending_codes
+
+        stats = kline_store.stats()
+        todo = pending_codes(min_bars=MIN_KLINE_BARS_FOR_BACKFILL)
+        limit = settings.kline_backfill_batch_limit
+        if limit and len(todo) > limit:
+            todo = todo[:limit]
+        if not todo:
+            logger.info("夜间日线回补：全部已足 %d 根，无需回补（仓库 %s）",
+                        MIN_KLINE_BARS_FOR_BACKFILL, stats)
+            return
+        names = {}
+        try:
+            from app.datasource.fallback import get_datasource
+            spot = get_datasource().fetch_spot_universe()
+            if spot is not None and not spot.empty and "name" in spot.columns:
+                names = {str(r["code"]): str(r.get("name") or "") for r in spot.to_dict("records")}
+        except Exception as exc:  # noqa: BLE001 名称非必需，缺失退化为空串（is_st 由本地库名兜底）
+            logger.warning("夜间日线回补：股票名称获取失败，退化为空名: %s", exc)
+        summary = backfill(todo, sleep_between=settings.kline_backfill_sleep, names=names,
+                           workers=settings.kline_backfill_workers)
+        logger.info("夜间日线回补完成: %s（仓库 %s）", summary, kline_store.stats())
+    except Exception as exc:  # noqa: BLE001 调度任务整体容错
+        logger.error("夜间日线回补失败: %s", exc)
+    finally:
+        cache.release_lock("kline_backfill")
+
+
 def kline_ingest_job() -> None:
     """本地日线仓库增量（工作日 16:25）；非交易日直接返回，除权票当场重建历史段。"""
     today = time.strftime("%Y-%m-%d")
@@ -959,6 +1005,11 @@ def start_scheduler() -> None:
     scheduler.add_job(kline_ingest_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=25,
                       id="kline_ingest", name="本地日线增量",
+                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
+    # 每夜 00:40 历史回补（逐夜分批、可中断续跑）；**刻意不占 16:50 扫描窗口**
+    scheduler.add_job(kline_backfill_job, "cron",
+                      day_of_week="tue-sat", hour=0, minute=40,
+                      id="kline_backfill", name="本地日线夜间回补",
                       replace_existing=True, misfire_grace_time=3600, max_instances=1)
     # 工作日 16:50 买卖点信号全市场扫描（批 1 只攒数据，不进任何 Agent、不触发交易动作）
     scheduler.add_job(signal_scan_job, "cron",

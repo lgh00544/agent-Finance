@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
+from app.core.config import settings
 from app.datasource import market_hours
 from app.datasource.fallback import get_datasource
 from app.db.models import SignalTrigger
@@ -55,15 +56,36 @@ def _load_keys(trade_date: str) -> tuple[set, set]:
 
 
 def _local_kline(code: str, ctx: dict):
-    """本地日线仓库优先（批1.5）：不足 MIN_BARS 即返回 None，交回远端路径。"""
+    """本地日线仓库优先（批1.5）：不足 MIN_BARS / 复权口径混用 → 记审计计数并返回 None。"""
     try:
         from app.services import kline_store
         if not kline_store.has_enough(code, MIN_BARS):
+            _mark_missing(ctx, code, "incomplete")
             return None
         return kline_store.load_frame(code, ctx["start"], ctx["end"])
+    except kline_store.MixedAdjustError as exc:  # noqa: BLE001 复权漂移：宁可缺数据不算指标
+        logger.warning("本地日线复权口径混用（拒绝计算）%s: %s", code, exc)
+        _mark_missing(ctx, code, "incomplete")
+        return None
     except Exception as exc:  # noqa: BLE001 本地库异常不阻断扫描
         logger.warning("本地日线读取失败 %s: %s", code, exc)
+        _mark_missing(ctx, code, "incomplete")
         return None
+
+
+def _mark_missing(ctx: dict, code: str, kind: str) -> None:
+    """审计计数 + 缺失清单（有上限，避免 summary 爆炸）；stale=本地有但末根不是当日
+
+    计数独立于 counters（local/remote 保持原契约，不破坏既有调用方与测试）。
+    """
+    missing, lock = ctx.get("missing"), ctx.get("lock")
+    if missing is None or lock is None:
+        return
+    with lock:
+        missing[kind] = missing.get(kind, 0) + 1
+        bucket = ctx.setdefault(kind, [])
+        if len(bucket) < 100:
+            bucket.append(code)
 
 
 def _bump(ctx: dict, key: str) -> None:
@@ -82,6 +104,9 @@ def _scan_one(item: dict, ctx: dict) -> tuple[list[dict], int]:
     if kline is not None:
         _bump(ctx, "local")
     else:
+        if ctx.get("local_only"):
+            _mark_missing(ctx, code, "data_missing")
+            return rows, 0
         _bump(ctx, "remote")  # 计入「仍需远端」的尝试（成败都算，用于核实本地覆盖率）
         try:
             kline = ctx["source"].fetch_daily_kline(code, ctx["start"], ctx["end"])
@@ -89,21 +114,25 @@ def _scan_one(item: dict, ctx: dict) -> tuple[list[dict], int]:
             logger.warning("信号扫描日线获取失败 %s: %s", code, exc)
             return rows, 1
     if kline is None or len(kline) < MIN_BARS or "close" not in getattr(kline, "columns", []):
+        _mark_missing(ctx, code, "incomplete")
         return rows, 0
     if "date" in kline.columns:
         kline = kline.sort_values("date")
         if str(kline["date"].iloc[-1])[:10] != ctx["trade_date"]:
-            return rows, 0  # 停牌/无当日行情：不记录
+            _mark_missing(ctx, code, "stale")  # 停牌/本地缺当日 bar：不记录但入清单
+            return rows, 0
     try:
         close = float(kline["close"].iloc[-1])
     except (TypeError, ValueError):
+        _mark_missing(ctx, code, "incomplete")
         return rows, 0
     if not np.isfinite(close):
         return rows, 0
     snap = compute_signal_snapshot(kline)
     if not snap:
         return rows, 0
-    st, limit_up = _flags(code, item["name"], snap.get("change_pct"))
+    name = item.get("name") or ctx.get("names", {}).get(code, "")
+    st, limit_up = _flags(code, name, snap.get("change_pct"))
     errors = 0
     for definition in ctx["defs"]:
         if (code, definition.id) in ctx["today"]:
@@ -168,10 +197,14 @@ def _persist(rows: list[dict]) -> int:
     return done
 
 
-def scan_signal_triggers(trade_date: str | None = None) -> dict:
+def scan_signal_triggers(trade_date: str | None = None, local_only: bool | None = None) -> dict:
     """全市场信号扫描并落表 signal_trigger；非交易日直接返回，不产生任何记录。
 
-    分批 ≤500 只、批内并发、单批失败跳过不影响其他批；总预算 540s，超时保留已完成批次。"""
+    分批 ≤500 只、批内并发、单批失败跳过不影响其他批；总预算 540s，超时保留已完成批次。
+    local_only=True（批1.5）时只读本地日线仓库：缺数据的票记 incomplete/data_missing 并进
+    补数队列，**禁止静默回退逐票远端**，使扫描时长稳定、结果可审计。"""
+    if local_only is None:
+        local_only = settings.kline_scan_local_only
     if not market_hours.is_trading_day():
         return {"trade_date": "", "universe": 0, "records": 0, "errors": 0, "dropped": 0,
                 "reason": "not_trading_day"}
@@ -188,12 +221,22 @@ def scan_signal_triggers(trade_date: str | None = None) -> dict:
                 "reason": "empty_universe"}
     universe = [{"code": str(row.get("code") or ""), "name": str(row.get("name") or "")}
                 for row in spot.to_dict("records") if row.get("code")]
+    if local_only:
+        try:
+            from app.services import kline_store
+            local_names = kline_store.name_map()
+            for item in universe:
+                if not item["name"]:
+                    item["name"] = local_names.get(item["code"], "")
+        except Exception as exc:  # noqa: BLE001 本地名称缺失不阻断（退化为股票池名称）
+            logger.warning("本地日线名称映射读取失败: %s", exc)
     today_keys, cooldown_keys = _load_keys(day)
     ctx = {
         "trade_date": day, "defs": list_all(), "source": source, "today": today_keys,
         "start": (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=_LOOKBACK_DAYS)).strftime("%Y-%m-%d"),
-        "end": day, "cooldown": cooldown_keys,
+        "end": day, "cooldown": cooldown_keys, "local_only": bool(local_only),
         "lock": threading.Lock(), "counters": {"local": 0, "remote": 0},
+        "missing": {"incomplete": 0, "data_missing": 0, "stale": 0},
     }
     records = errors = dropped = 0
     reason = "ok"
@@ -217,8 +260,17 @@ def scan_signal_triggers(trade_date: str | None = None) -> dict:
         records += _persist(rows)
         logger.info("信号扫描批次 %d~%d 命中 %d 条，累计落库 %d 条",
                     offset, offset + len(batch), len(rows), records)
+    counters = ctx["counters"]
+    incomplete, data_missing = ctx["missing"]["incomplete"], ctx["missing"]["data_missing"]
+    stale = ctx["missing"]["stale"]
+    eligible = len(universe) - incomplete - data_missing - stale
     summary = {"trade_date": day, "universe": len(universe), "records": records, "errors": errors,
-               "dropped": dropped, "reason": reason,
-               "local_bars": ctx["counters"]["local"], "remote_bars": ctx["counters"]["remote"]}
+               "dropped": dropped, "reason": reason, "local_only": bool(local_only),
+               "eligible": eligible, "incomplete": incomplete, "data_missing": data_missing,
+               "stale": stale,
+               "coverage_pct": round(eligible * 100.0 / len(universe), 1) if universe else 0.0,
+               "local_bars": counters["local"], "remote_bars": counters["remote"],
+               "incomplete_codes": ctx.get("incomplete", [])[:20],
+               "data_missing_codes": ctx.get("data_missing", [])[:20]}
     logger.info("信号扫描结束 %s: %s", day, summary)
     return summary

@@ -241,6 +241,17 @@ class Settings(BaseSettings):
     factor_ic_target_samples: int = 150       # 目标采样只数（≥ MIN_SAMPLE=100，留网络抖动余量）
     factor_ic_seconds_per_code: float = 30.0  # 单只采集耗时上限（秒）：日K+外挂数据实测 7~63s
 
+    # ---------- 买卖点信号 · 本地日线仓库（批1.5）----------
+    # local_only=True：16:50 扫描只读本地库，不足 250 根的票记 incomplete/data_missing，
+    # 禁止静默回退逐票远端（保证扫描时长稳定、结果可审计）。默认 False 以免回补未完成时覆盖率归零。
+    kline_scan_local_only: bool = False
+    # 夜间历史回补：每个 job 周期最多回补多少只（0=不限）；用于把数小时的全量首填切成多夜。
+    kline_backfill_batch_limit: int = 300
+    # 夜间回补单只之间的 sleep（秒），控速避免触发源站反爬
+    kline_backfill_sleep: float = 0.5
+    # 夜间回补并发（实测 8 并发 ≈ 2.9 只/s 且不再提升；>1 时忽略 sleep）
+    kline_backfill_workers: int = 8
+
     # ---------- 派生路径 ----------
     @property
     def data_dir(self) -> Path:

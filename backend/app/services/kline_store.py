@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS daily_kline (
     stock_code TEXT NOT NULL,
     trade_date TEXT NOT NULL,
     open REAL, high REAL, low REAL, close REAL, volume REAL, amount REAL,
+    stock_name TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT '',
     adjust TEXT NOT NULL DEFAULT 'qfq',
     updated_at TEXT NOT NULL,
@@ -36,6 +37,17 @@ _INDEXES = (
 )
 
 _BAR_COLS = ("open", "high", "low", "close", "volume", "amount")
+
+
+class MixedAdjustError(ValueError):
+    """同一票区间内混用不同复权口径 —— 禁止据此计算指标（方案 §6 复权漂移门禁）"""
+
+
+def _migrate(conn) -> None:
+    """老库补列（幂等）：stock_name 加入前建的表缺该列，ALTER 一次即可。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_kline)").fetchall()}
+    if "stock_name" not in cols:
+        conn.execute("ALTER TABLE daily_kline ADD COLUMN stock_name TEXT NOT NULL DEFAULT ''")
 
 
 def db_path(path: str | None = None) -> Path:
@@ -62,6 +74,7 @@ def connect(path: str | None = None):
         conn.execute("PRAGMA synchronous=NORMAL")
         for ddl in (_DDL, *_INDEXES):
             conn.execute(ddl)
+        _migrate(conn)
         yield conn
     finally:
         conn.close()
@@ -79,17 +92,20 @@ def upsert_bars(rows: list[dict], path: str | None = None) -> int:
         payload.append((
             str(row["stock_code"]), str(row["trade_date"]),
             *(None if row.get(c) is None else float(row[c]) for c in _BAR_COLS),
+            str(row.get("stock_name") or ""),
             str(row.get("source") or ""), str(row.get("adjust") or "qfq"), now,
         ))
     if not payload:
         return 0
     sql = ("INSERT INTO daily_kline "
-           "(stock_code, trade_date, open, high, low, close, volume, amount, source, adjust, updated_at) "
-           "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+           "(stock_code, trade_date, open, high, low, close, volume, amount, stock_name, source, adjust, updated_at) "
+           "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
            "ON CONFLICT(stock_code, trade_date) DO UPDATE SET "
            "open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close, "
-           "volume=excluded.volume, amount=excluded.amount, source=excluded.source, "
-           "adjust=excluded.adjust, updated_at=excluded.updated_at")
+           "volume=excluded.volume, amount=excluded.amount, "
+           "stock_name=CASE WHEN excluded.stock_name <> '' THEN excluded.stock_name "
+           "ELSE daily_kline.stock_name END, "
+           "source=excluded.source, adjust=excluded.adjust, updated_at=excluded.updated_at")
     with _LOCK, connect(path) as conn:
         conn.executemany(sql, payload)
         conn.commit()
@@ -99,7 +115,7 @@ def upsert_bars(rows: list[dict], path: str | None = None) -> int:
 def load_bars(code: str, start: str | None = None, end: str | None = None,
               path: str | None = None) -> list[dict]:
     """读某票 [start, end] 的日线（升序）；日期为 'YYYY-MM-DD'"""
-    sql = ("SELECT stock_code, trade_date, open, high, low, close, volume, amount "
+    sql = ("SELECT stock_code, trade_date, open, high, low, close, volume, amount, stock_name, adjust "
            "FROM daily_kline WHERE stock_code = ?")
     args: list = [code]
     if start:
@@ -112,20 +128,37 @@ def load_bars(code: str, start: str | None = None, end: str | None = None,
     with connect(path) as conn:
         rows = conn.execute(sql, args).fetchall()
     return [{"stock_code": r[0], "trade_date": r[1], "date": r[1], "open": r[2], "high": r[3],
-             "low": r[4], "close": r[5], "volume": r[6], "amount": r[7]} for r in rows]
+             "low": r[4], "close": r[5], "volume": r[6], "amount": r[7],
+             "stock_name": r[8] or "", "adjust": r[9] or ""} for r in rows]
+
+
+MIXED_ADJUST = "mixed_adjust"
 
 
 def load_frame(code: str, start: str | None = None, end: str | None = None, path: str | None = None):
     """读为 DataFrame（date/open/high/low/close/volume，升序）；不足 1 行返回 None
 
     不注入 change_pct：由 `services/indicator.pct_change` 口径统一推导，避免第二套算法。
+    **复权口径门禁**：区间内 adjust 混用（如 qfq 历史 + 不复权当日且除权重建未完成）时抛
+    `MixedAdjustError`，由调用方记 incomplete —— 宁可缺数据也不算出被污染的 MA/MACD。
     """
     rows = load_bars(code, start, end, path)
     if not rows:
         return None
+    adjusts = {str(r.get("adjust") or "") for r in rows}
+    if len(adjusts) > 1:
+        raise MixedAdjustError("%s: adjust=%s" % (code, sorted(adjusts)))
     import pandas as pd
     frame = pd.DataFrame(rows)
     return frame[["date", "open", "high", "low", "close", "volume"]]
+
+
+def name_map(path: str | None = None) -> dict:
+    """{stock_code: stock_name}：给扫描判定 is_st 用（本地库已存名称时无需再取股票池）"""
+    with connect(path) as conn:
+        rows = conn.execute(
+            "SELECT stock_code, MAX(stock_name) FROM daily_kline GROUP BY stock_code").fetchall()
+    return {r[0]: (r[1] or "") for r in rows}
 
 
 def prev_close(code: str, before: str, path: str | None = None) -> float | None:
@@ -151,6 +184,30 @@ def has_enough(code: str, min_bars: int, path: str | None = None) -> bool:
     with connect(path) as conn:
         n = conn.execute("SELECT COUNT(*) FROM daily_kline WHERE stock_code = ?", (code,)).fetchone()[0]
     return int(n) >= int(min_bars)
+
+
+def series_adjust(code: str, path: str | None = None) -> str | None:
+    """该票本地序列当前的复权口径（取最近一根的 adjust）；无数据返回 None
+
+    日增量据此继承口径：当日快照与 qfq 在「非除权日」等价（核验结论 v2 §11.4），
+    故追加当日 bar 时沿用历史口径即可；除权日由 ingest 检出后触发重建，不会静默混用。
+    """
+    with connect(path) as conn:
+        row = conn.execute(
+            "SELECT adjust FROM daily_kline WHERE stock_code = ? "
+            "ORDER BY trade_date DESC LIMIT 1", (code,)).fetchone()
+    return None if row is None else (row[0] or "")
+
+
+def codes_below(min_bars: int, path: str | None = None) -> list:
+    """返回 [(code, 已有根数, name)]，仅含不足 min_bars 的票（夜间回补的待办清单）
+
+    不含本地库里完全没有记录的票 —— 那些由调用方用股票池补齐（首次全量回补场景）。"""
+    with connect(path) as conn:
+        rows = conn.execute(
+            "SELECT stock_code, COUNT(*) n, MAX(stock_name) FROM daily_kline "
+            "GROUP BY stock_code HAVING n < ? ORDER BY n ASC", (int(min_bars),)).fetchall()
+    return [(r[0], int(r[1]), r[2] or "") for r in rows]
 
 
 def delete_code(code: str, path: str | None = None) -> int:

@@ -7,6 +7,7 @@
 - 单只失败只计数不抛出；批间 sleep 控速，避免触发源站反爬。
 """
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from app.services import kline_store as store
@@ -18,7 +19,7 @@ SLEEP_BETWEEN = 0.5
 
 
 def fetch_history(code: str, source=None, lookback_days: int = LOOKBACK_DAYS,
-                  end_date: str | None = None) -> list[dict]:
+                  end_date: str | None = None, name: str = "") -> list[dict]:
     """拉一只票历史日线（qfq）→ 本地行列表；空/异常返回 []（不抛出）"""
     end = end_date or time.strftime("%Y-%m-%d")
     start = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -39,13 +40,37 @@ def fetch_history(code: str, source=None, lookback_days: int = LOOKBACK_DAYS,
         rows.append({"stock_code": code, "trade_date": str(rec.get("date"))[:10], "open": rec.get("open"),
                      "high": rec.get("high"), "low": rec.get("low"), "close": close,
                      "volume": rec.get("volume"), "amount": rec.get("amount"),
-                     "source": "backfill", "adjust": "qfq"})
+                     "stock_name": name, "source": "backfill", "adjust": "qfq"})
     return rows
+
+
+def pending_codes(path: str | None = None, codes: list[str] | None = None,
+                 min_bars: int = MIN_BARS) -> list:
+    """待回补清单：已足够的不算；**本地完全没记录的票也算**（首次全量填充的关键）
+
+    codes 为空时用股票池补全「库里没记录的」部分；返回去重后的代码列表。
+    """
+    with store.connect(path) as conn:
+        rows = conn.execute(
+            "SELECT stock_code, COUNT(*) FROM daily_kline GROUP BY stock_code").fetchall()
+    have = {r[0]: int(r[1]) for r in rows}
+    pool = codes
+    if pool is None:
+        try:
+            from app.datasource.fallback import get_datasource
+            spot = get_datasource().fetch_spot_universe()
+            pool = [str(c) for c in spot["code"].tolist()] if spot is not None and not spot.empty else []
+        except Exception:  # noqa: BLE001 股票池失败：退化为仅本地已知的不足票
+            pool = []
+    known = {r[0] for r in rows}
+    merged = list(dict.fromkeys([str(c) for c in pool if str(c)] + [c for c in known if c not in pool]))
+    return [c for c in merged if have.get(c, 0) < min_bars]
 
 
 def backfill(codes: list[str], path: str | None = None, batch_size: int = BATCH_SIZE,
              min_bars: int = MIN_BARS, rebuild: bool = False, lookback_days: int = LOOKBACK_DAYS,
-             sleep_between: float = SLEEP_BETWEEN, source=None, on_progress=None) -> dict:
+             sleep_between: float = SLEEP_BETWEEN, source=None, on_progress=None,
+             names: dict | None = None, workers: int = 1) -> dict:
     """批量回补或重建；返回 {requested, written_bars, ok, skipped, failed, seconds}"""
     started = time.time()
     todo = [str(c) for c in codes if str(c)]
@@ -57,21 +82,52 @@ def backfill(codes: list[str], path: str | None = None, batch_size: int = BATCH_
     if source is None:
         from app.datasource.fallback import get_datasource
         source = get_datasource()
-    for i, code in enumerate(todo):
+    names = names or {}
+    n_total = len(todo)
+
+    def _one(code: str) -> tuple:
         if not rebuild and store.has_enough(code, min_bars, path):
-            summary["skipped"] += 1
-            continue
-        rows = fetch_history(code, source=source, lookback_days=lookback_days)
+            return code, "skipped", 0
+        rows = fetch_history(code, source=source, lookback_days=lookback_days,
+                             name=names.get(code, ""))
         if len(rows) < min_bars:
-            summary["failed"] += 1
-            if len(summary["failed_codes"]) < 20:
-                summary["failed_codes"].append(code)
-        else:
-            summary["written_bars"] += store.upsert_bars(rows, path)
-            summary["ok"] += 1
-        if on_progress is not None and (i + 1) % 50 == 0:
-            on_progress(i + 1, len(todo), summary)
-        if len(todo) > batch_size and (i + 1) % batch_size == 0:
-            time.sleep(sleep_between)
+            return code, "failed", 0
+        return code, "ok", store.upsert_bars(rows, path)
+
+    done = 0
+    if workers and workers > 1 and n_total > workers:
+        pool = ThreadPoolExecutor(max_workers=int(workers))
+        try:
+            for code, status, n in pool.map(_one, todo):
+                if status == "skipped":
+                    summary["skipped"] += 1
+                elif status == "failed":
+                    summary["failed"] += 1
+                    if len(summary["failed_codes"]) < 20:
+                        summary["failed_codes"].append(code)
+                else:
+                    summary["ok"] += 1
+                    summary["written_bars"] += n
+                done += 1
+                if on_progress is not None and done % 50 == 0:
+                    on_progress(done, n_total, summary)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    else:
+        for i, code in enumerate(todo):
+            _, status, n = _one(code)
+            if status == "skipped":
+                summary["skipped"] += 1
+            elif status == "failed":
+                summary["failed"] += 1
+                if len(summary["failed_codes"]) < 20:
+                    summary["failed_codes"].append(code)
+            else:
+                summary["ok"] += 1
+                summary["written_bars"] += n
+            if on_progress is not None and (i + 1) % 50 == 0:
+                on_progress(i + 1, n_total, summary)
+            if len(todo) > batch_size and (i + 1) % batch_size == 0:
+                time.sleep(sleep_between)
     summary["seconds"] = round(time.time() - started, 1)
     return summary

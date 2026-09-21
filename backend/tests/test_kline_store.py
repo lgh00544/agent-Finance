@@ -225,3 +225,79 @@ def test_scan_falls_back_to_remote_and_tolerates_ctx_without_counters(monkeypatc
               "today": set(), "cooldown": set(), "start": "2025-07-28", "end": TRADE_DATE}
     rows2, errors2 = signal_scan._scan_one({"code": "Y", "name": "y"}, legacy)
     assert (rows2, errors2) == ([], 0)  # 无 counters/lock 的旧 ctx（外部干跑工具）不得报错
+
+
+# ==================== 批1.5 门禁与审计（复权口径 / 名称 / local-only）====================
+
+
+def _bars_none(code="600519", n=260, last=TRADE_DATE, close=10.0):
+    """与 _bars 同构但 adjust='none'（当日快照口径），供复权门禁测试"""
+    rows = _bars(code=code, n=n, last=last, close=close)
+    for r in rows:
+        r["adjust"] = "none"
+        r["stock_name"] = "测试"
+    return rows
+
+
+def test_upsert_persists_stock_name_and_name_map(tmp_path):
+    db = str(tmp_path / "k.db")
+    kline_store.upsert_bars(_bars_none(code="600519", n=3), db)
+    assert kline_store.name_map(db) == {"600519": "测试"}
+
+
+def test_empty_name_does_not_overwrite_existing(tmp_path):
+    db = str(tmp_path / "k.db")
+    kline_store.upsert_bars([{"stock_code": "600519", "trade_date": "2026-09-17",
+                              "close": 1.0, "stock_name": "贵州茅台", "adjust": "qfq"}], db)
+    kline_store.upsert_bars([{"stock_code": "600519", "trade_date": "2026-09-17",
+                              "close": 1.0, "stock_name": "", "adjust": "qfq"}], db)
+    assert kline_store.name_map(db) == {"600519": "贵州茅台"}
+
+
+def test_mixed_adjust_raises_and_blocks_indicators(tmp_path):
+    db = str(tmp_path / "k.db")
+    kline_store.upsert_bars([{"stock_code": "X", "trade_date": "2026-09-17", "close": 1.0, "adjust": "qfq"},
+                             {"stock_code": "X", "trade_date": "2026-09-18", "close": 1.1, "adjust": "none"}], db)
+    with pytest.raises(kline_store.MixedAdjustError):
+        kline_store.load_frame("X", path=db)
+
+
+def test_ingest_skips_ex_dividend_bar_until_rebuild(tmp_path, monkeypatch):
+    """除权票当天不落原始 bar（口径不同基准），只登记待重建，避免污染序列"""
+    path = str(tmp_path / "k.db")
+    monkeypatch.setenv("KLINE_DB_PATH", path)
+    kline_store.upsert_bars([{"stock_code": "600519", "trade_date": "2026-09-17", "close": 10.0,
+                              "adjust": "qfq", "stock_name": "贵州茅台"}], path)
+    mapping = {"600519": _fields(pre=8.0, close=8.0)}          # 快照昨收 8.0 ≠ 本地前收 10.0
+    monkeypatch.setattr(kline_ingest, "fetch_snapshot", lambda codes, **kw: (mapping, []))
+    out = kline_ingest.ingest_today(TRADE_DATE, codes=["600519"], path=path)
+    assert out["ex_div_codes"] == ["600519"]
+    assert out["bars"] == 0                                     # 未写当日 bar
+    dates = [r["trade_date"] for r in kline_store.load_bars("600519", path=path)]
+    assert dates == ["2026-09-17"]                              # 本地序列保持干净
+
+
+def test_local_only_marks_data_missing_and_never_touches_remote(tmp_path, monkeypatch):
+    db = str(tmp_path / "k.db")
+    monkeypatch.setenv("KLINE_DB_PATH", db)
+    ctx = {"trade_date": TRADE_DATE, "start": "2025-07-25", "end": TRADE_DATE, "defs": [],
+           "source": _NoRemote(), "today": set(), "cooldown": set(), "local_only": True,
+           "lock": threading.Lock(), "counters": {"local": 0, "remote": 0},
+           "missing": {"incomplete": 0, "data_missing": 0, "stale": 0}}
+    rows, errors = signal_scan._scan_one({"code": "600519", "name": ""}, ctx)
+    assert rows == [] and errors == 0
+    assert ctx["counters"] == {"local": 0, "remote": 0}
+    assert ctx["missing"]["data_missing"] == 1 and ctx["data_missing"] == ["600519"]
+
+
+def test_local_only_marks_stale_when_last_bar_not_today(tmp_path, monkeypatch):
+    db = str(tmp_path / "k.db")
+    monkeypatch.setenv("KLINE_DB_PATH", db)
+    kline_store.upsert_bars(_bars_none(code="600519", n=260, last="2026-09-17"), db)
+    ctx = {"trade_date": TRADE_DATE, "start": "2025-07-25", "end": TRADE_DATE, "defs": [],
+           "source": _NoRemote(), "today": set(), "cooldown": set(), "local_only": True,
+           "lock": threading.Lock(), "counters": {"local": 0, "remote": 0},
+           "missing": {"incomplete": 0, "data_missing": 0, "stale": 0}}
+    rows, errors = signal_scan._scan_one({"code": "600519", "name": ""}, ctx)
+    assert rows == [] and ctx["counters"]["local"] == 1
+    assert ctx["missing"]["stale"] == 1 and ctx["stale"] == ["600519"]
