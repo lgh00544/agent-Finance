@@ -1,9 +1,9 @@
 import { useState } from 'react'
-import { Alert, App, Button, Card, Col, Row, Space, Tag, Typography } from 'antd'
+import { Alert, App, Button, Card, Col, Collapse, Row, Space, Table, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { dashboard, jobStatus, llmStats as fetchLlm, datasourceStats as fetchDs } from '@/api/system'
 import { recentTasks, retryTask } from '@/api/tasks'
-import { hotSectors, marketCondition, marketIndices } from '@/api/market'
+import { fetchOvernightFactor, hotSectors, marketCondition, marketIndices } from '@/api/market'
 import { holdingQuotes, redLineCheck, takeProfitPlan } from '@/api/holdings'
 import { todayPnlEstimate } from '@/api/account'
 import { getAuditStats } from '@/api/audit'
@@ -12,7 +12,7 @@ import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { ChartCard, hotSectorBarOption } from '@/components/charts/ChartCard'
 import { EmptyState, ErrorCard, StatCard, StatCardGrid, StockLabel } from '@/components/common'
 import { PaperTradingPanel } from '@/components/PaperTradingPanel'
-import type { AccountPnl, HotSector, TodayPnlEstimate } from '@/types'
+import type { AccountPnl, HotSector, OvernightFactorResponse, TodayPnlEstimate } from '@/types'
 
 const { Text } = Typography
 
@@ -44,6 +44,38 @@ function bandColor(b: string): string {
 /** 严格度档位 → Tag 色（宽松绿/标准蓝/严格橙/极严红） */
 function strictColor(s: string): string {
   return s.includes('宽松') ? 'green' : s.includes('标准') ? 'blue' : s.includes('严格') ? 'orange' : s.includes('极严') ? 'red' : 'default'
+}
+
+/** 美股隔夜因子档位 → Tag 色（低开=绿 / 偏空=浅绿 / 噪声区=灰 / 偏多=浅红 / 高开=红，红涨绿跌对齐现有） */
+function overnightBandColor(b: string): string {
+  if (b.includes('低开')) return 'green'
+  if (b.includes('偏空')) return 'lime'
+  if (b.includes('噪声')) return 'default'
+  if (b.includes('偏多')) return 'volcano'
+  if (b.includes('高开')) return 'red'
+  return 'default'
+}
+
+/** 美股隔夜因子预测方向 → Tag 色（低开=绿 / 高开=红 / 不押注=灰） */
+function overnightPredColor(p: string): string {
+  if (p.includes('低开')) return 'green'
+  if (p.includes('高开')) return 'red'
+  return 'default'
+}
+
+/** 因子值 → 百分比 2 位小数（后端为小数形式如 0.0234；已是百分数时绝对值 <5 直接按百分数处理兜底） */
+function fmtOvernightFactor(v: number | null | undefined): string {
+  if (v == null || Number.isNaN(Number(v))) return '—'
+  const n = Number(v)
+  const pct = Math.abs(n) < 5 ? n * 100 : n
+  return `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`
+}
+
+/** 美股隔夜因子明细涨跌幅 cell：红涨绿跌对齐现有 */
+function overnightPctCell(v: number | null | undefined) {
+  if (v == null || Number.isNaN(Number(v))) return <Text type="secondary">—</Text>
+  const n = Number(v)
+  return <span style={{ color: n >= 0 ? '#cf1322' : '#389e0d' }}>{n >= 0 ? '+' : ''}{n.toFixed(2)}%</span>
 }
 
 /** 今日盈亏（推算）cell：现价−昨收 × 股数；原同花顺三态逻辑保留于 if(false)（2026-09-16 下线） */
@@ -247,6 +279,13 @@ export function OverviewPage() {
     queryKey: ['audit-stats'], queryFn: getAuditStats,
     staleTime: 60_000, refetchInterval: 60_000, retry: 0,
   })
+  // 美股隔夜因子（21:30 后自动采集 / 开盘后校验；只读展示，失败静默降级不影响其他模块）
+  const { data: overnight } = useQuery<OvernightFactorResponse>({
+    queryKey: ['overnight-factor'],
+    queryFn: fetchOvernightFactor,
+    refetchInterval: 5 * 60_000,
+    retry: 0,
+  })
   // 持仓红线预警（复用已有 /red_line_check，5 分钟轮询平衡开销）
   const { data: redRes } = useQuery({
     queryKey: ['red-line-check'],
@@ -304,6 +343,16 @@ export function OverviewPage() {
     { key: 'sl', label: '止损触发', color: 'red', rows: stopLossHits, reason: () => '现价≤止损' },
     { key: 'rl', label: '红线预警', color: 'orange', rows: redLineHits, reason: redReason },
     { key: 'ql', label: '正常', color: 'default', rows: normalHits, reason: () => '无触发' },
+  ]
+
+  // 美股隔夜因子展示数据（latest 为空 → 占位）
+  const overnightLatest = overnight?.latest ?? null
+  const overnightRows = (overnightLatest?.stocks_detail ?? []) as Array<Record<string, unknown>>
+  const overnightDetailColumns = [
+    { title: '代码', dataIndex: 'symbol', key: 'symbol', render: (v: unknown) => <Text>{String(v ?? '—')}</Text> },
+    { title: '名称', dataIndex: 'name', key: 'name', render: (v: unknown) => <Text>{String(v ?? '—')}</Text> },
+    { title: '价格', dataIndex: 'price', key: 'price', render: (v: unknown) => <Text>{v == null ? '—' : Number(v).toFixed(2)}</Text> },
+    { title: '涨跌幅', dataIndex: 'change_pct', key: 'change_pct', render: (v: unknown) => overnightPctCell(v == null ? null : Number(v)) },
   ]
 
   return (
@@ -394,6 +443,74 @@ export function OverviewPage() {
           <EmptyState
             text={tradeableStatus === 'ready' ? '判定已完成，今日暂无可建仓标的' : tradeableStatus === 'pending' ? '今日可建仓判定尚未生成' : tradeableStatus === 'error' ? '可建仓判定读取失败' : '可建仓判定状态未知'}
             icon="—" />
+        )}
+      </Card>
+
+      {/* ② 美股隔夜因子（21:30 后自动采集；只读展示，不参与 A 股决策；latest 为空占位） */}
+      <Card size="small" title="美股隔夜因子" style={{ background: 'var(--bg-card)', marginBottom: 12 }}>
+        {overnightLatest ? (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>交易日</Text>
+                <div style={{ marginTop: 2 }}><Text strong>{String(overnightLatest.trade_date ?? '—')}</Text></div>
+              </div>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>因子值</Text>
+                <div style={{ marginTop: 2 }}><Text strong>{fmtOvernightFactor(overnightLatest.factor_value ?? null)}</Text></div>
+              </div>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>档位</Text>
+                <div style={{ marginTop: 2 }}>
+                  <Tag color={overnightBandColor(String(overnightLatest.band ?? ''))}>{String(overnightLatest.band ?? '—')}</Tag>
+                </div>
+              </div>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>预测方向</Text>
+                <div style={{ marginTop: 2 }}>
+                  <Tag color={overnightPredColor(String(overnightLatest.prediction ?? ''))}>{String(overnightLatest.prediction ?? '—')}</Tag>
+                </div>
+              </div>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>上涨家数</Text>
+                <div style={{ marginTop: 2 }}>
+                  <Text strong>{overnightLatest.up_count != null ? `${overnightLatest.up_count}/10` : '—'}</Text>
+                </div>
+              </div>
+              {overnightLatest.actual_gap != null ? (
+                <div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>实际缺口</Text>
+                  <div style={{ marginTop: 2 }}>
+                    <Text strong style={{ color: Number(overnightLatest.actual_gap) >= 0 ? '#cf1322' : '#389e0d' }}>
+                      {Number(overnightLatest.actual_gap) >= 0 ? '+' : ''}{Number(overnightLatest.actual_gap).toFixed(2)}%
+                    </Text>
+                    <Tag color={overnightLatest.is_correct ? 'green' : 'red'} style={{ marginLeft: 4 }}>
+                      {overnightLatest.is_correct ? '命中' : '未命中'}
+                    </Tag>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>开盘校验</Text>
+                  <div style={{ marginTop: 2 }}><Text type="secondary">待开盘后校验</Text></div>
+                </div>
+              )}
+            </div>
+            {overnightLatest.notes ? (
+              <Alert type="info" showIcon style={{ marginTop: 8, padding: '4px 8px' }} message={String(overnightLatest.notes)} />
+            ) : null}
+            <Collapse ghost size="small" style={{ marginTop: 8 }}
+              items={[{
+                key: 'detail',
+                label: `明细（${overnightRows.length} 只）`,
+                children: (
+                  <Table size="small" rowKey={(r) => String(r.symbol ?? (r as Record<string, unknown>).name ?? '')}
+                    columns={overnightDetailColumns} dataSource={overnightRows} pagination={false} />
+                ),
+              }]} />
+          </>
+        ) : (
+          <EmptyState text="暂无数据（21:30 后自动采集）" icon="—" />
         )}
       </Card>
 

@@ -11,7 +11,7 @@ import os
 import socket
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -718,6 +718,102 @@ def hot_money_win_rate_job() -> None:
         logger.error("游资胜率迭代失败: %s", exc)
 
 
+def _next_a_share_trade_date(now_dt: datetime | None = None) -> str:
+    """下一个A股交易日（简单算法：今天非周末取今天，否则顺延到周一）"""
+    dt = now_dt or datetime.now()
+    if dt.weekday() < 5:
+        return dt.strftime("%Y-%m-%d")
+    days = 2 if dt.weekday() == 5 else 1  # 周六顺延2天（到周一），周日顺延1天
+    return (dt + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def collect_overnight_factor_job() -> None:
+    """美股隔夜因子采集（每天 21:30 北京时间）：周六日跳过；trade_date 取下一个
+    A股交易日；已有该交易日记录则跳过（幂等）；失败只记日志不阻塞其他任务。"""
+    from app.services import overnight_factor
+
+    if not settings.overnight_factor_enabled:
+        logger.info("美股隔夜因子功能未开启，跳过采集")
+        return
+    now = datetime.now()
+    if now.weekday() >= 5:
+        logger.info("周末无美股隔夜参考，跳过隔夜因子采集")
+        return
+    trade_date = _next_a_share_trade_date(now)
+    if not cache.acquire_lock("overnight_factor_collect", ttl_seconds=3600):
+        logger.info("隔夜因子采集任务已在运行，跳过本次")
+        return
+    try:
+        latest = repo.get_latest_us_overnight_factor()
+        if latest and latest["trade_date"] == trade_date:
+            logger.info("交易日 %s 已有隔夜因子记录，跳过采集", trade_date)
+            return
+        data = overnight_factor.compute_overnight_factor(trade_date)
+        repo.upsert_us_overnight_factor(
+            trade_date=trade_date,
+            factor_value=data["factor_value"],
+            band=data["band"],
+            prediction=data["prediction"],
+            up_count=data["up_count"],
+            stocks_detail=data["stocks_detail"],
+            notes=data["notes"],
+        )
+        logger.info("美股隔夜因子采集完成: %s band=%s prediction=%s factor=%.2f%%",
+                    trade_date, data["band"], data["prediction"], data["factor_value"])
+    except Exception as exc:  # noqa: BLE001 定时任务整体容错
+        logger.error("美股隔夜因子采集失败: %s", exc)
+    finally:
+        cache.release_lock("overnight_factor_collect")
+
+
+def verify_overnight_factor_job() -> None:
+    """美股隔夜因子校验（工作日 9:35 开盘后）：拉上证指数今开/昨收计算开盘缺口，
+    对最新一条未校验（actual_gap IS NULL）且押注方向非「不押注」的记录回填
+    actual_gap 与 is_correct（缺口方向与预测一致=True）；失败只记日志不阻塞。"""
+    from app.datasource import us_quote
+
+    if not settings.overnight_factor_enabled:
+        logger.info("美股隔夜因子功能未开启，跳过校验")
+        return
+    today = time.strftime("%Y-%m-%d")
+    if not _is_trading_day(today):
+        logger.info("今天 %s 非交易日，跳过隔夜因子校验", today)
+        return
+    if not cache.acquire_lock("overnight_factor_verify", ttl_seconds=600):
+        logger.info("隔夜因子校验任务已在运行，跳过本次")
+        return
+    try:
+        latest = repo.get_latest_us_overnight_factor()
+        if not latest or latest.get("actual_gap") is not None:
+            logger.info("无待校验的隔夜因子记录，跳过校验")
+            return
+        if latest.get("prediction") == "不押注":
+            logger.info("最新记录为不押注，无需校验")
+            return
+        gap = us_quote.fetch_sh_index_open_gap()
+        if gap is None:
+            logger.warning("上证指数开盘缺口获取失败，本次跳过校验")
+            return
+        prediction = latest["prediction"]
+        is_correct = (prediction == "高开" and gap > 0) or (prediction == "低开" and gap < 0)
+        repo.upsert_us_overnight_factor(
+            trade_date=latest["trade_date"],
+            factor_value=latest["factor_value"],
+            band=latest["band"],
+            prediction=latest["prediction"],
+            up_count=latest["up_count"],
+            stocks_detail=latest["stocks_detail"],
+            actual_gap=gap,
+            is_correct=is_correct,
+        )
+        logger.info("美股隔夜因子校验完成: %s prediction=%s gap=%.2f%% is_correct=%s",
+                    latest["trade_date"], prediction, gap, is_correct)
+    except Exception as exc:  # noqa: BLE001 定时任务整体容错
+        logger.error("美股隔夜因子校验失败: %s", exc)
+    finally:
+        cache.release_lock("overnight_factor_verify")
+
+
 def maintenance_job() -> None:
     """每周空间维护（低频）：超期新闻清理 + SQLite 真空收缩 + 向量库超期索引清理。
     仅清理非核心数据（新闻原文），候选/评分/持仓/复盘等关键分析数据不清理。"""
@@ -1180,6 +1276,17 @@ def start_scheduler() -> None:
     from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
     scheduler.add_listener(_record_job_run, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+    # 美股隔夜因子：每天 21:30 采集（周末/非交易日函数内跳过，幂等）；
+    # 工作日 9:35 校验开盘缺口回填台账（只读观察因子，不参与现有决策）
+    scheduler.add_job(collect_overnight_factor_job, "cron",
+                      hour=settings.overnight_factor_hour,
+                      minute=settings.overnight_factor_minute,
+                      id="overnight_factor_collect", name="美股隔夜因子采集",
+                      replace_existing=True, misfire_grace_time=3600)
+    scheduler.add_job(verify_overnight_factor_job, "cron", day_of_week="mon-fri",
+                      hour=9, minute=35,
+                      id="overnight_factor_verify", name="美股隔夜因子校验",
+                      replace_existing=True, misfire_grace_time=3600)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")
 

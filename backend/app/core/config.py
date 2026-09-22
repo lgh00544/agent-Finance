@@ -125,6 +125,16 @@ class Settings(BaseSettings):
     monitor_interval_minutes: int = 3  # 交易时段持仓监控间隔（分钟）
     monitor_llm_cache_minutes: int = 3  # 监控 LLM 结果缓存（与监控频率同节奏，保证信号时效）
 
+    # ---------- 美股隔夜因子（只读观察因子，默认开启；不参与现有决策链路） ----------
+    # 21:30 采集美股行情计算因子分档落库，次日 9:35 校验开盘缺口写台账；
+    # false 时采集/校验定时任务直接跳过（函数内判断，不注册也不空转）。
+    overnight_factor_enabled: bool = True
+    # 美股标的列表（新浪 hq.sinajs.cn gb_ 前缀代码，逗号分隔）
+    overnight_factor_stocks: str = ("gb_nvda,gb_aapl,gb_msft,gb_goog,gb_amzn,"
+                                    "gb_meta,gb_tsla,gb_amd,gb_mu,gb_tsm")
+    overnight_factor_hour: int = 21    # 采集小时（北京时间）
+    overnight_factor_minute: int = 30  # 采集分钟
+
     # ---------- OCR 持仓截图识别 ----------
     ocr_enable: bool = False  # true=启用 PaddleOCR 本地识别；false=关闭
     ocr_device: str = "cpu"   # cpu / gpu（gpu 需安装 paddlepaddle-gpu 与 CUDA）
