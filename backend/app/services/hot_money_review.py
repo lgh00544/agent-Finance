@@ -24,9 +24,27 @@ _UPGRADE = {"一线": "一线", "二线": "一线", "观察": "二线"}
 _WIN_LOW = 0.4    # 胜率 < 40% → 降档建议
 _WIN_HIGH = 0.6   # 胜率 ≥ 60% → 升档建议
 _MIN_SIGNALS = 3  # 可统计信号数下限（低于不产生档位建议，防小样本误判）
-_BENCH_INDEX = "000300"  # 大盘基准：沪深300
+_BENCH_INDEX = "sh000300"  # 大盘基准：沪深300（指数代码；必须走 fetch_index_daily，勿当个股）
 
 _TIER_PATTERN = ("一线", "二线", "观察")
+
+_BENCH_CACHE: dict[tuple[str, str], object] = {}
+_BENCH_CACHE_MAX = 8
+
+
+def bench_index_frame(src, start: str, end: str):
+    """沪深300 日线（按区间记忆化）。指数必须走 fetch_index_daily：
+    历史上误用 fetch_daily_kline('000300') 会把指数当个股（_market_of→sz），
+    既取错数据又逐信号重复请求 ⇒ 游资胜率 job 16:30→17:10 空转并留下内存台阶。"""
+    key = (start, end)
+    frame = _BENCH_CACHE.get(key)
+    if frame is None:
+        frame = src.fetch_index_daily(_BENCH_INDEX, start, end)
+        if frame is not None and not getattr(frame, "empty", True):
+            if len(_BENCH_CACHE) >= _BENCH_CACHE_MAX:
+                _BENCH_CACHE.clear()
+            _BENCH_CACHE[key] = frame
+    return frame
 
 
 def collect_signals(profile: dict) -> list[dict]:
@@ -103,7 +121,7 @@ def real_price_lookup(stock_code: str, trade_date: str) -> tuple | None:
         start = f"{trade_date[:4]}0101"
         end = time.strftime("%Y-%m-%d")
         stock = src.fetch_daily_kline(stock_code, start, end)
-        index = src.fetch_daily_kline(_BENCH_INDEX, start, end)
+        index = bench_index_frame(src, start, end)
         return _forward_5d_returns(stock, index, trade_date)
     except Exception as exc:  # noqa: BLE001 单信号回溯失败跳过，不阻塞迭代
         logger.warning("游资信号行情回溯失败 %s/%s: %s", stock_code, trade_date, exc)

@@ -278,6 +278,7 @@ def daily_discover_job() -> None:
         logger.error("每日挖掘失败: %s", exc)
     finally:
         cache.release_lock("daily_discover")
+        _reclaim_memory()
 
 
 def paper_execution_job() -> None:
@@ -707,6 +708,13 @@ def dragon_tiger_job() -> None:
         cache.release_lock("dragon_tiger")
 
 
+def _reclaim_memory() -> None:
+    """重 job 结束显式回收：pandas/numpy 原生缓冲不随引用释放即时归还 OS，主动 GC 压 RSS 台阶。"""
+    import gc
+
+    gc.collect()
+
+
 def hot_money_win_rate_job() -> None:
     """游资胜率迭代（工作日 16:30，daily_discover 16:10 + market_intel 16:20 之后）：
     归一化匹配收信号 → 统计胜率落库 + 生成降/升档建议（pending 待人工审核，不自动改档）。"""
@@ -716,6 +724,8 @@ def hot_money_win_rate_job() -> None:
         run_win_rate_iteration()
     except Exception as exc:  # noqa: BLE001 迭代失败不阻塞其他任务
         logger.error("游资胜率迭代失败: %s", exc)
+    finally:
+        _reclaim_memory()
 
 
 def _next_a_share_trade_date(now_dt: datetime | None = None) -> str:
@@ -861,6 +871,8 @@ def experience_worker_job(force: bool = False) -> None:
         logger.info("经验沉淀 Worker: %s", result)
     except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
         logger.error("经验沉淀 Worker 异常: %s", exc)
+    finally:
+        _reclaim_memory()
 
 
 def audit_pending_job() -> None:
@@ -1005,6 +1017,7 @@ def signal_scan_job() -> None:
         logger.error("买卖点信号扫描失败: %s", exc)
     finally:
         cache.release_lock("signal_scan")
+        _reclaim_memory()
 
 
 MIN_KLINE_BARS_FOR_BACKFILL = 250
@@ -1051,6 +1064,7 @@ def kline_backfill_job() -> None:
         logger.error("夜间日线回补失败: %s", exc)
     finally:
         cache.release_lock("kline_backfill")
+        _reclaim_memory()
 
 
 def kline_ingest_job() -> None:
@@ -1075,6 +1089,7 @@ def kline_ingest_job() -> None:
         logger.error("本地日线增量失败: %s", exc)
     finally:
         cache.release_lock("kline_ingest")
+        _reclaim_memory()
 
 
 def start_scheduler() -> None:

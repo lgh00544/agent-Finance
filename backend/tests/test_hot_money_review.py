@@ -10,6 +10,7 @@
 6. trace_hot_money_review 留痕（source_module='hot_money_review'）；
 7. hot_money_profile 新列迁移幂等。
 """
+import pandas as pd
 import pytest
 
 from agent_prompts import review_prompt
@@ -91,6 +92,30 @@ def test_compute_win_rate_beats_index():
     assert wr["countable"] == 4 and wr["wins"] == 2
     assert wr["win_rate"] == 0.5
     assert wr["skipped"] == ["600105 2026-08-13"]
+
+
+def test_real_price_lookup_uses_index_interface_and_memoizes(monkeypatch):
+    """基准必须走 fetch_index_daily('sh000300')，且按区间记忆化（不再每股重复拉指数）。"""
+    calls = {"kline": [], "index": []}
+    dates = [f"2026-08-{d:02d}" for d in range(10, 20)]
+
+    class _Src:
+        def fetch_daily_kline(self, code, start, end):
+            calls["kline"].append(code)
+            return pd.DataFrame({"date": dates, "close": [10.0 + i for i in range(len(dates))]})
+
+        def fetch_index_daily(self, symbol, start, end):
+            calls["index"].append(symbol)
+            return pd.DataFrame({"date": dates, "close": [1000.0 + i for i in range(len(dates))]})
+
+    monkeypatch.setattr("app.datasource.fallback.get_datasource", lambda: _Src())
+    hmr._BENCH_CACHE.clear()
+    r1 = hmr.real_price_lookup("600101", "2026-08-10")
+    r2 = hmr.real_price_lookup("600102", "2026-08-10")
+    assert r1 is not None and r2 is not None
+    assert calls["index"] == ["sh000300"]        # 指数接口 + 记忆化只调一次
+    assert "000300" not in calls["kline"]         # 绝不再把指数当个股
+    assert calls["kline"] == ["600101", "600102"]
 
 
 # ================= 3. 胜率迭代：事实落库 + 建议生成（不自动生效） =================
