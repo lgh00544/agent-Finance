@@ -264,6 +264,13 @@ class Settings(BaseSettings):
     # 夜间回补并发（实测 8 并发 ≈ 2.9 只/s 且不再提升；>1 时忽略 sleep）
     kline_backfill_workers: int = 8
 
+    # ---------- 内存诊断端点（A3 复盘 2026-09-22）----------
+    # tracemalloc 一旦 start 便为每条存活分配保留 15 帧调用栈，实测把 RSS 抬高 ~300MB/h
+    # 且不归还，是 #5「内存趋势」No-Go 的自伤源。故默认禁止开启；需采样时显式置 true，
+    # 并由 mem_diag 的硬 TTL 兜底自动 stop。
+    mem_diag_trace_enable: bool = False
+    mem_diag_trace_ttl_s: int = 600       # 秒；<=0 表示下一次请求/回收即停
+
     # ---------- 派生路径 ----------
     @property
     def data_dir(self) -> Path:

@@ -75,6 +75,47 @@
 ### 方法学备注
 - 诊断端点已改轻量：`gc=1` 由 `gc.get_objects()`（107s、+200MB 污染）改为 `gc.get_count()/get_stats()`；新增廉价 `traced_current_kb`；全量快照仅 `trace=1` 按需。
 
+## 🔴 定位结论 v3：根因 = 诊断端点自身常开 tracemalloc（2026-09-22 19:00，已修并生效）
+
+### 决定性证据
+- **活进程自报**：PID 3308 调 `GET /api/diagnostics/memory`（**本次未带 `trace=1`**）返回 `traced_current_kb=212655`（207 MB）、`traced_peak_kb=251949` ⇒ **tracemalloc 一直开着**。
+- **代码事实**：`routes.py` 原实现 `if trace: if not tracemalloc.is_tracing(): tracemalloc.start(15)` —— **只 start，全文无 stop**。tracemalloc 为每条*存活分配*保留 15 帧调用栈，其元数据**不计入 `get_traced_memory()`**，故表现为「RSS 涨但 traced 只占小头」。
+- **修正 v2 的推论**：v2 由「traced ~160MB vs RSS 1.2GB」推出「主体是 pandas/numpy 原生缓冲」——该推论**不成立**（差值主要是 tracemalloc 自身元数据）。真正主体是本次自伤，pandas 缓冲尚需在干净窗口重判。
+
+### 逐 PID 还原（`logs/mem_probe.pre-fix-20260922.csv`，313 样本 / 2026-09-21 14:54 → 09-22 18:41）
+| pid | 样本 | 首→末 MB | 峰值 MB | 存活 min | MB/h |
+|---|---|---|---|---|---|
+| 31632 | 233 | 169→709 | 709 | 1208 | 27（tracemalloc 后段开启）|
+| 3308 | 36 | 167→1414 | **1770** | 191 | **392**（tracemalloc 开启，threads 峰值 79）|
+| 27604 | 6 | 156→654 | 693 | 29 | 1044 |
+| 35316 | 6 | 416→611 | 611 | 27 | 432（**traced=0，同窗口基本持平 600→612**）|
+| 7848 | 10 | 157→619 | 627 | 48 | 575 |
+| 27220 | 4 | 190→514 | 516 | 22 | 868 |
+| 21156 / 34872 | 5 / 6 | 316→595 / 193→541 | 595 / 541 | 29 / 34 | 578 / 622 |
+
+- **12 次进程更替、5739 处 Traceback 全来自历史 `reload-fail` 文件**；本轮各实例 stderr **0 条 Python 异常**（1.2 MB 内容全是 akshare `Please wait for a moment` 进度条）⇒ 进程是**被静默杀掉**（沙箱回收/OOM），不是自己抛错退出。
+- 开关对照：**开启 tracemalloc 的实例 3.2h 334→1414 MB；未开启的 35316 同窗口 600→612 MB**。
+
+### 修复（一次性收口，非打补丁）
+| 文件 | 改动 |
+|---|---|
+| `backend/app/core/mem_diag.py`（新） | `enabled()/start()/stop()/state()/trace_guard()`；默认禁开 + **硬 TTL** 自动 stop |
+| `backend/app/core/config.py` | `mem_diag_trace_enable=False`、`mem_diag_trace_ttl_s=600` |
+| `backend/app/api/routes.py` | 端点入口先 `trace_guard()`；`trace=1` 仅在启用时 start，`trace=-1` 立即 stop，回报 `trace_disabled/tracing/on_s/ttl_s` |
+| `backend/app/scheduler/jobs.py` | `_reclaim_memory()` 内调 `trace_guard()`（每 30min `experience_worker` 起兜底，防「开了就没人再请求」）|
+| `backend/tests/test_mem_diag_trace.py`（新） | 4 例：默认禁开 / 启用后可采样且 TTL 到期自动关 / 显式 stop / 外部开启也被兜住 |
+
+### 验证
+- 门禁：staged 树 `git write-tree`=9b3ea257 → 干净副本 `import app.main` **APP_MAIN_IMPORT_OK**；`test_mem_diag_trace.py` 干净 4 = 工作区 4 collected；用例 4 passed。
+- 运行时：重启后 PID 32024（19:02）`?trace=1` 返回 `trace_disabled="MEM_DIAG_TRACE_ENABLE=false…"`、`tracing=false`、`ttl_s=600` ⇒ 不再有任何路径留下常开态。
+
+### 仍未定（需干净窗口）
+- 静默被杀的确切机制（沙箱回收 vs OOM）：改由 A1 看门狗 + 日志对齐；本轮 12 次更替中 WATCHDOG_RESTART 仅 2 次，其余为人工/脚本重复拉起。
+- 连续基线残余（`35316` 持平、`31632` 27 MB/h）与夜间台阶（00:40 +35.9、02:00 +30.9 MB）需在无 tracemalloc 的 24h 重测。
+
+### 重测安排
+- 旧证据已转存 `logs/mem_probe.pre-fix-20260922.csv`；干净基线自 **2026-09-22 19:02** 起写入 `logs/mem_probe.csv`（`mem_probe.py --hours 24 --interval 300`，作业 `pwsh-100`）。
+
 
 
 

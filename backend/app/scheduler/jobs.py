@@ -709,9 +709,13 @@ def dragon_tiger_job() -> None:
 
 
 def _reclaim_memory() -> None:
-    """重 job 结束显式回收：pandas/numpy 原生缓冲不随引用释放即时归还 OS，主动 GC 压 RSS 台阶。"""
+    """重 job 结束显式回收：pandas/numpy 原生缓冲不随引用释放即时归还 OS，主动 GC 压 RSS 台阶。
+    并顺带按 TTL 硬关诊断端点可能开启的 tracemalloc（A3 复盘：常开会永久抬高 RSS ~300MB/h）。"""
     import gc
 
+    from app.core import mem_diag
+
+    mem_diag.trace_guard()
     gc.collect()
 
 

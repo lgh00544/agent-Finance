@@ -67,7 +67,16 @@ def main() -> None:
     ap.add_argument("--trace-every", type=int, default=0, help="每 N 次采样记录一次 tracemalloc/gc 明细（0=关）")
     args = ap.parse_args()
     CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # 表头与 FIELDS 不一致 -> 轮转旧文件：否则列错位会把证据写歪（2026-09-22 实际踩过）
     new = not CSV_PATH.exists()
+    if not new:
+        with CSV_PATH.open(encoding="utf-8") as fh:
+            head = (fh.readline() or "").strip()
+        if head != ",".join(FIELDS):
+            bak = CSV_PATH.with_name("mem_deep_probe.%s.bak" % datetime.now().strftime("%Y%m%d-%H%M%S"))
+            CSV_PATH.replace(bak)
+            print(f"[rotate] 表头不匹配 -> {bak.name}", flush=True)
+            new = True
     deadline = time.time() + args.hours * 3600
     first = None
     cycle = 0
@@ -87,14 +96,17 @@ def main() -> None:
             cycle += 1
             if args.trace_every and cycle % args.trace_every == 0:
                 deep = _get(DIAG + "?trace=1", timeout=300) or {}
-                with (ROOT / "logs" / "mem_trace.jsonl").open("a", encoding="utf-8") as tf:
-                    tf.write(json.dumps({"ts": row["ts"], "pid": deep.get("pid"),
-                                         "rss_kb": deep.get("rss_kb"),
-                                         "trace_top": deep.get("trace_top"),
-                                         "gc_top": deep.get("gc_top")}, ensure_ascii=False) + chr(10))
-                print(f"  [trace] {row['ts']} top_sites="
-                      f"{[s.get('file','').split(chr(92))[-1]+':'+str(s.get('line')) for s in (deep.get('trace_top') or [])[:5]]}",
-                      flush=True)
+                if deep.get("trace_disabled"):
+                    print(f"  [trace] 已禁用：{deep['trace_disabled']}", flush=True)
+                else:
+                    with (ROOT / "logs" / "mem_trace.jsonl").open("a", encoding="utf-8") as tf:
+                        tf.write(json.dumps({"ts": row["ts"], "pid": deep.get("pid"),
+                                             "rss_kb": deep.get("rss_kb"),
+                                             "trace_top": deep.get("trace_top"),
+                                             "gc_top": deep.get("gc_top")}, ensure_ascii=False) + chr(10))
+                    print(f"  [trace] {row['ts']} top_sites="
+                          f"{[s.get('file','').split(chr(92))[-1]+':'+str(s.get('line')) for s in (deep.get('trace_top') or [])[:5]]}",
+                          flush=True)
             time.sleep(max(20, args.interval))
     if first is not None:
         print(f"SUMMARY first_rss_kb={first}", flush=True)

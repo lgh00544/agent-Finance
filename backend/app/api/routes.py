@@ -852,7 +852,12 @@ def system_status():
 
 @router.get("/diagnostics/memory")
 def diagnostics_memory(trace: int = 0, gc: int = 0):
-    """只读内存诊断（A3 定位）：RSS/线程/handles + 缓存统计；trace=1 附 tracemalloc 前 15 分配点，gc=1 附对象类型计数。"""
+    """只读内存诊断（A3 定位）：RSS/线程/handles + 缓存统计。
+    trace=1 附 tracemalloc 前 15 分配点（受 MEM_DIAG_TRACE_ENABLE + 硬 TTL 双重收口），trace=-1 立即关闭；
+    gc=1 附 gc 计数。默认不常开 tracemalloc——其开销会永久抬高 RSS（实测 ~300MB/h）。"""
+    from app.core import mem_diag
+
+    mem_diag.trace_guard()  # 任意一次请求先按 TTL 收口，兜住任何来源开启的 tracemalloc
     info: dict = {"pid": os.getpid()}
     try:
         import psutil
@@ -873,13 +878,19 @@ def diagnostics_memory(trace: int = 0, gc: int = 0):
         try:
             import tracemalloc
 
-            if not tracemalloc.is_tracing():
-                tracemalloc.start(15)
-            snapshot = tracemalloc.take_snapshot()
-            info["trace_top"] = [
-                {"file": s.traceback[0].filename, "line": s.traceback[0].lineno,
-                 "size_kb": int(s.size / 1024), "count": int(s.count)}
-                for s in snapshot.statistics("lineno")[:15]]
+            if trace < 0:
+                mem_diag.stop()
+                info["trace_stopped"] = True
+            elif not mem_diag.start():
+                info["trace_disabled"] = (
+                    "MEM_DIAG_TRACE_ENABLE=false：已禁止常开 tracemalloc"
+                    "（实测抬高 RSS ~300MB/h），需采样时显式置 true")
+            elif tracemalloc.is_tracing():
+                snapshot = tracemalloc.take_snapshot()
+                info["trace_top"] = [
+                    {"file": s.traceback[0].filename, "line": s.traceback[0].lineno,
+                     "size_kb": int(s.size / 1024), "count": int(s.count)}
+                    for s in snapshot.statistics("lineno")[:15]]
         except Exception as exc:  # noqa: BLE001
             info["trace_error"] = str(exc)[:200]
     if gc:
@@ -890,6 +901,7 @@ def diagnostics_memory(trace: int = 0, gc: int = 0):
             info["gc_stats"] = gc_mod.get_stats()                # 各代 collections/collected（廉价）
         except Exception as exc:  # noqa: BLE001
             info["gc_error"] = str(exc)[:200]
+    info.update(mem_diag.state())                                # tracing / on_s / ttl_s
     try:
         import tracemalloc as tm
 
