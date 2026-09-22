@@ -1,0 +1,154 @@
+diff --git a/backend/app/scheduler/jobs.py b/backend/app/scheduler/jobs.py
+index a136ec2..4186a78 100644
+--- a/backend/app/scheduler/jobs.py
++++ b/backend/app/scheduler/jobs.py
+@@ -278,6 +278,7 @@ def daily_discover_job() -> None:
+         logger.error("每日挖掘失败: %s", exc)
+     finally:
+         cache.release_lock("daily_discover")
++        _reclaim_memory()
+ 
+ 
+ def paper_execution_job() -> None:
+@@ -707,6 +708,13 @@ def dragon_tiger_job() -> None:
+         cache.release_lock("dragon_tiger")
+ 
+ 
++def _reclaim_memory() -> None:
++    """重 job 结束显式回收：pandas/numpy 原生缓冲不随引用释放即时归还 OS，主动 GC 压 RSS 台阶。"""
++    import gc
++
++    gc.collect()
++
++
+ def hot_money_win_rate_job() -> None:
+     """游资胜率迭代（工作日 16:30，daily_discover 16:10 + market_intel 16:20 之后）：
+     归一化匹配收信号 → 统计胜率落库 + 生成降/升档建议（pending 待人工审核，不自动改档）。"""
+@@ -716,6 +724,8 @@ def hot_money_win_rate_job() -> None:
+         run_win_rate_iteration()
+     except Exception as exc:  # noqa: BLE001 迭代失败不阻塞其他任务
+         logger.error("游资胜率迭代失败: %s", exc)
++    finally:
++        _reclaim_memory()
+ 
+ 
+ def _next_a_share_trade_date(now_dt: datetime | None = None) -> str:
+@@ -861,6 +871,8 @@ def experience_worker_job(force: bool = False) -> None:
+         logger.info("经验沉淀 Worker: %s", result)
+     except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
+         logger.error("经验沉淀 Worker 异常: %s", exc)
++    finally:
++        _reclaim_memory()
+ 
+ 
+ def audit_pending_job() -> None:
+@@ -1005,6 +1017,7 @@ def signal_scan_job() -> None:
+         logger.error("买卖点信号扫描失败: %s", exc)
+     finally:
+         cache.release_lock("signal_scan")
++        _reclaim_memory()
+ 
+ 
+ MIN_KLINE_BARS_FOR_BACKFILL = 250
+@@ -1051,6 +1064,7 @@ def kline_backfill_job() -> None:
+         logger.error("夜间日线回补失败: %s", exc)
+     finally:
+         cache.release_lock("kline_backfill")
++        _reclaim_memory()
+ 
+ 
+ def kline_ingest_job() -> None:
+@@ -1075,6 +1089,7 @@ def kline_ingest_job() -> None:
+         logger.error("本地日线增量失败: %s", exc)
+     finally:
+         cache.release_lock("kline_ingest")
++        _reclaim_memory()
+ 
+ 
+ def start_scheduler() -> None:
+diff --git a/backend/app/services/hot_money_review.py b/backend/app/services/hot_money_review.py
+index 448812c..d5eef86 100644
+--- a/backend/app/services/hot_money_review.py
++++ b/backend/app/services/hot_money_review.py
+@@ -24,10 +24,28 @@ _UPGRADE = {"一线": "一线", "二线": "一线", "观察": "二线"}
+ _WIN_LOW = 0.4    # 胜率 < 40% → 降档建议
+ _WIN_HIGH = 0.6   # 胜率 ≥ 60% → 升档建议
+ _MIN_SIGNALS = 3  # 可统计信号数下限（低于不产生档位建议，防小样本误判）
+-_BENCH_INDEX = "000300"  # 大盘基准：沪深300
++_BENCH_INDEX = "sh000300"  # 大盘基准：沪深300（指数代码；必须走 fetch_index_daily，勿当个股）
+ 
+ _TIER_PATTERN = ("一线", "二线", "观察")
+ 
++_BENCH_CACHE: dict[tuple[str, str], object] = {}
++_BENCH_CACHE_MAX = 8
++
++
++def bench_index_frame(src, start: str, end: str):
++    """沪深300 日线（按区间记忆化）。指数必须走 fetch_index_daily：
++    历史上误用 fetch_daily_kline('000300') 会把指数当个股（_market_of→sz），
++    既取错数据又逐信号重复请求 ⇒ 游资胜率 job 16:30→17:10 空转并留下内存台阶。"""
++    key = (start, end)
++    frame = _BENCH_CACHE.get(key)
++    if frame is None:
++        frame = src.fetch_index_daily(_BENCH_INDEX, start, end)
++        if frame is not None and not getattr(frame, "empty", True):
++            if len(_BENCH_CACHE) >= _BENCH_CACHE_MAX:
++                _BENCH_CACHE.clear()
++            _BENCH_CACHE[key] = frame
++    return frame
++
+ 
+ def collect_signals(profile: dict) -> list[dict]:
+     """某游资的买入信号集合：主席位+协同席位在龙虎榜的净买入流水（口径 1d）。
+@@ -103,7 +121,7 @@ def real_price_lookup(stock_code: str, trade_date: str) -> tuple | None:
+         start = f"{trade_date[:4]}0101"
+         end = time.strftime("%Y-%m-%d")
+         stock = src.fetch_daily_kline(stock_code, start, end)
+-        index = src.fetch_daily_kline(_BENCH_INDEX, start, end)
++        index = bench_index_frame(src, start, end)
+         return _forward_5d_returns(stock, index, trade_date)
+     except Exception as exc:  # noqa: BLE001 单信号回溯失败跳过，不阻塞迭代
+         logger.warning("游资信号行情回溯失败 %s/%s: %s", stock_code, trade_date, exc)
+diff --git a/backend/tests/test_hot_money_review.py b/backend/tests/test_hot_money_review.py
+index 8eedd18..2135249 100644
+--- a/backend/tests/test_hot_money_review.py
++++ b/backend/tests/test_hot_money_review.py
+@@ -10,6 +10,7 @@
+ 6. trace_hot_money_review 留痕（source_module='hot_money_review'）；
+ 7. hot_money_profile 新列迁移幂等。
+ """
++import pandas as pd
+ import pytest
+ 
+ from agent_prompts import review_prompt
+@@ -93,6 +94,30 @@ def test_compute_win_rate_beats_index():
+     assert wr["skipped"] == ["600105 2026-08-13"]
+ 
+ 
++def test_real_price_lookup_uses_index_interface_and_memoizes(monkeypatch):
++    """基准必须走 fetch_index_daily('sh000300')，且按区间记忆化（不再每股重复拉指数）。"""
++    calls = {"kline": [], "index": []}
++    dates = [f"2026-08-{d:02d}" for d in range(10, 20)]
++
++    class _Src:
++        def fetch_daily_kline(self, code, start, end):
++            calls["kline"].append(code)
++            return pd.DataFrame({"date": dates, "close": [10.0 + i for i in range(len(dates))]})
++
++        def fetch_index_daily(self, symbol, start, end):
++            calls["index"].append(symbol)
++            return pd.DataFrame({"date": dates, "close": [1000.0 + i for i in range(len(dates))]})
++
++    monkeypatch.setattr("app.datasource.fallback.get_datasource", lambda: _Src())
++    hmr._BENCH_CACHE.clear()
++    r1 = hmr.real_price_lookup("600101", "2026-08-10")
++    r2 = hmr.real_price_lookup("600102", "2026-08-10")
++    assert r1 is not None and r2 is not None
++    assert calls["index"] == ["sh000300"]        # 指数接口 + 记忆化只调一次
++    assert "000300" not in calls["kline"]         # 绝不再把指数当个股
++    assert calls["kline"] == ["600101", "600102"]
++
++
+ # ================= 3. 胜率迭代：事实落库 + 建议生成（不自动生效） =================
+ 
+ def test_iteration_high_winrate_upgrade_suggestion_pending():

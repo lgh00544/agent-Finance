@@ -1,0 +1,4 @@
+docs(t5): 基线锁记录更新 + t5_commit_and_tag 脚本
+
+- 实盘GoNoGo清单：第 6 条改判 Go（e4d19bb + pre-live-2026-10-08），第 5 条改判 No-Go（内存增长趋势）
+- 新增 scripts/t5_commit_and_tag.ps1（默认 dry-run，须 -Confirm）

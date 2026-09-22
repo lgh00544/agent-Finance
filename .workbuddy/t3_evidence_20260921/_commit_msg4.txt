@@ -1,0 +1,5 @@
+fix(游资): 胜率基准改走指数接口（缺陷#1）+ 重 job 显式回收内存
+
+- hot_money_review: fetch_index_daily('sh000300') 取代 fetch_daily_kline('000300')，并按区间记忆化基准（消除逐信号重复拉取/空转与内存台阶）
+- jobs: _reclaim_memory() 于 hot_money_win_rate / signal_scan / kline_backfill / kline_ingest / daily_discover / experience_worker 收尾调用
+- tests: test_hot_money_review +1 覆盖指数接口与记忆化

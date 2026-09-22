@@ -1,0 +1,6 @@
+feat(diag): 只读内存诊断端点 + 深度探针（A3 #5 定位）
+
+- cache.py: CacheBackend.debug_stats()（Memory 键数/前缀/字节；Redis SCAN）
+- routes.py: GET /api/diagnostics/memory（RSS/线程/handles + cache；trace=1 分配点快照；gc=1 廉价的 gc.get_count/get_stats；traced_current_kb）
+- mem_deep_probe.py: 60s 采样 RSS/traced_kb/cache/job last_run，每 N 次记 tracemalloc 快照
+- 定位到：主因=盘后 job 窗口（hot_money_win_rate 40min 逐股 kline + 缺陷#1 'date' KeyError）致 RSS 1.27GB/线程59，主体为 pandas/numpy 原生缓冲；缓存已排除

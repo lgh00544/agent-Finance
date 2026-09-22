@@ -1,0 +1,7 @@
+feat(实盘就绪): 批A 稳定性底座 + 批D 同花顺下线/盈亏推算 + 8a B5 修复 + 本地仓库 local-only/unsupported
+
+- 批A: scripts/backend_watchdog.ps1 + job_run_log/last_run + mem_probe.py + push_alert 三态与落库
+- 批D: 同花顺全链注释下线, /account/pnl 与 refresh 返 410, 今日盈亏改推算
+- 8a: paper_monitor context 补 account_id (B5)
+- T4: kline_scan_local_only=True + short_history/unsupported (165 只短史, pending 跳过)
+- 配套测试同步；Go/No-Go 第 5 条内存增长趋势判 No-Go（详见 实盘GoNoGo清单_核对_20260930.md）
