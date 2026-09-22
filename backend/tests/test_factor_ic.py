@@ -1,5 +1,10 @@
+import json
+import os
+import shutil
 import threading
 import types
+import uuid
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -323,3 +328,65 @@ def test_collect_falls_back_to_remote_when_local_missing(monkeypatch):
     # 首轮远端取数须回写本地仓库（下一轮同票才能走本地）
     assert {row["stock_code"] for row in writes} == {"600000", "000001"}
     assert all(row["adjust"] == "qfq" and row["trade_date"] for row in writes)
+
+
+class _FailSession:
+    """落库即抛：模拟 TiDB 瞬时连不上"""
+
+    def __enter__(self):
+        raise RuntimeError("db down")
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _OkSession:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute(self, *args, **kwargs):
+        return types.SimpleNamespace(scalars=lambda: [])
+
+    def add(self, row):
+        pass
+
+    def commit(self):
+        pass
+
+
+def test_persist_retries_transient_db_failure(monkeypatch):
+    """一次落库失败（如 TiDB 瞬时超时）必须重试成功，不得丢掉整批采集。"""
+    state = {"calls": 0}
+
+    def session_factory():
+        state["calls"] += 1
+        return _FailSession() if state["calls"] == 1 else _OkSession()
+
+    monkeypatch.setattr(factor_ic, "SessionLocal", session_factory)
+    monkeypatch.setattr(factor_ic, "PERSIST_RETRY_DELAY_SECONDS", 0)
+    rows = [{"factor_id": "f01", "period": "2026-07", "sample_size": 120, "ic": 0.1}]
+    assert factor_ic.persist_history(rows) == 1
+    assert state["calls"] == 2
+
+
+def test_persist_dumps_fallback_before_raising(monkeypatch):
+    """重试用尽后必须把整批落盘（可补交）再抛，绝不让 75 分钟采集静默作废。"""
+    data_dir = Path(__file__).resolve().parents[2] / "data"
+    tmp = data_dir / ("ic_fallback_test_%s_%s" % (os.getpid(), uuid.uuid4().hex[:8]))
+    tmp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(factor_ic, "PERSIST_RETRY_TIMES", 1)
+    monkeypatch.setattr(factor_ic, "PERSIST_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(factor_ic, "PERSIST_FALLBACK_DIR", str(tmp))
+    monkeypatch.setattr(factor_ic, "SessionLocal", lambda: _FailSession())
+    rows = [{"factor_id": "f01", "period": "2026-07", "sample_size": 120, "ic": 0.1}]
+    try:
+        with pytest.raises(RuntimeError):
+            factor_ic.persist_history(rows)
+        dumps = list(tmp.glob("factor_ic_persist_fallback_*.json"))
+        assert len(dumps) == 1
+        assert json.loads(dumps[0].read_text(encoding="utf-8"))["rows"] == rows
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

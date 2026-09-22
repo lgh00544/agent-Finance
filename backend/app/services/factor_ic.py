@@ -1,10 +1,12 @@
 """因子 IC 月度回测：只读行情，结果写入独立历史表。"""
+import json
 import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from math import isfinite
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -43,6 +45,11 @@ COLLECT_WORKERS = 4
 # 才采用本地序列；新股/停牌/回补未完成一律回退远端，宁慢不错。
 LOCAL_KLINE_FIRST_TOLERANCE_DAYS = 20
 LOCAL_KLINE_LAST_TOLERANCE_DAYS = 10
+# 落库重试：一次 DB 抖动（TiDB Serverless 实测会瞬时超时）不得让 75 分钟采集作废；
+# 超窗仍失败则把整批落盘（PERSIST_FALLBACK_DIR），由 scripts/persist_factor_ic_fallback.py 补交。
+PERSIST_RETRY_TIMES = 4
+PERSIST_RETRY_DELAY_SECONDS = 60
+PERSIST_FALLBACK_DIR: str | None = None  # None = settings.data_dir；测试据此改路径
 
 
 def _rank(values):
@@ -290,7 +297,24 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
     return records
 
 
+def _dump_persist_fallback(rows: list[dict], error: Exception | None) -> str:
+    """落库彻底失败时把整批结果落盘，供 scripts/persist_factor_ic_fallback.py 补交。"""
+    try:
+        target_dir = Path(PERSIST_FALLBACK_DIR or settings.data_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / ("factor_ic_persist_fallback_%s.json"
+                             % datetime.now().strftime("%Y%m%d_%H%M%S"))
+        path.write_text(json.dumps({"error": str(error), "rows": rows}, ensure_ascii=False, default=str),
+                        encoding="utf-8")
+        logger.error("因子 IC 落库失败，已把 %d 行落盘待补交：%s", len(rows), path)
+        return str(path)
+    except Exception as exc:  # noqa: BLE001 兜底失败不得吞掉原异常
+        logger.error("因子 IC 落盘兜底也失败：%s", exc)
+        return ""
+
+
 def persist_history(rows: list[dict]) -> int:
+    """整批 upsert 落库；瞬时 DB 故障重试 PERSIST_RETRY_TIMES 次，超窗落盘兜底再抛。"""
     if not rows:
         return 0
     # 批次级护栏：全批零样本（未采到任何样本）时不触库；只要任一行 sample_size>0，
@@ -298,19 +322,32 @@ def persist_history(rows: list[dict]) -> int:
     if not any((row.get("sample_size") or 0) > 0 for row in rows):
         logger.warning("因子 IC 落库跳过：批次 %d 行全部 sample_size=0，未触库", len(rows))
         return 0
-    with SessionLocal() as db:
-        keys = {(r["factor_id"], r["period"]) for r in rows}
-        existing = {(r.factor_id, r.period): r for r in db.execute(select(FactorIcHistory)).scalars()
-                    if (r.factor_id, r.period) in keys}
-        for payload in rows:
-            current = existing.get((payload["factor_id"], payload["period"]))
-            if current is None:
-                db.add(FactorIcHistory(**payload))
-            else:
-                for key, value in payload.items():
-                    setattr(current, key, value)
-        db.commit()
-    return len(rows)
+    last_err: Exception | None = None
+    for attempt in range(1, PERSIST_RETRY_TIMES + 2):
+        try:
+            with SessionLocal() as db:
+                keys = {(r["factor_id"], r["period"]) for r in rows}
+                existing = {(r.factor_id, r.period): r for r in db.execute(select(FactorIcHistory)).scalars()
+                            if (r.factor_id, r.period) in keys}
+                for payload in rows:
+                    current = existing.get((payload["factor_id"], payload["period"]))
+                    if current is None:
+                        db.add(FactorIcHistory(**payload))
+                    else:
+                        for key, value in payload.items():
+                            setattr(current, key, value)
+                db.commit()
+            if attempt > 1:
+                logger.info("因子 IC 落库第 %d 次尝试成功（%d 行）", attempt, len(rows))
+            return len(rows)
+        except Exception as exc:  # noqa: BLE001 落库瞬时故障重试，避免整批采集作废
+            last_err = exc
+            if attempt <= PERSIST_RETRY_TIMES:
+                logger.warning("因子 IC 落库第 %d/%d 次失败：%s（%ss 后重试）",
+                               attempt, PERSIST_RETRY_TIMES + 1, exc, PERSIST_RETRY_DELAY_SECONDS)
+                time.sleep(PERSIST_RETRY_DELAY_SECONDS)
+    _dump_persist_fallback(rows, last_err)
+    raise last_err
 
 
 # 判定顺序锁定：消息级 timeout（_TIMEOUT_KW）必须先于 connection 关键词路（_CONN_ERROR_KW）——

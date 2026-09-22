@@ -34,6 +34,7 @@ from requests.adapters import HTTPAdapter
 from app.cache import cache
 from app.core.config import settings
 from app.datasource import market_hours
+from app.datasource import persist_cache
 from app.datasource.base import DataSource, DataSourceError
 from app.datasource.breaker import get_breaker
 from app.datasource.http_client import get as http_get
@@ -65,6 +66,10 @@ _KLINE_COLS = {
     "成交量": "volume", "成交额": "amount", "振幅": "amplitude",
     "涨跌幅": "change_pct", "涨跌额": "change_amount", "换手率": "turnover_rate",
 }
+# 二级磁盘缓存范围：TTL 长且按票取一次的外挂数据（财务/资金/新闻）。
+# 日K由本地仓库 kline_store 承接，实时快照属 tick/短TTL 不入盘。
+_PERSIST_SCOPES = frozenset({"fin", "fundflow", "news"})
+
 _FUND_FLOW_COLS = {
     "日期": "date",
     "主力净流入-净额": "main_net_inflow", "主力净流入-净占比": "main_net_pct",
@@ -441,6 +446,17 @@ class AkshareSource(DataSource):
                 return pd.DataFrame(json.loads(cached))
             except (ValueError, TypeError):
                 pass
+        if func_name in _PERSIST_SCOPES:
+            # 二级磁盘缓存：跨进程复用（内存缓存随进程清空，否则每轮回测都把 300 票重拉一遍）
+            disk = persist_cache.get(key)
+            if disk:
+                try:
+                    frame = pd.DataFrame(json.loads(disk))
+                except (ValueError, TypeError):
+                    frame = None
+                if frame is not None:
+                    cache.set(key, disk, ttl_seconds)  # 回填内存，同进程内不再反复读盘
+                    return frame
         try:
             df = self._call_with_retry(func_name, call, fallback, kind=kind)
             if normalize is not None:
@@ -450,7 +466,10 @@ class AkshareSource(DataSource):
                 df = df.copy()
                 df["date"] = df["date"].astype(str).str.slice(0, 10)
             if ttl_seconds > 0 and df is not None and not df.empty:
-                cache.set(key, df.to_json(orient="records", force_ascii=False), ttl_seconds)
+                payload = df.to_json(orient="records", force_ascii=False)
+                cache.set(key, payload, ttl_seconds)
+                if func_name in _PERSIST_SCOPES:
+                    persist_cache.set(key, payload, ttl_seconds)  # 写穿磁盘，供下一进程复用
             return df
         except DataSourceError:
             if not required:
