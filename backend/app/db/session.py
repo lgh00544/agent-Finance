@@ -163,11 +163,12 @@ def init_db() -> dict:
         _ensure_sector_snapshot_table()
         _ensure_quote_snapshot_table()
         _ensure_distribution_phase_table()
+        _ensure_job_run_log_table()
         _ensure_capital_view_tables()
         _ensure_identity_tables()
         _ensure_user_identity_columns()
         _ensure_user_columns()
-        _ensure_account_pnl_user_index()
+        # _ensure_account_pnl_user_index()  # DISABLED 2026-09-16 同花顺下线
         _ensure_reasoning_trace_user_scope()
         experience_ownership = _ensure_experience_audit_user_scope()
         knowledge = _ensure_knowledge_hit_columns()
@@ -235,6 +236,7 @@ def _ensure_user_identity_columns() -> None:
 
 def _ensure_account_pnl_user_index() -> None:
     """Move legacy global PnL snapshot uniqueness to a user-scoped key."""
+    return  # DISABLED 2026-09-16 同花顺下线
     if engine.dialect.name == "sqlite":
         with engine.begin() as conn:
             indexes = list(conn.exec_driver_sql("PRAGMA index_list(account_pnl_snapshot)"))
@@ -311,6 +313,15 @@ def _ensure_user_columns() -> None:
                  ")"),
             {"uid": default_id},
         )
+        # NULL 行彼此也可能同 (trade_date, ts)（MySQL 唯一键视 NULL 互不相同）→ 回填前每组只留最小 id
+        conn.execute(text(
+            "DELETE FROM account_pnl_snapshot WHERE user_id IS NULL AND id NOT IN ("
+            "  SELECT keep_id FROM ("
+            "    SELECT MIN(id) AS keep_id FROM account_pnl_snapshot "
+            "    WHERE user_id IS NULL GROUP BY trade_date, ts"
+            "  ) AS keepers"
+            ")"
+        ))
     tables = (
         "position_plan", "holding", "trade_record", "alert_log", "review_result",
         "agent_preference", "sys_trade_profile", "private_knowledge", "sell_decision",
@@ -603,6 +614,12 @@ def _ensure_distribution_phase_table() -> None:
     Base.metadata.create_all(bind=engine, tables=[models.DistributionPhaseLog.__table__])
 
 
+def _ensure_job_run_log_table() -> None:
+    """幂等补建 job_run_log 表（批A A2 调度留痕；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[models.JobRunLog.__table__])
+
+
 def _ensure_capital_view_tables() -> None:
     """幂等补建资本视图 4 表（capital_actor/dragon_tiger/capital_flow/capital_stats；
     批次E 游资真接入；create_all 兜底 SQLite/MySQL 通吃）"""
@@ -745,10 +762,14 @@ def _ensure_holding_high_price(eng=None) -> None:
 
 
 def _ensure_alert_log_source(eng=None) -> None:
-    """幂等补齐 alert_log.source 列（告警来源标记 monitor/portfolio_sentinel；
-    仅增量加列，不重建表不丢数据；旧数据默认 monitor）"""
+    """幂等补齐 alert_log 来源与投递留痕列（批A A4 的 push_channel/push_result；
+    仅增量加列，不重建表不丢数据；旧数据默认 monitor/none/skipped）"""
     eng = eng or engine
-    _add_columns(eng, "alert_log", {"source": "VARCHAR(16) DEFAULT 'monitor'"})
+    _add_columns(eng, "alert_log", {
+        "source": "VARCHAR(16) DEFAULT 'monitor'",
+        "push_channel": "VARCHAR(16) DEFAULT 'none'",
+        "push_result": "VARCHAR(16) DEFAULT 'skipped'",
+    })
 
 
 def _ensure_lhb_multi_source_verified(eng=None) -> None:

@@ -261,6 +261,7 @@ export interface AccountSummary {
   [k: string]: unknown
 }
 
+// === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 /** 同花顺真实盈亏快照（ths_pnl）字段可空，展示层缺字段一律 "—"，绝不出假正数 */
 export interface AccountPnlSnapshot {
   id?: number
@@ -279,6 +280,19 @@ export interface AccountPnlSnapshot {
 export interface AccountPnl {
   configured: boolean
   snapshot?: AccountPnlSnapshot | null
+  [k: string]: unknown
+}
+// === /DISABLED ===
+
+/** 今日盈亏推算（现价−昨收 × 股数；covered<total 表示有股票因缺行情被跳过，不伪造 0） */
+export interface TodayPnlEstimate {
+  pnl_amount?: number | null
+  pnl_pct?: number | null
+  covered?: number
+  total?: number
+  source?: string
+  quote_time?: string
+  error?: string | null
   [k: string]: unknown
 }
 

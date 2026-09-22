@@ -817,7 +817,31 @@ def sector_radar_collect(body: dict = Body(default=None)):
 
 @router.get("/jobs/status")
 def job_status():
-    return {"jobs": scheduler_jobs.job_status()}
+    jobs = scheduler_jobs.job_status()
+    try:
+        from app.cache import cache
+        from app.db.models import JobRunLog
+        from app.db.session import SessionLocal
+
+        with SessionLocal() as db:
+            rows = {r.job_id: r for r in db.query(JobRunLog).all()}
+        for j in jobs:
+            row = rows.get(str(j.get("id")))
+            if row is not None:
+                j["last_run"] = row.last_run.strftime("%Y-%m-%d %H:%M:%S") if row.last_run else None
+                j["last_status"] = row.last_status
+                j["last_reason"] = row.last_reason
+            elif str(j.get("id", "")).startswith("last_"):
+                cached = cache.get(f"job:{j['id']}")
+                err = cache.get(f"job:{j['id']}_error")
+                j["last_run"] = cached
+                j["last_status"] = "failed" if err else "ok" if cached else None
+            else:
+                j["last_run"] = None
+                j["last_status"] = None
+    except Exception as exc:  # noqa: BLE001 可观测字段缺失不得让接口 500
+        logger.warning("jobs/status 追加 last_run 失败: %s", exc)
+    return {"jobs": jobs}
 
 
 @router.get("/system/status")
@@ -989,35 +1013,44 @@ def account_summary():
         _request_user_id(), is_admin=current_user_role() == "admin")
 
 
+@router.get("/account/today-pnl-estimate")
+def account_today_pnl_estimate():
+    """今日盈亏推算（现价−昨收 × 股数；缺数据跳过并给覆盖率，不伪造 0）"""
+    return holding_view.build_today_pnl_estimate(
+        _request_user_id(), is_admin=current_user_role() == "admin")
+
+
 @router.get("/account/pnl")
 def account_pnl():
-    """同花顺真实账户今日盈亏（P0 数据通道，默认关闭）
-    未配置（ths_pnl_enable=false 或 Cookie 空）返回 {configured:false} 优雅降级，不报错；
-    配置后返回最新快照（含 error/token_expired，展示层诚实展示不伪造）。"""
-    if not settings.ths_pnl_enable:
-        return {"configured": False}
-    from app.services import ths_pnl as ths_pnl_service
+    """同花顺真实盈亏【已下线 2026-09-16】返回 410；原逻辑保留于 if False。"""
+    raise HTTPException(status_code=410, detail="同花顺真实盈亏已下线（账本登录态不可用）")
+    if False:  # === DISABLED 2026-09-16 ===
+        if not settings.ths_pnl_enable:
+            return {"configured": False}
+        from app.services import ths_pnl as ths_pnl_service
 
-    if not ths_pnl_service.load_cookie():
-        return {"configured": False}
-    return {"configured": True,
-            "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
-                user_id=_request_user_id(), is_admin=current_user_role() == "admin")}
+        if not ths_pnl_service.load_cookie():
+            return {"configured": False}
+        return {"configured": True,
+                "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
+                    user_id=_request_user_id(), is_admin=current_user_role() == "admin")}
 
 
 @router.post("/account/pnl/refresh")
 def account_pnl_refresh():
-    """重新读取当前 DSH 凭证并立即验证同花顺会话；不返回 Cookie。"""
-    if not settings.ths_pnl_enable:
-        return {"configured": False}
-    from app.services import ths_pnl as ths_pnl_service
+    """同花顺凭证刷新【已下线 2026-09-16】返回 410；原逻辑保留于 if False。"""
+    raise HTTPException(status_code=410, detail="同花顺真实盈亏已下线（账本登录态不可用）")
+    if False:  # === DISABLED 2026-09-16 ===
+        if not settings.ths_pnl_enable:
+            return {"configured": False}
+        from app.services import ths_pnl as ths_pnl_service
 
-    if not ths_pnl_service.load_cookie():
-        return {"configured": False}
-    return {"configured": True,
-            "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
-                force=True, user_id=_request_user_id(),
-                is_admin=current_user_role() == "admin")}
+        if not ths_pnl_service.load_cookie():
+            return {"configured": False}
+        return {"configured": True,
+                "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
+                    force=True, user_id=_request_user_id(),
+                    is_admin=current_user_role() == "admin")}
 
 
 class AccountBaselineBody(BaseModel):

@@ -167,7 +167,7 @@ def test_sentinel_node_exposes_portfolio_risk_snapshot(monkeypatch):
     )
     monkeypatch.setattr(ps, "get_datasource", lambda: source)
     monkeypatch.setattr(ps, "agent_call", lambda **kw: _sentinel_output())
-    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: False)
+    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: {"result": "failed", "channel": "none"})
 
     state = ps.portfolio_sentinel_node({"trade_date": _MODULE_DATE})
     assert "error" not in state or not state["error"]

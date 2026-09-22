@@ -11,7 +11,7 @@ from app.db import repo
 from app.graph import router as graph_router
 from app.llm.structured import ModelLevel
 from app.services import agent_chat, feishu_bridge, holding_view, market_view, status as status_service
-from app.services import task_queue, ths_pnl
+from app.services import task_queue  # ths_pnl DISABLED 2026-09-16（见 同花顺模块下线_方案.md §三）
 from app.system_map import collaboration as collaboration_registry
 
 logger = logging.getLogger(__name__)
@@ -156,17 +156,19 @@ def _fmt_holdings(params: dict, hint: str) -> str:
 
 
 def _fmt_pnl(params: dict, hint: str) -> str:
-    """今日真实盈亏三态：未接入 / Cookie 过期 / 正常（¥与%）"""
-    if not (settings.ths_pnl_enable and ths_pnl.load_cookie()):
-        return "同花顺未接入（THS_PNL_ENABLE=false 或未配 Cookie）"
-    snap = repo.get_latest_account_pnl(
-        params.get("user_id"), is_admin=params.get("user_role") == "admin") or {}
-    if snap.get("token_expired"):
-        return "同花顺 Cookie 过期，请到 DSH 插件重新登录"
-    if snap.get("pnl_yk") is None:
-        return f"今日盈亏获取失败：{snap.get('error') or '暂无数据'}"
-    sh = f" 上证{snap['sh_pct']}%" if snap.get("sh_pct") is not None else ""
-    return f"今日盈亏 ¥{snap['pnl_yk']:,.0f}（{snap.get('pnl_pct')}%）{sh}"
+    """今日真实盈亏【已下线 2026-09-16】改走推算口径。"""
+    return "同花顺真实盈亏已下线（账本登录态不可用）"
+    if False:  # === DISABLED 2026-09-16 ===
+        if not (settings.ths_pnl_enable and ths_pnl.load_cookie()):
+            return "同花顺未接入（THS_PNL_ENABLE=false 或未配 Cookie）"
+        snap = repo.get_latest_account_pnl(
+            params.get("user_id"), is_admin=params.get("user_role") == "admin") or {}
+        if snap.get("token_expired"):
+            return "同花顺 Cookie 过期，请到 DSH 插件重新登录"
+        if snap.get("pnl_yk") is None:
+            return f"今日盈亏获取失败：{snap.get('error') or '暂无数据'}"
+        sh = f" 上证{snap['sh_pct']}%" if snap.get("sh_pct") is not None else ""
+        return f"今日盈亏 ¥{snap['pnl_yk']:,.0f}（{snap.get('pnl_pct')}%）{sh}"
 
 
 def _fmt_score(params: dict, hint: str) -> str:

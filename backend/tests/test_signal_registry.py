@@ -153,6 +153,7 @@ class _FakeSource:
 def scan_env(monkeypatch, tmp_path):
     engine = create_engine("sqlite:///" + str(tmp_path / "signal.db").replace("\\", "/"))
     Base.metadata.create_all(bind=engine, tables=[SignalTrigger.__table__])
+    monkeypatch.setenv("KLINE_DB_PATH", str(tmp_path / "kline_store.db"))  # 隔离本地日线库（否则真库真票顶替假票）
     monkeypatch.setattr(signal_scan, "SessionLocal",
                         sessionmaker(bind=engine, autoflush=False, expire_on_commit=False))
     monkeypatch.setattr(signal_scan, "get_datasource", lambda: _FakeSource())
@@ -165,12 +166,12 @@ def scan_env(monkeypatch, tmp_path):
 def test_scan_skips_non_trading_day_without_any_record(monkeypatch):
     monkeypatch.setattr(signal_scan.market_hours, "is_trading_day", lambda: False)
     monkeypatch.setattr(signal_scan, "get_datasource", lambda: pytest.fail("非交易日不得拉股票池"))
-    out = signal_scan.scan_signal_triggers(TRADE_DATE)
+    out = signal_scan.scan_signal_triggers(TRADE_DATE, local_only=False)
     assert out["reason"] == "not_trading_day" and out["records"] == 0
 
 
 def test_scan_flags_dedup_suspension_and_null_returns(scan_env):
-    out = signal_scan.scan_signal_triggers(TRADE_DATE)
+    out = signal_scan.scan_signal_triggers(TRADE_DATE, local_only=False)
     assert out["reason"] == "ok" and out["universe"] == 3 and out["records"] > 0
     with scan_env() as db:
         rows = db.query(SignalTrigger).all()
@@ -184,13 +185,13 @@ def test_scan_flags_dedup_suspension_and_null_returns(scan_env):
         assert all(row.ret_5 is None and row.ret_10 is None and row.exec_price is None
                    and row.filled_at is None for row in rows)
         first = len(rows)
-    assert signal_scan.scan_signal_triggers(TRADE_DATE)["records"] == 0
+    assert signal_scan.scan_signal_triggers(TRADE_DATE, local_only=False)["records"] == 0
     with scan_env() as db:
         assert db.query(SignalTrigger).count() == first
         for row in db.query(SignalTrigger).all():
             row.trade_date = "2026-09-15"
         db.commit()
-    signal_scan.scan_signal_triggers(TRADE_DATE)
+    signal_scan.scan_signal_triggers(TRADE_DATE, local_only=False)
     with scan_env() as db:
         fresh = db.query(SignalTrigger).filter(SignalTrigger.trade_date == TRADE_DATE).all()
         assert fresh and all(row.dedup == 1 for row in fresh)

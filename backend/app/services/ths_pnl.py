@@ -9,6 +9,10 @@
   load_cookie / load_fund_key / discover_fund_key / fetch_pnl / fetch_index / get_snapshot
 纯函数可单测（不触网路径全覆盖）；网络/解析异常一律转 error 返回，绝不抛给调用方。
 """
+# ============================================================================
+# DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）
+# 本模块整体停用（不删代码，仅标记）；解注释路径见方案 §三。
+# ============================================================================
 import json
 import logging
 import re
@@ -37,10 +41,12 @@ _SNAPSHOT_STALE_SECONDS = 10 * 60
 logger = logging.getLogger(__name__)
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def _now_str() -> str:
     return datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def normalize_cookie(block: str) -> str:
     """Cookie 归一化：按 ; 拆分 → 去每段空白（含换行）→ '; ' 重连（处理 YAML 折叠换行）"""
     if not block:
@@ -49,17 +55,20 @@ def normalize_cookie(block: str) -> str:
     return "; ".join(p for p in parts if p)
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def _read_cred_block(raw: str, key: str) -> str:
     """读凭证文件某 key 块（refs.STOCK_PNL_COOKIE / STOCK_PNL_FUND_KEY，YAML 多行折叠）"""
     m = re.search(re.escape(key) + r":\s*(.*?)(?=\n\s*[A-Za-z0-9_]+\s*:|\Z)", raw, re.S)
     return m.group(1).strip() if m else ""
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def _cookie_field(cookie: str, name: str) -> str:
     m = re.search(r"(?:^|;\s*)%s=([^;]*)" % re.escape(name), cookie)
     return m.group(1).strip() if m else ""
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def load_cookie() -> str:
     """取 Cookie：优先 ths_pnl_cookie（非空），否则读 ths_pnl_cookie_file 的 STOCK_PNL_COOKIE 块。
     只返回归一化字符串供内存/HTTP 头使用；绝不打印、绝不落日志。"""
@@ -72,6 +81,7 @@ def load_cookie() -> str:
         return ""
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def load_fund_key() -> str:
     """取 fund_key：优先 ths_pnl_fund_key（非空），否则读凭证文件 STOCK_PNL_FUND_KEY 块"""
     if settings.ths_pnl_fund_key.strip():
@@ -88,6 +98,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def _post(url: str, payload: str, cookie: str, minimal: bool = False) -> tuple[bool, object, bool]:
     """POST 表单到同花顺账本 API（不跟随重定向）。返回 (ok, body|error, token_expired)。
 
@@ -118,6 +129,7 @@ def _post(url: str, payload: str, cookie: str, minimal: bool = False) -> tuple[b
         return False, "响应解析失败", False
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def discover_fund_key(cookie: str, user_id: str = "") -> str:
     """调 account_list 自动发现第一个有效 fund_key；任何失败返回空串（由调用方走 error）"""
     uid = user_id or _cookie_field(cookie, "userid")
@@ -132,6 +144,7 @@ def discover_fund_key(cookie: str, user_id: str = "") -> str:
     return ""
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def fetch_pnl(cookie: str, user_id: str = "", fund_key: str = "") -> dict:
     """POST time_share → 归一化今日盈亏。返回 dict 含 error/token_expired，不抛异常。
 
@@ -160,6 +173,7 @@ def fetch_pnl(cookie: str, user_id: str = "", fund_key: str = "") -> dict:
             "updated_at": _now_str(), "error": "", "token_expired": False}
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def fetch_index(cookie: str, user_id: str = "") -> float | None:
     """POST getQuotes → 上证指数（zqdm=1A0001）涨跌幅 %；失败返回 None（不伪造 0）"""
     uid = user_id or _cookie_field(cookie, "userid")
@@ -185,6 +199,7 @@ def fetch_index(cookie: str, user_id: str = "") -> float | None:
     return None
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def get_snapshot(cookie: str = "", user_id: str = "", fund_key: str = "") -> dict:
     """合并「今日盈亏 + 上证指数」归一化快照；失败写 error，不抛异常、不伪造 0。
 
@@ -203,6 +218,7 @@ def get_snapshot(cookie: str = "", user_id: str = "", fund_key: str = "") -> dic
     return {**pnl, "sh_pct": sh_pct}
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def _snapshot_age_seconds(snapshot: dict | None) -> float | None:
     """计算快照年龄；无法解析时返回 None，交给调用方按需刷新。"""
     if not snapshot:
@@ -219,6 +235,7 @@ def _snapshot_age_seconds(snapshot: dict | None) -> float | None:
         return None
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def refresh_snapshot_if_needed(force: bool = False, user_id: int | None = None,
                                *, is_admin: bool = False) -> dict | None:
     """按需实时读取凭证并落库，返回最新快照。

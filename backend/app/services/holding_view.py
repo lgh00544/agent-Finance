@@ -176,6 +176,43 @@ def build_account_summary(user_id: int | None = None, *, is_admin: bool = False)
             "quote_time": view["quote_time"], "quote_error": view["quote_error"]}
 
 
+def build_today_pnl_estimate(user_id: int | None = None, *, is_admin: bool = False) -> dict:
+    """今日盈亏推算：Σ(现价−昨收)×股数；缺 price/prev_close 或 shares≤0 跳过，不伪造 0。"""
+    try:
+        rows = repo.list_holdings(status="holding", user_id=user_id, is_admin=is_admin)
+    except TypeError:
+        rows = repo.list_holdings(status="holding")
+    quote_time = time.strftime("%Y-%m-%d %H:%M")
+    if not rows:
+        return {"pnl_amount": None, "pnl_pct": None, "covered": 0, "total": 0,
+                "source": "estimate", "quote_time": quote_time, "error": "当前无持仓"}
+    quotes: dict = {}
+    err = None
+    try:
+        quotes = get_datasource().fetch_tencent_quotes_batch([r["stock_code"] for r in rows])
+    except Exception as exc:  # noqa: BLE001 行情失败不伪造 0
+        err = f"行情获取失败：{exc}"
+    amount = base = 0.0
+    covered = 0
+    for row in rows:
+        quote = quotes.get(str(row["stock_code"]).zfill(6)) or {}
+        price, prev = quote.get("price"), quote.get("prev_close")
+        shares = row.get("shares") or 0
+        if price is None or prev is None or shares <= 0:
+            continue
+        amount += (float(price) - float(prev)) * float(shares)
+        base += float(prev) * float(shares)
+        covered += 1
+    if covered == 0:
+        return {"pnl_amount": None, "pnl_pct": None, "covered": 0, "total": len(rows),
+                "source": "estimate", "quote_time": quote_time,
+                "error": err or "行情不可用，无法推算"}
+    return {"pnl_amount": _round2(amount),
+            "pnl_pct": _round2(amount / base * 100) if base > 0 else None,
+            "covered": covered, "total": len(rows), "source": "estimate",
+            "quote_time": quote_time, "error": err}
+
+
 def _reference_price(manual, entry_price, plan_by_id, plan_by_code,
                      default_pct: float, is_stop: bool) -> tuple[float, str]:
     """参考价补全链：人工设置 → 关联建仓计划（plan_id 精确）→ 该股最新计划 → 成本×默认风控比例"""

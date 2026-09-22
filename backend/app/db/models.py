@@ -265,6 +265,8 @@ class AlertLog(Base):
     action: Mapped[str] = mapped_column(String(16), default="hold")  # hold/reduce/exit（LLM 输出）
     signal: Mapped[dict] = mapped_column(SafeJSON, default=dict)         # 完整信号结构化输出
     pushed: Mapped[bool] = mapped_column(Boolean, default=False)     # 是否已推飞书
+    push_channel: Mapped[str] = mapped_column(String(16), default="none")    # direct/webhook/both/none
+    push_result: Mapped[str] = mapped_column(String(16), default="skipped")  # delivered/failed/not_configured/skipped
     source: Mapped[str] = mapped_column(String(32), default="monitor")  # 告警来源标记 monitor/portfolio_sentinel
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
@@ -492,6 +494,7 @@ class AccountBaseline(Base):
     user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 class AccountPnlSnapshot(Base):
     """同花顺投资账本真实账户今日盈亏快照（P0 数据通道；默认 ths_pnl_enable=false 不采集）
 
@@ -1555,3 +1558,15 @@ class SignalTrigger(Base):
     dedup: Mapped[int] = mapped_column(Integer, default=0)
     filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class JobRunLog(Base):
+    """调度任务运行留痕（批A A2）：每 job 一行 upsert，重启后 last_run 不丢。
+    last_reason 无值留 NULL（K227 不编造）。"""
+    __tablename__ = "job_run_log"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_run: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

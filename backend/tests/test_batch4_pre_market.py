@@ -132,7 +132,8 @@ def test_pre_market_screen_uses_prev_candidate_date(monkeypatch):
     monkeypatch.setattr(pms, "get_datasource", lambda: src)
     pushed = {"n": 0}
     monkeypatch.setattr(pms, "push_alert",
-                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or True))
+                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1)
+                                        or {"result": "delivered", "channel": "direct"}))
     result = pms.pre_market_screen()
     assert src.calls[0]["force_realtime"] is True
     assert set(src.calls[0]["codes"]) == {"600001"}   # 只用最新日期 2026-08-13 的候选
@@ -156,7 +157,7 @@ def test_pre_market_screen_thresholds_and_suspended(monkeypatch):
         "600004": {"code": "600004", "name": "正常", "price": 10.2, "change_pct": 2.0, "time": "09:25"},
     })
     monkeypatch.setattr(pms, "get_datasource", lambda: src)
-    monkeypatch.setattr(pms, "push_alert", lambda *a, **k: True)
+    monkeypatch.setattr(pms, "push_alert", lambda *a, **k: {"result": "delivered", "channel": "direct"})
     result = pms.pre_market_screen()
     by_code = {a["code"]: a for a in result["anomalies"]}
     assert len(result["anomalies"]) == 3
@@ -181,7 +182,8 @@ def test_pre_market_screen_no_anomaly_no_push(monkeypatch):
     monkeypatch.setattr(pms, "get_datasource", lambda: src)
     pushed = {"n": 0}
     monkeypatch.setattr(pms, "push_alert",
-                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or True))
+                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1)
+                                        or {"result": "delivered", "channel": "direct"}))
     before = len(repo.list_alerts(limit=50))
     result = pms.pre_market_screen()
     assert result["anomalies"] == []
@@ -198,7 +200,8 @@ def test_pre_market_screen_quotes_unavailable(monkeypatch):
     monkeypatch.setattr(pms, "get_datasource", lambda: src)
     pushed = {"n": 0}
     monkeypatch.setattr(pms, "push_alert",
-                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or True))
+                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1)
+                                        or {"result": "delivered", "channel": "direct"}))
     result = pms.pre_market_screen()
     assert result["skipped"] == "竞价数据暂不可用"
     assert pushed["n"] == 0
@@ -276,7 +279,8 @@ def test_market_shift_detect_score_band_cap(monkeypatch):
     repo.upsert_market_condition("2026-08-12", 25, {}, 10, "s2")   # 过渡期 / 上限10，差13
     pushed = {"n": 0}
     monkeypatch.setattr(pms, "push_alert",
-                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or True))
+                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1)
+                                        or {"result": "delivered", "channel": "direct"}))
     changes = pms.market_shift_detect()
     dims = [c["dim"] for c in changes]
     assert "评分" in dims and "档位" in dims and "候选池上限" in dims
@@ -305,7 +309,8 @@ def test_market_shift_detect_no_change(monkeypatch):
     repo.upsert_market_condition("2026-08-12", 30, {}, 10, "s2")   # 同分同档同上限
     pushed = {"n": 0}
     monkeypatch.setattr(pms, "push_alert",
-                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or True))
+                        lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1)
+                                        or {"result": "delivered", "channel": "direct"}))
     changes = pms.market_shift_detect()
     assert changes == []
     assert pushed["n"] == 0

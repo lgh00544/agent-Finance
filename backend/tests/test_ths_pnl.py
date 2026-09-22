@@ -7,6 +7,9 @@ repo upsert/get_latest/list 落库闭环。红线：所有断言不含 Cookie �
 """
 import pytest
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
+pytestmark = pytest.mark.skip(reason="同花顺已下线 2026-09-16")
+
 from app.db import repo
 from app.db.session import init_db
 from app.services import ths_pnl

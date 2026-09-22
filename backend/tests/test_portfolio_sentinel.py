@@ -203,7 +203,7 @@ def test_node_persists_alerts_with_source(monkeypatch):
     monkeypatch.setattr(ps, "get_datasource", lambda: source)
     monkeypatch.setattr(ps, "agent_call", lambda **kw: _sentinel_output())
     pushed = {"n": 0}
-    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or True))
+    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or {"result": "delivered", "channel": "direct"}))
 
     state = ps.portfolio_sentinel_node({"trade_date": DATE})
     assert "error" not in state or not state["error"]
@@ -236,7 +236,7 @@ def test_node_no_alerts_no_feishu(monkeypatch):
                                            "concentration_alert": False})
     monkeypatch.setattr(ps, "agent_call", lambda **kw: out)
     pushed = {"n": 0}
-    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or True))
+    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: (pushed.__setitem__("n", pushed["n"] + 1) or {"result": "delivered", "channel": "direct"}))
 
     state = ps.portfolio_sentinel_node({"trade_date": DATE})
     assert "error" not in state or not state["error"]

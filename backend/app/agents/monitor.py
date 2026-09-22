@@ -268,11 +268,13 @@ def _rule_fallback_alert(code: str, name: str, today: str, math: dict) -> None:
     msg = (f"⚠️ LLM 研判不可用，此为规则兜底预警：{name}({code}) 浮亏 "
            f"{pnl}%（≤{_RULE_FALLBACK_LOSS_PCT}%），触及硬性止损红线。")
     dedup_key = f"{code}:rule_fallback:{today}"
-    pushed = False
+    pushed, push_result, push_channel = False, "skipped", "none"
     if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
-        pushed = push_alert(name, code, "rule_fallback", "critical", msg, "exit")
+        r = push_alert(name, code, "rule_fallback", "critical", msg, "exit")
+        pushed, push_result, push_channel = r["result"] == "delivered", r["result"], r["channel"]
     repo.insert_alert(code, name, "rule_fallback", "critical", msg, "exit",
-                      {"rule_fallback": True, "pnl_pct": pnl}, pushed=pushed)
+                      {"rule_fallback": True, "pnl_pct": pnl}, pushed=pushed,
+                      push_channel=push_channel, push_result=push_result)
     logger.error("监控规则兜底告警落库: %s（浮亏 %s%%，pushed=%s）", code, pnl, pushed)
 
 
@@ -287,21 +289,23 @@ def push_alert_node(state: StockAgentState) -> StockAgentState:
         return state
 
     # 所有信号落库（面板可见）；推送按严重度与去重控制
-    pushed = False
+    pushed, push_result, push_channel = False, "skipped", "none"
     if signal.get("action") != "hold" or signal.get("severity") in ("warning", "critical"):
         dedup_key = f"{code}:{signal.get('alert_type', 'unknown')}:{today}"
         if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
-            pushed = push_alert(name, code, signal.get("alert_type", "监控"),
-                                signal.get("severity", "info"),
-                                signal.get("message", ""), signal.get("action", "hold"))
+            r = push_alert(name, code, signal.get("alert_type", "监控"),
+                           signal.get("severity", "info"),
+                           signal.get("message", ""), signal.get("action", "hold"))
+            pushed, push_result, push_channel = r["result"] == "delivered", r["result"], r["channel"]
             cache.set(f"alert:last:{code}:{today}",
                       f"{signal.get('action')}|{signal.get('severity')}", 86400)
         elif _severity_changed(code, today, signal):
             # 同日同类告警但风险等级/建议发生变化 → 重新推送（30 分钟冷却，防 LLM 波动震荡）
             logger.info("告警等级变化，重新推送: %s %s", code, signal.get("alert_type"))
-            pushed = push_alert(name, code, signal.get("alert_type", "监控"),
-                                signal.get("severity", "info"),
-                                signal.get("message", ""), signal.get("action", "hold"))
+            r = push_alert(name, code, signal.get("alert_type", "监控"),
+                           signal.get("severity", "info"),
+                           signal.get("message", ""), signal.get("action", "hold"))
+            pushed, push_result, push_channel = r["result"] == "delivered", r["result"], r["channel"]
             cache.set(f"alert:last:{code}:{today}",
                       f"{signal.get('action')}|{signal.get('severity')}", 86400)
         else:
@@ -315,7 +319,8 @@ def push_alert_node(state: StockAgentState) -> StockAgentState:
             extra = {"model_thinking": _mt, "tool_trace": _tt}
     repo.insert_alert(code, name, signal.get("alert_type", "常规跟踪"),
                       signal.get("severity", "info"), signal.get("message", ""),
-                      signal.get("action", "hold"), signal, pushed, extra=extra)
+                      signal.get("action", "hold"), signal, pushed, extra=extra,
+                      push_channel=push_channel, push_result=push_result)
     return state
 
 

@@ -365,12 +365,14 @@ def _rule_fallback_alert(raw: dict, today: str) -> None:
     msg = "⚠️ LLM 研判不可用，此为规则兜底预警（回撤/集中度阈值触发）：" + "；".join(flags)
     severity = "critical" if drawdown else "warning"
     dedup_key = f"PORTFOLIO:rule_fallback:{today}"
-    pushed = False
+    pushed, push_result, push_channel = False, "skipped", "none"
     if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
-        pushed = push_alert("组合哨兵", "PORTFOLIO", "rule_fallback", severity, msg, "review")
+        r = push_alert("组合哨兵", "PORTFOLIO", "rule_fallback", severity, msg, "review")
+        pushed, push_result, push_channel = r["result"] == "delivered", r["result"], r["channel"]
     repo.insert_alert("PORTFOLIO", "组合哨兵", "rule_fallback", severity, msg, "review",
                       {"rule_fallback": True, "drawdown_alert": drawdown,
-                       "concentration_alert": concentration}, pushed=pushed, source=_ALERT_SOURCE)
+                       "concentration_alert": concentration}, pushed=pushed, source=_ALERT_SOURCE,
+                      push_channel=push_channel, push_result=push_result)
     logger.error("组合哨兵规则兜底告警落库: %s（回撤=%s 集中度=%s，pushed=%s）",
                  today, drawdown, concentration, pushed)
 
@@ -416,26 +418,28 @@ def _persist_alerts(raw: dict, result: dict, today: str) -> None:
                                   f"触发集中度预警，建议分散持仓。",
                        "signal": risk})
 
-    for al in alerts:
-        repo.insert_alert(al["stock_code"], al["stock_name"], al["alert_type"],
-                          al["severity"], al["message"], al["action"], al["signal"],
-                          pushed=False, source=_ALERT_SOURCE)
-
-    # 汇总落库 + 有告警才推飞书（当日去重）
+    # 先算汇总推送结果，再据此写每条告警的投递留痕（批A A4：不再写死 pushed=False）
     if alerts:
         n_alert = len(alerts)
         summary_msg = (f"组合哨兵 · {today}：共 {n_alert} 项告警\n"
                        f"总评估：{result.get('overall_assessment') or ''}\n"
                        + "\n".join(a["message"][:60] for a in alerts[:5]))
         dedup_key = f"portfolio_sentinel:summary:{today}"
-        pushed = False
+        pushed, push_result, push_channel = False, "skipped", "none"
         if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
-            pushed = push_alert("组合哨兵", "PORTFOLIO", "组合风控告警", "warning",
-                                summary_msg, "review")
+            r = push_alert("组合哨兵", "PORTFOLIO", "组合风控告警", "warning",
+                           summary_msg, "review")
+            pushed, push_result, push_channel = r["result"] == "delivered", r["result"], r["channel"]
+        for al in alerts:
+            repo.insert_alert(al["stock_code"], al["stock_name"], al["alert_type"],
+                              al["severity"], al["message"], al["action"], al["signal"],
+                              pushed=pushed, source=_ALERT_SOURCE,
+                              push_channel=push_channel, push_result=push_result)
         repo.insert_alert("PORTFOLIO", "组合哨兵", "组合哨兵-汇总", "warning",
                           summary_msg, "review",
                           {"overall_assessment": result.get("overall_assessment"),
-                           "alert_count": n_alert}, pushed=pushed, source=_ALERT_SOURCE)
+                           "alert_count": n_alert}, pushed=pushed, source=_ALERT_SOURCE,
+                          push_channel=push_channel, push_result=push_result)
         if pushed:
             logger.info("组合哨兵飞书推送成功: %s（%s 项告警）", today, n_alert)
     else:
@@ -445,4 +449,5 @@ def _persist_alerts(raw: dict, result: dict, today: str) -> None:
                           f"组合总盈亏 {risk.get('total_pnl_pct') or '数据不足'}%，"
                           f"最大板块占比 {risk.get('max_sector_pct') or '数据不足'}%",
                           "hold", {"overall_assessment": result.get("overall_assessment")},
-                          pushed=False, source=_ALERT_SOURCE)
+                          pushed=False, source=_ALERT_SOURCE,
+                          push_channel="none", push_result="skipped")

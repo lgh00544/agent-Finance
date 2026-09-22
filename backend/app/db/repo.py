@@ -1454,13 +1454,15 @@ def insert_plan(stock_code: str, stock_name: str, plan_date: str, total_pct: flo
 def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: str,
                  message: str, action: str, signal: dict, pushed: bool,
                  source: str = "monitor", extra: dict | None = None,
-                 user_id: int | None = None) -> int:
+                 user_id: int | None = None, push_channel: str = "none",
+                 push_result: str = "skipped") -> int:
     """写告警日志；source 标记来源（monitor/portfolio_sentinel）。extra=thinking 摘要，仅进 trace_alert.ext_info，
-    业务表 signal 保持干净。默认 None 零行为。"""
+    业务表 signal 保持干净；push_channel/push_result 记录投递留痕（批A A4）。"""
     with SessionLocal() as db:
         row = AlertLog(stock_code=stock_code, stock_name=stock_name, alert_type=alert_type,
                        severity=severity, message=message, action=action, signal=signal,
-                       pushed=pushed, source=source, user_id=user_id)
+                       pushed=pushed, source=source, user_id=user_id,
+                       push_channel=push_channel, push_result=push_result)
         db.add(row)
         task_queue.guarded_commit(db)
         db.refresh(row)
@@ -1816,6 +1818,7 @@ def get_latest_account_baseline(user_id: int | None = None, *, is_admin: bool = 
 
 # ==================== 同花顺真实账户今日盈亏快照（ths_pnl，默认关闭） ====================
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def upsert_account_pnl_snapshot(trade_date: str, ts: str, pnl_yk: float | None = None,
                                 pnl_pct: float | None = None, sh_pct: float | None = None,
                                 chart_data: list | None = None, source: str = "ths",
@@ -1850,6 +1853,7 @@ def upsert_account_pnl_snapshot(trade_date: str, ts: str, pnl_yk: float | None =
         return row.id
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def get_latest_account_pnl(user_id: int | None = None, *, is_admin: bool = False) -> dict | None:
     """读取最新同花顺盈亏快照；无记录返回 None"""
     user_id = _context_user_id(user_id)
@@ -1867,6 +1871,7 @@ def get_latest_account_pnl(user_id: int | None = None, *, is_admin: bool = False
                 "updated_at": str(r.updated_at)}
 
 
+# === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
 def list_account_pnl_history(days: int = 30, user_id: int | None = None,
                              *, is_admin: bool = False) -> list[dict]:
     """近 N 天同花顺盈亏快照历史（按日降序；每行只取核心字段）"""

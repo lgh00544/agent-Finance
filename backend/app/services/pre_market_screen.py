@@ -87,17 +87,20 @@ def pre_market_screen() -> dict:
                               "change_pct": change_pct, "price": price, "pre_close": pre_close})
         # 正常波动（-3 ~ +5）→ 不告警
 
+    pushed, push_result, push_channel = False, "skipped", "none"
+    if anomalies:
+        items = "；".join(f"{a['code']} {a['name']}{_anomaly_pct(a)}" for a in anomalies)
+        summary = (f"【盘前快筛汇总】今日 {len(anomalies)} 只候选异常：{items}，详见告警列表")
+        r = push_alert("盘前快筛", "PRE_MARKET", "盘前快筛", "warning", summary, "关注异常候选")
+        pushed, push_result, push_channel = r["result"] == "delivered", r["result"], r["channel"]
     for a in anomalies:
         repo.insert_alert(a["code"], a["name"], "盘前快筛", a["severity"], a["message"],
                           a["action"],
                           {"pre_market": True, "type": a["type"],
                            "change_pct": a["change_pct"], "price": a["price"],
                            "pre_close": a["pre_close"]},
-                          pushed=False, source="pre_market")
-    if anomalies:
-        items = "；".join(f"{a['code']} {a['name']}{_anomaly_pct(a)}" for a in anomalies)
-        summary = (f"【盘前快筛汇总】今日 {len(anomalies)} 只候选异常：{items}，详见告警列表")
-        push_alert("盘前快筛", "PRE_MARKET", "盘前快筛", "warning", summary, "关注异常候选")
+                          pushed=pushed, source="pre_market",
+                          push_channel=push_channel, push_result=push_result)
     return {"checked": len(candidates), "anomalies": anomalies}
 
 
@@ -203,7 +206,8 @@ def market_shift_detect() -> list[dict]:
         lines.append(f"综述：{today_summary}")
     message = "\n".join(lines)
     signal = {c["dim"]: c["data"] for c in changes}
-    pushed = push_alert("市场", "", "市况切换", "warning", message, "关注市况切换")
+    r = push_alert("市场", "", "市况切换", "warning", message, "关注市况切换")
     repo.insert_alert("", "市场", "市况切换", "warning", message,
-                      "关注市况切换", signal, pushed=pushed, source="market_shift")
+                      "关注市况切换", signal, pushed=r["result"] == "delivered", source="market_shift",
+                      push_channel=r["channel"], push_result=r["result"])
     return changes

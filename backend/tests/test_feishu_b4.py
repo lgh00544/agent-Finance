@@ -78,11 +78,13 @@ def test_daily_report_assembly(monkeypatch):
     monkeypatch.setattr("app.services.feishu_sender.send_text", lambda oid, t: sent.append(t))
     monkeypatch.setattr(ths_mod, "get_snapshot", lambda: {"pnl_yk": 1234.5, "pnl_pct": 2.3})
     monkeypatch.setattr("app.services.holding_view.build_holding_view",
-                        lambda: {"rows": [{"market_value": 100000.0, "pnl_amount": 5000.0}]})
+                        lambda user_id=None, is_admin=False: {
+                            "rows": [{"market_value": 100000.0, "pnl_amount": 5000.0}]})
     monkeypatch.setattr(jobs.repo, "list_candidates",
                         lambda d, n: [{"stock_code": "600519", "stock_name": "贵州茅台"}])
     monkeypatch.setattr(jobs.repo, "list_alerts",
-                        lambda n: [{"created_at": "2026-08-28 10:00:00"}])
+                        lambda n, user_id=None, is_admin=False: [
+                            {"created_at": "2026-08-28 10:00:00"}])
     monkeypatch.setattr(jobs, "_is_trading_day", lambda d: True)
     monkeypatch.setattr(jobs.settings, "feishu_daily_report", True)
     monkeypatch.setattr(jobs.settings, "feishu_admin_open_ids", "ou_adm")

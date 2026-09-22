@@ -197,7 +197,7 @@ def test_v5_sentinel_rule_fallback_push_and_dedup(monkeypatch):
     monkeypatch.setattr(ps, "agent_call", _boom)
     pushed = []
     monkeypatch.setattr(ps, "push_alert",
-                        lambda *a, **k: pushed.append({"name": a[0], "type": a[2]}) or True)
+                        lambda *a, **k: pushed.append({"name": a[0], "type": a[2]}) or {"result": "delivered", "channel": "direct"})
 
     ps.portfolio_sentinel_node({"trade_date": v5_date})
     rows = _alert_rows("rule_fallback")
@@ -229,7 +229,7 @@ def test_v6_sentinel_normal_path_zero_change(monkeypatch):
         overall_assessment="正常", action_suggestions=[])
     monkeypatch.setattr(ps, "agent_call", lambda **kw: out)
     pushed = []
-    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: pushed.append(a[2]) or True)
+    monkeypatch.setattr(ps, "push_alert", lambda *a, **k: pushed.append(a[2]) or {"result": "delivered", "channel": "direct"})
 
     ps.portfolio_sentinel_node({"trade_date": DATE})
     assert _alert_rows("rule_fallback") == []  # 无 rule_fallback
@@ -255,7 +255,7 @@ def test_v7_monitor_rule_fallback_push_when_big_loss(monkeypatch):
     monkeypatch.setattr(mn, "agent_call", _boom)
     pushed = []
     monkeypatch.setattr(mn, "push_alert",
-                        lambda *a, **k: pushed.append({"name": a[0], "type": a[2]}) or True)
+                        lambda *a, **k: pushed.append({"name": a[0], "type": a[2]}) or {"result": "delivered", "channel": "direct"})
 
     with pytest.raises(RuntimeError):
         mn.llm_signal(state)
@@ -278,7 +278,7 @@ def test_v7b_monitor_no_fallback_when_no_big_loss(monkeypatch):
         raise RuntimeError("LLM down")
     monkeypatch.setattr(mn, "agent_call", _boom)
     pushed = []
-    monkeypatch.setattr(mn, "push_alert", lambda *a, **k: pushed.append(a[2]) or True)
+    monkeypatch.setattr(mn, "push_alert", lambda *a, **k: pushed.append(a[2]) or {"result": "delivered", "channel": "direct"})
 
     with pytest.raises(RuntimeError):
         mn.llm_signal(state)

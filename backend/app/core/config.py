@@ -206,16 +206,18 @@ class Settings(BaseSettings):
     #   none = 明确只用东财单源（置信度不足降级保留）。
     dragon_tiger_second_source: str = "auto"
 
+    # === DISABLED 2026-09-16: 同花顺账本登录态不可用（见 同花顺模块下线_方案.md §三 解注释路径）===
     # ---------- 同花顺投资账本真实账户采集（P0 数据通道，默认关闭）----------
     # 直连同花顺账本 API 拉取真实「今日盈亏 + 上证指数」（替代估算/akshare 延迟值）。
     # 默认关不改变现有行为；Cookie/密钥只进内存与 HTTP 头，禁止任何日志/输出明文（红线）；
     # 采集失败只写 error 字段，不抛异常、不伪造 0、不阻塞调度。
-    ths_pnl_enable: bool = True           # 总开关 THS_PNL_ENABLE（默认开；Cookie 已配，Collect 失败只落 error 不崩、前端诚实降级）
+    ths_pnl_enable: bool = False          # 总开关 THS_PNL_ENABLE（下线：默认关；见 同花顺模块下线_方案.md）
     ths_pnl_cookie: str = ""               # 直接给 Cookie（可选，绕过 DSH 凭证文件）
     ths_pnl_cookie_file: str = r"D:\AI\Deepseek Harness\.dsh\.credentials.yaml"  # DSH 凭证文件
     ths_pnl_poll_seconds: int = 20         # 采集间隔（交易时段）
     ths_pnl_user_id: str = ""              # 可选；空则从 Cookie 的 userid= 提取
     ths_pnl_fund_key: str = ""             # 可选；空则调 account_list 自动发现
+    # === /DISABLED ===
 
     # ---------- ReAct 智能体研判环（agentic 平行通道，默认关闭）----------
     # 开启后 score 等节点走 run_agentic_judge 只读工具环，失败自动回退单发；关闭时主链零影响。
@@ -244,7 +246,7 @@ class Settings(BaseSettings):
     # ---------- 买卖点信号 · 本地日线仓库（批1.5）----------
     # local_only=True：16:50 扫描只读本地库，不足 250 根的票记 incomplete/data_missing，
     # 禁止静默回退逐票远端（保证扫描时长稳定、结果可审计）。默认 False 以免回补未完成时覆盖率归零。
-    kline_scan_local_only: bool = False
+    kline_scan_local_only: bool = True    # 2026-09-21 开启：本地覆盖 97.0%（5397/5564）≥95%；缺票记 incomplete/data_missing 并进补数队列
     # 夜间历史回补：每个 job 周期最多回补多少只（0=不限）；用于把数小时的全量首填切成多夜。
     kline_backfill_batch_limit: int = 300
     # 夜间回补单只之间的 sleep（秒），控速避免触发源站反爬

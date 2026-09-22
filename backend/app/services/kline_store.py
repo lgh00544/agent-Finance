@@ -36,6 +36,14 @@ _INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_daily_kline_code ON daily_kline (stock_code)",
 )
 
+_SHORT_DDL = """
+CREATE TABLE IF NOT EXISTS short_history (
+    stock_code TEXT PRIMARY KEY,
+    bars INTEGER NOT NULL DEFAULT 0,
+    checked_at TEXT NOT NULL DEFAULT ''
+)
+"""
+
 _BAR_COLS = ("open", "high", "low", "close", "volume", "amount")
 
 
@@ -72,12 +80,62 @@ def connect(path: str | None = None):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA synchronous=NORMAL")
-        for ddl in (_DDL, *_INDEXES):
+        for ddl in (_DDL, *_INDEXES, _SHORT_DDL):
             conn.execute(ddl)
         _migrate(conn)
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def connect_read(path: str | None = None):
+    """只读连接（扫描热路径专用）：不做 DDL / 写型 PRAGMA；库不存在时 yield None
+
+    为什么单独一条：扫描期每只票要读 2 次（has_enough + load_frame），若每次连接都建表、
+    跑 journal_mode 等写操作，5,564 只 ≈ 1.7 万次写锁/DDL，被并发线程串行化 ⇒ 实测 129ms/只
+    （全市场 716s > 540s 预算）。只读连接把该开销降为零。
+    """
+    target = db_path(path)
+    if not target.exists():
+        yield None
+        return
+    conn = sqlite3.connect("file:%s?mode=ro" % str(target).replace("\\", "/"), uri=True, timeout=15)
+    try:
+        conn.execute("PRAGMA busy_timeout=10000")
+        yield conn
+    finally:
+        conn.close()
+
+
+def mark_short(code: str, bars: int, path: str | None = None) -> None:
+    """记录「源可取但历史不足 MIN_BARS」的短史票（回补/扫描据此标 unsupported，不再夜夜重试）"""
+    with connect(path) as conn:
+        conn.execute("INSERT OR REPLACE INTO short_history (stock_code, bars, checked_at) "
+                     "VALUES (?,?,?)", (str(code), int(bars), datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+
+
+def clear_short(code: str, path: str | None = None) -> None:
+    """该票已足量时清除短史标记（自我修复）"""
+    with connect(path) as conn:
+        conn.execute("DELETE FROM short_history WHERE stock_code = ?", (str(code),))
+        conn.commit()
+
+
+def short_codes(path: str | None = None) -> set[str]:
+    """当前短史票集合；库/表不存在时返回空集（老库无表不报错）"""
+    try:
+        with connect_read(path) as conn:
+            if conn is None:
+                return set()
+            try:
+                return {str(r[0]) for r in conn.execute(
+                    "SELECT stock_code FROM short_history").fetchall()}
+            except sqlite3.OperationalError:
+                return set()
+    except Exception:  # noqa: BLE001 只读探测失败不影响主链路
+        return set()
 
 
 def upsert_bars(rows: list[dict], path: str | None = None) -> int:
@@ -125,7 +183,9 @@ def load_bars(code: str, start: str | None = None, end: str | None = None,
         sql += " AND trade_date <= ?"
         args.append(end)
     sql += " ORDER BY trade_date ASC"
-    with connect(path) as conn:
+    with connect_read(path) as conn:
+        if conn is None:
+            return []
         rows = conn.execute(sql, args).fetchall()
     return [{"stock_code": r[0], "trade_date": r[1], "date": r[1], "open": r[2], "high": r[3],
              "low": r[4], "close": r[5], "volume": r[6], "amount": r[7],
@@ -155,7 +215,9 @@ def load_frame(code: str, start: str | None = None, end: str | None = None, path
 
 def name_map(path: str | None = None) -> dict:
     """{stock_code: stock_name}：给扫描判定 is_st 用（本地库已存名称时无需再取股票池）"""
-    with connect(path) as conn:
+    with connect_read(path) as conn:
+        if conn is None:
+            return {}
         rows = conn.execute(
             "SELECT stock_code, MAX(stock_name) FROM daily_kline GROUP BY stock_code").fetchall()
     return {r[0]: (r[1] or "") for r in rows}
@@ -163,7 +225,9 @@ def name_map(path: str | None = None) -> dict:
 
 def prev_close(code: str, before: str, path: str | None = None) -> float | None:
     """`before` 之前最近一根的收盘价（用于除权检测：与快照昨收比对）"""
-    with connect(path) as conn:
+    with connect_read(path) as conn:
+        if conn is None:
+            return None
         row = conn.execute(
             "SELECT close FROM daily_kline WHERE stock_code = ? AND trade_date < ? "
             "ORDER BY trade_date DESC LIMIT 1", (code, before)).fetchone()
@@ -172,7 +236,9 @@ def prev_close(code: str, before: str, path: str | None = None) -> float | None:
 
 def stats(path: str | None = None) -> dict:
     """仓库概览：总行数 / 股票数 / 日期范围（用于回补与巡检）"""
-    with connect(path) as conn:
+    with connect_read(path) as conn:
+        if conn is None:
+            return {"rows": 0, "codes": 0, "min_date": None, "max_date": None}
         total = conn.execute("SELECT COUNT(*) FROM daily_kline").fetchone()[0]
         codes = conn.execute("SELECT COUNT(DISTINCT stock_code) FROM daily_kline").fetchone()[0]
         span = conn.execute("SELECT MIN(trade_date), MAX(trade_date) FROM daily_kline").fetchone()
@@ -181,7 +247,9 @@ def stats(path: str | None = None) -> dict:
 
 def has_enough(code: str, min_bars: int, path: str | None = None) -> bool:
     """该票本地是否已有 ≥min_bars 根（扫描是否可完全离线判定）"""
-    with connect(path) as conn:
+    with connect_read(path) as conn:
+        if conn is None:
+            return False
         n = conn.execute("SELECT COUNT(*) FROM daily_kline WHERE stock_code = ?", (code,)).fetchone()[0]
     return int(n) >= int(min_bars)
 
@@ -192,7 +260,9 @@ def series_adjust(code: str, path: str | None = None) -> str | None:
     日增量据此继承口径：当日快照与 qfq 在「非除权日」等价（核验结论 v2 §11.4），
     故追加当日 bar 时沿用历史口径即可；除权日由 ingest 检出后触发重建，不会静默混用。
     """
-    with connect(path) as conn:
+    with connect_read(path) as conn:
+        if conn is None:
+            return None
         row = conn.execute(
             "SELECT adjust FROM daily_kline WHERE stock_code = ? "
             "ORDER BY trade_date DESC LIMIT 1", (code,)).fetchone()
@@ -203,7 +273,9 @@ def codes_below(min_bars: int, path: str | None = None) -> list:
     """返回 [(code, 已有根数, name)]，仅含不足 min_bars 的票（夜间回补的待办清单）
 
     不含本地库里完全没有记录的票 —— 那些由调用方用股票池补齐（首次全量回补场景）。"""
-    with connect(path) as conn:
+    with connect_read(path) as conn:
+        if conn is None:
+            return []
         rows = conn.execute(
             "SELECT stock_code, COUNT(*) n, MAX(stock_name) FROM daily_kline "
             "GROUP BY stock_code HAVING n < ? ORDER BY n ASC", (int(min_bars),)).fetchall()

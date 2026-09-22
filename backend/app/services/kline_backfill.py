@@ -64,7 +64,8 @@ def pending_codes(path: str | None = None, codes: list[str] | None = None,
             pool = []
     known = {r[0] for r in rows}
     merged = list(dict.fromkeys([str(c) for c in pool if str(c)] + [c for c in known if c not in pool]))
-    return [c for c in merged if have.get(c, 0) < min_bars]
+    short = store.short_codes(path)  # 源可取但历史 <MIN_BARS：显式短史，不再夜夜重试
+    return [c for c in merged if have.get(c, 0) < min_bars and c not in short]
 
 
 def backfill(codes: list[str], path: str | None = None, batch_size: int = BATCH_SIZE,
@@ -91,7 +92,10 @@ def backfill(codes: list[str], path: str | None = None, batch_size: int = BATCH_
         rows = fetch_history(code, source=source, lookback_days=lookback_days,
                              name=names.get(code, ""))
         if len(rows) < min_bars:
+            if rows:
+                store.mark_short(code, len(rows), path)  # 短史标记：扫描标 unsupported、补数队列跳过
             return code, "failed", 0
+        store.clear_short(code, path)  # 已足量则清除短史标记（自我修复）
         return code, "ok", store.upsert_bars(rows, path)
 
     done = 0

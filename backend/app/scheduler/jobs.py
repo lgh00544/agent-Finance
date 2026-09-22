@@ -101,6 +101,26 @@ def _mark_sector_job(job_key: str, success: bool, error: str | None = None) -> N
     cache.set(f"job:last_{job_key}_error", "" if success else (error or "unknown")[:500], 86400)
 
 
+def _record_job_run(event) -> None:
+    """APScheduler 执行事件 → job_run_log upsert（批A A2）；留痕失败不影响调度。"""
+    try:
+        from app.db.models import JobRunLog
+        from app.db.session import SessionLocal
+
+        exc = getattr(event, "exception", None)
+        with SessionLocal() as db:
+            row = db.get(JobRunLog, event.job_id)
+            if row is None:
+                row = JobRunLog(job_id=event.job_id)
+                db.add(row)
+            row.last_run = datetime.now()
+            row.last_status = "error" if exc else "ok"
+            row.last_reason = str(exc)[:500] if exc else None
+            db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("job_run_log 写入失败: %s", exc)
+
+
 def _is_trading_day(today: str) -> bool:
     """今天是否交易日（akshare 交易日历为全量静态历 1990~年末，成员判定即可）"""
     try:
@@ -117,6 +137,7 @@ def _in_trading_window(now: datetime) -> bool:
     return (930 <= hm <= 1130) or (1300 <= hm <= 1500)
 
 
+# === DISABLED 2026-09-16: 同花顺下线（函数保留，不再被调用）===
 def _in_ths_pnl_window(now: datetime) -> bool:
     """同花顺盈亏采集窗口 9:15-16:00（用户指定：盘前 15 分钟起覆盖集合竞价）"""
     hm = now.hour * 100 + now.minute
@@ -801,6 +822,7 @@ def ths_pnl_job() -> None:
     """同花顺真实账户今日盈亏采集（P0 数据通道，默认关闭）
     开关 ths_pnl_enable 才跑 + 交易日 + 采集窗口 9:15-16:00；失败只落 error 不抛异常；
     Cookie 零日志（红线 R6）。"""
+    return  # DISABLED 2026-09-16 同花顺下线（原逻辑保留在下方）
     if not settings.ths_pnl_enable:
         return
     now_tz = datetime.now(ZoneInfo("Asia/Shanghai"))
@@ -841,7 +863,7 @@ def feishu_daily_report_job() -> None:
     """每日收盘日报直发，按绑定用户分别生成并发送。"""
     if not settings.feishu_daily_report or not _is_trading_day(time.strftime("%Y-%m-%d")):
         return
-    from app.services import holding_view, ths_pnl
+    from app.services import holding_view  # ths_pnl DISABLED 2026-09-16
     from app.services.feishu_sender import send_text
     users = repo.list_active_users() if settings.multi_user_enabled else [
         {"id": None, "role": None, "feishu_open_id": None}]
@@ -851,7 +873,7 @@ def feishu_daily_report_job() -> None:
         tokens = set_user_context(user["id"], user.get("role"))
         try:
             lines = [f"📊 {time.strftime('%Y-%m-%d')} 收盘日报"]
-            snap = ths_pnl.get_snapshot()
+            snap = {}  # DISABLED 2026-09-16：同花顺已下线，走 fallback 文案
             lines.append(f"今日盈亏: ¥{snap['pnl_yk']:,.0f}（{snap.get('pnl_pct')}%）"
                          if snap.get('pnl_yk') is not None else f"今日盈亏: {snap.get('error') or '未接入'}")
             view = holding_view.build_holding_view(
@@ -1140,7 +1162,8 @@ def start_scheduler() -> None:
                       replace_existing=True, misfire_grace_time=300)
     # 同花顺真实账户今日盈亏采集（开关开启才注册；cron 精确 9:15-16:00 窗口、
     # 按 ths_pnl_poll_seconds 触发，仅工作日；函数内再按交易日+窗口过滤，夜间不空转）
-    if settings.ths_pnl_enable:
+    # === DISABLED 2026-09-16: 同花顺下线，cron 停注册 ===
+    if False:
         _poll = max(10, int(settings.ths_pnl_poll_seconds))
         scheduler.add_job(ths_pnl_job, "cron", day_of_week="mon-fri",
                           hour=9, minute="15-59", second=f"*/{_poll}",
@@ -1154,6 +1177,9 @@ def start_scheduler() -> None:
                           hour=16, minute=0, second=f"*/{_poll}",
                           id="ths_pnl_1600", name="同花顺今日盈亏采集",
                           replace_existing=True, misfire_grace_time=60)
+    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
+
+    scheduler.add_listener(_record_job_run, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")
 

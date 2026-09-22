@@ -171,10 +171,17 @@ def test_ingest_today_detects_ex_dividend(tmp_path):
     assert out["ex_div_codes"] == ["600519"]  # 昨收 1266.98 vs 本地前收 1400 → 判为除权
 
 
-def test_ingest_today_empty_universe_writes_nothing(tmp_path):
+def test_ingest_today_empty_universe_writes_nothing(tmp_path, monkeypatch):
+    import app.datasource.fallback as fb
+
+    class _Empty:
+        def fetch_spot_universe(self):
+            return pd.DataFrame()          # 隔离真实股票池（离线、确定性）
+
+    monkeypatch.setattr(fb, "get_datasource", lambda: _Empty())
     db = str(tmp_path / "k.db")
     out = kline_ingest.ingest_today(trade_date=TRADE_DATE, codes=[], path=db)
-    assert out["reason"] in ("empty_universe", "error:universe") and out["bars"] == 0
+    assert out["reason"] == "empty_universe" and out["bars"] == 0
     assert kline_store.stats(db)["rows"] == 0
 
 
@@ -301,3 +308,31 @@ def test_local_only_marks_stale_when_last_bar_not_today(tmp_path, monkeypatch):
     rows, errors = signal_scan._scan_one({"code": "600519", "name": ""}, ctx)
     assert rows == [] and ctx["counters"]["local"] == 1
     assert ctx["missing"]["stale"] == 1 and ctx["stale"] == ["600519"]
+
+
+def test_short_history_mark_persist_and_pending_exclusion(tmp_path):
+    """短史票（源可取但 <MIN_BARS）持久标记：补数队列不再重试，足量后可清除（自我修复）"""
+    db = str(tmp_path / "k.db")
+    assert kline_store.short_codes(db) == set()
+    kline_store.mark_short("920003", 214, db)
+    assert kline_store.short_codes(db) == {"920003"}
+    todo = kline_backfill.pending_codes(path=db, codes=["920003", "600519"])
+    assert "920003" not in todo and "600519" in todo
+    kline_store.clear_short("920003", db)
+    assert kline_store.short_codes(db) == set()
+    assert "920003" in kline_backfill.pending_codes(path=db, codes=["920003"])
+
+
+def test_local_only_marks_unsupported_for_short_history(tmp_path, monkeypatch):
+    """已知短史票在 local-only 下记 unsupported（不再混入 data_missing）"""
+    db = str(tmp_path / "k.db")
+    monkeypatch.setenv("KLINE_DB_PATH", db)
+    ctx = {"trade_date": TRADE_DATE, "start": "2025-07-25", "end": TRADE_DATE, "defs": [],
+           "source": _NoRemote(), "today": set(), "cooldown": set(), "local_only": True,
+           "lock": threading.Lock(), "counters": {"local": 0, "remote": 0},
+           "missing": {"incomplete": 0, "data_missing": 0, "stale": 0, "unsupported": 0},
+           "unsupported_codes": {"600519"}}
+    rows, errors = signal_scan._scan_one({"code": "600519", "name": ""}, ctx)
+    assert rows == [] and errors == 0
+    assert ctx["missing"]["unsupported"] == 1 and ctx["unsupported"] == ["600519"]
+    assert "data_missing" not in ctx

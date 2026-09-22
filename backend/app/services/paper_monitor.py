@@ -107,6 +107,7 @@ def run(account_id: int, trade_date: str, *, mode: str = "live_paper",
             frozen_research = (historical_facts or {}).get("contexts", {}).get(code, {})
             research = _research(account_id, code, trade_date, mode, recent, frozen_research)
             context = {**(research.get("facts") or {}), "mode": mode,
+                       "account_id": account_id,
                        "trade_date": trade_date, "decision_date": trade_date,
                        "fact_as_of": quote.get("fact_as_of"),
                        "context_id": research.get("id"),

@@ -60,7 +60,8 @@ def _local_kline(code: str, ctx: dict):
     try:
         from app.services import kline_store
         if not kline_store.has_enough(code, MIN_BARS):
-            _mark_missing(ctx, code, "incomplete")
+            kind = "unsupported" if code in (ctx.get("unsupported_codes") or ()) else "incomplete"
+            _mark_missing(ctx, code, kind)
             return None
         return kline_store.load_frame(code, ctx["start"], ctx["end"])
     except kline_store.MixedAdjustError as exc:  # noqa: BLE001 复权漂移：宁可缺数据不算指标
@@ -105,7 +106,8 @@ def _scan_one(item: dict, ctx: dict) -> tuple[list[dict], int]:
         _bump(ctx, "local")
     else:
         if ctx.get("local_only"):
-            _mark_missing(ctx, code, "data_missing")
+            if code not in (ctx.get("unsupported_codes") or ()):
+                _mark_missing(ctx, code, "data_missing")  # 短史票已由 _local_kline 记 unsupported，不重复计
             return rows, 0
         _bump(ctx, "remote")  # 计入「仍需远端」的尝试（成败都算，用于核实本地覆盖率）
         try:
@@ -221,6 +223,7 @@ def scan_signal_triggers(trade_date: str | None = None, local_only: bool | None 
                 "reason": "empty_universe"}
     universe = [{"code": str(row.get("code") or ""), "name": str(row.get("name") or "")}
                 for row in spot.to_dict("records") if row.get("code")]
+    short_set: set[str] = set()
     if local_only:
         try:
             from app.services import kline_store
@@ -228,6 +231,9 @@ def scan_signal_triggers(trade_date: str | None = None, local_only: bool | None 
             for item in universe:
                 if not item["name"]:
                     item["name"] = local_names.get(item["code"], "")
+            short_set = kline_store.short_codes()
+            if short_set:
+                logger.info("本地仓库短史票 %d 只，标记 unsupported（源可取但 <MIN_BARS，不再重试）", len(short_set))
         except Exception as exc:  # noqa: BLE001 本地名称缺失不阻断（退化为股票池名称）
             logger.warning("本地日线名称映射读取失败: %s", exc)
     today_keys, cooldown_keys = _load_keys(day)
@@ -236,7 +242,8 @@ def scan_signal_triggers(trade_date: str | None = None, local_only: bool | None 
         "start": (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=_LOOKBACK_DAYS)).strftime("%Y-%m-%d"),
         "end": day, "cooldown": cooldown_keys, "local_only": bool(local_only),
         "lock": threading.Lock(), "counters": {"local": 0, "remote": 0},
-        "missing": {"incomplete": 0, "data_missing": 0, "stale": 0},
+        "missing": {"incomplete": 0, "data_missing": 0, "stale": 0, "unsupported": 0},
+        "unsupported_codes": short_set,
     }
     records = errors = dropped = 0
     reason = "ok"
@@ -263,14 +270,16 @@ def scan_signal_triggers(trade_date: str | None = None, local_only: bool | None 
     counters = ctx["counters"]
     incomplete, data_missing = ctx["missing"]["incomplete"], ctx["missing"]["data_missing"]
     stale = ctx["missing"]["stale"]
-    eligible = len(universe) - incomplete - data_missing - stale
+    unsupported = ctx["missing"].get("unsupported", 0)
+    eligible = len(universe) - incomplete - data_missing - stale - unsupported
     summary = {"trade_date": day, "universe": len(universe), "records": records, "errors": errors,
                "dropped": dropped, "reason": reason, "local_only": bool(local_only),
                "eligible": eligible, "incomplete": incomplete, "data_missing": data_missing,
-               "stale": stale,
+               "stale": stale, "unsupported": unsupported,
                "coverage_pct": round(eligible * 100.0 / len(universe), 1) if universe else 0.0,
                "local_bars": counters["local"], "remote_bars": counters["remote"],
                "incomplete_codes": ctx.get("incomplete", [])[:20],
-               "data_missing_codes": ctx.get("data_missing", [])[:20]}
+               "data_missing_codes": ctx.get("data_missing", [])[:20],
+               "unsupported_codes": ctx.get("unsupported", [])[:20]}
     logger.info("信号扫描结束 %s: %s", day, summary)
     return summary
