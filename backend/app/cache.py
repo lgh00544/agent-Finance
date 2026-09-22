@@ -69,6 +69,10 @@ class CacheBackend(ABC):
     def get_lock_owner(self, lock_name: str) -> str | None:
         return None
 
+    def debug_stats(self, top: int = 20) -> dict:
+        """只读诊断：缓存键数与前缀分布（A3 内存定位用；子类覆盖）"""
+        return {"backend": type(self).__name__}
+
 
 class MemoryCache(CacheBackend):
     """dev 模式：进程内缓存，线程安全"""
@@ -148,6 +152,23 @@ class MemoryCache(CacheBackend):
             item = self._store.get(f"lock:{lock_name}")
             return item[0] if item else None
 
+    def debug_stats(self, top: int = 20) -> dict:
+        with self._lock:
+            now = time.time()
+            prefixes: dict[str, int] = {}
+            value_bytes = 0
+            expired = 0
+            for key, (value, exp) in self._store.items():
+                if exp < now:
+                    expired += 1
+                value_bytes += len(value or "")
+                parts = key.split(":")
+                prefix = ":".join(parts[:2]) if len(parts) > 1 else parts[0]
+                prefixes[prefix] = prefixes.get(prefix, 0) + 1
+            return {"backend": "memory", "keys": len(self._store),
+                    "expired_pending": expired, "value_bytes": value_bytes,
+                    "top_prefixes": sorted(prefixes.items(), key=lambda kv: kv[1], reverse=True)[:top]}
+
 
 class RedisCache(CacheBackend):
     """prod 模式：Redis 实现"""
@@ -206,6 +227,23 @@ class RedisCache(CacheBackend):
 
     def get_lock_owner(self, lock_name: str) -> str | None:
         return self._client.get(self._key(f"lock:{lock_name}"))
+
+    def debug_stats(self, top: int = 20) -> dict:
+        namespace = f"{settings.redis_namespace}:"
+        prefixes: dict[str, int] = {}
+        total = 0
+        cursor = 0
+        while True:
+            cursor, keys = self._client.scan(cursor, match=f"{namespace}*", count=500)
+            for key in keys:
+                total += 1
+                parts = key[len(namespace):].split(":")
+                prefix = ":".join(parts[:2]) if len(parts) > 1 else parts[0]
+                prefixes[prefix] = prefixes.get(prefix, 0) + 1
+            if cursor == 0:
+                break
+        return {"backend": "redis", "keys": total,
+                "top_prefixes": sorted(prefixes.items(), key=lambda kv: kv[1], reverse=True)[:top]}
 
 
 def get_cache() -> CacheBackend:

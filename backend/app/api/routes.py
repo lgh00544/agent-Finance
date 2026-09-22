@@ -850,6 +850,58 @@ def system_status():
     return status_service.system_status()
 
 
+@router.get("/diagnostics/memory")
+def diagnostics_memory(trace: int = 0, gc: int = 0):
+    """只读内存诊断（A3 定位）：RSS/线程/handles + 缓存统计；trace=1 附 tracemalloc 前 15 分配点，gc=1 附对象类型计数。"""
+    info: dict = {"pid": os.getpid()}
+    try:
+        import psutil
+
+        proc = psutil.Process(os.getpid())
+        info["rss_kb"] = int(proc.memory_info().rss / 1024)
+        info["threads"] = proc.num_threads()
+        info["handles"] = proc.num_handles() if hasattr(proc, "num_handles") else None
+    except Exception as exc:  # noqa: BLE001 只读诊断不得 500
+        info["psutil_error"] = str(exc)[:200]
+    from app.cache import cache
+
+    try:
+        info["cache"] = cache.debug_stats()
+    except Exception as exc:  # noqa: BLE001
+        info["cache_error"] = str(exc)[:200]
+    if trace:
+        try:
+            import tracemalloc
+
+            if not tracemalloc.is_tracing():
+                tracemalloc.start(15)
+            snapshot = tracemalloc.take_snapshot()
+            info["trace_top"] = [
+                {"file": s.traceback[0].filename, "line": s.traceback[0].lineno,
+                 "size_kb": int(s.size / 1024), "count": int(s.count)}
+                for s in snapshot.statistics("lineno")[:15]]
+        except Exception as exc:  # noqa: BLE001
+            info["trace_error"] = str(exc)[:200]
+    if gc:
+        try:
+            import gc as gc_mod
+
+            info["gc_count"] = list(gc_mod.get_count())          # 各代未回收计数（廉价）
+            info["gc_stats"] = gc_mod.get_stats()                # 各代 collections/collected（廉价）
+        except Exception as exc:  # noqa: BLE001
+            info["gc_error"] = str(exc)[:200]
+    try:
+        import tracemalloc as tm
+
+        if tm.is_tracing():
+            current, peak = tm.get_traced_memory()               # 廉价：Python 跟踪到的当前/峰值
+            info["traced_current_kb"] = int(current / 1024)
+            info["traced_peak_kb"] = int(peak / 1024)
+    except Exception as exc:  # noqa: BLE001
+        info["trace_mem_error"] = str(exc)[:200]
+    return info
+
+
 @router.get("/system-map")
 def system_map():
     """只读系统能力地图汇总。"""
