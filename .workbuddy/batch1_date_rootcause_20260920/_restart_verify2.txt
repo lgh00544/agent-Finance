@@ -1,0 +1,14 @@
+HEALTH={"status":"ok","time":"2026-09-21 09:45:19","env":"dev"}
+LOG lines=195
+  2026-09-21 09:45:00,014 [INFO] apscheduler.executors.default - Running job "同花顺今日盈亏采集 (trigger: cron[day_of_week='mon-fri', hour='9', minute='15-59', second='*/20'], next
+  2026-09-21 09:45:00,291 [WARNING] scheduler - 同花顺盈亏采集未成功: TOKEN_EXPIRED (HTTP 401)
+  2026-09-21 09:45:00,700 [INFO] app.graph.router - 批量监控完成: 0/0（批量行情命中 0/0）
+  2026-09-21 09:45:00,700 [INFO] scheduler - 监控轮询完成: 0 持仓
+  2026-09-21 09:45:00,701 [INFO] apscheduler.executors.default - Job "盘中持仓监控 (trigger: cron[day_of_week='mon-fri', hour='9-16', minute='*/5'], next run at: 2026-09-21 09:50
+  2026-09-21 09:45:02,131 [INFO] scheduler - 持仓价快照刷新完成: 0 条 (source=none)
+  2026-09-21 09:45:02,132 [INFO] apscheduler.executors.default - Job "持仓价快照刷新 (trigger: cron[day_of_week='mon-fri', hour='9-15', minute='*/5'], next run at: 2026-09-21 09:5
+  2026-09-21 09:45:03,318 [INFO] apscheduler.executors.default - Job "同花顺今日盈亏采集 (trigger: cron[day_of_week='mon-fri', hour='9', minute='15-59', second='*/20'], next run at:
+  2026-09-21 09:45:05,720 [INFO] app.datasource.fallback - 麦蕊增强数据源已启用（MAIRUI_ENABLE=true），高级字段主源缺失时回退麦蕊
+  2026-09-21 09:45:06,250 [INFO] app.datasource.akshare_source - 数据源 industry_spot 已降级到备用接口
+  2026-09-21 09:45:12,325 [WARNING] app.datasource.breaker - 数据源 snapshot 连续 3 次失败，进入临时降级 600 秒（期间直接走备用源，冷却到期静默探测主源自动切回）
+  INFO:     127.0.0.1:50377 - "GET /api/health HTTP/1.1" 200 OK

@@ -1,0 +1,6 @@
+HEALTH_ERR=URLError: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>
+JOBS_ERR=<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>
+LOG lines=75 first=2026-09-21 09:36:08,716 [INFO] app.db.se
+  2026-09-21 09:36:08,716 [INFO] app.db.session - 数据库初始化/迁移完成 backend=mysql database=stock_agent knowledge_added=0 knowledge_existing=11 experience_added=0 experience_exist
+  2026-09-21 09:40:54,378 [INFO] dev_run - 启动同步完成：本地 data/dev.db 已与云端对齐
+ERROR lines=0 

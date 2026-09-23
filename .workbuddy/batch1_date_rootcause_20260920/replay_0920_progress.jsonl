@@ -1,0 +1,10 @@
+{"stage": "universe", "rows": 0, "sec": 0.0}
+{"stage": "start", "at": "2026-09-20 17:48:40", "day": "2026-09-18", "mode": "read_only_no_persist"}
+{"stage": "universe", "rows": 5564, "sec": 45.8}
+{"stage": "slice", "n": 500, "codes_head": ["000001", "000002", "000006", "000007", "000008", "000009", "000010", "000011", "000012", "000014"], "codes_tail": ["001333", "001335", "001336", "001337", "001338"], "prefix": ["000", "001"]}
+{"stage": "keys", "today": 149, "cooldown": 0}
+{"stage": "slice_loaded", "n": 500, "head": {"code": "000001", "name": "平安银行"}, "tail": {"code": "001338", "name": "永顺泰"}}
+{"stage": "ready", "defs": 22, "today": 149, "cooldown": 0, "src": "FallbackSource"}
+{"stage": "variant", "tag": "no_dedup_cold", "n_batch": 500, "hits": 6, "errors": 0, "dropped": 488, "wall_s": 165.5, "throughput": 3.0211, "distinct_codes_with_signal": 4, "by_signal": {"s02": 1, "s03": 1, "s04": 1, "s06": 1, "s17": 2}, "dedup1": 0, "dedup0": 6, "exec_mode": "read_only_no_persist"}
+{"stage": "variant", "tag": "with_dedup", "n_batch": 500, "hits": 14, "errors": 0, "dropped": 460, "wall_s": 134.4, "throughput": 3.7202, "distinct_codes_with_signal": 11, "by_signal": {"s01": 1, "s02": 2, "s03": 1, "s04": 3, "s05": 1, "s06": 1, "s10": 1, "s13": 1, "s17": 2, "s19": 1}, "dedup1": 0, "dedup0": 14, "exec_mode": "read_only_no_persist"}
+{"stage": "done", "results": {"no_dedup_cold": {"stage": "variant", "tag": "no_dedup_cold", "n_batch": 500, "hits": 6, "errors": 0, "dropped": 488, "wall_s": 165.5, "throughput": 3.0211, "distinct_codes_with_signal": 4, "dedup1": 0, "dedup0": 6, "exec_mode": "read_only_no_persist"}, "with_dedup": {"stage": "variant", "tag": "with_dedup", "n_batch": 500, "hits": 14, "errors": 0, "dropped": 460, "wall_s": 134.4, "throughput": 3.7202, "distinct_codes_with_signal": 11, "dedup1": 0, "dedup0": 14, "exec_mode": "read_only_no_persist"}}}

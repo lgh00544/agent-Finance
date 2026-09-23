@@ -1,0 +1,20 @@
+=== 0. caller constant ===
+  _BENCH_INDEX = '000300'
+
+=== 1. rerun original params: fetch_daily_kline(start=2026-01-01, end=2026-09-18) ===
+  688620 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 10.99s
+  688004 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 16.09s
+  601579 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 17.63s
+  600000 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 27.69s
+  BENCH 000300 (sz) EXC DataSourceError: DataSourceError("数据源 kline 重试失败: 'date'") 11.16s
+
+=== 2. direct akshare upstream (bypass project wrapper) ===
+  sz000300 EXC KeyError: KeyError('date')
+    TB: indexer = self.columns.get_loc(key) | File "D:\self\.venv\Lib\site-packages\pandas\core\indexes\range.py", line 525, in get_loc | raise KeyError(key) | KeyError: 'date'
+  sh000300 EXC JSONDecodeError: JSONDecodeError('No value to decode', position=position_marker(offset=0,line=1,column=0,text_after=True), severity='error')
+    TB: ) | File "D:\self\.venv\Lib\site-packages\akshare\utils\demjson.py", line 5501, in decode | raise errors[0] | akshare.utils.demjson.JSONDecodeError: No value to decode
+  sh600000 OK shape=(174, 9)
+
+=== 3. upstream empty-frame behaviour ===
+  pd.DataFrame(None)["date"] -> KeyError: KeyError('date') (cols=[])
+  pd.DataFrame([])["date"] -> KeyError: KeyError('date') (cols=[])

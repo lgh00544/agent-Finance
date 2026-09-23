@@ -1,0 +1,9 @@
+jobs module import OK; has kline_backfill_job=True
+MIN_KLINE_BARS_FOR_BACKFILL=250
+store path=D:\self\.wb_smoke\kline.db
+before stats={'rows': 0, 'codes': 0, 'min_date': None, 'max_date': None}
+backfill 600519 = {'requested': 1, 'written_bars': 281, 'ok': 1, 'skipped': 0, 'failed': 0, 'failed_codes': [], 'seconds': 18.8} wall=18.8s
+after stats={'rows': 281, 'codes': 1, 'min_date': '2025-07-28', 'max_date': '2026-09-18'}
+name_map={'600519': ''}
+has_enough(600519,250)=True
+load_frame rows=281 cols=['date', 'open', 'high', 'low', 'close', 'volume'] last_date=2026-09-18

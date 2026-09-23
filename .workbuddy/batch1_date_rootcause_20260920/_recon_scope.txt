@@ -1,0 +1,15 @@
+=== signal_scan public/private fns present ===
+  _scan_batch            OK (batch: list[dict], ctx: dict, timeout: float) -> tuple[list[dict], int, int]
+  _scan_one              OK (item: dict, ctx: dict) -> tuple[list[dict], int]
+  _load_keys             OK (trade_date: str) -> tuple[set, set]
+  _persist               OK (rows: list[dict]) -> int
+  scan_signal_triggers   OK (trade_date: str | None = None) -> dict
+  BATCH_SIZE=500 PARALLEL_MAX=8 BATCH_BUDGET=120 TOTAL_BUDGET=540 MIN_BARS=250
+
+=== signal definitions ===
+  count=22
+  ids=['s01', 's02', 's03', 's04', 's05', 's06', 's07', 's08', 's09', 's10', 's11', 's12', 's13', 's14', 's15', 's16', 's17', 's18', 's19', 's20', 's21', 's22']
+
+=== _load_keys read-only? ===
+  writes? INSERT/UPDATE/DELETE present: False
+  query only: True

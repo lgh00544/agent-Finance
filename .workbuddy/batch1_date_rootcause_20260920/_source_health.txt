@@ -1,0 +1,5 @@
+stock_zh_a_spot(sina) try1 EXC JSONDecodeError: Can not decode value starting with character '<'
+stock_zh_a_spot(sina) try2 EXC JSONDecodeError: Can not decode value starting with character '<'
+stock_zh_a_spot_em(em) try1 EXC ProxyError: HTTPSConnectionPool(host='82.push2.eastmoney.com', port=443): Max retries exceeded with ur
+stock_zh_a_spot_em(em) try2 EXC ProxyError: HTTPSConnectionPool(host='82.push2.eastmoney.com', port=443): Max retries exceeded with ur
+tencent quote http=200 bytes=542

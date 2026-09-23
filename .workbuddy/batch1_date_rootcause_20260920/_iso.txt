@@ -1,0 +1,5 @@
+PASS test_ingest_skips_ex_dividend_bar_until_rebuild
+PASS test_ingest_today_writes_bars
+PASS test_ingest_today_empty_universe_writes_nothing
+PASS test_local_only_marks_data_missing_and_never_touches_remote
+FAIL test_backfill_skips_sufficient_and_fills_missing :: AssertionError: 

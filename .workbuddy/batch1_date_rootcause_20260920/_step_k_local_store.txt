@@ -1,0 +1,14 @@
+db_path=D:\self\data\kline.db exists=True
+size=20480 bytes
+stats={'rows': 0, 'codes': 0, 'min_date': None, 'max_date': None}
+--- jobs.py kline refs ---
+892: def kline_ingest_job() -> None:
+893: """本地日线仓库增量（工作日 16:25）；非交易日直接返回，除权票当场重建历史段。"""
+898: if not cache.acquire_lock("kline_ingest", ttl_seconds=3600):
+899: logger.info("kline_ingest 锁被占用，跳过本次")
+902: from app.services.kline_backfill import backfill
+903: from app.services.kline_ingest import ingest_today
+913: cache.release_lock("kline_ingest")
+958: # 工作日 16:25 本地日线仓库增量（批量快照落当日 bar；16:50 扫描只读本地，批 1.5 容量修复）
+959: scheduler.add_job(kline_ingest_job, "cron",
+961: id="kline_ingest", name="本地日线增量",

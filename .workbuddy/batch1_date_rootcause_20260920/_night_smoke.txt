@@ -1,0 +1,10 @@
+store=D:\self\.wb_night\kline.db stats_before={'rows': 0, 'codes': 0, 'min_date': None, 'max_date': None}
+universe=5564 (41.2s)
+pending_codes=5564 (首次应等于 universe)
+本夜切片=12 只 first=['920000', '920001', '920002', '920003', '920005']
+backfill={'requested': 12, 'written_bars': 2236, 'ok': 8, 'skipped': 0, 'failed': 4, 'failed_codes': ['920003', '920009', '920011', '920012'], 'seconds': 57.1} wall=57.1s
+stats_after={'rows': 2236, 'codes': 8, 'min_date': '2025-07-28', 'max_date': '2026-09-18'}
+等效单只=7.1s ⇒ 5564 只约 11.0 小时 / 每夜300只需 19 夜
+name_map 样例={'920000': '安徽凤凰', '920001': '纬达光电', '920002': '万达轴承'}
+series_adjust 样例={'920000': 'qfq', '920001': 'qfq', '920002': 'qfq'}
+backfill 后 pending=5556（应减少 8）

@@ -1,0 +1,8 @@
+JOBS_TOTAL=48 (before restart 46)
+  kline_backfill   next_run=2026-09-22 00:40:00+08:00
+  kline_ingest     next_run=2026-09-21 16:25:00+08:00
+  signal_scan      next_run=2026-09-21 16:50:00+08:00
+--- processes ---
+Id StartTime        
+   -- ---------        
+29764 2026/9/21 9:35:53

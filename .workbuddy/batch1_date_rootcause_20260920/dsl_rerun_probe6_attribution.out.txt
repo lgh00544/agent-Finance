@@ -1,0 +1,26 @@
+=== A. force STOCK fetch to fail (bad=600000) -> what does the log blame? ===
+  return=None
+  LOG: 游资信号行情回溯失败 600000/2026-09-16: FAKE_FAIL_FOR_600000
+  -> message names stock_code=600000; actual failure was 600000 too? YES (this run cannot distinguish)
+
+=== B. force BENCH fetch to fail (bad=000300), stock SUCCEEDS ===
+  return=None
+  LOG: 游资信号行情回溯失败 600000/2026-09-16: FAKE_FAIL_FOR_000300
+  -> actual failing code = 000300 (bench); logged stock_code = 600000 => misattribution
+
+=== C. source proof: hot_money_review.py:105-109 ===
+  96|def real_price_lookup(stock_code: str, trade_date: str) -> tuple | None:
+  97|    """真实行情回溯（调度/面板触发迭代用）：标的 vs 沪深300 信号后 5 日涨跌幅。
+  98|    行情不足/接口失败 → None（该信号不计入统计，诚实降级）。"""
+  99|    try:
+  100|        from app.datasource.fallback import get_datasource
+  101|
+  102|        src = get_datasource()
+  103|        start = f"{trade_date[:4]}0101"
+  104|        end = time.strftime("%Y-%m-%d")
+  105|        stock = src.fetch_daily_kline(stock_code, start, end)
+  106|        index = src.fetch_daily_kline(_BENCH_INDEX, start, end)
+  107|        return _forward_5d_returns(stock, index, trade_date)
+  108|    except Exception as exc:  # noqa: BLE001 单信号回溯失败跳过，不阻塞迭代
+  109|        logger.warning("游资信号行情回溯失败 %s/%s: %s", stock_code, trade_date, exc)
+  110|        return None

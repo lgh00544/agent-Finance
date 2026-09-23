@@ -1,0 +1,9 @@
+SINA hq list=1 -> http=200 rows=1 0.83s bytes=290
+SINA hq list=2 -> http=200 rows=2 0.77s bytes=576
+SINA hq list=3 -> http=200 rows=3 0.77s bytes=853
+SINA klc_kl sh600519 -> http=200 bars~0 0.93s bytes=69163
+SINA klc_kl sz000001 -> http=200 bars~0 1.05s bytes=77852
+TENCENT fqkline sh600519 -> http=200 bars=320 1.05s first=[['2025-06-03', '1428.429', '1429.419', '1439.419', '1425.439', '28979.000']] last=[['2026-09-18', '1262.990', '1257.120', '1265.880', '1256.100', '24891.000']]
+TENCENT fqkline sz000001 -> http=200 bars=320 0.97s first=[['2025-06-03', '10.582', '10.852', '10.952', '10.572', '2192480.000']] last=[['2026-09-18', '11.590', '11.700', '11.820', '11.560', '853038.000']]
+TENCENT fqkline bj920001 -> http=200 bars=1 1.06s first=[['2026-09-18', '11.90', '11.70', '12.49', '11.51', '48940']] last=[['2026-09-18', '11.90', '11.70', '12.49', '11.51', '48940']]
+TENCENT multi-probe(2 syms) skipped (接口 param 单票) ; 单票基准 bars=320

@@ -1,0 +1,17 @@
+SNAPSHOT=D:\self\.workbuddy\ledger_snapshots\买卖点信号体系_批1_观察期台账_20260921.md
+snapshot_bytes=10040 sha256=201ce0070c31325b88f620ba9e2547f28fc71317e380b8f2070143164904ce3a
+source_bytes=10040 sha256=201ce0070c31325b88f620ba9e2547f28fc71317e380b8f2070143164904ce3a
+identical=True
+line_count=79
+heading_count=8
+table_separator_count=4
+taken_at=2026-09-20 17:36:20
+--- headings ---
+  # 买卖点信号体系 · 批 1 观察期台账
+  ## 日程（09-17 / 09-18 均未通过，待 sir 定顺延口径）
+  ## 逐日记录
+  ### 2026-09-17（四）❌ 作废 —— 根因：本机出网整体中断
+  ### 2026-09-18（五）❌ 不通过 —— 根因：kline 主源 8 并发全量降级 ＋ 容量/参数不匹配
+  #### ⚠️ 附带发现（P0，影响剩余观察日）：`signal_check.py` 今日会**双重误判**
+  #### 数据落点复核
+  ## 附：运行工具（均在 `D:\self\`，解释器 `D:/self/.venv/Scripts/python.exe`）

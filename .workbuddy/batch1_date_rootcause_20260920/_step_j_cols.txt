@@ -1,0 +1,1 @@
+columns = ['id', 'trade_date', 'stock_code', 'signal_id', 'direction', 'trigger_close', 'exec_price', 'limit_up', 'is_st', 'ret_5', 'ret_10', 'ret_20', 'excess_10', 'excess_20', 'max_profit_20', 'max_drawdown_20', 'dedup', 'filled_at', 'created_at']

@@ -1,0 +1,42 @@
+=== _forward_5d_returns signature/behaviour ===
+def _forward_5d_returns(stock_df, index_df, trade_date: str) -> tuple | None:
+    """信号日 t0 收盘 → 后第 5 个交易日收盘的累计涨跌幅（标的 vs 大盘）。
+    数据不足（t0 后不足 5 个交易日 / 任一缺失）→ None，该信号不计入统计。"""
+    def _norm(df):
+        if df is None or df.empty:
+            return []
+        out = []
+        for _, r in df.iterrows():
+            d = str(r.get("date") or "").strip()[:10]
+            close = r.get("close")
+            try:
+                c = float(close)
+            except (TypeError, ValueError):
+                continue
+            if d and c == c:
+                out.append((d, c))
+        return out
+
+    s, i = _norm(stock_df), _norm(index_df)
+    if not s or not i:
+        return None
+    s_map, i_map = dict(s), dict(i)
+    if trade_date not in s_map or trade_date not in i_map:
+        return None
+    dates = [d for d, _ in s]
+    try:
+        t0 = dates.index(trade_date)
+    except ValueError:
+   
+
+bench sh000300 rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume']
+stock 600000 rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct']
+bench date range: 2026-01-05 -> 2026-09-18
+trade_date=2026-09-16 present in bench? True
+trade_date=2026-09-16 present in stock? True
+  _forward_5d_returns(stk, idx, 2026-09-16) -> None
+  _forward_5d_returns(stk, idx, 2026-08-27) -> (2.21, -1.68)
+  _forward_5d_returns(stk, idx, 2026-08-25) -> (2.97, 1.31)
+
+=== does fetch_daily_kline(000300) raise or return empty? (path evidence) ===
+  raised DataSourceError: DataSourceError("数据源 kline 重试失败: 'date'")

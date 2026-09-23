@@ -1,0 +1,24 @@
+RC=1
+--- STDOUT tail ---
+============================== warnings summary ===============================
+backend/tests/test_kline_store.py: 13 warnings
+  D:\self\.venv\Lib\site-packages\_pytest\pathlib.py:103: PytestWarning: (rm_rf) unknown function <built-in function scandir> when removing \\?\D:\self\.pytest_tmp:
+  <class 'PermissionError'>: [WinError 5] 拒绝访问。: '\\\\?\\D:\\self\\.pytest_tmp'
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+ERROR backend/tests/test_kline_store.py::test_upsert_and_load_roundtrip - Per...
+ERROR backend/tests/test_kline_store.py::test_upsert_is_idempotent_and_updates
+ERROR backend/tests/test_kline_store.py::test_upsert_skips_rows_without_keys
+ERROR backend/tests/test_kline_store.py::test_prev_close_and_has_enough_and_stats
+ERROR backend/tests/test_kline_store.py::test_load_frame_columns_and_delete_code
+ERROR backend/tests/test_kline_store.py::test_ingest_today_writes_bars - Perm...
+ERROR backend/tests/test_kline_store.py::test_ingest_today_detects_ex_dividend
+ERROR backend/tests/test_kline_store.py::test_ingest_today_empty_universe_writes_nothing
+ERROR backend/tests/test_kline_store.py::test_backfill_skips_sufficient_and_fills_missing
+ERROR backend/tests/test_kline_store.py::test_backfill_rebuild_deletes_before_refetch
+ERROR backend/tests/test_kline_store.py::test_backfill_counts_short_and_failed_sources
+ERROR backend/tests/test_kline_store.py::test_scan_uses_local_bars_first - Pe...
+ERROR backend/tests/test_kline_store.py::test_scan_falls_back_to_remote_and_tolerates_ctx_without_counters
+2 passed, 13 warnings, 13 errors in 12.04s

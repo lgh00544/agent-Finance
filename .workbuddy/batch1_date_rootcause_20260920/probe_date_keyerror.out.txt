@@ -1,0 +1,32 @@
+=== A. 机制静态复核：空表访问 date 列 ===
+pd.DataFrame([])['date'] -> KeyError: KeyError('date')
+
+=== B. 上游源码定位：akshare stock_zh_a_daily 入口前 3 步 ===
+  src[3] start_date: str = "19900101",
+  src[4] end_date: str = "21000118",
+  src[12] :param start_date: 20201103; 开始日期
+  src[13] :type start_date: str
+  src[14] :param end_date: 20201103; 结束日期
+  src[15] :type end_date: str
+  src[18] :return: 行情数据
+  src[24] r = requests.get(zh_sina_a_stock_hfq_url.format(symbol))
+  src[30] hfq_factor_df.columns = ["date", "hfq_factor"]
+  src[31] hfq_factor_df.index = pd.to_datetime(hfq_factor_df.date)
+  src[32] del hfq_factor_df["date"]
+  src[34] return hfq_factor_df
+  src[36] r = requests.get(zh_sina_a_stock_qfq_url.format(symbol))
+  src[42] qfq_factor_df.columns = ["date", "qfq_factor"]
+  src[43] qfq_factor_df.index = pd.to_datetime(qfq_factor_df.date)
+  src[44] del qfq_factor_df["date"]
+  src[46] return qfq_factor_df
+  src[49] return _fq_factor(adjust.split("-")[0])
+  src[51] r = requests.get(zh_sina_a_stock_hist_url.format(symbol))
+  src[58] data_df.index = pd.to_datetime(data_df["date"], errors="coerce").dt.date
+  src[59] del data_df["date"]
+  src[70] r = requests.get(zh_sina_a_stock_amount_url.format(symbol, symbol))
+
+=== C. 实跑 akshare stock_zh_a_daily(adjust='qfq') 看真实异常 ===
+  OK shape=(174, 9) cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'outstanding_share', 'turnover']
+
+=== D. 走本项目 DataSourceError 包装链 ===
+  OK shape=(174, 8)

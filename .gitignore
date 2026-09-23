@@ -70,3 +70,14 @@ storage/
 .qdrant-initialized
 # 批次证据目录（临时留痕，不入库）
 .workbuddy/batch*_evidence_*/
+
+# ===== 补充忽略（2026-09-22 追加，本地沙箱残留/日志/临时件）=====
+# pytest 基目录与本地沙箱残留（带拒绝 ACL，无法读取，严禁入库）
+.wb_h*/
+.wb_pt/
+.pytest_bt/
+.pytest_tmp*/
+pytest-of-*/
+# 本地运行日志与临时探测输出
+*.log
+_sp*.txt

@@ -1,0 +1,25 @@
+PASS test_backfill_counts_short_and_failed_sources
+PASS test_backfill_rebuild_deletes_before_refetch
+FAIL test_backfill_skips_sufficient_and_fills_missing
+Traceback (most recent call last):
+  File "D:\self\.workbuddy\batch1_date_rootcause_20260920\harness2.py", line 26, in <module>
+    fn(**kwargs)
+    ~~^^^^^^^^^^
+  File "D:\self\backend\tests\test_kline_store.py", line 186, in test_backfill_skips_sufficient_and_fills_missing
+    assert out["skipped"] == 1 and out["ok"] == 1 and out["failed"] == 0
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+PASS test_fetch_snapshot_batches_and_tolerates_batch_failure
+PASS test_ingest_today_detects_ex_dividend
+PASS test_ingest_today_empty_universe_writes_nothing
+PASS test_ingest_today_writes_bars
+PASS test_load_frame_columns_and_delete_code
+PASS test_parse_bar_maps_fields_and_rejects_suspended
+PASS test_prev_close_and_has_enough_and_stats
+PASS test_scan_falls_back_to_remote_and_tolerates_ctx_without_counters
+PASS test_scan_uses_local_bars_first
+PASS test_upsert_and_load_roundtrip
+PASS test_upsert_is_idempotent_and_updates
+PASS test_upsert_skips_rows_without_keys
+TOTAL=15 PASSED=14 FAILED=1

@@ -1,0 +1,22 @@
+=== 0. 调用方常量 ===
+  _BENCH_INDEX = '000300'
+
+=== 1. 原参数复跑 fetch_daily_kline(start=2026-01-01, end=2026-09-18, adjust=qfq) ===
+  688620 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 10.88s
+  688004 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 7.62s
+  601579 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 9.77s
+  600000 (sh) OK rows=174 cols=['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'change_pct'] 15.04s
+  BENCH 000300 (sz) EXC DataSourceError: DataSourceError("数据源 kline 重试失败: 'date'")
+
+=== 2. 直调 akshare 上游（绕过本项目包装），看异常类名与抛出点 ===
+  sh688620 OK shape=(174, 9)
+  sh688620 adjust='' OK shape=(174, 9)
+  sh688004 OK shape=(174, 9)
+  sh688004 adjust='' OK shape=(174, 9)
+  sh601579 OK shape=(174, 9)
+  sh601579 adjust='' OK shape=(174, 9)
+
+=== 3. 上游 :184 行为验证：空/异常响应 -> KeyError 'date' ===
+  pd.DataFrame(None)['date'] -> 
+    KeyError: KeyError('date')
+  pd.DataFrame([]).index.name = None (unnamed -> reset_index 产出 'index' 而非 'date')
