@@ -300,17 +300,26 @@ def test_candidate_pool_explicit_target_allocation_overrides_fixed_default():
     assert row["metadata"]["target_allocation_source"] == "input"
 
 
-def test_candidate_pool_target_allocation_percent_form_and_single_stock_cap():
+def test_candidate_pool_target_allocation_percent_form_and_no_code_cap():
     percent = repo.create_paper_account("目标仓位百分数测试", 100_000, "candidate_pool")
     by_percent = paper_execution.run(percent["id"], "2026-09-21", facts=_facts(price=10.0),
                                      target_allocations={"688901": 30})
     assert by_percent["executions"][0]["shares"] == 3000
 
-    capped = repo.create_paper_account("目标仓位上限测试", 100_000, "candidate_pool")
-    too_big = paper_execution.run(capped["id"], "2026-09-21", facts=_facts(price=10.0),
-                                  target_allocations={"688901": 0.90})
-    assert too_big["executions"][0]["shares"] == int(paper_execution.POSITION_TARGET_MAX * 100_000 / 10)
-    assert too_big["executions"][0]["metadata"]["target_allocation"] == paper_execution.POSITION_TARGET_MAX
+    # C 拍板：不再夹 40%，90% 目标照买（只受现金/费用约束）
+    no_cap = repo.create_paper_account("无代码上限测试", 100_000, "candidate_pool")
+    big = paper_execution.run(no_cap["id"], "2026-09-21", facts=_facts(price=10.0),
+                              target_allocations={"688901": 0.90})
+    assert big["executions"][0]["shares"] == 9000
+    assert big["executions"][0]["metadata"]["target_allocation"] == 0.9
+
+    # 超出本金的比例由现金收敛，不是代码上限
+    cash_bound = repo.create_paper_account("现金收敛测试", 100_000, "candidate_pool")
+    over = paper_execution.run(cash_bound["id"], "2026-09-21", facts=_facts(price=10.0),
+                               target_allocations={"688901": 150})
+    row = over["executions"][0]
+    assert row["shares"] == 9900
+    assert row["total_amount"] <= 100_000
 
 
 def test_candidate_pool_replay_never_calls_size_model(monkeypatch):
@@ -327,20 +336,20 @@ def test_candidate_pool_replay_never_calls_size_model(monkeypatch):
     assert called == []
 
 
-def test_candidate_pool_add_stops_at_single_stock_target_cap():
-    account = repo.create_paper_account("单票上限加仓测试", 100_000, "candidate_pool")
+def test_candidate_pool_add_stops_when_single_stock_target_fully_allocated():
+    account = repo.create_paper_account("额度用尽加仓测试", 100_000, "candidate_pool")
     opened = paper_execution.run(account["id"], "2026-09-23", facts=_facts(price=10.0),
-                                 target_allocations={"688901": 0.40})
-    assert opened["executions"][0]["shares"] == 4000
+                                 target_allocations={"688901": 1.0})
+    assert opened["filled"] == 1
     held = repo.list_paper_positions(account["id"], status="holding")[0]
-    assert held["metadata"]["lifecycle"]["allocated_pct"] == 0.4
+    assert held["metadata"]["lifecycle"]["allocated_pct"] == 1.0
     added = paper_execution.run(account["id"], "2026-09-24", facts=_facts(price=10.5),
-                                target_allocations={"688901": 0.40})
+                                target_allocations={"688901": 1.0})
     assert added["filled"] == 0
     assert added["executions"][0]["reject_reason"] == "single_stock_target_reached"
 
 
-def test_candidate_pool_add_uses_remaining_room_below_cap():
+def test_candidate_pool_add_uses_one_add_step_below_cap():
     account = repo.create_paper_account("剩余额度加仓测试", 100_000, "candidate_pool")
     paper_execution.run(account["id"], "2026-09-25", facts=_facts(price=10.0),
                         target_allocations={"688901": 0.35})
@@ -348,5 +357,5 @@ def test_candidate_pool_add_uses_remaining_room_below_cap():
                                 target_allocations={"688901": 0.35})
     assert added["filled"] == 1
     assert added["executions"][0]["metadata"]["lifecycle_reason"] == "candidate_pool_add"
-    assert added["executions"][0]["shares"] == 400
+    assert added["executions"][0]["shares"] == 900
 

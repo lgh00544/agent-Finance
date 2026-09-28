@@ -13,7 +13,6 @@ import logging
 from datetime import date, datetime, timedelta
 from statistics import mean
 
-from app.core.config import settings
 from app.db import repo
 
 logger = logging.getLogger(__name__)
@@ -38,10 +37,9 @@ CANDIDATE_POOL_FIRST_REDUCE_RATIO = 0.30
 CANDIDATE_POOL_INITIAL_ALLOCATION = 0.10
 CANDIDATE_POOL_ADD_ALLOCATION = 0.10
 CANDIDATE_POOL_MAX_ALLOCATION = 0.20
-# AI 决策层给出的单票目标仓位比例区间；上限与个人偏好单票上限对齐，避免两套口径。
-POSITION_TARGET_MIN = 0.05
-POSITION_TARGET_MAX = round(max(POSITION_TARGET_MIN,
-                                float(getattr(settings, "max_single_position_pct", 40.0) or 40.0) / 100.0), 4)
+# 单票目标仓位比例不设代码硬上限（sir 2026-09-28 拍板 C）：可买量只由现金、费用与整手约束决定。
+# 1.0 是「不超本金」的物理边界，真实成交上限由可用现金在换算时收敛。
+POSITION_TARGET_MAX = 1.0
 PAPER_MARKET_SYNC_INDEX_PCT = 0.50
 PAPER_MARKET_SYNC_BREADTH = 0.55
 PAPER_MARKET_SYNC_RELATIVE_PCT = 0.50
@@ -64,13 +62,17 @@ def _num(value, default: float = 0.0) -> float:
 
 
 def _normalize_target_allocation(value) -> float | None:
-    """把 AI/调用方给的目标仓位比例归一化为小数并夹到单票上限；无效值返回 None。"""
+    """把 AI/调用方给的目标仓位比例归一化为 (0, 1] 内的小数；无效值返回 None。
+
+    不再设 5%~40% 代码上下限：过小的比例在整手换算时自然落空，
+    过大的比例由可用现金与费用约束收敛。
+    """
     number = _num(value, 0.0)
     if number <= 0:
         return None
     if number > 1:
         number /= 100.0
-    return min(max(number, POSITION_TARGET_MIN), POSITION_TARGET_MAX)
+    return min(number, POSITION_TARGET_MAX)
 
 
 def _fact_is_available(value: object, trade_date: str) -> bool:
@@ -352,6 +354,7 @@ def _candidate_pool_lifecycle(position: dict, account: dict, price: float,
             reason = "first_take_profit_protection"
     elif candidate_present and int(lifecycle.get("add_count") or 0) < 1 and pnl_pct >= CANDIDATE_POOL_ADD_TRIGGER_PCT:
         target = _normalize_target_allocation(target_allocation) or CANDIDATE_POOL_INITIAL_ALLOCATION
+        # 加仓同样不设硬上限，只在已用额度与现金之间取剩余空间
         used = _num(lifecycle.get("allocated_pct"), target)
         step = min(CANDIDATE_POOL_ADD_ALLOCATION, max(0.0, POSITION_TARGET_MAX - used))
         shares = _candidate_pool_allocation_shares(account, price, code, step) if step > 0 else 0
