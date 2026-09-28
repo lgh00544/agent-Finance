@@ -3407,6 +3407,23 @@ def audit_paper_review(review_id: int, verdict: str, reason: str) -> dict | None
                 "shadow_status": row.shadow_status}
 
 
+def save_paper_review_analysis(review_id: int, *, review: dict | None = None,
+                               audit: dict | None = None) -> bool:
+    """把 AI 生成的模拟复盘正文/审核明细增量写回 paper_review.content（不改冻结事实字段）。"""
+    with SessionLocal() as db:
+        row = db.get(PaperReview, review_id)
+        if row is None:
+            return False
+        content = dict(row.content or {})
+        if review:
+            content["review"] = review
+        if audit:
+            content["audit"] = audit
+        row.content = content
+        db.commit()
+        return True
+
+
 def mark_paper_shadow(review_id: int) -> dict | None:
     with SessionLocal() as db:
         row = db.get(PaperReview, review_id)

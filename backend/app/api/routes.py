@@ -1338,13 +1338,22 @@ def paper_account_run(account_id: int, body: PaperRunBody | None = None):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _paper_audit_label(audit_status: str, audit_reason: str | None) -> str:
+    """模拟复盘审核标签：人工复审（audit_reason 以“人工复审：”开头）与 AI 审核分开显示。"""
+    if audit_status == "pending":
+        return "待AI审核"
+    if str(audit_reason or "").startswith("人工复审："):
+        return "人工复核通过" if audit_status == "passed" else "人工复核未通过"
+    return "AI审核通过" if audit_status == "passed" else "AI审核未通过"
+
+
 @router.get("/paper/reviews")
 def paper_reviews(account_id: int | None = None, limit: int = 100):
     if account_id is not None:
         _paper_account_for_request(account_id)
     return [{**row, "execution_mode": "paper", "review_source": "模拟复盘",
-             "audit_status_label": "AI审核通过" if row["audit_status"] == "passed" else
-             ("待AI审核" if row["audit_status"] == "pending" else "AI审核未通过")}
+             "audit_mode": "manual" if str(row.get("audit_reason") or "").startswith("人工复审：") else "ai",
+             "audit_status_label": _paper_audit_label(row["audit_status"], row.get("audit_reason"))}
             for row in repo.list_paper_reviews(
                 account_id, max(1, min(limit, 500)), user_id=_request_user_id(),
                 is_admin=current_user_role() == "admin")]
@@ -1378,6 +1387,31 @@ def paper_review_ai_audit(review_id: int):
         raise HTTPException(status_code=404, detail="模拟复盘不存在")
     return {**result, "execution_mode": "paper", "review_source": "模拟复盘",
             "audit_status_label": "AI审核通过" if result["audit_status"] == "passed" else "AI审核未通过"}
+
+
+class PaperReviewAuditBody(BaseModel):
+    verdict: str = Field(pattern="^(pass|fail)$", description="人工复审结论")
+    reason: str = Field(min_length=1, description="人工复审理由（必填，留痕）")
+
+
+@router.post("/paper/reviews/{review_id}/audit")
+def paper_review_manual_audit(review_id: int, body: PaperReviewAuditBody):
+    """人工复审模拟复盘：写入人工裁决（理由必填留痕，覆盖 AI 结论）；只有 pass 才进入影子验证。"""
+    require_write_access()
+    _require_owned_paper_review(review_id)
+    try:
+        result = repo.audit_paper_review(review_id, body.verdict, f"人工复审：{body.reason.strip()}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="模拟复盘不存在")
+    if result.get("audit_status") == "passed":
+        shadow = repo.mark_paper_shadow(review_id)
+        if shadow:
+            result.update(shadow)
+    return {**result, "execution_mode": "paper", "review_source": "模拟复盘", "audit_mode": "manual",
+            "formal_rule_change": False,
+            "audit_status_label": _paper_audit_label(result["audit_status"], result.get("audit_reason"))}
 
 
 @router.post("/paper/reviews/{review_id}/shadow")

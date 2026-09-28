@@ -18,7 +18,9 @@ def audit_review(review_id: int) -> dict:
     # A stored review may already carry a generated review.  If it does not,
     # generate it from the same frozen facts before auditing; caller supplied
     # verdicts are never accepted as audit evidence.
-    facts = dict(content.get("facts") or content)
+    # review/audit 是本模块自己写回的分析产物，任何一次重审都必须排除，避免自我污染事实闸门。
+    facts = {k: v for k, v in (content.get("facts") or content).items()
+             if k not in ("review", "audit")}
     generated = content.get("review")
     if not generated:
         generated_result = review_cycle({
@@ -33,6 +35,15 @@ def audit_review(review_id: int) -> dict:
     audited = audit_case(facts, generated)
     verdict = audited.get("verdict") if audited.get("status") in ("ok", "error") else "fail"
     reason = audited.get("reason") or audited.get("error") or "模拟复盘审核失败"
+    # 复盘正文与审核明细落库（前端可读）；闸门拒绝时没有正文，绝不伪造占位内容
+    body = generated if isinstance(generated, dict) and generated.get("plan_vs_actual") else None
+    repo.save_paper_review_analysis(
+        review_id, review=body,
+        audit={"verdict": verdict, "reason": reason,
+               "evidence_gaps": list(audited.get("evidence_gaps") or []),
+               "shadow_eligible": bool(audited.get("shadow_eligible")),
+               "audit_agent": "paper_audit"},
+    )
     result = repo.audit_paper_review(review_id, verdict, reason)
     if result and result.get("audit_status") == "passed":
         shadow = repo.mark_paper_shadow(review_id)

@@ -11,6 +11,7 @@ import {
   Drawer,
   Input,
   List,
+  Radio,
   Row,
   Segmented,
   Select,
@@ -32,7 +33,7 @@ import { trackVerifyDates, trackVerifyList } from '@/api/track'
 import { useTaskSubmit } from '@/hooks/useTaskSubmit'
 import { traceDetail, traces } from '@/api/traces'
 import { reAuditSuggestion as triggerAiAudit } from '@/api/audit'
-import { auditPaperReview, paperReviews, type PaperReview } from '@/api/paper'
+import { auditPaperReview, manualAuditPaperReview, paperReviews, type PaperReview } from '@/api/paper'
 import { ChartCard } from '@/components/charts/ChartCard'
 import { KlineChart } from '@/components/charts/KlineChart'
 import type { EChartsOption } from 'echarts'
@@ -51,6 +52,10 @@ const SUG_STATUS_TIP: Record<string, string> = {
   approved: '已生效 = 已人工采纳并写入偏好/规则',
   adopted: '已采纳 = 写入偏好档案并生效',
   rejected: '已驳回 = 留痕不生效',
+}
+const AUDIT_REASON_LABEL: Record<string, string> = {
+  future_data: '事实闸门拦截：快照含未来数据或事实时间无效，AI 拒绝出具复盘结论',
+  llm_unavailable: '审核模型不可用，未给出结论',
 }
 const textVal = (v: unknown, empty = '—') => String(v ?? '').trim() || empty
 
@@ -125,15 +130,121 @@ function ReasonCell({ text }: { text: unknown }) {
   )
 }
 
+const PAPER_AGENT = '模拟操盘'
+/** 类型标签：模拟复盘与建议类共用一套类型区分 */
+const KIND_META: Record<string, { label: string; color: string }> = {
+  paper: { label: '模拟复盘', color: 'blue' },
+  hard: { label: '规则类', color: 'volcano' },
+  profile: { label: '偏好类', color: 'geekblue' },
+  prompt: { label: '提示词', color: 'default' },
+  soft: { label: '软性', color: 'default' },
+}
+
+/** 人工复审模拟复盘弹窗（复用：面板与合并列表） */
+function openPaperManualAudit(
+  modal: ReturnType<typeof App.useApp>['modal'],
+  message: ReturnType<typeof App.useApp>['message'],
+  reviewId: number,
+  refresh: () => void,
+) {
+  let verdict: 'pass' | 'fail' = 'pass'
+  let reason = ''
+  modal.confirm({
+    title: '人工复审模拟复盘（覆盖 AI 结论，理由必填留痕）',
+    content: <Space orientation="vertical" style={{ width: '100%' }}>
+      <Radio.Group defaultValue="pass" onChange={(e) => { verdict = e.target.value as 'pass' | 'fail' }}>
+        <Radio value="pass">复核通过（进入影子验证）</Radio>
+        <Radio value="fail">复核不通过</Radio>
+      </Radio.Group>
+      <Input.TextArea rows={3} placeholder="人工复审理由（必填，写入 audit_reason 留痕）" onChange={(e) => { reason = e.target.value }} />
+    </Space>,
+    okText: '提交复核',
+    onOk: async () => {
+      if (!reason.trim()) { message.error('复审理由必填'); return Promise.reject() }
+      try { await manualAuditPaperReview(reviewId, verdict, reason.trim()); message.success('人工复审已留痕'); refresh() }
+      catch (e) {
+        const msg = e instanceof Error ? e.message : '人工复审失败'
+        message.error(/405|Method Not Allowed/i.test(msg) ? '后端还没加载人工复审接口，重启后端后再试' : msg)
+        return Promise.reject()
+      }
+    },
+  })
+}
+
+/** 模拟复盘的只读事实明细：只展示能看懂的字段，不丢原始 JSON */
+function PaperReviewDetail({ p }: { p: PaperReview }) {
+  const content = p.content ?? {}
+  const position = (content.position ?? {}) as Record<string, unknown>
+  const quote = (content.quote ?? {}) as Record<string, unknown>
+  const exit = (content.exit_execution ?? {}) as Record<string, unknown>
+  const num = (v: unknown, digits = 2) => (v == null || v === '' || !Number.isFinite(Number(v)) ? '—' : Number(v).toFixed(digits))
+  const verdict = String(p.audit_verdict ?? '')
+  const reason = String(p.audit_reason ?? '').trim()
+  const review = (content.review ?? null) as Record<string, unknown> | null
+  const auditMeta = (content.audit ?? {}) as Record<string, unknown>
+  const gaps = Array.isArray(auditMeta.evidence_gaps) ? (auditMeta.evidence_gaps as unknown[]).map((g) => String(g)) : []
+  const kvText = (v: unknown) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      return Object.entries(v as Record<string, unknown>).map(([k, val]) => `${k}：${val == null || val === '' ? '—' : String(val)}`).join('\n')
+    }
+    return textVal(v, '暂无')
+  }
+  return (
+    <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+      <Card size="small" title="AI 审核结论" style={{ background: 'var(--bg-input)' }}>
+        <Descriptions size="small" column={1} items={[
+          { label: '裁决', children: <Tag color={verdict === 'pass' ? 'green' : verdict === 'fail' ? 'red' : 'default'}>{p.audit_status_label ?? (verdict || '未出')}</Tag> },
+          { label: '审核方式', children: p.audit_mode === 'manual' ? '人工复审' : 'AI 审核' },
+          { label: '结论理由', children: <span style={{ whiteSpace: 'pre-wrap' }}>{reason ? (AUDIT_REASON_LABEL[reason] ?? reason) : '尚未审核'}</span> },
+          { label: '影子状态', children: textVal(p.shadow_status) },
+          { label: '审核时间', children: textVal(p.audited_at) },
+        ]} />
+      </Card>
+      <Card size="small" title="AI 复盘正文" style={{ background: 'var(--bg-input)' }}>
+        {review ? (
+          <Descriptions size="small" column={1}>
+            <Descriptions.Item label="计划 vs 实际"><span style={{ whiteSpace: 'pre-wrap' }}>{kvText(review.plan_vs_actual)}</span></Descriptions.Item>
+            <Descriptions.Item label="经验教训"><span style={{ whiteSpace: 'pre-wrap' }}>{textVal(review.lesson, '暂无')}</span></Descriptions.Item>
+            <Descriptions.Item label="偏好反馈"><span style={{ whiteSpace: 'pre-wrap' }}>{kvText(review.feedback)}</span></Descriptions.Item>
+            {Array.isArray(review.agent_suggestions) && review.agent_suggestions.length
+              ? <Descriptions.Item label="当场提出的建议">{String(review.agent_suggestions.length) + ' 条（已进入下方建议列表待审）'}</Descriptions.Item> : null}
+          </Descriptions>
+        ) : (
+          <Text type="secondary">本次审核在「事实闸门」阶段就被拦截，AI 没有生成复盘正文（原因见上）；只有通过闸门的案例才会产出正文。</Text>
+        )}
+        {gaps.length ? (
+          <Space wrap size={4} style={{ marginTop: 8 }}>
+            <Text type="secondary">证据缺口：</Text>
+            {gaps.map((g) => <Tag key={g} color="orange">{g}</Tag>)}
+          </Space>
+        ) : null}
+      </Card>
+      <Card size="small" title="模拟操盘事实（冻结快照）" style={{ background: 'var(--bg-input)' }}>
+        <Descriptions size="small" column={1} items={[
+          { label: '复盘日期', children: textVal(p.review_date) },
+          { label: '事实时点', children: textVal(content.fact_as_of ?? quote.quote_time) },
+          { label: '当时报价', children: quote.price == null ? '暂无' : `${num(quote.price, 2)} 元（昨收 ${num(quote.prev_close)} / 涨跌 ${num(quote.change_pct)}% / 来源 ${textVal(quote.source)}）` },
+          { label: '模拟持仓', children: position.available_shares == null ? '暂无' : `可用 ${num(position.available_shares, 0)} 股 / 均价 ${num(position.avg_price, 4)} 元 / 成本 ${num(position.cost, 2)} 元` },
+          { label: '平仓成交', children: exit.executed_price == null ? '暂无' : `成交价 ${num(exit.executed_price, 4)} 元 / 金额 ${num(exit.gross_amount)} 元 / 手续费 ${num(exit.commission)} 元` },
+          { label: '盈亏金额', children: content.pnl_amount == null ? '—' : `${num(content.pnl_amount)} 元` },
+          { label: '来源引用', children: `候选 ${textVal(content.candidate_id)} · 评分 ${textVal(content.score_id)} · 建仓计划 ${textVal(content.plan_id)}` },
+        ]} />
+      </Card>
+    </Space>
+  )
+}
+
 /** 模拟复盘复用本页入口：AI审核通过后才允许送入 paper shadow。 */
 function PaperReviewPanel() {
-  const { message } = App.useApp()
+  const { message, modal } = App.useApp()
   const qc = useQueryClient()
   const { data, isLoading, isError, error } = useQuery({ queryKey: ['paper-reviews'], queryFn: () => paperReviews(), retry: 1 })
+  const refresh = () => qc.invalidateQueries({ queryKey: ['paper-reviews'] })
   const audit = async (id: number) => {
-    try { await auditPaperReview(id); message.success('模拟复盘 AI 审核完成'); qc.invalidateQueries({ queryKey: ['paper-reviews'] }) }
+    try { await auditPaperReview(id); message.success('模拟复盘 AI 审核完成'); refresh() }
     catch (e) { message.error(e instanceof Error ? e.message : 'AI审核失败') }
   }
+  const manualAudit = (id: number) => openPaperManualAudit(modal, message, id, refresh)
   const rows = data ?? []
   return (
     <Card size="small" title={<Space><span>AI模拟复盘</span><Tag color="blue">模拟复盘</Tag></Space>} style={{ marginBottom: 12 }}>
@@ -141,40 +252,57 @@ function PaperReviewPanel() {
       {isLoading ? <Text type="secondary">正在加载模拟复盘…</Text> : !rows.length ? <Text type="secondary">暂无模拟复盘；模拟卖出后会在此生成待 AI 审核案例。</Text> : (
         <List size="small" dataSource={rows} renderItem={(r: PaperReview) => {
           const content = r.content ?? {}
-          const provenance = content.provenance ?? {}
           const auditPassed = r.audit_status === 'passed'
+          const verdict = String(r.audit_verdict ?? '')
+          const reason = String(r.audit_reason ?? '')
           return (
             <List.Item actions={[
               r.audit_status === 'pending' ? <Button key="audit" size="small" type="primary" onClick={() => audit(r.id)}>AI审核</Button> : null,
+              <Button key="manual" size="small" onClick={() => manualAudit(r.id)}>人工复审</Button>,
               auditPassed ? <Tag key="shadow" color={r.shadow_status === 'pending' || r.shadow_status === 'active' ? 'green' : 'blue'}>{r.shadow_status === 'pending' || r.shadow_status === 'active' ? '已进入影子验证' : '审核通过，待影子验证'}</Tag> : null,
             ].filter(Boolean) as ReactNode[]}>
               <List.Item.Meta
                 title={<Space wrap><StockLabel code={r.stock_code} name={r.stock_name} /><Tag color="blue">AI模拟</Tag><Tag>{r.audit_status_label ?? (auditPassed ? 'AI审核通过' : '待AI审核')}</Tag></Space>}
-                description={<Collapse ghost items={[{ key: 'detail', label: '查看复盘详情', children: <Descriptions size="small" column={1}>
-                  <Descriptions.Item label="复盘日期">{textVal(r.review_date)}</Descriptions.Item>
-                  <Descriptions.Item label="经验结论">{textVal(content.lesson, '暂无')}</Descriptions.Item>
-                  <Descriptions.Item label="计划与实际">{textVal(content.plan_vs_actual, '暂无')}</Descriptions.Item>
-                  <Descriptions.Item label="收益 / 持有天数">{content.pnl_pct == null ? '—' : `${Number(content.pnl_pct).toFixed(2)}%`} / {content.hold_days == null ? '—' : `${content.hold_days} 天`}</Descriptions.Item>
-                  <Descriptions.Item label="来源链路">{textVal(provenance.source_type ?? r.review_source, '模拟执行 Agent')} · 候选/评分/建仓计划均保留引用</Descriptions.Item>
-                  {r.knowledge_id != null ? <Descriptions.Item label="影子知识编号">{r.knowledge_id}</Descriptions.Item> : null}
-                </Descriptions>}]} />}
+                description={<>
+                  <Space wrap size={4} style={{ marginBottom: 4 }}>
+                    <Tag color={verdict === 'pass' ? 'green' : verdict === 'fail' ? 'red' : 'default'}>裁决 {verdict || '未出'}</Tag>
+                    <Tag>{r.audit_mode === 'manual' ? '人工复审' : 'AI 审核'}</Tag>
+                    <Tag>影子状态 {textVal(r.shadow_status)}</Tag>
+                    {r.audited_at ? <Tag>审核时间 {String(r.audited_at).slice(0, 16)}</Tag> : null}
+                  </Space>
+                  <Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>
+                    审核结论：{reason ? (AUDIT_REASON_LABEL[reason] ?? reason) : '尚未审核'}
+                  </Text>
+                  <Collapse ghost items={[{ key: 'detail', label: '查看复盘详情', children: <Descriptions size="small" column={1}>
+                    <Descriptions.Item label="复盘日期">{textVal(r.review_date)}</Descriptions.Item>
+                    <Descriptions.Item label="审核裁决">{verdict || '未出'} · {reason ? (AUDIT_REASON_LABEL[reason] ?? reason) : '暂无'}</Descriptions.Item>
+                    <Descriptions.Item label="事实快照时间">{textVal(content.fact_as_of ?? content.trade_date)}</Descriptions.Item>
+                    <Descriptions.Item label="模式 / 状态">{textVal(content.mode)} / {textVal(content.status)}</Descriptions.Item>
+                    <Descriptions.Item label="盈亏金额">{content.pnl_amount == null ? '—' : `${Number(content.pnl_amount).toFixed(2)} 元`}</Descriptions.Item>
+                    <Descriptions.Item label="持仓快照">{content.position ? <Typography.Paragraph style={{ marginBottom: 0 }} ellipsis={{ rows: 2, expandable: true }}>{JSON.stringify(content.position)}</Typography.Paragraph> : '暂无'}</Descriptions.Item>
+                    <Descriptions.Item label="行情快照">{content.quote ? <Typography.Paragraph style={{ marginBottom: 0 }} ellipsis={{ rows: 2, expandable: true }}>{JSON.stringify(content.quote)}</Typography.Paragraph> : '暂无'}</Descriptions.Item>
+                    <Descriptions.Item label="来源链路">{textVal(r.review_source ?? content.source_type, '模拟执行 Agent')} · 候选/评分/建仓计划引用：{textVal(content.candidate_id)} / {textVal(content.score_id)} / {textVal(content.plan_id)}</Descriptions.Item>
+                    {r.knowledge_id != null ? <Descriptions.Item label="影子知识编号">{r.knowledge_id}</Descriptions.Item> : null}
+                  </Descriptions>}]} />
+                </>}
               />
             </List.Item>
           )
         }} />
       )}
-      <Text type="secondary" style={{ fontSize: 12 }}>AI审核通过后由系统自动进入影子验证；影子案例不能直接改变正式规则，仍须人工采纳和回滚。</Text>
+      <Text type="secondary" style={{ fontSize: 12 }}>AI 审核只决定能否进入影子验证，不改任何正式规则；「人工复审」可覆盖 AI 结论（理由必填留痕）。影子案例仍须人工采纳和回滚。</Text>
     </Card>
   )
 }
 
 function SuggestionDetail({
-  r, onAct, onReReview, onAiAudit, onClose,
+  r, onAct, onReReview, onAiAudit, onOverride, onClose,
 }: {
   r: AgentSuggestion
   onAct: (r: AgentSuggestion, action: 'approve' | 'adopt' | 'reject') => void
   onReReview: (r: AgentSuggestion) => void
   onAiAudit?: (r: AgentSuggestion) => void
+  onOverride?: (r: AgentSuggestion) => void
   onClose?: () => void
 }) {
   const status = String(r.status ?? '')
@@ -214,7 +342,7 @@ function SuggestionDetail({
       <Card size="small" title="操作" style={{ background: 'var(--bg-input)' }}>
         <Space wrap>
           {status === 'pending' && audit === 'pass' ? <Button size="small" type="primary" style={{ background: 'var(--up)', borderColor: 'var(--up)' }} onClick={stop(() => onAct(r, kind === 'profile' ? 'approve' : 'adopt'))}>采纳</Button> : null}
-          {status === 'pending' && audit !== 'pass' ? <Tooltip title={audit === 'fail' ? 'AI 未通过，可重新审核或驳回' : '等待 AI 审核通过后才能应用'}><Button size="small" disabled>待AI通过</Button></Tooltip> : null}
+          {status === 'pending' && audit !== 'pass' ? <Tooltip title={audit === 'fail' ? 'AI 未通过；可用人工理由强制采纳（覆盖 AI 意见），或重新审核 / 驳回' : 'AI 尚未审核；也可用人工理由强制采纳'}><Button size="small" onClick={stop(() => onOverride?.(r))}>强制采纳</Button></Tooltip> : null}
           {status === 'pending' && onAiAudit && ['pending', 'fail'].includes(audit) ? <Button size="small" onClick={stop(() => onAiAudit(r))}>AI审核</Button> : null}
           {status === 'approved' ? <Text type="success">已采纳生效</Text> : null}
           {status === 'pending' ? <Button size="small" danger onClick={stop(() => onAct(r, 'reject'))}>驳回</Button> : null}
@@ -1180,7 +1308,14 @@ function Suggestions() {
   const qc = useQueryClient()
   const [selectedSug, setSelectedSug] = useState<AgentSuggestion | null>(null)
   const { data: rows } = useQuery({ queryKey: ['agent-sug'], queryFn: () => agentSuggestions() })
+  const { data: paperRaw } = useQuery({ queryKey: ['paper-reviews'], queryFn: () => paperReviews(), retry: 1 })
   const list = rows ?? []
+  const paperList = (paperRaw ?? []) as PaperReview[]
+  const [kw, setKw] = useState('')
+  const [fAgent, setFAgent] = useState('')
+  const [fKind, setFKind] = useState('')
+  const [fStatus, setFStatus] = useState('')
+  const [fAudit, setFAudit] = useState('')
   const pendingAuditCount = list.filter((r) => r.status === 'pending' && ['pending', 'fail'].includes(auditVerdictOf(r))).length
   const auditTask = useTaskSubmit('audit_pending', () => {
     message.success('增量 AI 审核已完成')
@@ -1190,19 +1325,20 @@ function Suggestions() {
   const byAgent = (() => {
     const m = new Map<string, number>()
     for (const s of list) { const a = s.target_agent ?? '其他'; m.set(a, (m.get(a) ?? 0) + 1) }
+    if (paperList.length) m.set(PAPER_AGENT, paperList.length)
     return Array.from(m)
   })()
-  if (!list.length) return <EmptyState text="暂无优化建议。" icon="💡" />
+  if (!list.length && !paperList.length) return <EmptyState text="暂无优化建议。" icon="💡" />
 
-  const act = (r: (typeof list)[number], action: 'approve' | 'adopt' | 'reject') => {
+  const act = (r: (typeof list)[number], action: 'approve' | 'adopt' | 'reject', overrideReason?: string) => {
     if (action === 'reject') {
       openRejectConfirm(modal, message, `驳回建议：${r.rule_name}`,
         (reason) => rejectSuggestion(r.id, reason), () => qc.invalidateQueries({ queryKey: ['agent-sug'] }))
       return
     }
     const confirmMap: Record<string, { title: string; fn: () => Promise<unknown> }> = {
-      approve: { title: `确认采纳建议：${r.rule_name}`, fn: () => approveSuggestion(r.id) },
-      adopt: { title: `应用生效：${r.rule_name}（硬规则需二次确认）`, fn: () => adoptSuggestion(r.id, r.rule_type === 'hard') },
+      approve: { title: `确认采纳建议：${r.rule_name}`, fn: () => approveSuggestion(r.id, overrideReason) },
+      adopt: { title: `应用生效：${r.rule_name}（硬规则需二次确认）`, fn: () => adoptSuggestion(r.id, r.rule_type === 'hard', overrideReason) },
     }
     modal.confirm({
       title: confirmMap[action].title,
@@ -1234,6 +1370,29 @@ function Suggestions() {
       qc.invalidateQueries({ queryKey: ['agent-sug'] })
     } catch (e) { message.error(e instanceof Error ? e.message : 'AI 审核提交失败') }
   }
+  /** 人工强制采纳：AI 只是建议，人工可用必填理由覆盖其裁决（后端写 conflict_note 留痕） */
+  const overrideAdopt = (r: (typeof list)[number]) => {
+    let reason = ''
+    const kind = String(r.target_kind ?? r.rule_type ?? '')
+    modal.confirm({
+      title: `强制采纳（覆盖 AI 意见）：${r.rule_name}`,
+      content: <Space orientation="vertical" style={{ width: '100%' }}>
+        <Alert type="warning" showIcon message={`AI 裁决：${AUDIT_STATUS[auditVerdictOf(r)]?.label ?? auditVerdictOf(r)}`}
+          description="AI 结论仅供参考。强制采纳会用你的人工理由覆盖它并留痕，规则仍可随时回滚。" />
+        <Input.TextArea rows={3} placeholder="人工覆盖理由（必填，写入 conflict_note 留痕）" onChange={(e) => { reason = e.target.value }} />
+      </Space>,
+      okText: '强制采纳',
+      onOk: async () => {
+        if (!reason.trim()) { message.error('覆盖理由必填'); return Promise.reject() }
+        try {
+          if (kind === 'profile') await approveSuggestion(r.id, reason.trim())
+          else await adoptSuggestion(r.id, r.rule_type === 'hard', reason.trim())
+          message.success('已按人工结论采纳并留痕')
+          qc.invalidateQueries({ queryKey: ['agent-sug'] })
+        } catch (e) { message.error(e instanceof Error ? e.message : '强制采纳失败'); return Promise.reject() }
+      },
+    })
+  }
   const renderOps = (r: AgentSuggestion) => {
     const status = String(r.status ?? '')
     const kind = String(r.target_kind ?? r.rule_type ?? '')
@@ -1241,7 +1400,7 @@ function Suggestions() {
     return (
       <Space size={4} wrap onClick={(e) => e.stopPropagation()}>
         {status === 'pending' && audit === 'pass' ? <Button size="small" type="primary" style={{ background: 'var(--up)', borderColor: 'var(--up)' }} onClick={() => act(r, kind === 'profile' ? 'approve' : 'adopt')}>采纳</Button> : null}
-        {status === 'pending' && audit !== 'pass' ? <Tooltip title={audit === 'fail' ? 'AI 未通过，可重新审核或驳回' : '等待 AI 审核通过后才能应用'}><Button size="small" disabled>待AI通过</Button></Tooltip> : null}
+        {status === 'pending' && audit !== 'pass' ? <Tooltip title={audit === 'fail' ? 'AI 未通过；可用人工理由强制采纳（覆盖 AI 意见），或重新审核 / 驳回' : 'AI 尚未审核；也可用人工理由强制采纳'}><Button size="small" onClick={() => overrideAdopt(r)}>强制采纳</Button></Tooltip> : null}
         {status === 'pending' && ['pending', 'fail'].includes(audit) ? <Button size="small" onClick={() => aiAudit(r)}>AI审核</Button> : null}
         {status === 'approved' ? <Button size="small" onClick={() => setSelectedSug(r)}>查看</Button> : null}
         {status === 'pending' ? <Button size="small" danger onClick={() => act(r, 'reject')}>驳回</Button> : null}
@@ -1252,12 +1411,41 @@ function Suggestions() {
     )
   }
 
+  const paperAudit = async (id: number) => {
+    try { await auditPaperReview(id); message.success('模拟复盘 AI 审核完成'); qc.invalidateQueries({ queryKey: ['paper-reviews'] }) }
+    catch (e) { message.error(e instanceof Error ? e.message : 'AI审核失败') }
+  }
+  const renderPaperOps = (p: PaperReview) => (
+    <Space size={4} wrap onClick={(e) => e.stopPropagation()}>
+      {p.audit_status === 'pending' ? <Button size="small" onClick={() => paperAudit(p.id)}>AI审核</Button> : null}
+      <Button size="small" onClick={() => openPaperManualAudit(modal, message, p.id, () => qc.invalidateQueries({ queryKey: ['paper-reviews'] }))}>人工复审</Button>
+    </Space>
+  )
+  // 模拟复盘与建议合并到同一列表：类型区分 + 统一筛选口径
+  type Row =
+    | { key: string; kind: 'paper'; p: PaperReview; kindValue: string; agent: string; status: string; audit: string }
+    | { key: string; kind: 'sug'; s: AgentSuggestion; kindValue: string; agent: string; status: string; audit: string }
+  const paperStatus = (p: PaperReview) => (p.audit_status === 'passed' ? 'approved' : p.audit_status === 'failed' ? 'rejected' : 'pending')
+  const unified: Row[] = [
+    ...paperList.map((p): Row => ({ key: `paper:${p.id}`, kind: 'paper', p, kindValue: 'paper', agent: PAPER_AGENT, status: paperStatus(p), audit: String(p.audit_verdict || 'pending') })),
+    ...list.map((s): Row => ({ key: `sug:${s.id}`, kind: 'sug', s, kindValue: String(s.target_kind ?? s.rule_type ?? 'prompt'), agent: String(s.target_agent ?? '其他'), status: String(s.status ?? ''), audit: auditVerdictOf(s) })),
+  ]
+  const visible = unified.filter((r) => {
+    const k = kw.trim().toLowerCase()
+    const text = r.kind === 'paper'
+      ? [r.p.stock_code, r.p.stock_name, r.p.audit_reason, r.p.review_date]
+      : [r.s.rule_name, r.s.reason, r.s.review_text]
+    const hitKw = !k || text.some((x) => String(x ?? '').toLowerCase().includes(k))
+    return hitKw && (!fAgent || r.agent === fAgent) && (!fKind || r.kindValue === fKind)
+      && (!fStatus || r.status === fStatus) && (!fAudit || r.audit === fAudit)
+  })
+  const resetFilters = () => { setKw(''); setFAgent(''); setFKind(''); setFStatus(''); setFAudit('') }
+
   return (
     <>
-      <PaperReviewPanel />
       <Alert type="info" showIcon style={{ marginBottom: 10 }}
         title="交易复盘 · ReviewAgent 全链路"
-        description="Agent 复盘后产出 review_log（Agent 调整建议 + 偏好优化建议），需经人工审核确认后才生效。包含两类建议：① 偏好类（写偏好档案）② 规则类（写生效规则表）；系统先做 AI 辩证审核，AI 通过后才开放人工采纳。" />
+        description="Agent 复盘后产出 review_log（Agent 调整建议 + 偏好优化建议），需经人工审核确认后才生效。包含两类建议：① 偏好类（写偏好档案）② 规则类（写生效规则表）；系统先做 AI 辩证审核，AI 结论是建议而非闸门 —— 未通过时你仍可填写理由「强制采纳」（留痕可回滚）。" />
       <StatCardGrid>
         <StatCard label="待审建议" value={byStatus('pending')} tone={byStatus('pending') ? 'warn' : 'mute'} sub="需人工审核后生效" />
         <StatCard label="已生效" value={byStatus('approved') + byStatus('adopted')} tone="ok" sub="已写入偏好/规则" />
@@ -1282,49 +1470,58 @@ function Suggestions() {
         <Text type="secondary">规则类型：</Text>
         <Tag color={hardCount ? 'volcano' : 'default'}>硬规则 {hardCount}</Tag>
         <Tag>偏好/参数 {list.length - hardCount}</Tag>
-        <Text type="secondary" style={{ marginLeft: 8 }}>Agent 分布：</Text>
-        {byAgent.map(([a, n]) => <Tag key={a}>{MODULE_LABEL[a] ?? a} {n}</Tag>)}
+        <Text type="secondary" style={{ marginLeft: 8 }}>Agent 分布（点击筛选）：</Text>
+        {byAgent.map(([a, n]) => <Tag key={a} color={fAgent === a ? 'blue' : undefined} style={{ cursor: 'pointer' }}
+          onClick={() => setFAgent(fAgent === a ? '' : a)}>{MODULE_LABEL[a] ?? a} {n}</Tag>)}
+      </Space>
+      <Space wrap style={{ marginBottom: 8 }}>
+        <Input.Search allowClear placeholder="搜索规则名/原因" style={{ width: 200 }} onChange={(e) => setKw(e.target.value)} />
+        <Select allowClear placeholder="目标 Agent" style={{ width: 140 }} value={fAgent || undefined} onChange={(v) => setFAgent(v ?? '')}
+          options={byAgent.map(([a]) => ({ value: a, label: MODULE_LABEL[a] ?? a }))} />
+        <Select allowClear placeholder="类型" style={{ width: 120 }} value={fKind || undefined} onChange={(v) => setFKind(v ?? '')}
+          options={[{ value: 'paper', label: '模拟复盘' }, { value: 'hard', label: '规则类' }, { value: 'profile', label: '偏好类' }, { value: 'prompt', label: '提示词' }, { value: 'soft', label: '软性' }]} />
+        <Select allowClear placeholder="状态" style={{ width: 120 }} value={fStatus || undefined} onChange={(v) => setFStatus(v ?? '')}
+          options={[{ value: 'pending', label: '待审核' }, { value: 'approved', label: '已生效' }, { value: 'adopted', label: '已采纳' }, { value: 'rejected', label: '已驳回' }]} />
+        <Select allowClear placeholder="AI 结论" style={{ width: 120 }} value={fAudit || undefined} onChange={(v) => setFAudit(v ?? '')}
+          options={[{ value: 'pass', label: 'AI通过' }, { value: 'fail', label: 'AI未通过' }, { value: 'pending', label: 'AI待审' }]} />
+        <Button size="small" onClick={resetFilters}>重置筛选</Button>
+        <Text type="secondary">命中 {visible.length} / {unified.length}</Text>
       </Space>
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
-        建议按目标 Agent 分布如上；AI 通过后才开放人工应用，「硬规则」采纳需二次确认。点击行可查看完整上下文，展开行可查看复盘原文。
+        模拟复盘 = AI 影子验证前的案例（AI 未通过的不需要你处理，想翻案才点「人工复审」）；建议类 = 会写偏好/规则的提案。展开行看明细，点击建议行看完整上下文；「硬规则」采纳需二次确认，AI 未通过时可用「强制采纳」+ 理由覆盖（写入 conflict_note 留痕，仍可回滚）。
       </Text>
-      <Table size="small" rowKey="id" dataSource={list} pagination={{ pageSize: 10 }}
-        onRow={(r) => ({ onClick: () => setSelectedSug(r), style: { cursor: 'pointer' } })}
-        expandable={{ expandedRowRender: (r) => <SuggestionDetail r={r} onAct={act} onReReview={reReview} onAiAudit={aiAudit} /> }}
+      <Table size="small" rowKey="key" dataSource={visible} pagination={{ pageSize: 10 }}
+        onRow={(r) => ({ onClick: () => { if (r.kind === 'sug') setSelectedSug(r.s) }, style: { cursor: r.kind === 'sug' ? 'pointer' : 'default' } })}
+        expandable={{ expandedRowRender: (r) => r.kind === 'paper'
+          ? <PaperReviewDetail p={r.p} />
+          : <SuggestionDetail r={r.s} onAct={act} onReReview={reReview} onAiAudit={aiAudit} onOverride={overrideAdopt} /> }}
         columns={[
-          { title: 'Agent', dataIndex: 'target_agent', width: 100, render: (v: string) => MODULE_LABEL[v] ?? v },
-          { title: '类型', key: 'kind', width: 90, render: (_: unknown, r: (typeof list)[number]) => {
-            const v = String(r.target_kind ?? r.rule_type ?? '')
-            return <Tag color={v === 'hard' ? 'volcano' : v === 'profile' ? 'blue' : 'default'}>{v === 'hard' ? '规则类' : v === 'profile' ? '偏好类' : textVal(v, '提示词')}</Tag>
-          } },
-          { title: '规则名', dataIndex: 'rule_name', width: 150, ellipsis: true },
-          { title: '调整前', key: 'before', width: 180, render: (_: unknown, r: (typeof list)[number]) => <Text ellipsis>{textVal(r.current_value ?? r.review_text)}</Text> },
-          { title: '调整后', key: 'after', width: 180, render: (_: unknown, r: (typeof list)[number]) => <Text ellipsis>{textVal(r.suggested_value ?? r.new_text)}</Text> },
-          { title: '当前-重议', key: 'reason', width: 220, render: (_: unknown, r: (typeof list)[number]) => <ReasonCell text={r.reason ?? r.reason_text} /> },
-          { title: '置信度/影响', key: 'impact', width: 110, render: (_: unknown, r: (typeof list)[number]) => <Space orientation="vertical" size={2}><Tag>{textVal(r.confidence ?? r.audit_confidence, '置信度—')}</Tag><Tag color="blue">{textVal(r.impact ?? r.priority ?? r.risk_level, '影响—')}</Tag></Space> },
-          { title: '时间', dataIndex: 'created_at', width: 130, render: (v: string) => String(v ?? '').slice(0, 16) },
-          { title: '状态', dataIndex: 'status', width: 110, render: (v: string, r: (typeof list)[number]) => (
+          { title: '类型', key: 'kind', width: 96, render: (_: unknown, r: Row) => <Tag color={KIND_META[r.kindValue]?.color ?? 'default'}>{KIND_META[r.kindValue]?.label ?? r.kindValue}</Tag> },
+          { title: '标的 / 规则', key: 'title', width: 200, render: (_: unknown, r: Row) => r.kind === 'paper'
+            ? <StockLabel code={String(r.p.stock_code ?? '')} name={String(r.p.stock_name ?? '')} />
+            : <Text ellipsis>{textVal(r.s.rule_name)}</Text> },
+          { title: 'Agent', key: 'agent', width: 96, render: (_: unknown, r: Row) => MODULE_LABEL[r.agent] ?? r.agent },
+          { title: '结论 / 状态', key: 'state', render: (_: unknown, r: Row) => (
             <Space orientation="vertical" size={0}>
-              <Tooltip title={SUG_STATUS_TIP[v] ?? textVal(v)}><Tag color={SUG_STATUS[v]?.color ?? 'default'}>{SUG_STATUS[v]?.label ?? textVal(v)}</Tag></Tooltip>
-              <Tag color={AUDIT_STATUS[auditVerdictOf(r)]?.color ?? 'default'}>
-                {AUDIT_STATUS[auditVerdictOf(r)]?.label ?? auditVerdictOf(r)}
-              </Tag>
-              {v === 'rejected' ? <Text type="secondary" style={{ fontSize: 12 }}>驳回原因：{String(r.reject_reason || '（未录入原因）')}</Text> : null}
+              <Space size={4} wrap>
+                {r.kind === 'paper' ? <Tag color={r.audit === 'pass' ? 'green' : r.audit === 'fail' ? 'red' : 'default'}>{r.p.audit_status_label ?? '待AI审核'}</Tag> : null}
+                {r.kind === 'paper' ? <Tag>{r.p.audit_mode === 'manual' ? '人工复审' : 'AI 审核'}</Tag> : null}
+                {r.kind === 'paper' ? <Tag>影子 {textVal(r.p.shadow_status)}</Tag> : null}
+                {r.kind === 'sug' ? <Tooltip title={SUG_STATUS_TIP[r.status] ?? textVal(r.status)}><Tag color={SUG_STATUS[r.status]?.color ?? 'default'}>{SUG_STATUS[r.status]?.label ?? textVal(r.status)}</Tag></Tooltip> : null}
+                {r.kind === 'sug' ? <Tag color={AUDIT_STATUS[r.audit]?.color ?? 'default'}>{AUDIT_STATUS[r.audit]?.label ?? r.audit}</Tag> : null}
+              </Space>
+              <ReasonCell text={r.kind === 'paper' ? (r.p.audit_reason ? (AUDIT_REASON_LABEL[String(r.p.audit_reason)] ?? r.p.audit_reason) : '尚未审核') : (r.s.reason ?? r.s.review_text)} />
+              {r.kind === 'sug' && r.status === 'rejected' ? <Text type="secondary" style={{ fontSize: 12 }}>驳回原因：{String(r.s.reject_reason || '（未录入原因）')}</Text> : null}
             </Space>
           ) },
-          { title: '处理建议', key: 'guide', width: 130, render: (_: unknown, r: (typeof list)[number]) => String(r.status) === 'pending'
-            ? <Text type="secondary">{auditVerdictOf(r) === 'pass' ? '可应用 / 驳回' : auditVerdictOf(r) === 'fail' ? '重审 / 驳回' : '等AI审核'}</Text>
-            : <Text type="secondary">{String(r.status) === 'rejected' ? '可重新审核' : '查看留痕'}</Text> },
-          {
-            title: '操作', key: 'ops', width: 180,
-            render: (_: unknown, r: (typeof list)[number]) => renderOps(r),
-          },
+          { title: '时间', key: 'time', width: 130, render: (_: unknown, r: Row) => String((r.kind === 'paper' ? (r.p.audited_at ?? r.p.review_date) : r.s.created_at) ?? '').slice(0, 16) || '—' },
+          { title: '操作', key: 'ops', width: 210, render: (_: unknown, r: Row) => (r.kind === 'paper' ? renderPaperOps(r.p) : renderOps(r.s)) },
         ]} />
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-        操作指引：生成建议 → AI 审核 → AI 通过后你点采纳；AI 未通过的建议由你选择重新 AI 审核或驳回。全部规则落地仍需人工操作，系统绝不自动生效。
+        操作指引：模拟复盘无需你逐条处理（AI 未通过的是被拦下的失败案例，想翻案才点「人工复审」）；建议类走「AI 审核 → 你点采纳」，AI 未通过时可重审、驳回，或填写理由「强制采纳」（覆盖 AI 意见并留痕）。全部规则落地仍需人工操作，系统绝不自动生效。
       </Text>
       <Drawer title="ReviewAgent 建议详情" open={!!selectedSug} size={720} onClose={() => setSelectedSug(null)} destroyOnHidden>
-        {selectedSug ? <SuggestionDetail r={selectedSug} onAct={act} onReReview={reReview} onAiAudit={aiAudit} onClose={() => setSelectedSug(null)} /> : null}
+        {selectedSug ? <SuggestionDetail r={selectedSug} onAct={act} onReReview={reReview} onAiAudit={aiAudit} onOverride={overrideAdopt} onClose={() => setSelectedSug(null)} /> : null}
       </Drawer>
     </>
   )

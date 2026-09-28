@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { DndContext, DragOverlay, PointerSensor, useDroppable, useSensor, useSensors, type DragEndEvent, type DragStartEvent } from '@dnd-kit/core'
+import { useNavigate } from 'react-router-dom'
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { App, Button, Card, Col, Descriptions, Drawer, Input, Popover, Radio, Row, Select, Space, Tag, Typography } from 'antd'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -13,6 +14,9 @@ const { Text } = Typography
 const STATUS: Record<string, { label: string; color: string }> = {
   active: { label: '生效中', color: 'green' },
   rolled_back: { label: '已回滚', color: 'default' },
+  pending: { label: '待人工处理', color: 'gold' },
+  approved: { label: '已采纳', color: 'green' },
+  rejected: { label: '已驳回', color: 'red' },
 }
 /** rule_type_label 语义 */
 const TYPE_TONE: Record<string, { label: string; color: string }> = {
@@ -36,7 +40,7 @@ const agentLabel = (v: unknown) => AGENT_LABELS[String(v ?? '')] ?? val(v)
 const statusLabel = (v: unknown) => ({ pending: '待审核', pass: '通过', fail: '未通过', auditing: '审核中',
   approved: '已通过', adopted: '已采纳', rejected: '已驳回', active: '生效中', rolled_back: '已回滚' } as Record<string, string>)[String(v ?? '')] ?? val(v)
 const desc = (items: Array<[string, string | number]>) => <Descriptions size="small" column={1} items={items.map(([label, children]) => ({ label, children }))} />
-type RuleRow = Record<string, unknown> & { id: number; _sid: number; _sug: Record<string, unknown>; _column: string; _audit: string; _round: number }
+type RuleRow = Record<string, unknown> & { id: number; _key: string; _sid: number; _sug: Record<string, unknown>; _column: string; _audit: string; _round: number }
 const COLUMNS = [
   { key: 'pending', title: '待 AI 审' }, { key: 'auditing', title: 'AI 审中' }, { key: 'manual', title: '人工审' },
   { key: 'pass', title: '通过' }, { key: 'recheck', title: '驳回后待重审' },
@@ -103,7 +107,9 @@ function auditLabel(v: string) {
 }
 
 function RuleCardBody({ rule, onAction, onOpen }: { rule: RuleRow; onAction: (a: string, r: RuleRow) => void; onOpen: (r: RuleRow) => void }) {
+  const navigate = useNavigate()
   const stop = (fn: () => void) => (e: React.MouseEvent) => { e.stopPropagation(); fn() }
+  const isSug = String(rule._key ?? '').startsWith('sug:')
   return (
     <Card size="small" hoverable onClick={() => onOpen(rule)} styles={{ body: { padding: 10 }, actions: { cursor: 'default' } }}>
       <Text strong ellipsis style={{ display: 'block' }}>{val(rule.rule_name)}</Text>
@@ -119,6 +125,7 @@ function RuleCardBody({ rule, onAction, onOpen }: { rule: RuleRow; onAction: (a:
       <Space size={4} style={{ marginTop: 8 }}>
         {['pending', 'fail'].includes(rule._audit) ? <Button size="small" type="primary" style={{ background: 'var(--up)', borderColor: 'var(--up)' }} onClick={stop(() => onAction('reaudit', rule))}>重新审核</Button> : null}
         {rule.status === 'active' ? <Button size="small" danger onClick={stop(() => onAction('rollback', rule))}>回滚</Button> : null}
+        {isSug ? <Button size="small" onClick={stop(() => navigate('/reviews?tab=sug'))}>去处理</Button> : null}
         <Button size="small" onClick={stop(() => onOpen(rule))}>查看完整</Button>
       </Space>
     </Card>
@@ -126,7 +133,7 @@ function RuleCardBody({ rule, onAction, onOpen }: { rule: RuleRow; onAction: (a:
 }
 
 function RuleChangeCard({ rule, onAction, onOpen }: { rule: RuleRow; onAction: (a: string, r: RuleRow) => void; onOpen: (r: RuleRow) => void }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: `rule:${rule.id}`, data: { rule, column: rule._column } })
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: rule._key, data: { rule, column: rule._column } })
   const style = {
     transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${isDragging ? 1.02 : 1})` : undefined,
     transition, opacity: isDragging ? 0.3 : 1, marginBottom: 8, cursor: isDragging ? 'grabbing' : 'grab',
@@ -148,8 +155,8 @@ function BoardColumn({ col, items, onAction, onOpen }: { col: (typeof COLUMNS)[n
           style={{ height: '100%', display: 'flex', flexDirection: 'column', background: isOver ? 'rgba(24,144,255,0.12)' : 'var(--bg-card)', borderColor: isOver ? '#1677ff' : undefined, boxShadow: isOver ? '0 0 0 2px rgba(22,119,255,0.2)' : undefined }}
           styles={{ body: { flex: 1, minHeight: 0, overflow: 'hidden', padding: 8 } }}>
           <div style={{ height: '100%', overflowY: 'auto', paddingRight: 4 }}>
-            <SortableContext items={items.map((r) => `rule:${r.id}`)} strategy={verticalListSortingStrategy}>
-              {items.length ? items.map((rule) => <RuleChangeCard key={rule.id} rule={rule} onAction={onAction} onOpen={onOpen} />) : <Text type="secondary">拖到这里</Text>}
+            <SortableContext items={items.map((r) => r._key)} strategy={verticalListSortingStrategy}>
+              {items.length ? items.map((rule) => <RuleChangeCard key={rule._key} rule={rule} onAction={onAction} onOpen={onOpen} />) : <Text type="secondary">拖到这里</Text>}
             </SortableContext>
           </div>
         </Card>
@@ -177,15 +184,24 @@ export function RuleChangesPage() {
   })
   const sugById = new Map((sugRows ?? []).map((s) => [s.id, s]))
   const list = rows ?? []
-  const rowsView = list.map((r) => {
+  const ruleRows = list.map((r) => {
     const sid = Number(r.source_suggestion_id ?? 0)
     const sug = (sugById.get(sid) ?? {}) as Record<string, unknown>
     const audit = String(r.audit_verdict ?? sug.audit_verdict ?? 'pending') || 'pending'
     const round = Number(r.audit_round ?? sug.audit_round ?? 0)
-    const manual = String(r.review_status ?? r.review_log_status ?? '') === 'pending'
-    const column = manual ? 'manual' : audit === 'pass' ? 'pass' : audit === 'fail' ? 'recheck' : round > 0 ? 'auditing' : 'pending'
-    return { ...(r as Record<string, unknown>), _sid: sid, _sug: sug, _audit: audit, _round: round, _column: column } as RuleRow
-  }).filter((r) => {
+    const column = audit === 'pass' ? 'pass' : audit === 'fail' ? 'recheck' : round > 0 ? 'auditing' : 'pending'
+    return { ...(r as Record<string, unknown>), _key: `rule:${r.id}`, _sid: sid, _sug: sug, _audit: audit, _round: round, _column: column } as RuleRow
+  })
+  // 待审建议并入看板：「增量 AI 审核」计数来自 agent_suggestion，必须与看板可见卡片一致
+  const linkedSids = new Set(list.map((r) => Number(r.source_suggestion_id ?? 0)).filter((n) => n > 0))
+  const sugRowsView = (sugRows ?? []).filter((s) => String(s.status ?? '') === 'pending' && !linkedSids.has(Number(s.id))).map((s) => {
+    const sug = s as unknown as Record<string, unknown>
+    const audit = String(sug.audit_verdict ?? 'pending') || 'pending'
+    const round = Number(sug.audit_round ?? 0)
+    const column = audit === 'fail' ? 'recheck' : audit === 'pass' ? 'manual' : round > 0 ? 'auditing' : 'pending'
+    return { ...sug, id: s.id, source_suggestion_id: s.id, _key: `sug:${s.id}`, _sid: s.id, _sug: sug, _audit: audit, _round: round, _column: column } as RuleRow
+  })
+  const rowsView = [...ruleRows, ...sugRowsView].filter((r) => {
     const kw = keyword.trim().toLowerCase()
     const hit = !kw || [r.rule_name, r.reason, r._sug.reason].some((x) => String(x ?? '').toLowerCase().includes(kw))
     return hit && (!agents.length || agents.includes(String(r.target_agent))) && (!types.length || types.includes(String(r.rule_type)))
@@ -212,7 +228,7 @@ export function RuleChangesPage() {
       <Button onClick={() => refetch()}>重试</Button>
     </div>
   )
-  if (!list.length && !pendingAuditCount) return <EmptyState text="暂无规则变更记录。在「交易复盘」页对规则类建议执行「一键采纳」后会在此留痕。" icon="📜" />
+  if (!rowsView.length && !pendingAuditCount) return <EmptyState text="暂无规则变更记录。在「交易复盘」页对规则类建议执行「一键采纳」后会在此留痕。" icon="📜" />
 
   const rollback = (r: { id: number; rule_name?: unknown }) => {
     let reason = ''
@@ -269,7 +285,7 @@ export function RuleChangesPage() {
     onOk: async () => { try { await reReviewSuggestion(r._sid); message.success('已回到待审核'); refresh(r._sid) } catch (e) { message.error(e instanceof Error ? e.message : '操作失败'); return Promise.reject() } } })
   const onAction = (a: string, r: RuleRow) => a === 'rollback' ? rollback(r) : a === 'reject' ? reject(r) : a === 'rereview' ? reReview(r) : reAudit(r)
   const targetColumn = (overId: string, overData?: Record<string, unknown>) => (overData?.column as ColumnKey | undefined)
-    ?? (rowsView.find((row) => `rule:${row.id}` === overId)?._column as ColumnKey | undefined)
+    ?? (rowsView.find((row) => row._key === overId)?._column as ColumnKey | undefined)
     ?? (COLUMNS.some((c) => c.key === overId) ? overId as ColumnKey : undefined)
   const dragAction = (r: RuleRow, target: ColumnKey) => {
     if (target === 'recheck') return String(r._sug.status ?? r.status) === 'pending' ? 'reject' : ''

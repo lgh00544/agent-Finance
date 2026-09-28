@@ -11,13 +11,15 @@ export const agentSuggestions = (
     ...(targetAgent ? { target_agent: targetAgent } : {}),
   })
 
-/** POST /api/agent-suggestions/{id}/approve */
-export const approveSuggestion = (sid: number): Promise<Record<string, unknown>> =>
-  post(`/agent-suggestions/${sid}/approve`)
+/** POST /api/agent-suggestions/{id}/approve（overrideReason：AI 未通过时人工强制采纳，后端必填理由留痕） */
+export const approveSuggestion = (sid: number, overrideReason?: string): Promise<Record<string, unknown>> =>
+  post(`/agent-suggestions/${sid}/approve`,
+    overrideReason ? { override_audit: true, override_reason: overrideReason } : undefined)
 
-/** POST /api/agent-suggestions/{id}/adopt（硬规则需 confirm=True 二次确认） */
-export const adoptSuggestion = (sid: number, confirm = false): Promise<Record<string, unknown>> =>
-  post(`/agent-suggestions/${sid}/adopt`, { confirm })
+/** POST /api/agent-suggestions/{id}/adopt（硬规则需 confirm=True 二次确认；overrideReason：AI 未通过时人工强制采纳） */
+export const adoptSuggestion = (sid: number, confirm = false, overrideReason?: string): Promise<Record<string, unknown>> =>
+  post(`/agent-suggestions/${sid}/adopt`,
+    overrideReason ? { confirm, override_audit: true, override_reason: overrideReason } : { confirm })
 
 /** POST /api/agent-suggestions/{id}/reject */
 export const rejectSuggestion = (sid: number, reason = ''): Promise<Record<string, unknown>> =>

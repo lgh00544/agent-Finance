@@ -156,7 +156,11 @@ export interface PaperReview {
   shadow_status?: string
   review_source?: string
   knowledge_id?: number | null
-  content?: { lesson?: string; plan_vs_actual?: string; pnl_pct?: number; hold_days?: number; provenance?: Record<string, unknown>; [key: string]: unknown }
+  audit_verdict?: string
+  audit_reason?: string
+  audit_mode?: 'ai' | 'manual'
+  audited_at?: string | null
+  content?: { fact_as_of?: string; mode?: string; status?: string; pnl_amount?: number; position?: Record<string, unknown>; quote?: Record<string, unknown>; candidate_id?: number | null; score_id?: number | null; plan_id?: number | null; [key: string]: unknown }
   [key: string]: unknown
 }
 
@@ -191,4 +195,7 @@ export const paperReviews = (accountId?: number) =>
 export const runPaper = (accountId: number, tradeDate?: string) =>
   post<{ task_id?: string; status?: string; [key: string]: unknown }>(`/paper/accounts/${accountId}/run`, { trade_date: tradeDate ?? '' })
 export const auditPaperReview = (reviewId: number) => post(`/paper/reviews/${reviewId}/ai-audit`)
+/** 人工复审模拟复盘（理由必填留痕；pass 才进入影子验证） */
+export const manualAuditPaperReview = (reviewId: number, verdict: 'pass' | 'fail', reason: string) =>
+  post(`/paper/reviews/${reviewId}/audit`, { verdict, reason })
 export const shadowPaperReview = (reviewId: number) => post(`/paper/reviews/${reviewId}/shadow`)
