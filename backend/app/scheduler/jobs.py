@@ -1173,14 +1173,17 @@ def start_scheduler() -> None:
                       id="monitor", name="盘中持仓监控",
                       replace_existing=True, misfire_grace_time=300)
     # 模拟研究上下文每 15 分钟复用；监控轮询至少间隔 5 分钟，控制模型调用成本。
+    # 分钟错峰（2026-09-28）：同刻并发调用 akshare 会让 py_mini_racer 内置 V8
+    # 二次初始化 → [FATAL:partition_address_space.cc(243)] 进程级崩溃（无任何 Python
+    # 异常可捕获）。故把各 5/10/30 分钟任务错开到不同分钟偏移，避免整点合流。
     scheduler.add_job(paper_monitor_job, "cron",
-                      day_of_week="mon-fri", hour="9-15", minute=f"*/{max(5, monitor_minutes)}",
+                      day_of_week="mon-fri", hour="9-15", minute=f"3-59/{max(5, monitor_minutes)}",
                       id="paper_monitor", name="AI模拟盘中监控",
                       replace_existing=True, misfire_grace_time=300, max_instances=1)
     # 交易日 9:00-16:00 每 10 分钟触发（函数内过滤交易时段窗口；组合级风控巡检，
     # 与 monitor 独立锁/独立频率，互不影响）
     scheduler.add_job(portfolio_sentinel_job, "cron",
-                      day_of_week="mon-fri", hour="9-16", minute="*/10",
+                      day_of_week="mon-fri", hour="9-16", minute="4-59/10",
                       id="portfolio_sentinel", name="组合哨兵巡检",
                       replace_existing=True, misfire_grace_time=300)
     # 工作日 9:25 盘前快筛（集合竞价撮合完成后；候选为上一交易日 16:10 生成）
@@ -1197,7 +1200,7 @@ def start_scheduler() -> None:
     scheduler.add_job(experience_worker_job, "cron", hour=2, minute=0,
                       args=[True], id="experience_worker", name="经验沉淀识别",
                       replace_existing=True, misfire_grace_time=3600)
-    scheduler.add_job(experience_worker_job, "cron", minute="*/30",
+    scheduler.add_job(experience_worker_job, "cron", minute="7-59/30",
                       args=[False], id="experience_worker_probe", name="经验沉淀积压探针",
                       replace_existing=True, misfire_grace_time=1800)
     # 通用审核 Agent：每日 03:30 低峰批量辩证审核待审建议（游标增量，幂等）
@@ -1228,7 +1231,7 @@ def start_scheduler() -> None:
                           replace_existing=True, misfire_grace_time=3600)
     # 板块快照刷新：每 5 分钟 9:00-15:55（独立锁，不与 monitor 冲突）
     scheduler.add_job(sector_refresh_job, "cron",
-                      day_of_week="mon-fri", hour="9-15", minute="*/5",
+                      day_of_week="mon-fri", hour="9-15", minute="1-59/5",
                       id="sector_refresh", name="板块快照刷新",
                       replace_existing=True, misfire_grace_time=300)
     # 派发期判定：每日 15:30 收盘后逐只落库（6 维自动判定，供 Monitor/Sell/Score 参考）
@@ -1272,7 +1275,7 @@ def start_scheduler() -> None:
                       replace_existing=True, misfire_grace_time=3600)
     # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
     scheduler.add_job(quote_snapshot_refresh_job, "cron",
-                      day_of_week="mon-fri", hour="9-15", minute="*/5",
+                      day_of_week="mon-fri", hour="9-15", minute="2-59/5",
                       id="quote_snapshot_refresh", name="持仓价快照刷新",
                       replace_existing=True, misfire_grace_time=300)
     # 同花顺真实账户今日盈亏采集（开关开启才注册；cron 精确 9:15-16:00 窗口、

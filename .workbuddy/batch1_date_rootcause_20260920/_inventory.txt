@@ -1,0 +1,59 @@
+=== A. 根目录散落文件（top 30 by mtime）===
+  backend-dev.stdout.log                                  0.02 MB  09-28 11:43
+  backend-dev.stderr.log                                  0.03 MB  09-28 11:40
+  AI模拟_仓位放开_DSH执行指令.md                                    0.00 MB  09-28 11:35
+  AI模拟_仓位放开_方案.md                                         0.01 MB  09-28 11:35
+  web-dev.stderr.log                                      0.04 MB  09-28 11:24
+  backend-dev.stdout.20260928-1124.log                    0.09 MB  09-28 11:24
+  backend-dev.stderr.20260928-1124.log                    0.12 MB  09-28 11:22
+  backend-dev.stderr.20260928-103505.log                  0.00 MB  09-28 10:35
+  backend-dev.stdout.20260928-103505.log                  0.01 MB  09-28 10:35
+  backend-dev.stderr.20260928-102931.log                  0.01 MB  09-28 10:29
+  backend-dev.stdout.20260928-102931.log                  0.00 MB  09-28 10:29
+  实盘GoNoGo清单_核对_20260930.md                               0.02 MB  09-25 19:09
+  买卖点信号体系_批1_观察自动核对_2026-09-23.md                         0.00 MB  09-23 18:30
+  app.log.20260923-obs.log                                7.06 MB  09-23 18:30
+  backend-dev.stdout.log.20260923-obs.log                 0.54 MB  09-23 18:30
+  backend-dev.stderr.log.20260923-obs.log                 0.87 MB  09-23 16:50
+  backend-dev.stderr.20260923-004703.log                  0.02 MB  09-23 00:46
+  backend-dev.stdout.20260923-004703.log                  0.05 MB  09-23 00:46
+  买卖点信号体系_批1_观察自动核对_2026-09-22.md                         0.00 MB  09-23 00:43
+  backend-dev.stdout.log.20260922-obs.log                 0.05 MB  09-23 00:42
+  app.log.20260922-obs.log                                6.59 MB  09-23 00:41
+  backend-dev.stderr.log.20260922-obs.log                 0.01 MB  09-23 00:41
+  backend-dev.stderr.20260922-185539.log                  0.00 MB  09-22 18:55
+  backend-dev.stdout.20260922-185539.log                  0.00 MB  09-22 18:55
+  mem_deep_probe.py                                       0.00 MB  09-22 18:51
+  AGENTS.md                                               0.01 MB  09-22 17:30
+  backend-dev.stderr.20260922-152654.log                  0.04 MB  09-22 15:26
+  backend-dev.stdout.20260922-152654.log                  0.05 MB  09-22 15:26
+  backend-dev.stderr.20260922-145548.log                  0.16 MB  09-22 14:55
+  backend-dev.stdout.20260922-145548.log                  0.08 MB  09-22 14:55
+
+=== B. 临时/证据目录 ===
+  .pytest_tmp                                    files=0         0.00 MB  09-20 20:23
+  .pytest_tmp2                                   files=0         0.00 MB  09-20 20:23
+  .pytest_tmp3                                   files=0         0.00 MB  09-20 20:24
+  .wb_h                                          files=1580     56.53 MB  09-25 19:09
+  .wb_h2                                         files=1         0.00 MB  09-21 18:01
+  .wb_h3                                         files=2         1.26 MB  09-21 19:04
+  .wb_h4                                         files=4         3.84 MB  09-22 17:29
+  .wb_h5                                         files=2         1.30 MB  09-22 17:31
+  .wb_pt                                         files=1         0.00 MB  09-20 20:28
+  batch1_date_rootcause_20260920                 files=134       0.49 MB  09-28 11:43
+  batch1_evidence_20260918                       files=47        0.16 MB  09-20 17:37
+  batchA_evidence_20260921                       files=2         0.00 MB  09-21 15:06
+  batchE2_evidence_20260918                      files=35        0.82 MB  09-19 00:43
+  batchE_evidence_20260918                       files=31        0.65 MB  09-18 13:54
+
+=== C. data/kline.db ===
+  size=304.6 MB mtime=2026-09-24 16:28:11.263099
+  rows=1828209 codes=5566
+  重复主键组=0（主键约束应为 0）
+  每票根数 top5: [('000028', 834), ('000060', 834), ('000415', 834), ('000531', 834), ('000553', 834)]
+  不足250根的票=166
+
+=== D. data/dev.db 表盘点（行数）===
+  表数=76 空表=6
+  空表: candidate_adjust, capital_actor, knowledge_shadow_hit, paper_web_evidence, sector_news_feedback, sector_next_hot
+  行数 top15: [(18518, 'account_pnl_snapshot'), (18501, 'lhb_original_flow'), (2813, 'paper_context'), (1552, 'news_article'), (1420, 'capital_flow'), (1231, 'sector_daily_snapshot'), (1231, 'paper_execution'), (1196, 'paper_alert'), (1065, 'alert_log'), (1061, 'signal_trigger'), (900, 'factor_ic_history'), (635, 'pending_experience'), (537, 'ai_reasoning_trace'), (390, 'sector_forward_forecast'), (227, 'sector_news_article')]

@@ -1,0 +1,30 @@
+check-ignore data/dev.db      -> .gitignore:6:data/	data/dev.db
+check-ignore data/kline.db    -> .gitignore:6:data/	data/kline.db
+check-ignore data/            -> .gitignore:6:data/	data/
+check-ignore *.db             -> .gitignore:7:*.db	*.db
+dev.db 是否已入库: 否
+--- data/ 文件 ---
+  kline.db                               304.6 MB  09-24 16:28
+  dev.db                                 179.6 MB  09-28 11:25
+  dev.db-shm                               0.0 MB  09-28 11:26
+  datasource_cache.db                     10.9 MB  09-28 11:32
+  dev.db-wal                               0.8 MB  09-28 11:40
+--- git log data/dev.db ---
+(无历史提交)
+--- 最近提交 ---
+710eb73|2026-09-28 11:38|feat(AI模拟): 取消单票仓位 5%~40% 代码上限（sir 拍板 C），只留现金/费用/整手约束
+c7c17d3|2026-09-28 11:28|feat(AI模拟): 仓位改由 AI 决策层给目标比例，去掉固定 10% 首仓（每只≈100 股）
+401c844|2026-09-25 19:09|docs(go-no-go): #5 Go 坐实（连续 2 个 24h 窗口达标 +35.8MB / +10.0MB）
+--- 工作区（前 12 行）---
+M .workbuddy/memory/ENV_OPS.md
+?? .env.bak-mysql-20260928-112400
+?? .workbuddy/_dates_probe.py
+?? .workbuddy/batch1_date_rootcause_20260920/_db_health_log.txt
+?? .workbuddy/batch1_date_rootcause_20260920/_db_live_check.txt
+?? .workbuddy/batch1_date_rootcause_20260920/_local_switch_pre.txt
+?? .workbuddy/batch1_date_rootcause_20260920/_sqlite_restart_verify.txt
+?? .workbuddy/batch1_date_rootcause_20260920/db_cfg.py
+?? .workbuddy/batch1_date_rootcause_20260920/db_live.py
+?? .workbuddy/batch1_date_rootcause_20260920/db_log.py
+?? .workbuddy/batch1_date_rootcause_20260920/final_api.py
+?? .workbuddy/batch1_date_rootcause_20260920/git_db.py

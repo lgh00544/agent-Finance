@@ -1,0 +1,10 @@
+HEALTH={"status":"ok","time":"2026-09-28 11:30:28","env":"dev"}
+HOLDINGS_ERR='str' object has no attribute 'read'
+JOBS_ERR='str' object has no attribute 'read'
+LOG lines=109
+  2026-09-28 11:30:13,495 [WARNING] app.datasource.breaker - 数据源 snapshot 连续 3 次失败，进入临时降级 600 秒（期间直接走备用源，冷却到期静默探测主源自动切回）
+  2026-09-28 11:30:27,541 [INFO] app.datasource.akshare_source - 数据源 index_spot 已降级到备用接口
+  INFO:     127.0.0.1:55025 - "GET /api/health HTTP/1.1" 200 OK
+  INFO:     127.0.0.1:55030 - "GET /api/holdings HTTP/1.1" 200 OK
+  INFO:     127.0.0.1:55033 - "GET /api/jobs/status HTTP/1.1" 200 OK
+DB/sync 相关行=0 

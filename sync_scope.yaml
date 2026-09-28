@@ -1,0 +1,133 @@
+# 多机数据同步范围配置（草案 v1）
+# 生成 2026-09-28 ｜ 依据 D:\self\多机数据同步_手动按钮与半月自动_方案.md §2
+# 来源：backend/app/db/models.py 的 Base.metadata 全表导出（70 张）+ 逐张归层
+# 校验规则（由 sync_manager 强制）：A/B/C/D/E 五层并集必须 == 全表；未归类表 → 报错
+# 同步层 = B + C + D = 48 张；A 与 E 永不出现在同步链路
+
+version: "1"
+strict: true
+
+layers:
+
+  # ── A 公共事实（19 张）─────────────────────────────────────────────
+  # 判据：可由数据源重算、跨机天然一致。数据源全在国内，从海外云库搬运既慢又费额度。
+  A:
+    - capital_actor                # 游资档案
+    - capital_flow                 # 资金流
+    - capital_stats                # 资金统计
+    - dragon_tiger                 # 龙虎榜
+    - factor_ic_history            # 因子 IC 历史（回测重算一致）
+    - lhb_original_flow            # 龙虎榜原始流水（18,501 行，全库最大表之一）
+    - news_article                 # 新闻原文
+    - public_fact_snapshot         # 公共事实快照
+    - quote_snapshot               # 行情快照
+    - sector_daily_rank_log        # 板块排名日志
+    - sector_daily_snapshot        # 板块日快照
+    - sector_dict_v1               # 板块字典
+    - sector_forecast_verify       # 板块预测验证
+    - sector_news_ai_interpret     # 板块新闻 AI 解读
+    - sector_news_article          # 板块新闻
+    - sector_news_feedback         # 板块新闻反馈
+    - sector_news_shadow_verify    # 板块新闻影子验证
+    - sector_snapshot              # 板块快照
+    - us_overnight_factor          # 美股隔夜因子
+
+  # ── B 用户私有（25 张）─────────────────────────────────────────────
+  # 判据：用户操作产生、不可重建，换机器必须能接着看。
+  B:
+    - account_baseline
+    - agent_chat_message
+    - agent_preference
+    - agent_suggestion
+    - ai_reasoning_trace
+    - ai_reasoning_trace_history
+    - alert_log
+    - app_user                     # 用户身份（多人化改造）
+    - experience_config            # 经验沉淀配置
+    - holding                      # 持仓
+    - paper_account
+    - paper_alert
+    - paper_context
+    - paper_execution
+    - paper_position
+    - paper_quote_snapshot
+    - paper_review
+    - paper_web_evidence
+    - position_plan                # 建仓计划
+    - private_knowledge
+    - review_result                # 交易复盘
+    - rule_change
+    - sell_decision
+    - sys_trade_profile
+    - trade_record                 # 交易流水
+
+  # ── C 可审核共享（6 张）────────────────────────────────────────────
+  # 判据：需审计留痕的共享产物，量小但不可丢。
+  C:
+    - audit_log
+    - experience
+    - knowledge_shadow_hit
+    - pending_experience
+    - review_log
+    - worker_run
+
+  # ── D 系统产出（17 张）─────────────────────────────────────────────
+  # 判据：Agent / 任务跑出来的产物，另一台要能接着看，不必重跑。
+  D:
+    - batch_adjust
+    - candidate_adjust
+    - candidate_track_verify
+    - candidate_tradeable
+    - distribution_phase_log
+    - factor_candidate
+    - forward_view_history
+    - hot_money_profile
+    - market_condition
+    - market_intel
+    - sector_forward_forecast
+    - sector_launch_reason
+    - sector_next_hot
+    - sector_regime_forecast
+    - signal_trigger
+    - stock_candidate
+    - stock_score
+
+  # ── E 本机专属 / 已下线死数据（3 张）───────────────────────────────
+  E:
+    - account_pnl_snapshot         # 同花顺 09-16 下线，纯历史死数据（18,518 行 = 全库 34.5%）
+    - job_run_log                  # 本机任务留痕
+    - user_session                 # 本机登录会话
+
+# ── 冲突裁决用时间列（按序取第一个存在的）────────────────────────────
+time_columns_priority:
+  - updated_at
+  - update_time
+  - recorded_at
+  - created_at
+  - create_time
+
+# ── 同步层中需补 updated_at 的表（仅 created_at 但有"更新语义"）──────
+# 处理方式：init_db() 中幂等 ALTER TABLE ADD COLUMN，并由 repo.py 统一打戳（见方案 §5.4）
+need_updated_at:
+  - position_plan          # 计划状态 / 替代链（supersedes_id）
+  - review_result          # 建议状态迭代（suggest_status / suggest_iteration）
+  - pending_experience     # 审核状态流转
+  - experience             # 状态 / 阶段流转
+  - private_knowledge      # status / hit_count
+  - agent_preference       # status
+  - market_condition       # next_day_index_pct 次日回填
+  - ai_reasoning_trace     # 唯一键 upsert 覆盖写入
+  - review_log             # 完全无时间列
+  - worker_run             # 完全无时间列
+
+# ── 待确认（归层存疑，暂按当前归口执行，sir 确认后可改）───────────────
+pending_confirm:
+  layering:
+    - job_run_log          # 现归 E（本机）；若希望另一台能看到任务留痕 → 改 D
+    - market_intel         # 现归 D；LLM 产出两台重算会不同，若视为"公共事实解读" → 改 A
+  time_column:
+    - rule_change              # 有 status 流转，是否需补 updated_at？
+    - signal_trigger           # 是否存在状态更新语义？
+    - sector_forward_forecast  # 有 sector_tag 回填
+    - paper_review             # 是否有二次分析更新
+    - paper_alert              # 是否有状态更新

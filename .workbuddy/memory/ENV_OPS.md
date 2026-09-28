@@ -151,3 +151,46 @@ taskkill /F /PID <pid>
 2. 启动后 **30–60 秒 `head` 日志**，确认没有那行 port-busy 警告，再进入 ~6 分钟等待（否则白等）；
 3. 若被拒 → 立刻重查端口（此时多半已空）→ 立即重发启动命令，不要假定"已有实例在跑"。
 
+## 云端 TiDB 配额耗尽 → 后端起不来，降级 `DB_BACKEND=sqlite`（2026-09-28）
+
+**症状**：重启后端时日志结尾是 `ERROR: Application startup failed. Exiting.`，端口不监听。
+根因是 `app.db.session` 在 app lifespan 里直连云端 init_db，抛：
+
+```
+(pymysql.err.OperationalError) (1105, "Due to the usage quota being exhausted,
+ access to the cluster '<id>' has been restricted. Try increasing spending limits ...")
+```
+
+**要点**：
+- 该 1105 在 **pymysql 认证阶段**就抛 ⇒ 云端**读写全断**，不是"只写失败"。
+- `dev_run` 的 `_sync_on_start` 有兜底（同步失败只告警、降级本地快照），但 **app 自身 init_db 失败会直接退出**——兜底救不了启动。
+- 旧实例若是在配额耗尽**之前**起的，会"带病存活"照常响应 health；**一重启就暴露**。所以"服务活着"不能证明"还能重启成功"。
+
+**绕过办法（立即可用）**：
+
+```bash
+DB_BACKEND=sqlite .venv/Scripts/python.exe backend/scripts/dev_run.py
+```
+
+- 环境变量优先于 `.env`（pydantic-settings），已验证可覆盖；
+- 非 mysql ⇒ 跳过启动同步 ⇒ 启动耗时从 ~6 分钟降到 **~1.5 分钟**；
+- 启动后日志应见 `backend=sqlite` 的迁移完成 + `DB_BACKEND=sqlite：未配置云端，跳过启动同步`。
+
+## 进程级原生崩溃：py_mini_racer V8 FATAL 会带走整个后端（2026-09-28）
+
+**症状**：后端跑了没多久突然整个消失，端口释放，`stderr` 里**没有 Python traceback**，只有：
+
+```
+[FATAL:partition_address_space.cc(243)] Check failed: !IsConfigurablePoolInitialized().
+#0  .venv\Lib\site-packages\py_mini_racer\mini_racer.dll+0x...
+```
+
+- 这是 **py_mini_racer 内置 V8 的致命错误**（V8 被二次初始化），**进程直接死**，APScheduler 一起没，任何 Python 层 try/except 都拦不住。
+- 本项目里 `backend/app` 不直接用它，是 **akshare** 大量模块在用；多个 cron 任务**在同一分钟并发调用 akshare** 时容易触发。
+- 环境是 Python 3.14，py_mini_racer 对 3.14 支持存疑（放大因素）。
+- **不是必现**：同配置再起一次可正常扛过整分钟的任务波。缓解方向：任务错开分钟 / 对 akshare 调用加全局锁 / 暂停非必需任务。
+
+## 恢复云端时的坑
+
+`sync_manager.py backup` 是**云端→本地全表 delete+insert**，会**用云端旧数据覆盖本地新增**；配额恢复后要先把本地增量回灌云端，用 `sync_manager.py init`（本地→云端按唯一键 upsert，不删云端行），再切回 `DB_BACKEND=mysql`。根本解决是去 TiDB Cloud 控制台提高 spending limit。
+

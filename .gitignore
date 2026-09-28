@@ -81,3 +81,10 @@ pytest-of-*/
 # 本地运行日志与临时探测输出
 *.log
 _sp*.txt
+
+# ===== 补充忽略（2026-09-28 追加，含云端凭据的备份/探针，严禁入库）=====
+# .env 备份副本（上方 *.bak 不匹配 .bak-时间戳 命名，必须单独挡）
+.env.bak*
+# 数据库连接探针与其输出（含 TiDB 明文口令）
+.workbuddy/batch*_rootcause_*/db_live.py
+.workbuddy/batch*_rootcause_*/_db_live_check.txt

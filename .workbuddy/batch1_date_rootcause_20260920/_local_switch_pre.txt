@@ -1,0 +1,21 @@
+dev.db size=179.5 MB mtime=2026-09-28 11:21:05.918496
+表数=76
+  signal_trigger   rows=1061
+  holdings         (表不存在)
+  alert_log        rows=1065
+  review_result    rows=12
+  candidate        (表不存在)
+--- 快照文件 ---
+  dev.db.bak-20260916  113.2 MB  2026-09-16 19:29:00.921609
+  dev.db.bak-20260916-wal  0.0 MB  2026-09-16 19:29:05.624302
+  dev.db.bak-20260916-shm  0.0 MB  2026-09-16 19:36:31.809971
+--- config db_backend 支持 ---
+  - 数据库：SQLite 单文件 data/dev.db（DB_BACKEND=mysql 可切外部 MySQL）
+  db_backend: str = "sqlite"     # sqlite（默认，单文件 data/dev.db）/ mysql
+  sqlite_path: str = ""
+  db_maintenance_enabled: bool = True  # 定时空间维护总开关（SQLite VACUUM + 超期数据清理）
+  if settings.db_backend.lower() != "mysql":
+ENV: #   DB_BACKEND=mysql = 云端 TiDB 主库，另一台电脑与本机共享同一份数据（实时同步）
+ENV: #   临时想绕开云端跑：只允许设 SYNC_ON_START=false（跳过启动同步），跑完记得改回来
+ENV: DB_BACKEND=mysql
+ENV: # ---------- MySQL（DB_BACKEND=mysql 时生效）----------
