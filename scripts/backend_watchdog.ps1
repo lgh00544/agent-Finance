@@ -1,11 +1,13 @@
-﻿# 后端进程守护 watchdog (批A · A1)
+# 后端进程守护 watchdog (批A · A1)
 # 60s 探活 127.0.0.1:8000 + /api/health；连续 3 次探活失败才判挂死（单次抖动不误杀）。
-# 拉起 gate：net_check 出网/TiDB 不通不拉起；同一自然日拉起上限 3 次；拉起前归档 stdout/stderr。
+# 拉起 gate：net_check 出网/TiDB 不通不拉起；同一自然日拉起上限 12 次；拉起前归档 stdout/stderr。
+# 2026-09-28 sir 拍板 A：单日 3 次会被一次崩溃风暴用光（当日 13:00/13:05 连崩两次即触顶、watchdog 退出），
+# 故上限提到 12，并注册计划任务常驻。
 param(
     [int]$IntervalSec = 60,
     [int]$ColdGrace = 600,
     [int]$StartupWait = 90,
-    [int]$DailyRestartLimit = 3,
+    [int]$DailyRestartLimit = 12,
     [switch]$Once,
     [switch]$DryRun,
     [switch]$SimulateDown,
