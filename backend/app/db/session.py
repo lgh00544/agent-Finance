@@ -31,32 +31,113 @@ def _sqlite_pragmas(dbapi_connection, connection_record):
     cursor.close()
 
 
-def _build_engine_url() -> str:
-    if settings.db_backend == "mysql":
-        # ssl_verify_cert/identity=0：TiDB Serverless 强制 TLS 但用系统默认证书、
-        # 不校验主机名（等效 pymysql ssl={"check_hostname":False,"verify_mode":0}，已实测连通）
-        return (
-            f"mysql+pymysql://{settings.mysql_user}:{settings.mysql_root_password}"
-            f"@{settings.mysql_host}:{settings.mysql_port}/{settings.mysql_database}"
-            "?charset=utf8mb4&ssl_verify_cert=0&ssl_verify_identity=0"
-        )
-    # 默认：SQLite 单文件（SQLITE_PATH 便于测试隔离）
+def _safe_error(exc: BaseException) -> str:
+    """Keep startup diagnostics useful without exposing credentials."""
+    message = str(exc) or exc.__class__.__name__
+    message = re.sub(r"(?i)(mysql(?:\+\w+)?://)[^@\s]+@", r"\1<redacted>@", message)
+    message = re.sub(r"(?i)(password|passwd|pwd)=([^&\s]+)", r"\1=<redacted>", message)
+    return message
+
+
+def _sqlite_url() -> str:
+    """本地单文件（SQLITE_PATH 便于测试隔离）。"""
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     db_file = os.environ.get("SQLITE_PATH") or settings.sqlite_path or (data_dir / "dev.db")
     return f"sqlite:///{db_file}"
 
 
+def _mysql_url() -> str:
+    # ssl_verify_cert/identity=0：TiDB Serverless 强制 TLS 但用系统默认证书、
+    # 不校验主机名（等效 pymysql ssl={"check_hostname":False,"verify_mode":0}，已实测连通）
+    return (
+        f"mysql+pymysql://{settings.mysql_user}:{settings.mysql_root_password}"
+        f"@{settings.mysql_host}:{settings.mysql_port}/{settings.mysql_database}"
+        "?charset=utf8mb4&ssl_verify_cert=0&ssl_verify_identity=0"
+    )
+
+
+def _mysql_reachable(url: str) -> bool:
+    """短超时探测云端可用性（SELECT 1）；任何异常都判不可达且不外抛。"""
+    from sqlalchemy.pool import NullPool
+
+    timeout = max(1, int(getattr(settings, "db_probe_timeout_s", 5) or 5))
+    attempts = max(1, int(getattr(settings, "db_probe_attempts", 2) or 1))
+    probe = None
+    try:
+        probe = create_engine(url, poolclass=NullPool,
+                              connect_args={"connect_timeout": timeout})
+        for i in range(attempts):
+            try:
+                with probe.connect() as conn:
+                    conn.exec_driver_sql("SELECT 1")
+                return True
+            except Exception as exc:  # noqa: BLE001 探测失败不是启动失败
+                logger.warning("云端数据库探测失败（第 %d/%d 次，超时 %ss）：%s",
+                               i + 1, attempts, timeout, _safe_error(exc))
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("云端数据库探测引擎创建失败：%s", _safe_error(exc))
+        return False
+    finally:
+        if probe is not None:
+            try:
+                probe.dispose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _resolve_engine_url() -> tuple[str, dict]:
+    """决定实际生效的 DB URL：云端优先，探测失败且允许时落本地 SQLite。
+
+    返回 (url, meta)；meta 供健康检查/系统状态卡读取，降级绝不静默。
+    多人模式（MULTI_USER_ENABLED）禁止降级 —— 共享主库不一致比不可用更危险。
+    """
+    requested = (settings.db_backend or "sqlite").strip().lower()
+    meta = {"requested": requested, "active": requested, "fallback": False, "reason": ""}
+    if requested != "mysql":
+        return _sqlite_url(), meta
+    url = _mysql_url()
+    if _mysql_reachable(url):
+        return url, meta
+    if settings.multi_user_enabled:
+        meta["reason"] = "云端不可达，但多人模式禁止降级（共享主库一致性优先），按原配置启动"
+        logger.error("数据库容灾：%s", meta["reason"])
+        return url, meta
+    if not getattr(settings, "db_fallback_to_sqlite", True):
+        meta["reason"] = "云端不可达，且 DB_FALLBACK_TO_SQLITE=false 明确不允许降级"
+        logger.error("数据库容灾：%s", meta["reason"])
+        return url, meta
+    meta.update(active="sqlite", fallback=True,
+                reason="云端不可达，已自动降级为本地 SQLite（数据只写本机、多机不再同步）")
+    logger.warning("⚠️ 数据库容灾降级：%s → 本地 SQLite（%s）", requested, meta["reason"])
+    return _sqlite_url(), meta
+
+
+_ENGINE_URL, _ENGINE_META = _resolve_engine_url()
+
 engine = create_engine(
-    _build_engine_url(),
+    _ENGINE_URL,
     pool_pre_ping=True,
     echo=False,
 )
 
-if settings.db_backend != "mysql":
+if engine.dialect.name == "sqlite":
     event.listen(engine, "connect", _sqlite_pragmas)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def _build_engine_url() -> str:
+    """兼容薄封装：返回实际生效的 URL。"""
+    return _ENGINE_URL
+
+
+def get_db_backend_state() -> dict:
+    """只读：实际生效的 DB 后端 + 是否发生容灾降级（供健康检查/系统状态卡展示）。"""
+    state = dict(_ENGINE_META)
+    state["active"] = engine.dialect.name
+    return state
 
 
 def _database_identity(eng=engine) -> dict:
@@ -64,21 +145,19 @@ def _database_identity(eng=engine) -> dict:
     if eng.dialect.name == "sqlite":
         database = str(eng.url.database or "")
         digest = hashlib.sha256(database.encode("utf-8")).hexdigest()[:12]
-        return {"backend": "sqlite", "sqlite_path_digest": digest}
-    return {"backend": eng.dialect.name, "database": str(eng.url.database or "")}
+        info = {"backend": "sqlite", "sqlite_path_digest": digest}
+    else:
+        info = {"backend": eng.dialect.name, "database": str(eng.url.database or "")}
+    if _ENGINE_META.get("fallback"):      # 容灾降级必须出现在启动诊断里，不静默
+        info["requested_backend"] = _ENGINE_META.get("requested")
+        info["db_fallback"] = True
+        info["fallback_reason"] = _ENGINE_META.get("reason")
+    return info
 
 
 def get_init_db_result() -> dict:
     """Return a read-only copy of the latest startup migration result."""
     return deepcopy(_LAST_INIT_DB_RESULT)
-
-
-def _safe_error(exc: BaseException) -> str:
-    """Keep startup diagnostics useful without exposing credentials."""
-    message = str(exc) or exc.__class__.__name__
-    message = re.sub(r"(?i)(mysql(?:\+\w+)?://)[^@\s]+@", r"\1<redacted>@", message)
-    message = re.sub(r"(?i)(password|passwd|pwd)=([^&\s]+)", r"\1=<redacted>", message)
-    return message
 
 
 def _is_duplicate_column_error(exc: BaseException) -> bool:
@@ -553,7 +632,7 @@ def _ensure_experience_fts() -> None:
     """经验全文检索 FTS5 虚拟表 + 触发器（幂等）。SQLAlchemy 不直接支持虚拟表，
     用原生 SQL；仅 SQLite 模式启用（MySQL 无 FTS5，检索走 LIKE 降级，见 repo.search_experience）。
     必须与 create_all 后同一会话执行：FTS 内容表触发器引用 experience 表须已存在。"""
-    if settings.db_backend == "mysql":
+    if engine.dialect.name != "sqlite":   # 按实际生效后端判断：容灾降级到 sqlite 时 FTS 仍须建
         return
     statements = [
         "CREATE VIRTUAL TABLE IF NOT EXISTS experience_fts USING fts5("

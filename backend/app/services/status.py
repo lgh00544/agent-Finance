@@ -54,12 +54,17 @@ def _check_llm() -> dict:
 
 
 def _check_db() -> dict:
-    """数据库探活：SELECT 1"""
-    from app.db.session import engine
+    """数据库探活：SELECT 1（detail 显示实际生效后端；容灾降级显式标注，不静默）"""
+    from app.db.session import engine, get_db_backend_state
+
+    state = get_db_backend_state()
     try:
         with engine.connect() as conn:
             conn.exec_driver_sql("SELECT 1")
-        return {"name": "数据库", "ok": True, "detail": settings.db_backend.upper()}
+        detail = str(state.get("active") or settings.db_backend).upper()
+        if state.get("fallback"):
+            detail += "（容灾降级：%s 不可达，已落本地）" % str(state.get("requested") or "").upper()
+        return {"name": "数据库", "ok": True, "detail": detail}
     except Exception as exc:  # noqa: BLE001
         return {"name": "数据库", "ok": False, "detail": str(exc)[:60]}
 

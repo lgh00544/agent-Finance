@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     mysql_root_password: str = "change_me"
     mysql_database: str = "stock"
 
+    # ---------- DB 容灾（云端优先，连不上自动落本地）----------
+    # DB_BACKEND=mysql 时启动先探测云端；不可达则自动改用本地 SQLite，保证服务不因
+    # 云端挂掉而起不来。降级绝不静默：日志 WARNING + 系统状态卡/健康检查显式标注。
+    # ⚠️ 多人模式（MULTI_USER_ENABLED=true）禁止降级：共享主库不一致比不可用更危险，保持 fail closed。
+    db_fallback_to_sqlite: bool = True
+    db_probe_timeout_s: int = 5           # 单次云端连接探测超时（秒）
+    db_probe_attempts: int = 2            # 探测尝试次数（TiDB Serverless 冷启可能较慢）
+
     # ---------- Redis（CACHE_BACKEND=redis 时生效）----------
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379

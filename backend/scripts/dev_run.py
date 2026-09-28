@@ -55,8 +55,15 @@ def _sync_on_start() -> None:
         import sync_manager  # noqa: F401
         from app.core.config import settings
 
-        if settings.db_backend != "mysql":
-            log.info("DB_BACKEND=%s：未配置云端，跳过启动同步", settings.db_backend)
+        from app.db.session import get_db_backend_state
+
+        state = get_db_backend_state()
+        if state.get("active") != "mysql":
+            if state.get("fallback"):
+                log.warning("⚠️ DB 容灾降级：%s 不可达，已落本地 SQLite，跳过启动同步（%s）",
+                            str(state.get("requested") or "").upper(), state.get("reason"))
+            else:
+                log.info("DB_BACKEND=%s：未配置云端，跳过启动同步", settings.db_backend)
             return
         with sync_manager.cloud_engine().begin() as conn:
             [conn.exec_driver_sql(f"UPDATE `{t}` SET `{c}`='' WHERE `{c}` IS NULL")
