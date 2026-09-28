@@ -83,12 +83,11 @@ _CONF_THIRD = 0.8
 _CONF_VERIFIED = 0.9      # 双源在榜采信（东财金额 + 新浪上榜确认，金额以东财为准）
 _CONF_SINA_ONLY = 0.55    # 仅新浪上榜确认（无金额，置信度不足档，不参与金额采信）
 
-try:
-    import akshare as ak  # noqa: PLC0415 数据源层按需导入，缺失时整体降级
-except Exception:  # noqa: BLE001
-    ak = None
-
+from app.datasource.akshare_lock import load_akshare  # noqa: E402
 from app.datasource.http_client import get as http_get  # noqa: E402
+
+# 统一走加锁代理：py_mini_racer/V8 并发初始化会判死进程，禁止直接 import akshare
+ak = load_akshare()
 
 # 东财 datacenter HTTP API（vendored 直连：akshare 1.18.81 的 stock_lhb_detail_em 真实环境报
 # 'NoneType' object is not subscriptable，照 _batch_from_ulist 模式直连 + JSON 容错解析）

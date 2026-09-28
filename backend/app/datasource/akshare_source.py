@@ -34,6 +34,7 @@ from requests.adapters import HTTPAdapter
 from app.cache import cache
 from app.core.config import settings
 from app.datasource import market_hours
+from app.datasource.akshare_lock import load_akshare
 from app.datasource import persist_cache
 from app.datasource.base import DataSource, DataSourceError
 from app.datasource.breaker import get_breaker
@@ -43,10 +44,8 @@ from app.services import datasource_stats
 
 logger = logging.getLogger(__name__)
 
-try:
-    import akshare as ak
-except ImportError:  # pragma: no cover
-    ak = None
+# 统一走加锁代理：py_mini_racer/V8 并发初始化会判死进程，禁止直接 import akshare
+ak = load_akshare()
 
 # akshare 内部请求不传 headers，这里从 requests 层全局补浏览器 UA（一次性，见 http_client）
 patch_requests_headers()
