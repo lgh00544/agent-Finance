@@ -112,3 +112,40 @@ def test_audit_failure_is_not_reported_as_pass(monkeypatch):
     assert result["verdict"] == "fail"
     assert result.get("shadow_eligible", False) is False
     assert result.get("formal_rule_change", False) is False
+
+def test_size_position_uses_price_free_daily_facts_and_reports_allocation(monkeypatch):
+    calls = []
+
+    def fake(*, agent, cache_key, system_prompt, user_prompt, schema, **kwargs):
+        calls.append({"agent": agent, "user_prompt": user_prompt})
+        return paper_analysis.PaperSizeOutput(allocation_pct=25, confidence="high",
+                                              reasons=["综合评分 86（A 级）"],
+                                              risk_note="跌破 MA20 按止损处理")
+
+    monkeypatch.setattr(paper_analysis, "call_llm_cached", fake)
+    result = paper_analysis.size_position(
+        {"id": 1, "stock_code": "600001", "stock_name": "测试股", "snapshot": {"price": 10.5}},
+        {"id": 2, "score": 86, "grade": "A"},
+        {"id": 3, "total_pct": 30},
+        {"trade_date": "2026-09-08", "market_context": {"status": "强势"}})
+    assert result["status"] == "ok"
+    assert result["decision"]["allocation_pct"] == 25
+    assert result["source_label"] == "AI模拟"
+    assert calls and calls[0]["agent"] == "paper_size"
+    # 盘中报价不入缓存键：同一标的当日复用同一次模型决策
+    assert "10.5" not in calls[0]["user_prompt"]
+
+
+def test_size_position_rejects_missing_candidate_and_surfaces_model_failure(monkeypatch):
+    missing = paper_analysis.size_position({}, {}, {}, {})
+    assert missing["status"] == "rejected"
+    assert missing["reason"] == "missing_candidate"
+
+    def broken(**kwargs):
+        raise RuntimeError("502")
+
+    monkeypatch.setattr(paper_analysis, "call_llm_cached", broken)
+    failed = paper_analysis.size_position({"stock_code": "600001"}, {}, {}, {})
+    assert failed["status"] == "error"
+    assert failed["reason"] == "llm_unavailable"
+

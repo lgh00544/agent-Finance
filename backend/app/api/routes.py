@@ -1153,6 +1153,9 @@ class PaperRunBody(BaseModel):
     facts: dict | None = Field(default=None, description="历史重放事实包；只能包含该日期已知事实")
     requested_sides: dict[str, str] = Field(default_factory=dict,
                                              description="可选的已存在模拟仓位卖出意图")
+    target_allocations: dict[str, float] = Field(
+        default_factory=dict,
+        description="AI 决策层给出的每只标的目标仓位比例（0-1 小数或 0-100 百分数）")
 
 
 class PaperStatusBody(BaseModel):
@@ -1329,7 +1332,8 @@ def paper_account_run(account_id: int, body: PaperRunBody | None = None):
     from app.services import paper_execution
     try:
         return paper_execution.run(account_id, trade_date, facts=body.facts,
-                                   requested_sides=body.requested_sides)
+                                   requested_sides=body.requested_sides,
+                                   target_allocations=body.target_allocations)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

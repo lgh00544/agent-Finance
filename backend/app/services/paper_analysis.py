@@ -17,7 +17,8 @@ from typing import Any, Type
 
 from pydantic import BaseModel, Field
 
-from agent_prompts import audit_prompt, monitor_prompt, review_prompt, sell_prompt
+from agent_prompts import (audit_prompt, monitor_prompt, position_size_prompt,
+                           review_prompt, sell_prompt)
 from app.agents.schemas import MonitorOutput, ReviewOutput, SellOutput
 from app.llm.structured import ModelLevel, call_llm_cached
 
@@ -40,6 +41,15 @@ class PaperAuditOutput(BaseModel):
     support_view: str = ""
     dissent_view: str = ""
     boundary_cases: str = ""
+
+
+class PaperSizeOutput(BaseModel):
+    """AI 模拟单票目标仓位比例；只影响模拟账本，不修改任何正式规则。"""
+
+    allocation_pct: float = Field(ge=0, le=100, description="目标仓位占总资金比例 %（5~40）")
+    confidence: str = Field(pattern="^(high|medium|low)$")
+    reasons: list[str] = Field(default_factory=list)
+    risk_note: str = ""
 
 
 def _snapshot(value: Any) -> Any:
@@ -231,6 +241,40 @@ def sell_position(position: dict, quote: dict, context: dict, signal: dict | Non
                 "execution_mode": "paper"}
     return {"status": "ok", **refs, "execution_mode": "paper", "source_label": "AI模拟",
             "decision": out.model_dump(), "fact_as_of": quote.get("fact_as_of") or context.get("fact_as_of")}
+
+
+def _size_facts(candidate: dict, score: dict, plan: dict, context: dict) -> dict:
+    """构造与盘中价格无关的当日冻结事实，使同一标的当日缓存可复用。"""
+    market_context = context.get("market_context")
+    return {
+        "trade_date": context.get("trade_date") or context.get("decision_date"),
+        "candidate": {key: value for key, value in (candidate or {}).items() if key != "snapshot"},
+        "candidate_fact_as_of": (candidate.get("snapshot") or {}).get("fact_as_of"),
+        "score": score or {},
+        "plan": plan or {},
+        "market_regime": market_context.get("status") if isinstance(market_context, dict) else market_context,
+    }
+
+
+def size_position(candidate: dict, score: dict | None, plan: dict | None,
+                  context: dict | None) -> dict:
+    """由 AI 决策层给出模拟建仓的目标仓位比例；执行器只做整手/现金换算。
+
+    只消费价格无关的当日冻结事实，同一标的当日缓存命中，不在盘中轮询里重复调用模型。
+    """
+    facts = _size_facts(candidate or {}, score or {}, plan or {}, context or {})
+    if not facts["candidate"]:
+        return {"status": "rejected", "reason": "missing_candidate",
+                "execution_mode": "paper"}
+    try:
+        out = _call("size", facts, position_size_prompt.SYSTEM_PROMPT,
+                    position_size_prompt.build_user_prompt("【模拟建仓目标仓位决策】"),
+                    PaperSizeOutput)
+    except Exception as exc:  # 模型不可用必须显式返回，由执行器回退兜底比例
+        return {"status": "error", "reason": "llm_unavailable", "error": str(exc)[:300],
+                "execution_mode": "paper", "source_label": "AI模拟"}
+    return {"status": "ok", "execution_mode": "paper", "source_label": "AI模拟",
+            "decision": out.model_dump(), "facts": facts}
 
 
 def review_cycle(facts: dict) -> dict:

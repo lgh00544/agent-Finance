@@ -13,6 +13,7 @@ import logging
 from datetime import date, datetime, timedelta
 from statistics import mean
 
+from app.core.config import settings
 from app.db import repo
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,10 @@ CANDIDATE_POOL_FIRST_REDUCE_RATIO = 0.30
 CANDIDATE_POOL_INITIAL_ALLOCATION = 0.10
 CANDIDATE_POOL_ADD_ALLOCATION = 0.10
 CANDIDATE_POOL_MAX_ALLOCATION = 0.20
+# AI 决策层给出的单票目标仓位比例区间；上限与个人偏好单票上限对齐，避免两套口径。
+POSITION_TARGET_MIN = 0.05
+POSITION_TARGET_MAX = round(max(POSITION_TARGET_MIN,
+                                float(getattr(settings, "max_single_position_pct", 40.0) or 40.0) / 100.0), 4)
 PAPER_MARKET_SYNC_INDEX_PCT = 0.50
 PAPER_MARKET_SYNC_BREADTH = 0.55
 PAPER_MARKET_SYNC_RELATIVE_PCT = 0.50
@@ -56,6 +61,16 @@ def _num(value, default: float = 0.0) -> float:
         return number if math.isfinite(number) else default
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_target_allocation(value) -> float | None:
+    """把 AI/调用方给的目标仓位比例归一化为小数并夹到单票上限；无效值返回 None。"""
+    number = _num(value, 0.0)
+    if number <= 0:
+        return None
+    if number > 1:
+        number /= 100.0
+    return min(max(number, POSITION_TARGET_MIN), POSITION_TARGET_MAX)
 
 
 def _fact_is_available(value: object, trade_date: str) -> bool:
@@ -220,9 +235,11 @@ def _candidate_pool_allocation_shares(account: dict, price: float, code: str, al
     return shares
 
 
-def _candidate_pool_shares(account: dict, price: float, code: str = "") -> int:
-    """候选池研究账户首次建仓按初始资金 10% 配置。"""
-    return _candidate_pool_allocation_shares(account, price, code, CANDIDATE_POOL_INITIAL_ALLOCATION)
+def _candidate_pool_shares(account: dict, price: float, code: str = "",
+                           allocation: float | None = None) -> int:
+    """候选池账户首仓优先用 AI 决策层给的目标仓位比例，缺失才回退兜底默认值。"""
+    resolved = _normalize_target_allocation(allocation) or CANDIDATE_POOL_INITIAL_ALLOCATION
+    return _candidate_pool_allocation_shares(account, price, code, resolved)
 
 
 def _candidate_pool_control_plan(entry_price: float) -> dict:
@@ -276,8 +293,32 @@ def _candidate_pool_control_state(position: dict) -> tuple[dict, dict, bool]:
     return enriched, plan, changed
 
 
+def _candidate_target_allocation(code: str, price: float, candidate: dict, score: dict | None,
+                                 plan: dict | None, context: dict, target_allocations: dict,
+                                 mode: str, positions: dict) -> tuple[float | None, str]:
+    """解析候选池建仓目标仓位比例：调用方入参 → 冻结事实 → live 下 AI 决策 → 兜底默认。"""
+    explicit = _normalize_target_allocation(target_allocations.get(code))
+    if explicit is not None:
+        return explicit, "input"
+    if mode != "live_paper" or code in positions or price <= 0:
+        return CANDIDATE_POOL_INITIAL_ALLOCATION, "default"
+    try:
+        from app.services import paper_analysis
+        sized = paper_analysis.size_position(candidate, score, plan, context)
+    except Exception as exc:  # 模型不可用不得阻断账本，回退兜底比例并留痕
+        logger.warning("模拟目标仓位决策异常 %s: %s", code, exc)
+        return CANDIDATE_POOL_INITIAL_ALLOCATION, "llm_unavailable"
+    if sized.get("status") != "ok":
+        return CANDIDATE_POOL_INITIAL_ALLOCATION, "llm_unavailable"
+    allocation = _normalize_target_allocation((sized.get("decision") or {}).get("allocation_pct"))
+    if allocation is None:
+        return CANDIDATE_POOL_INITIAL_ALLOCATION, "llm_invalid"
+    return allocation, "llm"
+
+
 def _candidate_pool_lifecycle(position: dict, account: dict, price: float,
-                              code: str, candidate_present: bool) -> dict:
+                              code: str, candidate_present: bool,
+                              target_allocation: float | None = None) -> dict:
     """依据模拟盈亏计划生成下一阶段动作；只返回 paper 意图，不触碰真实账户。"""
     position, plan, _ = _candidate_pool_control_state(position)
     entry = _num(plan.get("entry_price") or position.get("avg_price"))
@@ -310,10 +351,17 @@ def _candidate_pool_lifecycle(position: dict, account: dict, price: float,
         else:
             reason = "first_take_profit_protection"
     elif candidate_present and int(lifecycle.get("add_count") or 0) < 1 and pnl_pct >= CANDIDATE_POOL_ADD_TRIGGER_PCT:
-        shares = _candidate_pool_allocation_shares(account, price, code, CANDIDATE_POOL_ADD_ALLOCATION)
-        action, reason, phase = ("add", "candidate_pool_add", "added") if shares >= LOT_SIZE else ("hold", "add_cash_or_lot_blocked", "opened")
+        target = _normalize_target_allocation(target_allocation) or CANDIDATE_POOL_INITIAL_ALLOCATION
+        used = _num(lifecycle.get("allocated_pct"), target)
+        step = min(CANDIDATE_POOL_ADD_ALLOCATION, max(0.0, POSITION_TARGET_MAX - used))
+        shares = _candidate_pool_allocation_shares(account, price, code, step) if step > 0 else 0
         if shares >= LOT_SIZE:
+            action, reason, phase = "add", "candidate_pool_add", "added"
             lifecycle["add_count"] = int(lifecycle.get("add_count") or 0) + 1
+            lifecycle["allocated_pct"] = round(used + step, 4)
+        else:
+            reason = "single_stock_target_reached" if step <= 0 else "add_cash_or_lot_blocked"
+            action, phase = "hold", "opened"
     lifecycle["phase"] = phase
     metadata["control_plan"] = plan
     metadata["lifecycle"] = lifecycle
@@ -496,7 +544,8 @@ def _live_buy_gate(snapshot: dict, context: dict, market_context: dict,
 def run(account_id: int, trade_date: str, *, facts: dict | None = None,
         requested_sides: dict[str, str] | None = None,
         position_facts: list[dict] | None = None, quote_facts: dict | None = None,
-        requested_shares: dict[str, int] | None = None) -> dict:
+        requested_shares: dict[str, int] | None = None,
+        target_allocations: dict[str, float] | None = None) -> dict:
     """运行一个交易日；可传入 facts 进行历史重放，禁止读取未来行情。"""
     account = repo.get_paper_account(account_id)
     if account is None:
@@ -515,6 +564,9 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
     requested_shares = dict(requested_shares or {})
     if any(side not in {"buy", "sell"} for side in requested_sides.values()):
         raise ValueError("模拟方向仅支持 buy/sell")
+    target_allocations = dict(target_allocations or {})
+    for key, value in ((facts or {}).get("target_allocations") or {}).items():
+        target_allocations.setdefault(key, value)
     repo.release_paper_t1(account_id, trade_date)
     market_context = (facts or {}).get("market_context") or {}
     if facts is None:
@@ -581,6 +633,7 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
         code = row.get("stock_code") or ""
         if not code:
             continue
+        allocation, allocation_source = None, ""
         if account_dict["strategy_variant"] == CANDIDATE_POOL_VARIANT and code in closed_today and code not in positions:
             continue
         candidate = candidates.get(code) if isinstance(candidates, dict) else next((x for x in candidates if x.get("stock_code") == code), {})
@@ -622,7 +675,9 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
             held, _, _ = _candidate_pool_control_state(positions[code])
             candidate_present = code in candidates if isinstance(candidates, dict) else any(
                 x.get("stock_code") == code for x in candidates or [])
-            lifecycle_intent = _candidate_pool_lifecycle(held, account_dict, price, code, candidate_present)
+            lifecycle_intent = _candidate_pool_lifecycle(
+                held, account_dict, price, code, candidate_present,
+                target_allocations.get(code))
             repo.update_paper_position_state(
                 account_id, code, metadata=lifecycle_intent["metadata"],
                 high_price=lifecycle_intent["high_price"],
@@ -664,11 +719,15 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
             elif account_dict["strategy_variant"] != CANDIDATE_POOL_VARIANT and (not plan or not score or not candidate or price <= 0):
                 payload = _payload(account_dict, row, candidate or {}, score, plan, side, 0, price, trade_date, snapshot, "rejected", "plan_or_price_missing")
             else:
-                shares = (lifecycle_intent.get("shares", 0)
-                          if lifecycle_intent.get("action") == "add" else
-                          (_candidate_pool_shares(account_dict, price, code)
-                           if account_dict["strategy_variant"] == CANDIDATE_POOL_VARIANT
-                           else _position_shares(account_dict, plan, price, code)))
+                if account_dict["strategy_variant"] == CANDIDATE_POOL_VARIANT:
+                    allocation, allocation_source = _candidate_target_allocation(
+                        code, price, candidate or {}, score, plan, context,
+                        target_allocations, mode, positions)
+                    shares = (lifecycle_intent.get("shares", 0)
+                              if lifecycle_intent.get("action") == "add"
+                              else _candidate_pool_shares(account_dict, price, code, allocation))
+                else:
+                    shares = _position_shares(account_dict, plan, price, code)
                 reason = _limit_block(side, code, snapshot)
                 if mode == "live_paper":
                     if account_dict["strategy_variant"] != CANDIDATE_POOL_VARIANT:
@@ -724,6 +783,11 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
             })
             if lifecycle_intent.get("action") in {"add", "sell"}:
                 payload["execution_key"] += f":lifecycle:{lifecycle_intent.get('action')}:{lifecycle_intent.get('reason')}"
+        if account_dict["strategy_variant"] == CANDIDATE_POOL_VARIANT and side == "buy":
+            metadata["target_allocation"] = round(allocation, 4) if allocation else 0.0
+            metadata["target_allocation_source"] = allocation_source
+            if lifecycle_intent.get("action") == "open" and allocation:
+                metadata.setdefault("lifecycle", {})["allocated_pct"] = round(allocation, 4)
         metadata.update({"mode": mode, "context_id": context.get("id") or supplied_positions.get(code, {}).get("context_id"),
                          "source_refs": context.get("source_refs") or [], "tool_trace": context.get("tool_trace") or [],
                          "facts": trace})
