@@ -74,6 +74,36 @@ def test_paper_monitor_delegates_exit_without_candidate_pool(sandbox):
     assert sandbox["research"][0]["web_query"].startswith("600001")
 
 
+def test_candidate_pool_position_uses_ai_action_instead_of_monitor(monkeypatch, sandbox):
+    monkeypatch.setattr(paper_monitor.repo, "get_paper_account",
+                        lambda _: SimpleNamespace(status="active", strategy_variant="candidate_pool"))
+    monitor_calls = []
+    monkeypatch.setattr(paper_monitor.paper_analysis, "monitor_position",
+                        lambda *a: monitor_calls.append(a) or {"status": "ok", "signal": {}})
+    monkeypatch.setattr(paper_monitor.paper_analysis, "decide_position_action",
+                        lambda *a: {"status": "ok",
+                                    "decision": {"action": "add", "add_allocation_pct": 6,
+                                                 "reasons": ["趋势延续"]}})
+    result = paper_monitor.run(1, sandbox["date"])
+    assert result["monitored"] == 1
+    assert monitor_calls == []          # 候选池账户不再走 Monitor/Sell 固定链路
+    execution = sandbox["executions"][0]
+    assert execution["facts"]["position_actions"]["600001"]["action"] == "add"
+    assert "requested_sides" not in execution
+    assert sandbox["alerts"][0][-1]["alert_type"] == "模拟仓位动作"
+
+
+def test_candidate_pool_hold_records_action_without_executing(monkeypatch, sandbox):
+    monkeypatch.setattr(paper_monitor.repo, "get_paper_account",
+                        lambda _: SimpleNamespace(status="active", strategy_variant="candidate_pool"))
+    monkeypatch.setattr(paper_monitor.paper_analysis, "decide_position_action",
+                        lambda *a: {"status": "ok", "decision": {"action": "hold", "reasons": ["证据不足"]}})
+    result = paper_monitor.run(1, sandbox["date"])
+    assert result["monitored"] == 1
+    assert sandbox["executions"] == []
+    assert result["results"][0]["action"]["decision"]["action"] == "hold"
+
+
 def test_paper_partial_decision_retains_ratio(monkeypatch, sandbox):
     monkeypatch.setattr(paper_monitor.paper_analysis, "sell_position", lambda *a: {
         "status": "ok", "decision": {"action": "partial", "reduce_ratio": 0.3}})

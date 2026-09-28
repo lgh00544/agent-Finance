@@ -262,32 +262,63 @@ def test_candidate_pool_uses_candidate_universe_for_non_tradeable_grade():
     assert position["metadata"]["control_plan"]["version"] == "candidate-pool-control-v1"
 
 
-def test_candidate_pool_lifecycle_control_and_review():
-    account = repo.create_paper_account("候选池生命周期测试", 100_000, "candidate_pool")
+def _action_facts(price: float, action: dict) -> dict:
+    facts = _facts(price=price)
+    facts["position_actions"] = {"688901": action}
+    return facts
+
+
+def test_candidate_pool_ai_action_add_reduce_and_exit():
+    account = repo.create_paper_account("AI 动作测试", 100_000, "candidate_pool")
 
     opened = paper_execution.run(account["id"], "2026-09-08", facts=_facts(price=10.0))
     assert opened["filled"] == 1
     assert opened["executions"][0]["side"] == "buy"
 
-    added = paper_execution.run(account["id"], "2026-09-09", facts=_facts(price=10.5))
+    # 加多少由模型给：模型给 10% 就按 10% 换算整手，不套固定档位
+    added = paper_execution.run(account["id"], "2026-09-09",
+                                facts=_action_facts(10.5, {"action": "add", "add_allocation_pct": 10}))
     assert added["filled"] == 1
-    assert added["executions"][0]["side"] == "buy"
-    assert added["executions"][0]["metadata"]["lifecycle_reason"] == "candidate_pool_add"
+    assert added["executions"][0]["metadata"]["lifecycle_reason"] == "ai_add"
+    assert added["executions"][0]["shares"] == 900
 
-    first_take = paper_execution.run(account["id"], "2026-09-10", facts=_facts(price=10.81))
-    assert first_take["filled"] == 1
-    assert first_take["executions"][0]["side"] == "sell"
-    assert first_take["executions"][0]["shares"] == 500
+    # 何时减、减多少由模型给：减 30% → 1900 股取 5 手
+    reduced = paper_execution.run(account["id"], "2026-09-10",
+                                  facts=_action_facts(10.0, {"action": "reduce", "reduce_ratio": 0.3}))
+    assert reduced["filled"] == 1
+    assert reduced["executions"][0]["side"] == "sell"
+    assert reduced["executions"][0]["shares"] == 500
+    assert reduced["executions"][0]["metadata"]["lifecycle_reason"] == "ai_reduce"
 
-    trailing = paper_execution.run(account["id"], "2026-09-11", facts=_facts(price=10.1))
-    assert trailing["filled"] == 1
-    assert trailing["executions"][0]["metadata"]["lifecycle_reason"] == "trailing_stop"
+    exited = paper_execution.run(account["id"], "2026-09-11",
+                                 facts=_action_facts(10.0, {"action": "exit"}))
+    assert exited["filled"] == 1
+    assert exited["executions"][0]["metadata"]["lifecycle_reason"] == "ai_exit"
     assert repo.list_paper_positions(account["id"])[0]["status"] == "exited"
     reviews = repo.list_paper_reviews(account["id"])
-    assert reviews and reviews[0]["execution_id"] == trailing["executions"][0]["id"]
+    assert reviews and reviews[0]["execution_id"] == exited["executions"][0]["id"]
 
-    again = paper_execution.run(account["id"], "2026-09-11", facts=_facts(price=10.1))
+    again = paper_execution.run(account["id"], "2026-09-11",
+                                facts=_action_facts(10.0, {"action": "exit"}))
     assert again["filled"] == 0
+
+
+def test_candidate_pool_holds_when_model_says_hold():
+    """固定 +3% 加仓触发已经删除：浮盈 5% 但没有 AI 动作时不得动手。"""
+    account = repo.create_paper_account("无 AI 动作即不动测试", 100_000, "candidate_pool")
+    paper_execution.run(account["id"], "2026-09-27", facts=_facts(price=10.0))
+    held = paper_execution.run(account["id"], "2026-09-28", facts=_facts(price=10.5))
+    assert held["filled"] == 0
+    assert held["executions"][0]["reject_reason"] == "control_hold"
+
+
+def test_candidate_pool_stop_loss_no_longer_fires_without_model_action():
+    """固定 -8% 硬止损已经删除：跌幅超阈值但模型说 hold 时不得卖出。"""
+    account = repo.create_paper_account("无硬止损测试", 100_000, "candidate_pool")
+    paper_execution.run(account["id"], "2026-09-29", facts=_facts(price=10.0))
+    held = paper_execution.run(account["id"], "2026-09-30", facts=_facts(price=8.5))
+    assert held["filled"] == 0
+    assert held["executions"][0]["reject_reason"] == "control_hold"
 
 def test_candidate_pool_explicit_target_allocation_overrides_fixed_default():
     account = repo.create_paper_account("目标仓位显式测试", 100_000, "candidate_pool")
@@ -336,26 +367,26 @@ def test_candidate_pool_replay_never_calls_size_model(monkeypatch):
     assert called == []
 
 
-def test_candidate_pool_add_stops_when_single_stock_target_fully_allocated():
+def test_candidate_pool_ai_add_blocked_when_budget_fully_allocated():
     account = repo.create_paper_account("额度用尽加仓测试", 100_000, "candidate_pool")
     opened = paper_execution.run(account["id"], "2026-09-23", facts=_facts(price=10.0),
                                  target_allocations={"688901": 1.0})
     assert opened["filled"] == 1
     held = repo.list_paper_positions(account["id"], status="holding")[0]
     assert held["metadata"]["lifecycle"]["allocated_pct"] == 1.0
-    added = paper_execution.run(account["id"], "2026-09-24", facts=_facts(price=10.5),
-                                target_allocations={"688901": 1.0})
+    added = paper_execution.run(account["id"], "2026-09-24",
+                                facts=_action_facts(10.5, {"action": "add", "add_allocation_pct": 10}))
     assert added["filled"] == 0
     assert added["executions"][0]["reject_reason"] == "single_stock_target_reached"
 
 
-def test_candidate_pool_add_uses_one_add_step_below_cap():
-    account = repo.create_paper_account("剩余额度加仓测试", 100_000, "candidate_pool")
+def test_candidate_pool_ai_add_amount_comes_from_model():
+    account = repo.create_paper_account("模型给额度加仓测试", 100_000, "candidate_pool")
     paper_execution.run(account["id"], "2026-09-25", facts=_facts(price=10.0),
                         target_allocations={"688901": 0.35})
-    added = paper_execution.run(account["id"], "2026-09-26", facts=_facts(price=10.5),
-                                target_allocations={"688901": 0.35})
+    added = paper_execution.run(account["id"], "2026-09-26",
+                                facts=_action_facts(10.5, {"action": "add", "add_allocation_pct": 5}))
     assert added["filled"] == 1
-    assert added["executions"][0]["metadata"]["lifecycle_reason"] == "candidate_pool_add"
-    assert added["executions"][0]["shares"] == 900
+    assert added["executions"][0]["metadata"]["lifecycle_reason"] == "ai_add"
+    assert added["executions"][0]["shares"] == 400
 

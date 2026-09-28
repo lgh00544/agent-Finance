@@ -149,3 +149,40 @@ def test_size_position_rejects_missing_candidate_and_surfaces_model_failure(monk
     assert failed["status"] == "error"
     assert failed["reason"] == "llm_unavailable"
 
+
+def _action_ctx():
+    position = {"stock_code": "600001", "entry_price": 10, "shares": 1000,
+                "available_shares": 1000, "high_price": 11}
+    quote = {"stock_code": "600001", "price": 9.6, "fact_as_of": "2026-09-08"}
+    return position, quote, {"trade_date": "2026-09-08", "plan": {"id": 3},
+                             "facts": {"trade_date": "2026-09-08", "fact_as_of": "2026-09-08",
+                                       "position": position, "quote": quote}}
+
+
+def test_decide_position_action_returns_model_amounts(monkeypatch):
+    def fake(*, agent, cache_key, system_prompt, user_prompt, schema, **kwargs):
+        assert schema is paper_analysis.PaperActionOutput
+        assert agent == "paper_action"
+        return paper_analysis.PaperActionOutput(action="reduce", reduce_ratio=0.5,
+                                                confidence="high", reasons=["跌破 MA20"],
+                                                risk_note="继续走弱则清仓")
+
+    monkeypatch.setattr(paper_analysis, "call_llm_cached", fake)
+    position, quote, context = _action_ctx()
+    result = paper_analysis.decide_position_action(position, quote, context)
+    assert result["status"] == "ok"
+    assert result["decision"]["action"] == "reduce"
+    assert result["decision"]["reduce_ratio"] == 0.5
+    assert result["source_label"] == "AI模拟"
+
+
+def test_decide_position_action_surfaces_model_failure(monkeypatch):
+    def broken(**kwargs):
+        raise RuntimeError("502")
+
+    monkeypatch.setattr(paper_analysis, "call_llm_cached", broken)
+    position, quote, context = _action_ctx()
+    result = paper_analysis.decide_position_action(position, quote, context)
+    assert result["status"] == "error"
+    assert result["reason"] == "llm_unavailable"
+

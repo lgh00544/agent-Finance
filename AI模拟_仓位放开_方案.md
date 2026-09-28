@@ -1,4 +1,4 @@
-# AI模拟_仓位放开_方案（v1.1 · 2026-09-28）
+# AI模拟_仓位放开_方案（v1.2 · 2026-09-28）
 
 > 触发：sir 问「AI 模拟是不是限制每只标的只能买 100 股？别有这个限制，就是要让它探索可能性的」。
 > 结论：**不存在「每只只能买 100 股」的硬编码**；100 股是「固定比例首仓 + 100 股整手向下取整 + 账户资金偏小」三者的合成结果。
@@ -74,3 +74,15 @@ AI 决策层 ──target_allocations{code: 比例}──┐
 - 涨跌停 / T+1 / 费用 / 滑点约束**不放宽**；
 - 交易规则表 `auto-merge` 不动；比例上下限若认定为规则 → 记 `review_log` 可回滚；
 - LLM 只做「比例」判断，不做成交价计算。
+
+## 8. 批 2（2026-09-28 sir 拍板）：持仓动作也交给 AI
+
+- 移除候选池持仓阶段的**全部固定阈值**：`-8%` 硬止损、`+15%` 主止盈、`5%` 移动止盈、`+8%` 首减 `30%`、`+3%` 加仓 `10%`。
+- 新增 `agent_prompts/position_action_prompt.py` + `paper_analysis.decide_position_action`：模型直接给
+  `action`（add/reduce/exit/hold）、`add_allocation_pct`（加多少）、`reduce_ratio`（减多少）与依据。
+- `paper_execution._candidate_pool_lifecycle` 退化为换算器：AI 动作 → 100 股整手 → 单票额度/现金/T+1；
+  `metadata.lifecycle` 记录 `ai_action/ai_confidence/ai_reasons` 以便审计。
+- `paper_monitor.run`：`candidate_pool` 账户改走 AI 持仓动作，不再调用 Monitor/Sell 固定链路。
+- 代码不再参与「何时该动」的策略判断，只保留成交硬约束（整手 / T+1 / 涨跌停 / 现金 / 费用）。
+- 测试：`test_paper_execution` 新增 AI 动作加/减/清仓、无动作即 hold、无固定止损；`test_paper_analysis` 动作适配器两态；
+  `test_paper_monitor` 候选池走动作分支两态。

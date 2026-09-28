@@ -320,8 +320,9 @@ def _candidate_target_allocation(code: str, price: float, candidate: dict, score
 
 def _candidate_pool_lifecycle(position: dict, account: dict, price: float,
                               code: str, candidate_present: bool,
-                              target_allocation: float | None = None) -> dict:
-    """依据模拟盈亏计划生成下一阶段动作；只返回 paper 意图，不触碰真实账户。"""
+                              target_allocation: float | None = None,
+                              ai_action: dict | None = None) -> dict:
+    """把 AI 持仓动作（加减仓/清仓）换算成整手意图；只返回 paper 意图，不触碰真实账户。"""
     position, plan, _ = _candidate_pool_control_state(position)
     entry = _num(plan.get("entry_price") or position.get("avg_price"))
     price = _num(price)
@@ -331,40 +332,39 @@ def _candidate_pool_lifecycle(position: dict, account: dict, price: float,
     lifecycle = copy.deepcopy(metadata.get("lifecycle") or {})
     lifecycle["max_price"] = round(high, 4)
     lifecycle["pool_present"] = bool(candidate_present)
-    first_done = bool(lifecycle.get("first_take_profit_done"))
     effective_stop = max(_num(plan.get("stop_loss")), _num(lifecycle.get("protected_stop_loss")))
     action, shares, reason, phase = "hold", 0, "control_hold", lifecycle.get("phase") or "opened"
-    if price <= effective_stop:
-        action, shares, reason, phase = "sell", int(position.get("available_shares") or position.get("shares") or 0), "hard_stop_loss", "hard_stop_loss"
-    elif price >= _num(plan.get("main_take_profit")):
-        action, shares, reason, phase = "sell", int(position.get("available_shares") or position.get("shares") or 0), "main_take_profit", "main_take_profit"
-    elif first_done and high > entry and price <= high * (1 - CANDIDATE_POOL_TRAILING_STOP_PCT):
-        action, shares, reason, phase = "sell", int(position.get("available_shares") or position.get("shares") or 0), "trailing_stop", "trailing_stop"
-    elif not first_done and pnl_pct >= CANDIDATE_POOL_FIRST_TAKE_PCT:
-        lifecycle["first_take_profit_done"] = True
-        lifecycle["protected_stop_loss"] = round(entry, 4)
-        lifecycle["phase"] = "trailing_protection"
-        phase = "trailing_protection"
-        total = int(position.get("shares") or 0)
-        available = int(position.get("available_shares") or 0)
-        if total >= 200 and available >= LOT_SIZE:
-            shares = min(available, max(LOT_SIZE, (int(total * CANDIDATE_POOL_FIRST_REDUCE_RATIO) // LOT_SIZE) * LOT_SIZE))
-            action, shares, reason = "sell", shares, "first_take_profit"
-        else:
-            reason = "first_take_profit_protection"
-    elif candidate_present and int(lifecycle.get("add_count") or 0) < 1 and pnl_pct >= CANDIDATE_POOL_ADD_TRIGGER_PCT:
+    # 何时加/减、加多少/减多少全部由 AI 动作给出；代码只做整手、额度与 T+1 换算。
+    intent = ai_action if isinstance(ai_action, dict) else {}
+    wanted = str(intent.get("action") or "hold").strip().lower()
+    lifecycle["ai_action"] = wanted
+    lifecycle["ai_confidence"] = intent.get("confidence")
+    lifecycle["ai_reasons"] = [str(item)[:200] for item in (intent.get("reasons") or [])][:6]
+    if wanted == "add" and candidate_present:
         target = _normalize_target_allocation(target_allocation) or CANDIDATE_POOL_INITIAL_ALLOCATION
-        # 加仓同样不设硬上限，只在已用额度与现金之间取剩余空间
         used = _num(lifecycle.get("allocated_pct"), target)
-        step = min(CANDIDATE_POOL_ADD_ALLOCATION, max(0.0, POSITION_TARGET_MAX - used))
+        asked = _normalize_target_allocation(intent.get("add_allocation_pct")) or 0.0
+        step = min(asked, max(0.0, POSITION_TARGET_MAX - used))
         shares = _candidate_pool_allocation_shares(account, price, code, step) if step > 0 else 0
         if shares >= LOT_SIZE:
-            action, reason, phase = "add", "candidate_pool_add", "added"
+            action, reason, phase = "add", "ai_add", "added"
             lifecycle["add_count"] = int(lifecycle.get("add_count") or 0) + 1
             lifecycle["allocated_pct"] = round(used + step, 4)
         else:
-            reason = "single_stock_target_reached" if step <= 0 else "add_cash_or_lot_blocked"
-            action, phase = "hold", "opened"
+            reason = "ai_add_blocked_cash_or_lot" if step > 0 else "single_stock_target_reached"
+    elif wanted in {"reduce", "exit"}:
+        total = int(position.get("shares") or 0)
+        available = int(position.get("available_shares") or 0)
+        ratio = 1.0 if wanted == "exit" else _num(intent.get("reduce_ratio"))
+        if 0 < ratio <= 1 and total > 0 and available >= LOT_SIZE:
+            lots = max(1, int(total * ratio) // LOT_SIZE) if wanted != "exit" else total // LOT_SIZE
+            shares = (min(available, lots * LOT_SIZE) // LOT_SIZE) * LOT_SIZE
+            if shares >= LOT_SIZE:
+                action, reason, phase = "sell", f"ai_{wanted}", f"ai_{wanted}"
+            else:
+                reason = "ai_reduce_below_one_lot"
+        else:
+            reason = "ai_reduce_unavailable_or_invalid"
     lifecycle["phase"] = phase
     metadata["control_plan"] = plan
     metadata["lifecycle"] = lifecycle
@@ -570,6 +570,7 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
     target_allocations = dict(target_allocations or {})
     for key, value in ((facts or {}).get("target_allocations") or {}).items():
         target_allocations.setdefault(key, value)
+    position_actions = dict((facts or {}).get("position_actions") or {})
     repo.release_paper_t1(account_id, trade_date)
     market_context = (facts or {}).get("market_context") or {}
     if facts is None:
@@ -680,7 +681,7 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
                 x.get("stock_code") == code for x in candidates or [])
             lifecycle_intent = _candidate_pool_lifecycle(
                 held, account_dict, price, code, candidate_present,
-                target_allocations.get(code))
+                target_allocations.get(code), position_actions.get(code))
             repo.update_paper_position_state(
                 account_id, code, metadata=lifecycle_intent["metadata"],
                 high_price=lifecycle_intent["high_price"],

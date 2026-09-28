@@ -60,6 +60,11 @@ def _research(account_id: int, code: str, trade_date: str, mode: str,
                                  web_query=f"{code} 公告 风险 最新")
 
 
+def _is_candidate_pool(account) -> bool:
+    """候选池研究账户的加减仓由 AI 持仓动作统一决定，不再走 Monitor/Sell 固定链路。"""
+    return str(getattr(account, "strategy_variant", "") or "") == paper_execution.CANDIDATE_POOL_VARIANT
+
+
 def run(account_id: int, trade_date: str, *, mode: str = "live_paper",
         historical_facts: dict | None = None) -> dict:
     """Refresh paper facts, analyse holdings, and delegate approved paper exits."""
@@ -113,6 +118,50 @@ def run(account_id: int, trade_date: str, *, mode: str = "live_paper",
                        "context_id": research.get("id"),
                        "tool_trace": research.get("tool_trace") or [],
                        "source_refs": research.get("source_refs") or []}
+            if _is_candidate_pool(account):
+                # 加减仓时机与幅度全部由 AI 动作给出；代码只做整手/T+1/现金换算。
+                action = paper_analysis.decide_position_action(position, quote, context)
+                decision = action.get("decision") or {}
+                action_name = str(decision.get("action") or "hold")
+                healthy = action.get("status") == "ok"
+                context_id = repo.create_paper_context(account_id, trade_date, mode, code,
+                                                       "position_action",
+                                                       {"position": position, "quote": quote,
+                                                        "research_context_id": research.get("id"),
+                                                        "action": action, "mode": mode,
+                                                        "trade_date": trade_date,
+                                                        "fact_as_of": quote.get("fact_as_of")},
+                                                       context["tool_trace"], context["source_refs"])
+                alert_id = repo.create_paper_alert(account_id, code, trade_date, {
+                    "severity": "warning" if (not healthy or action_name in {"reduce", "exit"}) else "info",
+                    "alert_type": "模拟仓位动作" if healthy else "模拟仓位决策未完成",
+                    "message": (f"AI 判定 {action_name}：" + "；".join(decision.get("reasons") or [])[:180])
+                               if healthy else str(action.get("reason") or "模型或事实不可用"),
+                    "context_id": context_id})
+                item = {"stock_code": code, "status": "ok" if healthy else "error",
+                        "context_id": context_id, "alert_id": alert_id, "action": action}
+                if healthy and action_name in {"add", "reduce", "exit"}:
+                    execution_quote = quote
+                    if mode == "live_paper":
+                        paper_valuation.refresh_account(account_id)
+                        execution_quote = next((row for row in repo.list_paper_quotes(
+                            account_id, paper_valuation.FRESH_MINUTES) if row.get("stock_code") == code), {})
+                    execution_problem = _quote_problem(execution_quote, trade_date, mode)
+                    if execution_problem:
+                        item.update(status="skipped", reason=execution_problem)
+                        item["execution_alert_id"] = repo.create_paper_alert(account_id, code, trade_date, {
+                            "severity": "warning", "alert_type": "模拟成交行情不可用",
+                            "message": execution_problem, "context_id": context_id})
+                        results.append(item)
+                        continue
+                    item["execution"] = paper_execution.run(
+                        account_id, trade_date,
+                        facts={"mode": mode,
+                               "contexts": {code: {**context, "context_id": context_id}},
+                               "position_actions": {code: decision}},
+                        position_facts=[position], quote_facts={code: execution_quote})
+                results.append(item)
+                continue
             monitor = paper_analysis.monitor_position(position, quote, context)
             signal = monitor.get("signal") or {}
             sell = None

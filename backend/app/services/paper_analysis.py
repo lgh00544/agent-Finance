@@ -17,8 +17,8 @@ from typing import Any, Type
 
 from pydantic import BaseModel, Field
 
-from agent_prompts import (audit_prompt, monitor_prompt, position_size_prompt,
-                           review_prompt, sell_prompt)
+from agent_prompts import (audit_prompt, monitor_prompt, position_action_prompt,
+                           position_size_prompt, review_prompt, sell_prompt)
 from app.agents.schemas import MonitorOutput, ReviewOutput, SellOutput
 from app.llm.structured import ModelLevel, call_llm_cached
 
@@ -41,6 +41,17 @@ class PaperAuditOutput(BaseModel):
     support_view: str = ""
     dissent_view: str = ""
     boundary_cases: str = ""
+
+
+class PaperActionOutput(BaseModel):
+    """AI 模拟持仓动作；只影响模拟账本，不修改任何正式规则。"""
+
+    action: str = Field(pattern="^(add|reduce|exit|hold)$")
+    add_allocation_pct: float | None = Field(default=None, ge=0, le=100)
+    reduce_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence: str = Field(pattern="^(high|medium|low)$")
+    reasons: list[str] = Field(default_factory=list)
+    risk_note: str = ""
 
 
 class PaperSizeOutput(BaseModel):
@@ -137,7 +148,8 @@ def _prepare(position: dict, quote: dict, context: dict) -> tuple[dict, dict, di
 
 
 def _call(agent: str, facts: dict, system_prompt: str, user_prompt: str,
-          schema: Type[BaseModel], *, suffix: str = "", live_tools: bool = False) -> BaseModel:
+          schema: Type[BaseModel], *, suffix: str = "", live_tools: bool = False,
+          ttl_seconds: int = 86400) -> BaseModel:
     system_prompt = system_prompt + _SNAPSHOT_POLICY
     user_prompt += "\n【本次完整冻结事实】\n" + _canonical(facts)
     digest = hashlib.sha256(_canonical({"facts": facts, "system": system_prompt,
@@ -148,7 +160,7 @@ def _call(agent: str, facts: dict, system_prompt: str, user_prompt: str,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         schema=schema,
-        ttl_seconds=86400,
+        ttl_seconds=ttl_seconds,
         model_level=ModelLevel.DEEP,
     )
 
@@ -275,6 +287,43 @@ def size_position(candidate: dict, score: dict | None, plan: dict | None,
                 "execution_mode": "paper", "source_label": "AI模拟"}
     return {"status": "ok", "execution_mode": "paper", "source_label": "AI模拟",
             "decision": out.model_dump(), "facts": facts}
+
+
+def decide_position_action(position: dict, quote: dict, context: dict) -> dict:
+    """由 AI 决定模拟持仓的加/减仓动作与幅度；执行器只做整手、T+1、现金与费用换算。
+
+    与固定阈值方案不同：止损、止盈、加仓触发与减仓比例全部由模型判断，
+    代码不参与"何时该动"的策略决策。
+    """
+    try:
+        position, quote, context, refs = _prepare(position or {}, quote or {}, context or {})
+    except (ValueError, TypeError) as exc:
+        return {"status": "rejected", "reason": "future_data", "error": str(exc),
+                "execution_mode": "paper"}
+    code = str(position.get("stock_code") or quote.get("stock_code") or "")
+    name = str(position.get("stock_name") or quote.get("name") or code)
+    metadata = position.get("metadata") or {}
+    holding = _canonical({
+        "stock_code": code, "stock_name": name,
+        "entry_price": position.get("entry_price", position.get("avg_price")),
+        "shares": position.get("shares"),
+        "available_shares": position.get("available_shares"),
+        "high_price": position.get("high_price"),
+        "control_plan": metadata.get("control_plan"),
+        "lifecycle": metadata.get("lifecycle"),
+    })
+    try:
+        out = _call("action", {"position": position, "quote": quote, "context": context},
+                    position_action_prompt.SYSTEM_PROMPT,
+                    position_action_prompt.build_user_prompt(
+                        f"【模拟持仓快照】{holding}\n【当前行情】{_canonical(quote)}"),
+                    PaperActionOutput, ttl_seconds=900)
+    except Exception as exc:  # 模型不可用必须显式返回，由执行器保持不动
+        return {"status": "error", "reason": "llm_unavailable", "error": str(exc)[:300],
+                "execution_mode": "paper", "source_label": "AI模拟"}
+    return {"status": "ok", **refs, "execution_mode": "paper", "source_label": "AI模拟",
+            "decision": out.model_dump(),
+            "fact_as_of": quote.get("fact_as_of") or context.get("fact_as_of")}
 
 
 def review_cycle(facts: dict) -> dict:
