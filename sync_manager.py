@@ -11,6 +11,11 @@ TiDB 云端主库 ↔ 本地 SQLite 冷备 同步管理脚本（项目根，独�
   python sync_manager.py init     → 首次：建库+建表（走项目 init_db 逻辑），并把本地 dev.db 全量灌入云端（按唯一键 upsert）
   python sync_manager.py backup   → 定时冷备：备份当前 dev.db 到 backup/（保留最近 10 份），云端全量拉回本地 dev.db
   python sync_manager.py restore  → 用 backup/ 里最近一份快照覆盖 data/dev.db（断网手动回看用）
+  python sync_manager.py degraded-status → 查看容灾降级标记（上一轮是否为「云端不可达→落本地」）
+  python sync_manager.py degraded-clear  → 清除降级标记（确认已合并或放弃合并）
+
+⚠️ A 方案（防丢）：存在降级标记时 backup 会拒绝执行（本地库可能含降级期数据，
+   全表覆盖会丢掉它们），需先合并上云或显式 backup --force。
 
 约束：表名/字段名与现有 ORM 完全一致；所有库操作 try/except，失败打日志不崩；同步前自动备份可回滚。
 """
@@ -288,8 +293,51 @@ def _snapshot_local_db() -> Path | None:
     return dest
 
 
+def _degraded():
+    """惰性 import 容灾标记模块（本脚本常以独立进程运行）。"""
+    from app.db import degraded
+
+    return degraded
+
+
+def _degraded_guard() -> dict:
+    try:
+        return _degraded().guard_backup()
+    except Exception as exc:  # noqa: BLE001 守卫自身失败不阻断正常备份
+        log.warning("读取降级标记失败（%s），按无标记处理", exc)
+        return {"blocked": False, "marker": None, "reason": ""}
+
+
+def cmd_degraded_status() -> int:
+    """查看容灾降级标记（A 方案）。"""
+    info = _degraded().read()
+    if not info:
+        print("无降级标记：上一轮不是容灾降级态")
+        return 0
+    print("== 容灾降级标记 ==")
+    for key in ("degraded_since", "last_seen", "requested_backend", "active_backend",
+                "sqlite_path", "pid", "reason"):
+        print(f"{key:<18}{info.get(key)}")
+    print("提示：合并上云成功后执行 degraded-clear；确认放弃合并也执行 degraded-clear")
+    return 0
+
+
+def cmd_degraded_clear() -> int:
+    """清除降级标记（人工确认：已合并，或放弃合并）。"""
+    ok = _degraded().clear()
+    print("已清除降级标记" if ok else "清除失败")
+    return 0
+
+
 def cmd_backup() -> int:
     print("== backup：云端全量 → 本地 SQLite 快照 ==")
+    guard = _degraded_guard()
+    if guard["blocked"] and "--force" not in sys.argv:
+        print(f"[BLOCKED] {guard['reason']}")
+        print("（确认要覆盖可显式执行：python sync_manager.py backup --force）")
+        return 2
+    if guard["blocked"]:
+        print("[WARN] --force：无视降级标记，覆盖本地库（本地数据仅存于 backup/ 快照）")
     _snapshot_local_db()
 
     local = local_engine()
@@ -339,7 +387,8 @@ def cmd_restore() -> int:
 
 # ==================== 入口 ====================
 
-COMMANDS = {"check": cmd_check, "init": cmd_init, "backup": cmd_backup, "restore": cmd_restore}
+COMMANDS = {"check": cmd_check, "init": cmd_init, "backup": cmd_backup, "restore": cmd_restore,
+            "degraded-status": cmd_degraded_status, "degraded-clear": cmd_degraded_clear}
 
 
 def main() -> int:

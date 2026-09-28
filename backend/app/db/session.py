@@ -111,7 +111,12 @@ def _resolve_engine_url() -> tuple[str, dict]:
     meta.update(active="sqlite", fallback=True,
                 reason="云端不可达，已自动降级为本地 SQLite（数据只写本机、多机不再同步）")
     logger.warning("⚠️ 数据库容灾降级：%s → 本地 SQLite（%s）", requested, meta["reason"])
-    return _sqlite_url(), meta
+    local_url = _sqlite_url()
+    from app.db import degraded as _degraded          # A 方案：落标记，防恢复后被整表覆盖
+
+    _degraded.mark(reason=meta["reason"], requested=requested, active="sqlite",
+                   db_path=local_url.replace("sqlite:///", ""))
+    return local_url, meta
 
 
 _ENGINE_URL, _ENGINE_META = _resolve_engine_url()

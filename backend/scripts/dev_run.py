@@ -65,6 +65,16 @@ def _sync_on_start() -> None:
             else:
                 log.info("DB_BACKEND=%s：未配置云端，跳过启动同步", settings.db_backend)
             return
+        from app.db import degraded
+
+        guard = degraded.guard_backup()
+        if guard["blocked"]:      # A 方案：有降级标记时绝不做云端→本地整表覆盖
+            log.warning("⛔ 启动同步已被容灾守卫拦截：%s", guard["reason"])
+            try:
+                log.warning("已保留本地库快照：%s", sync_manager._snapshot_local_db())
+            except Exception as snap_exc:  # noqa: BLE001 快照失败也必须跳过覆盖
+                log.warning("本地快照失败（%s），仍跳过云端→本地覆盖", snap_exc)
+            return
         with sync_manager.cloud_engine().begin() as conn:
             [conn.exec_driver_sql(f"UPDATE `{t}` SET `{c}`='' WHERE `{c}` IS NULL")
              for t, c in (("private_knowledge", "risk_note"), ("experience", "curator_note"))]
