@@ -18,6 +18,7 @@ from app.db.models import Base
 
 logger = logging.getLogger(__name__)
 _LAST_INIT_DB_RESULT: dict = {"status": "not_run"}
+_PROBE_ERROR: str = ""          # 最近一次云端探测失败原因（供状态卡/check 展示，不含凭据）
 
 
 def _sqlite_pragmas(dbapi_connection, connection_record):
@@ -58,7 +59,12 @@ def _mysql_url() -> str:
 
 
 def _mysql_reachable(url: str) -> bool:
-    """短超时探测云端可用性（SELECT 1）；任何异常都判不可达且不外抛。"""
+    """短超时探测云端可用性（SELECT 1）；任何异常都判不可达且不外抛。
+
+    失败原因记入 _PROBE_ERROR，供状态卡/sync_manager check 直接展示（如 TiDB 配额用尽）。
+    """
+    global _PROBE_ERROR
+
     from sqlalchemy.pool import NullPool
 
     timeout = max(1, int(getattr(settings, "db_probe_timeout_s", 5) or 5))
@@ -71,10 +77,12 @@ def _mysql_reachable(url: str) -> bool:
             try:
                 with probe.connect() as conn:
                     conn.exec_driver_sql("SELECT 1")
+                _PROBE_ERROR = ""
                 return True
             except Exception as exc:  # noqa: BLE001 探测失败不是启动失败
+                _PROBE_ERROR = _safe_error(exc)
                 logger.warning("云端数据库探测失败（第 %d/%d 次，超时 %ss）：%s",
-                               i + 1, attempts, timeout, _safe_error(exc))
+                               i + 1, attempts, timeout, _PROBE_ERROR)
         return False
     except Exception as exc:  # noqa: BLE001
         logger.warning("云端数据库探测引擎创建失败：%s", _safe_error(exc))
@@ -102,14 +110,17 @@ def _resolve_engine_url() -> tuple[str, dict]:
         return url, meta
     if settings.multi_user_enabled:
         meta["reason"] = "云端不可达，但多人模式禁止降级（共享主库一致性优先），按原配置启动"
+        meta["probe_error"] = _PROBE_ERROR
         logger.error("数据库容灾：%s", meta["reason"])
         return url, meta
     if not getattr(settings, "db_fallback_to_sqlite", True):
         meta["reason"] = "云端不可达，且 DB_FALLBACK_TO_SQLITE=false 明确不允许降级"
+        meta["probe_error"] = _PROBE_ERROR
         logger.error("数据库容灾：%s", meta["reason"])
         return url, meta
     meta.update(active="sqlite", fallback=True,
-                reason="云端不可达，已自动降级为本地 SQLite（数据只写本机、多机不再同步）")
+                reason="云端不可达，已自动降级为本地 SQLite（数据只写本机、多机不再同步）",
+                probe_error=_PROBE_ERROR)
     logger.warning("⚠️ 数据库容灾降级：%s → 本地 SQLite（%s）", requested, meta["reason"])
     local_url = _sqlite_url()
     from app.db import degraded as _degraded          # A 方案：落标记，防恢复后被整表覆盖

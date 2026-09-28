@@ -13,6 +13,9 @@ TiDB 云端主库 ↔ 本地 SQLite 冷备 同步管理脚本（项目根，独�
   python sync_manager.py restore  → 用 backup/ 里最近一份快照覆盖 data/dev.db（断网手动回看用）
   python sync_manager.py degraded-status → 查看容灾降级标记（上一轮是否为「云端不可达→落本地」）
   python sync_manager.py degraded-clear  → 清除降级标记（确认已合并或放弃合并）
+  python sync_manager.py merge-up [--since T] [--yes] → B 方案：降级期本地数据反向合并上云
+      （默认 dry-run 只出 diff；--since 缺省取降级标记的 degraded_since；只 insert/update 不 delete；
+       云端同一行时间戳不早于本地时判 stale 跳过，绝不覆盖云端）
 
 ⚠️ A 方案（防丢）：存在降级标记时 backup 会拒绝执行（本地库可能含降级期数据，
    全表覆盖会丢掉它们），需先合并上云或显式 backup --force。
@@ -121,11 +124,27 @@ def table_pk_and_unique(name: str) -> tuple[list[str], list[str]]:
 # ==================== check ====================
 
 def cmd_check() -> int:
+    """云端连通性检查：始终直连云端探测（降级态下 engine 已是 sqlite，会误报 no such function: VERSION）。"""
     print(f"云端目标: {settings.mysql_host}:{settings.mysql_port}/{settings.mysql_database}"
           f" (user={settings.mysql_user})")
+    state: dict = {}
+    eng = None
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.pool import NullPool
+
+        from app.db.session import _mysql_url, get_db_backend_state
+
+        state = get_db_backend_state()
+        eng = create_engine(_mysql_url(), connect_args={"connect_timeout": 5},
+                            poolclass=NullPool)
+    except Exception as probe_exc:  # noqa: BLE001 退化到当前 engine
+        log.warning("构造云端探测引擎失败（%s），改用当前 engine", probe_exc)
+    if state.get("fallback"):
+        print(f"[WARN] 进程处于容灾降级态：{state.get('reason')}")
     t0 = time.time()
     try:
-        eng = cloud_engine()
+        eng = eng if eng is not None else cloud_engine()
         with eng.connect() as conn:
             ver = conn.exec_driver_sql("SELECT VERSION()").scalar()
             n = conn.exec_driver_sql("SELECT COUNT(*) FROM information_schema.tables"
@@ -134,7 +153,9 @@ def cmd_check() -> int:
         print(f"   当前库内表数: {n}")
         return 0
     except Exception as exc:  # noqa: BLE001 探测失败只报告，不崩
-        print(f"[FAIL] 不可达: {type(exc).__name__}: {exc}")
+        print(f"[FAIL] 不可达: {type(exc).__name__}: {str(exc)[:220]}")
+        if state.get("probe_error"):
+            print(f"       启动探测记录: {state['probe_error']}")
         return 1
 
 
@@ -385,10 +406,185 @@ def cmd_restore() -> int:
         return 1
 
 
+# ==================== merge-up（B 方案：降级期数据反向合并上云） ====================
+
+WATERMARK_COLUMNS = ("updated_at", "created_at", "last_run", "updated_time", "ts")
+UPSERT_CHUNK = 500
+
+
+def _watermark_column(name: str) -> str | None:
+    """挑一个能代表行更新时间的列；都没有则该表无法按水位判定（转人工）。"""
+    cols = set(Base.metadata.tables[name].columns.keys())
+    for candidate in WATERMARK_COLUMNS:
+        if candidate in cols:
+            return candidate
+    return None
+
+
+def _pk_cols(name: str) -> list[str]:
+    return [c.name for c in Base.metadata.tables[name].primary_key.columns]
+
+
+def classify_merge_rows(local_rows: list[dict], cloud_rows: list[dict],
+                        pk_cols: list[str], wm: str | None) -> dict:
+    """纯函数：本地候选行分三类 —— new（云端无）/ stale（跳过）/ conflict（本地更新，upsert）。
+
+    安全底线：无法证明本地更新（云端时间戳不早于本地、或任一侧时间戳缺失时）一律判 stale，
+    绝不覆盖云端已有行；宁可漏合并，也不制造数据分叉。
+    """
+    index = {tuple(r.get(c) for c in pk_cols): r for r in cloud_rows}
+    out: dict = {"new": [], "conflict": [], "stale": []}
+    for row in local_rows:
+        other = index.get(tuple(row.get(c) for c in pk_cols))
+        if other is None:
+            out["new"].append(row)
+            continue
+        local_ts = row.get(wm) if wm else None
+        cloud_ts = other.get(wm) if wm else None
+        if local_ts is None or cloud_ts is None or str(cloud_ts) >= str(local_ts):
+            out["stale"].append(row)
+            continue
+        out["conflict"].append(row)
+    return out
+
+
+def merge_since(argv: list[str], marker: dict | None) -> str:
+    """合并水位：--since 优先，其次降级标记的 degraded_since；都没有返回空串。"""
+    if "--since" in argv:
+        idx = argv.index("--since")
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
+            return argv[idx + 1]
+    return str((marker or {}).get("degraded_since") or "")
+
+
+def _cloud_ready(cloud) -> str:
+    """云端可用性校验：降级态下 db_session.engine 其实是本地 SQLite，禁止拿它当云端写。"""
+    if cloud.dialect.name != "mysql":
+        return (f"当前生效后端是 {cloud.dialect.name}（容灾降级态）：merge-up 必须在云端可达的"
+                "环境执行（DB_BACKEND=mysql 且探测通过）")
+    return ""
+
+
+def _fetch_cloud_by_pk(cloud, tbl, pk_cols: list[str], keys: list[tuple]) -> list[dict]:
+    from sqlalchemy import tuple_
+
+    rows: list[dict] = []
+    objs = [tbl.columns[c] for c in pk_cols]
+    for i in range(0, len(keys), UPSERT_CHUNK):
+        chunk = keys[i:i + UPSERT_CHUNK]
+        cond = objs[0].in_([k[0] for k in chunk]) if len(objs) == 1 else tuple_(*objs).in_(chunk)
+        with cloud.connect() as conn:
+            rows.extend(dict(r._mapping) for r in conn.execute(select(tbl).where(cond)))
+    return rows
+
+
+def _upsert_to_cloud(cloud, tbl, rows: list[dict], pk_cols: list[str]) -> int:
+    """按主键 upsert（只 insert/update，永不 delete）。"""
+    if not rows:
+        return 0
+    cols = [c.name for c in tbl.columns]
+    update_cols = [c for c in cols if c not in pk_cols]
+    written = 0
+    for i in range(0, len(rows), UPSERT_CHUNK):
+        chunk = [{c: r.get(c) for c in cols} for r in rows[i:i + UPSERT_CHUNK]]
+        stmt = mysql_insert(tbl).values(chunk)
+        if update_cols:
+            stmt = stmt.on_duplicate_key_update(**{c: stmt.inserted[c] for c in update_cols})
+        with cloud.begin() as conn:
+            conn.execute(stmt)
+        written += len(chunk)
+    return written
+
+
+def _append_merge_log(since: str, stat: dict) -> None:
+    """留痕：每次真实写入都在 data/db_merge_log.jsonl 追加一行。"""
+    try:
+        import json
+        from datetime import datetime as _dt
+
+        path = PROJECT_DIR / "data" / "db_merge_log.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": _dt.now().isoformat(timespec="seconds"),
+                                 "since": since, **stat}, ensure_ascii=False) + chr(10))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("写合并日志失败：%s", exc)
+
+
+def cmd_merge_up() -> int:
+    """B 方案：把降级期本地新增/修改的行合并上云。默认 dry-run，加 --yes 才真正写。"""
+    argv = sys.argv
+    marker = _degraded().read()
+    since = merge_since(argv, marker)
+    dry = "--yes" not in argv
+    if not since:
+        print("[FAIL] 无法确定合并水位：无降级标记，请显式指定 --since YYYY-MM-DDTHH:MM:SS")
+        return 2
+    print(f"== merge-up：本地 SQLite → 云端 TiDB（水位 since={since}；"
+          f"模式={'DRY-RUN（不写云端）' if dry else 'WRITE'}）==")
+    local, cloud = local_engine(), cloud_engine()
+    block = _cloud_ready(cloud)
+    if block:
+        print(f"[FAIL] {block}")
+        return 2
+    stat = {"tables": 0, "new": 0, "conflict": 0, "stale": 0, "pushed": 0,
+            "manual": 0, "failed": 0}
+    manual_tables: list[str] = []
+    for name in _ordered_tables():
+        tbl = Base.metadata.tables[name]
+        pk_cols = _pk_cols(name)
+        wm = _watermark_column(name)
+        if not pk_cols or not wm:
+            manual_tables.append(name)
+            stat["manual"] += 1
+            continue
+        try:
+            with local.connect() as conn:
+                local_rows = [dict(r._mapping) for r in
+                              conn.execute(select(tbl).where(tbl.columns[wm] >= since))]
+            if not local_rows:
+                continue
+            stat["tables"] += 1
+            keys = [tuple(r.get(c) for c in pk_cols) for r in local_rows]
+            cloud_rows = _fetch_cloud_by_pk(cloud, tbl, pk_cols, keys)
+            cls = classify_merge_rows(local_rows, cloud_rows, pk_cols, wm)
+            stat["new"] += len(cls["new"])
+            stat["conflict"] += len(cls["conflict"])
+            stat["stale"] += len(cls["stale"])
+            todo = cls["new"] + cls["conflict"]
+            print(f"{name:<28} new={len(cls['new']):<5} conflict={len(cls['conflict']):<5} "
+                  f"stale={len(cls['stale']):<5} "
+                  f"样本={[tuple(r.get(c) for c in pk_cols) for r in todo[:3]]}")
+            if todo and not dry:
+                stat["pushed"] += _upsert_to_cloud(cloud, tbl, todo, pk_cols)
+        except Exception as exc:  # noqa: BLE001 单表失败不中断
+            stat["failed"] += 1
+            print(f"{name:<28} [FAIL] {type(exc).__name__}: {str(exc)[:100]}")
+    print(f"汇总：涉及表 {stat['tables']}，new {stat['new']}，conflict {stat['conflict']}，"
+          f"stale(跳过) {stat['stale']}，写云端 {stat['pushed']} 行，失败表 {stat['failed']}，"
+          f"无水位列(需人工) {stat['manual']}")
+    if manual_tables:
+        print("⚠️ 以下表无 updated_at/created_at/last_run 等水位列，无法自动判定，需人工核对：")
+        for name in manual_tables:
+            print("   -", name)
+    if dry:
+        print("dry-run 结束：确认无误后加 --yes 真正写入云端。")
+        return 0 if stat["failed"] == 0 else 1
+    if stat["failed"] == 0 and stat["manual"] == 0:
+        _degraded().clear()
+        print("合并完成，已清除降级标记（后续启动可正常 backup）。")
+    else:
+        print("合并未完全成功（有失败表或无水位列表），保留降级标记；"
+              "处理后可重跑 merge-up，确认放弃合并再执行 degraded-clear。")
+    _append_merge_log(since, stat)
+    return 0 if stat["failed"] == 0 else 1
+
+
 # ==================== 入口 ====================
 
 COMMANDS = {"check": cmd_check, "init": cmd_init, "backup": cmd_backup, "restore": cmd_restore,
-            "degraded-status": cmd_degraded_status, "degraded-clear": cmd_degraded_clear}
+            "degraded-status": cmd_degraded_status, "degraded-clear": cmd_degraded_clear,
+            "merge-up": cmd_merge_up}
 
 
 def main() -> int:
