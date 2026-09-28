@@ -77,6 +77,7 @@
 | 9 | **断路器未生效** | `fetch_industry_spot` 必须传 `kind="snapshot"` 才走断路器。 |
 | 10 | **WebFetch 失效** | 改用 `request` 直调 akshare；`market_hours.snapshot_allowed()` 是交易日闸门。 |
 | 11 | **AppTest 22 failed** | 属环境性内存压力，与代码改动无关，不要据此返工。 |
+| 12 | **编辑 `.ps1` 丢 UTF-8 BOM** | Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 解码，中文注释变乱码 → 解析报 `Unexpected token ')'`（2026-09-28 `backend_watchdog.ps1` 被 `163f67e` 前身改坏），watchdog 直接起不来。**改 `.ps1` 后必须校验 BOM 还在**：`[IO.File]::ReadAllBytes(p)[0..2]` 应为 `EF BB BF`，并用 `Parser::ParseFile` 过一遍。 |
 
 ---
 
