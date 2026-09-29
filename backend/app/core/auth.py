@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import hashlib
 import hmac
 import secrets
+import threading
+import time
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -15,6 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.db import repo
+from app.db.models import _now  # M16 配套：会话过期与库内时间戳必须同一时钟
 
 _current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
 _current_user_role: ContextVar[str | None] = ContextVar("current_user_role", default=None)
@@ -67,9 +70,86 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
+class LoginGuard:
+    """M13：登录失败锁定（进程内实现，按「用户名 + 客户端 IP」维度计数）。
+
+    阈值依据：连续失败 5 次锁定 15 分钟 —— 等价于单键每小时最多约 20 次尝试，
+    远低于撞库/弱口令穷举所需量级；正常用户手误 4 次内仍可登录，成功即清零。
+    维度取舍：键里带客户端 IP，攻击者只能锁死「自己 IP + 目标用户名」这一组合，
+    不会因为恶意失败把真实用户从其他 IP 登录也一并锁掉（避免锁定型 DoS）。
+    实现取舍：项目当前是单进程 uvicorn 部署，用 threading.Lock 保护的进程内字典最简单
+    可靠；将来若多进程/多实例部署，需把 _entries 迁到 app.cache（Redis）才能全局生效。
+    """
+
+    def __init__(self, max_failures: int = 5, lock_seconds: int = 900,
+                 window_seconds: int = 900) -> None:
+        self.max_failures = max(1, int(max_failures))
+        self.lock_seconds = max(1, int(lock_seconds))
+        self.window_seconds = max(1, int(window_seconds))
+        self._lock = threading.Lock()
+        # key -> [连续失败次数, 锁定截止(monotonic 秒), 最后一次失败时间(monotonic 秒)]
+        self._entries: dict[str, list] = {}
+
+    def _prune(self, now: float) -> None:
+        """滑动窗口清理：锁定已过期且超出窗口期的条目删除，防止字典无限增长（内存 DoS）。"""
+        stale = [k for k, v in self._entries.items()
+                 if now >= v[1] and now - v[2] > self.window_seconds]
+        for key in stale:
+            self._entries.pop(key, None)
+
+    def check(self, key: str) -> int:
+        """返回剩余锁定秒数（向上取整，最后一秒不提前放行）；0 表示未锁定。"""
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            entry = self._entries.get(key)
+            if not entry or now >= entry[1]:
+                return 0
+            return int(entry[1] - now) + 1
+
+    def record_failure(self, key: str) -> int:
+        """记一次失败（窗口内累加）；达到阈值即锁定，返回剩余锁定秒数（0=未锁定）。"""
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            failures, locked_until, _last = self._entries.get(key, [0, 0.0, now])
+            failures += 1
+            if failures >= self.max_failures:
+                locked_until = now + self.lock_seconds
+            self._entries[key] = [failures, locked_until, now]
+            return int(locked_until - now) if locked_until > now else 0
+
+    def reset(self, key: str) -> None:
+        """登录成功清零失败计数。"""
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def failures(self, key: str) -> int:
+        """当前窗口内连续失败次数（仅用于提示文案/日志，不参与判定）。"""
+        with self._lock:
+            entry = self._entries.get(key)
+            return int(entry[0]) if entry else 0
+
+
+login_guard = LoginGuard()
+
+
+def client_ip(request: Request) -> str:
+    """登录失败计数用的客户端标识：只取 TCP 对端 IP。
+
+    刻意不信任 X-Forwarded-For：该头可被客户端随意伪造，若用它做计数维度，
+    攻击者只要每次换一个头就能永久绕过失败锁定（反代场景的 IP 维度应由 nginx 层限流承担）。
+    """
+    client = getattr(request, "client", None)
+    return str(getattr(client, "host", "") or "unknown")
+
+
 def issue_token(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now() + timedelta(hours=max(1, settings.auth_session_ttl_hours))
+    # M16 配套：expires_at 必须与 models._now() 用同一时钟（北京时间 naive）。
+    # 否则 TZ=UTC 容器里 expires_at 落在 UTC 口径、repo.get_user_by_token 用北京口径
+    # 比较，24h 会话实际 16h 就失效（repo 里较多 datetime.now() 与库列混用，详见修复报告）。
+    expires_at = _now() + timedelta(hours=max(1, settings.auth_session_ttl_hours))
     repo.create_user_session(user_id, token, expires_at)
     return token
 

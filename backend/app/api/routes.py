@@ -15,13 +15,16 @@ from typing import Optional
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from starlette.requests import Request  # M13：登录失败锁定需要读取客户端 IP
 
 from app.agents.review import llm_rethink_suggestion
 from app.core.config import settings
 from app.core.auth import (
+    client_ip,
     current_user_is_admin,
     current_user_role,
     issue_token,
+    login_guard,
     require_user,
     require_write_access,
 )
@@ -85,6 +88,8 @@ def _paper_account_for_request(account_id: int):
 class LoginBody(BaseModel):
     username: str
     password: str
+    # M14：注册邀请码（仅注册接口使用）。默认空串 —— REGISTER_INVITE_CODE 未配置时不校验。
+    invite_code: str = ""
 
 
 class PasswordChangeBody(BaseModel):
@@ -116,25 +121,51 @@ def auth_status():
 
 
 @router.post("/auth/login")
-def auth_login(body: LoginBody):
+def auth_login(body: LoginBody, request: Request):
+    """登录。M13：连续失败 5 次锁定 15 分钟（用户名 + 客户端 IP 维度，成功登录清零）。"""
+    guard_key = f"{body.username.strip().lower()}|{client_ip(request)}"
+    locked = login_guard.check(guard_key)
+    if locked > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"登录失败次数过多，已临时锁定，请 {max(1, locked // 60)} 分钟后再试")
     user = repo.get_user_by_credentials(body.username, body.password)
     if user is None:
+        if login_guard.record_failure(guard_key) > 0:
+            # 第 5 次失败即锁定：本次直接回 429，明确告知锁定窗口（避免前端只看到 401 反复重试）
+            raise HTTPException(
+                status_code=429,
+                detail=f"登录失败次数过多，已临时锁定 {login_guard.lock_seconds // 60} 分钟")
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+    login_guard.reset(guard_key)
     return {**user, "access_token": issue_token(user["id"]), "token_type": "bearer"}
 
 
 @router.post("/auth/register")
 def auth_register(body: LoginBody):
-    """Self-service researcher registration for first-time local users."""
+    """Self-service researcher registration for first-time local users.
+
+    M14：多用户模式下自助注册无门槛（任何匿名者都能拿到 researcher 账号），
+    增加两道可配置门槛：邀请码（REGISTER_INVITE_CODE）与人工审核
+    （REGISTER_REQUIRE_APPROVAL）。两项默认关闭时，本函数行为与旧版逐行等价。
+    """
     username = body.username.strip()
     if len(username) < 2:
         raise HTTPException(status_code=400, detail="用户名至少需要 2 个字符")
     if len(body.password) < 8:
         raise HTTPException(status_code=400, detail="密码至少需要 8 个字符")
+    if settings.register_invite_code and body.invite_code.strip() != settings.register_invite_code:
+        raise HTTPException(status_code=403, detail="邀请码无效")
+    pending = bool(settings.register_require_approval)
     try:
-        user = repo.create_user(username, body.password, "researcher")
+        # 需人工审核时先落库为未激活（is_active=False）：此时签发的 token 也过不了
+        # repo.get_user_by_token 的 is_active 过滤，故下面不签发 token，只回待审核状态。
+        user = repo.create_user(username, body.password, "researcher", is_active=not pending)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if pending:
+        return {**user, "pending_approval": True,
+                "message": "注册已提交，等待管理员审核通过后即可登录"}
     return {**user, "access_token": issue_token(user["id"]), "token_type": "bearer"}
 
 
@@ -1098,37 +1129,21 @@ def account_today_pnl_estimate():
         _request_user_id(), is_admin=current_user_role() == "admin")
 
 
+# M17：同花顺账本已于 2026-09-16 下线（登录态不可用，原因见 同花顺模块下线_方案.md）。
+# 原实现在 raise 之后用 `if False:` 包住旧逻辑：永远不可达，却仍会被静态检查/阅读
+# 当作活代码。这里直接删除死代码，只保留显式 410 语义；需要恢复时按方案文档的
+# 解注释路径重新实现（旧实现可从 git 历史取回）。
 @router.get("/account/pnl")
 def account_pnl():
-    """同花顺真实盈亏【已下线 2026-09-16】返回 410；原逻辑保留于 if False。"""
+    """同花顺真实盈亏【已下线 2026-09-16】返回 410。"""
     raise HTTPException(status_code=410, detail="同花顺真实盈亏已下线（账本登录态不可用）")
-    if False:  # === DISABLED 2026-09-16 ===
-        if not settings.ths_pnl_enable:
-            return {"configured": False}
-        from app.services import ths_pnl as ths_pnl_service
-
-        if not ths_pnl_service.load_cookie():
-            return {"configured": False}
-        return {"configured": True,
-                "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
-                    user_id=_request_user_id(), is_admin=current_user_role() == "admin")}
 
 
+# M17：同花顺模块已下线（见 同花顺模块下线_方案.md），删除不可达的 `if False:` 死代码。
 @router.post("/account/pnl/refresh")
 def account_pnl_refresh():
-    """同花顺凭证刷新【已下线 2026-09-16】返回 410；原逻辑保留于 if False。"""
+    """同花顺凭证刷新【已下线 2026-09-16】返回 410。"""
     raise HTTPException(status_code=410, detail="同花顺真实盈亏已下线（账本登录态不可用）")
-    if False:  # === DISABLED 2026-09-16 ===
-        if not settings.ths_pnl_enable:
-            return {"configured": False}
-        from app.services import ths_pnl as ths_pnl_service
-
-        if not ths_pnl_service.load_cookie():
-            return {"configured": False}
-        return {"configured": True,
-                "snapshot": ths_pnl_service.refresh_snapshot_if_needed(
-                    force=True, user_id=_request_user_id(),
-                    is_admin=current_user_role() == "admin")}
 
 
 class AccountBaselineBody(BaseModel):

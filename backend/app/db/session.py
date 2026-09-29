@@ -132,10 +132,24 @@ def _resolve_engine_url() -> tuple[str, dict]:
 
 _ENGINE_URL, _ENGINE_META = _resolve_engine_url()
 
+# M12：连接池容量与「信号扫描 8 线程 + APScheduler 多任务并发访问 DB」的并发量匹配。
+# 原实现用 QueuePool 默认值（pool_size=5 / max_overflow=10 = 上限 15 条），高并发取连接时
+# 溢出连接被丢弃并报 QueuePool limit reached，连接反复重建。SQLAlchemy 2.0 下文件型 SQLite
+# 同样是 QueuePool，故池容量对两种后端统一放大（SQLite 的 WAL/PRAGMA 分支完全不变）；
+# pool_recycle 只对 MySQL/TiDB 有意义（服务端 wait_timeout 主动断连），SQLite 本地文件不设。
+_pool_kwargs: dict = {
+    "pool_size": settings.db_pool_size,
+    "max_overflow": settings.db_max_overflow,
+    "pool_timeout": settings.db_pool_timeout,
+}
+if not _ENGINE_URL.startswith("sqlite"):
+    _pool_kwargs["pool_recycle"] = settings.db_pool_recycle
+
 engine = create_engine(
     _ENGINE_URL,
     pool_pre_ping=True,
     echo=False,
+    **_pool_kwargs,
 )
 
 if engine.dialect.name == "sqlite":
@@ -399,12 +413,14 @@ def _ensure_user_columns() -> None:
     default_id = repo.ensure_default_user()
     # account_pnl_snapshot 在加 UNIQUE 后，user_id=NULL 的行与 user_id=1 已存在行
     # 在 (user_id, trade_date, ts) 上可能撞约束，必须先清掉这些 NULL 行再回填。
-    # 该清理为方言无关的标准 SQL：SQLite 同样会撞 uq_account_pnl_user_date_ts，故不设方言守卫。
+    # 子查询需套派生表：MySQL 不允许同语句 DELETE 目标表并直接 SELECT 该表（MySQL 1093）。
     with engine.begin() as conn:
         conn.execute(
             text("DELETE FROM account_pnl_snapshot WHERE user_id IS NULL "
                  "AND (trade_date, ts) IN ("
-                 "  SELECT trade_date, ts FROM account_pnl_snapshot WHERE user_id = :uid"
+                 "  SELECT trade_date, ts FROM ("
+                 "    SELECT trade_date, ts FROM account_pnl_snapshot WHERE user_id = :uid"
+                 "  ) AS dup_rows"
                  ")"),
             {"uid": default_id},
         )
@@ -734,9 +750,10 @@ def _ensure_stock_candidate_detail(eng=None) -> None:
 def _ensure_review_result_columns(eng=None) -> None:
     """幂等补齐 review_result 建议驳回迭代列（仅增量加列，不重建表不丢数据）"""
     eng = eng or engine
+    text_default = "TEXT NOT NULL DEFAULT ''" if eng.dialect.name == "sqlite" else "TEXT"
     additions = {
         "suggest_status": "VARCHAR(16) DEFAULT 'pending'",
-        "reject_reason": "TEXT DEFAULT ''",
+        "reject_reason": text_default,
         "suggest_iteration": "INTEGER DEFAULT 1",
         "suggest_history": "JSON",
     }
@@ -811,18 +828,19 @@ def _ensure_agent_suggestion_columns(eng=None) -> None:
     """幂等补齐 agent_suggestion 列（人工驳回原因留痕 + v2 一键采纳落地信息列；
     仅增量加列，不重建表不丢数据；旧数据 default 兼容）"""
     eng = eng or engine
+    text_default = "TEXT NOT NULL DEFAULT ''" if eng.dialect.name == "sqlite" else "TEXT"
     additions = {
-        "reject_reason": "TEXT DEFAULT ''",
+        "reject_reason": text_default,
         "priority": "VARCHAR(8) DEFAULT 'medium'",
         "rule_type": "VARCHAR(8) DEFAULT 'soft'",
-        "problem_desc": "TEXT DEFAULT ''",
-        "rule_text": "TEXT DEFAULT ''",
-        "expected_effect": "TEXT DEFAULT ''",
-        "risk_note": "TEXT DEFAULT ''",
+        "problem_desc": text_default,
+        "rule_text": text_default,
+        "expected_effect": text_default,
+        "risk_note": text_default,
         "file_path": "VARCHAR(255) DEFAULT ''",
         "insert_position": "VARCHAR(32) DEFAULT ''",
-        "conflict_note": "TEXT DEFAULT ''",
-        "dedup_note": "TEXT DEFAULT ''",
+        "conflict_note": text_default,
+        "dedup_note": text_default,
         "suggestion_source": "VARCHAR(16) DEFAULT 'llm'",
         "audit_verdict": "VARCHAR(8) DEFAULT 'pending'",
         "audit_round": "INTEGER DEFAULT 0",

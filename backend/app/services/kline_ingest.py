@@ -8,12 +8,21 @@
 import time
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.services import kline_store as store
 
 SNAPSHOT_URL = "https://hq.sinajs.cn/list="
 HEADERS = {"Referer": "https://finance.sina.com.cn"}
 DEFAULT_BATCH = 100
+
+# M11c：快照请求的传输层加固（夜间回补 8 并发下 Connection aborted/RemoteDisconnected 属瞬态，
+# 原实现一次失败就丢整批）。只重试幂等 GET，raise_on_status=False 让状态码仍由调用方判断。
+_SNAPSHOT_ADAPTER = HTTPAdapter(
+    max_retries=Retry(total=2, connect=2, read=1, backoff_factor=0.5,
+                      allowed_methods=frozenset({"GET", "HEAD"}), raise_on_status=False),
+    pool_connections=10, pool_maxsize=20)
 EX_DIV_TOL = 0.005
 _F = {"open": 1, "pre_close": 2, "close": 3, "high": 4, "low": 5, "volume": 8, "amount": 9, "date": 30}
 
@@ -37,6 +46,9 @@ def fetch_snapshot(codes: list[str], batch: int = DEFAULT_BATCH, timeout: int = 
     out: dict[str, list[str]] = {}
     errors: list = []
     sess = session or requests.Session()
+    if session is None:      # M11c：仅自建兜底会话挂适配器，调用方传入的会话不改其配置
+        sess.mount("http://", _SNAPSHOT_ADAPTER)
+        sess.mount("https://", _SNAPSHOT_ADAPTER)
     for part in _chunks(list(codes), max(1, batch)):
         symbols = ",".join(f"{_prefix(c)}{c}" for c in part)
         try:

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([int]$Port = 8100)
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path $PSScriptRoot).Path

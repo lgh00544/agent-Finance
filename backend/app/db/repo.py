@@ -81,7 +81,12 @@ def ensure_default_user() -> int:
         return row.id
 
 
-def create_user(username: str, password: str, role: str = "researcher") -> dict:
+def create_user(username: str, password: str, role: str = "researcher", *,
+                is_active: bool = True) -> dict:
+    """创建用户；is_active=False 用于 M14「注册需人工审核」：先落库为未激活，待管理员审核。
+
+    默认 True，保持既有调用方（自助注册 / 管理员建号 / 测试）语义完全不变。
+    """
     if role not in {"admin", "researcher", "viewer"}:
         raise ValueError("角色仅支持 admin/researcher/viewer")
     from app.core.auth import hash_password
@@ -89,7 +94,7 @@ def create_user(username: str, password: str, role: str = "researcher") -> dict:
         if db.execute(select(User).where(User.username == username)).scalar_one_or_none():
             raise ValueError("用户名已存在")
         row = User(username=username.strip(), password_hash=hash_password(password),
-                   role=role, is_active=True)
+                   role=role, is_active=bool(is_active))
         db.add(row)
         db.commit()
         db.refresh(row)

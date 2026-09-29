@@ -31,7 +31,9 @@ def fetch_us_quotes(symbols: list[str]) -> list[dict]:
     if not codes:
         return []
     url = _SINA_US_URL.format(symbols=",".join(codes))
-    resp = http_get(url, referer="sina")
+    # M10b：本函数按 status_code 自己分支并给出明确中文错误文案，
+    # 故显式关闭共享会话的状态码校验（M10 逃生口），行为与修复前完全一致。
+    resp = http_get(url, referer="sina", raise_for_status=False)
     if resp.status_code != 200:
         raise RuntimeError(f"新浪美股行情请求失败 status={resp.status_code}")
     text = resp.content.decode("gbk", errors="ignore")
@@ -65,7 +67,9 @@ def fetch_sh_index_open_gap() -> float | None:
     返回 (open - prev_close) / prev_close * 100；请求失败/字段缺失返回 None
     （校验任务跳过本次，不抛异常中断调度）。"""
     try:
-        resp = http_get("http://hq.sinajs.cn/list=sh000001", referer="sina")
+        # M10b：同上，这里需要按 status_code 记 WARNING 并返回 None（不抛异常中断调度）
+        resp = http_get("http://hq.sinajs.cn/list=sh000001", referer="sina",
+                        raise_for_status=False)
     except Exception as exc:  # noqa: BLE001 网络异常不中断校验调度
         logger.warning("上证指数行情请求异常: %s", exc)
         return None

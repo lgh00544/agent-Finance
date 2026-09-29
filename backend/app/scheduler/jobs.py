@@ -6,6 +6,7 @@ APScheduler 定时任务（Asia/Shanghai）
 - 任务锁防重叠（prod=Redis / dev=内存锁）
 【刚性代码逻辑】只做调度，不包含任何市场判断。
 """
+import functools
 import logging
 import os
 import socket
@@ -25,12 +26,29 @@ from app.graph import router as graph_router
 
 logger = get_logger("scheduler")
 
+# M6：调度统一口径 Asia/Shanghai —— 本模块所有「今天 / 当前时间戳」一律走这两个 helper，
+# 不再用 time.strftime() / datetime.now()（宿主机本地时区）。宿主机 TZ 非 UTC+8
+# （容器未挂载 /etc/localtime）时，交易日判定与幂等键（job:last_*）会整体偏移一天/数小时。
+_CN_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _cn_now() -> datetime:
+    """当前上海时间（M6）：本模块统一时间口径。"""
+    return datetime.now(_CN_TZ)
+
+
+def _today_cn() -> str:
+    """上海时区的今天（M6）：交易日判定 / 幂等键统一用它。"""
+    return _cn_now().strftime("%Y-%m-%d")
+
 scheduler: BackgroundScheduler | None = None
 _leader_acquired = False
 _leader_owner = f"{socket.gethostname()}:{os.getpid()}"
-_leader_stop = threading.Event()
+_leader_stop = threading.Event()          # 进程级停止（stop_scheduler 置位，永不清除）
+_leader_renew_stop = threading.Event()    # 续约线程终止信号（失租/降级时置位；P0-5c）
 _leader_thread: threading.Thread | None = None
 _leader_standby_thread: threading.Thread | None = None
+_leader_state_lock = threading.Lock()     # 串行化「抢锁 / 降级 / 重建调度器」状态迁移（P0-5）
 
 
 def _leader_ttl_seconds() -> int:
@@ -41,26 +59,87 @@ def _leader_renew_seconds() -> int:
     return max(5, min(int(settings.scheduler_leader_renew_seconds), _leader_ttl_seconds() // 2))
 
 
-def _leader_renew_loop() -> None:
+def _leader_lock_enabled() -> bool:
+    """是否启用 leader 锁（P0-5）：多人模式 + 共享 Redis。
+
+    架构限制（如实声明，勿当已根治）：单用户 + 内存缓存（默认）下锁只在进程内有效，
+    多 uvicorn worker / 多容器部署仍会各自启动 APScheduler、重复执行同一批 cron；本仓库
+    代码无法根治，只能靠部署约束（multi_user_enabled=True + CACHE_BACKEND=redis，
+    即本函数为真）才有跨进程协调手段。
+    """
+    return bool(settings.multi_user_enabled and settings.cache_backend == "redis")
+
+
+def _leader_owned() -> bool:
+    """P0-5b：执行前 fencing 校验 —— 本实例此刻是否仍持有 leader 租约。
+
+    * 未启用 leader 锁（单用户 + 内存锁）：无跨进程锁可校验，直接放行，绝不打死单用户调度；
+    * 已启用：每次执行前回查归属，租约过期 / 被抢占 / 续约线程挂掉都能立刻发现；
+    * 查询异常：宁可不执行也不双跑（按失租处理），避免脑裂。
+    """
+    if not _leader_lock_enabled():
+        return True
+    if not _leader_acquired:
+        return False
+    try:
+        return cache.get_lock_owner("scheduler:leader") == _leader_owner
+    except Exception as exc:  # noqa: BLE001 查不到归属时按失租处理，避免脑裂双跑
+        logger.error("调度 leader 归属查询失败，本实例按失租处理: %s", exc)
+        return False
+
+
+def _ensure_leader() -> bool:
+    """P0-5b：所有受 leader 保护的任务执行前的统一闸门（经 _add_job 统一包装）。
+
+    返回 False 表示本实例已不是 leader，任务必须立刻返回（继续跑就是与新 leader 双跑）。
+    未启用 leader 锁时恒为 True（单用户调度行为不变）。
+    """
+    if _leader_owned():
+        return True
+    _leader_demote("执行前 fencing 校验未通过")
+    return False
+
+
+def _leader_demote(reason: str) -> None:
+    """P0-5a：立刻放弃 leader 身份 —— 先关闸，再停调度器，最后进 standby。
+
+    顺序不能反：必须先把 _leader_acquired 置 False（fencing 立即拦住新任务），再
+    shutdown APScheduler；否则「续约失败 → 调度器真正停止」这段窗口里本实例仍会继续
+    执行任务，与新 leader 双跑（脑裂）。可从续约线程 / standby 线程 / 任务线程调用：
+    shutdown(wait=False) 不等待在跑任务，不会在任务线程内自锁。
+    """
     global scheduler, _leader_acquired
-    while not _leader_stop.wait(_leader_renew_seconds()):
-        if not _leader_acquired:
+    with _leader_state_lock:
+        was_leader = _leader_acquired
+        _leader_acquired = False
+        _leader_renew_stop.set()
+        if scheduler is not None:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("停止失租调度器失败: %s", exc)
+            scheduler = None
+    if was_leader:
+        logger.error("本实例失去调度 leader 租约（%s），已停止 APScheduler 并进入 standby", reason)
+    else:
+        logger.info("本实例当前不是调度 leader（%s），保持 standby", reason)
+    _start_leader_standby()
+
+
+def _leader_renew_loop() -> None:
+    # P0-5c：只监听本线程的终止信号 _leader_renew_stop，不再与进程级 _leader_stop 共用
+    while not _leader_renew_stop.wait(_leader_renew_seconds()):
+        if not _leader_acquired or _leader_stop.is_set():
             return
         try:
             ok = cache.renew_lock_owner("scheduler:leader", _leader_owner, _leader_ttl_seconds())
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 续约异常一律按失租处理
             ok = False
-            logger.error("调度 leader 租约续期失败: %s", exc)
+            logger.error("调度 leader 租约续期失败: %s", exc, exc_info=True)
         if not ok:
-            logger.error("调度 leader 租约丢失，停止本实例 APScheduler")
-            if scheduler is not None:
-                try:
-                    scheduler.shutdown(wait=False)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("停止失租调度器失败: %s", exc)
-                scheduler = None
-            _leader_acquired = False
-            _start_leader_standby()
+            # P0-5a：续约失败（返回 False 或抛异常）→ 置 _leader_acquired=False、
+            # 停本实例 APScheduler、进 standby，由 _leader_demote 一次性完成。
+            _leader_demote("租约续期失败或已被其他实例抢占")
             return
 
 
@@ -70,14 +149,24 @@ def _leader_standby_loop() -> None:
         if _leader_acquired:
             return
         try:
-            if cache.acquire_lock_owner("scheduler:leader", _leader_owner, _leader_ttl_seconds()):
+            with _leader_state_lock:
+                if not cache.acquire_lock_owner(
+                        "scheduler:leader", _leader_owner, _leader_ttl_seconds()):
+                    continue
                 _leader_acquired = True
                 start_scheduler()
+                if scheduler is None:
+                    # 抢到锁但调度器没建起来（如多人模式缓存后端不合法）：让出锁继续竞争，
+                    # 避免「持有 leader 锁却一个任务都不跑」把整个集群的调度挡在门外。
+                    _leader_acquired = False
+                    cache.release_lock_owner("scheduler:leader", _leader_owner)
+                    continue
                 _start_leader_renewal()
-                logger.info("调度 leader 接管成功 owner=%s", _leader_owner)
-                return
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("调度 leader 接管竞争失败: %s", exc)
+            logger.info("调度 leader 接管成功 owner=%s", _leader_owner)
+            return
+        except Exception as exc:  # noqa: BLE001 接管异常必须让出锁复位，否则「持锁空转」
+            logger.warning("调度 leader 接管竞争失败: %s", exc, exc_info=True)
+            _leader_demote("standby 接管异常")
 
 
 def _start_leader_standby() -> None:
@@ -91,13 +180,53 @@ def _start_leader_standby() -> None:
 
 def _start_leader_renewal() -> None:
     global _leader_thread
-    _leader_stop.clear()
+    if _leader_thread is not None and _leader_thread.is_alive():
+        return                                  # 已有续约线程在跑，避免重复续约/重复线程
+    _leader_renew_stop.clear()                  # P0-5c：只清续约终止信号，绝不动进程级 _leader_stop
     _leader_thread = threading.Thread(
         target=_leader_renew_loop, name="scheduler-leader-renew", daemon=True)
     _leader_thread.start()
 
+
+def _guarded(func):
+    """P0-5b：给任务套上执行前 leader fencing —— 本实例不是 leader 时直接跳过本次任务。
+
+    在注册处（_add_job）统一包装，而不是逐个任务入口手写：30+ 个任务入口漏一个就漏一个
+    脑裂口子。未启用 leader 锁（单用户 + 内存锁）时 _ensure_leader() 恒为 True，
+    行为与改造前完全一致。functools.wraps 保留真实函数名，日志/堆栈仍指向原任务函数。
+    """
+    @functools.wraps(func)
+    def _leader_fenced(*args, **kwargs):
+        if not _ensure_leader():
+            return None
+        return func(*args, **kwargs)
+    return _leader_fenced
+
+
+def _add_job(func, *args, **kwargs) -> None:
+    """统一任务注册入口（M9）+ 统一任务入口 fencing（P0-5b）。
+
+    * M9：cron 参数非法（配置项越界/拼错）原先会让整个 start_scheduler 抛异常，
+      结果是所有任务都注册不上；这里逐任务 try/except，坏的那个只丢自己，其余照常注册。
+    * P0-5b：注册时统一包 _guarded（执行前校验 leader 归属）。
+    * 并发语义沿用 APScheduler 默认值（已核实 BackgroundScheduler 的 _job_defaults =
+      misfire_grace_time=1 / coalesce=True / max_instances=1）：错过多次只补跑一次、
+      同一任务不并发；此处显式兜底声明，避免将来误删。
+    """
+    if scheduler is None:
+        logger.error("调度器未初始化，跳过任务注册: %s", getattr(func, "__name__", func))
+        return
+    kwargs.setdefault("coalesce", True)
+    kwargs.setdefault("max_instances", 1)
+    try:
+        scheduler.add_job(_guarded(func), *args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 单个任务注册失败不影响其他任务
+        logger.error("定时任务注册失败（降级跳过，其余任务不受影响）id=%s: %s",
+                     kwargs.get("id"), exc, exc_info=True)
+
+
 def _mark_sector_job(job_key: str, success: bool, error: str | None = None) -> None:
-    cache.set(f"job:last_{job_key}", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+    cache.set(f"job:last_{job_key}", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
     cache.set(f"job:last_{job_key}_error", "" if success else (error or "unknown")[:500], 86400)
 
 
@@ -113,7 +242,8 @@ def _record_job_run(event) -> None:
             if row is None:
                 row = JobRunLog(job_id=event.job_id)
                 db.add(row)
-            row.last_run = datetime.now()
+            # M6：DB 列是 naive DateTime，aware 时间会破坏契约 → 取上海墙上时间后摘掉 tzinfo
+            row.last_run = _cn_now().replace(tzinfo=None)
             row.last_status = "error" if exc else "ok"
             row.last_reason = str(exc)[:500] if exc else None
             db.commit()
@@ -155,7 +285,7 @@ def track_verify_job() -> None:
     到期收尾 → 统计 → 建议生成（锁在链路内部 run_verify_chain，幂等）。
     16:00 验证的是前一日候选（当日收盘已定格）；16:10 每日挖掘入库当日候选，
     次日 16:00 自动初始化，时序自洽。"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         logger.info("今天 %s 非交易日，跳过候选验证", today)
         return
@@ -179,7 +309,7 @@ def market_intel_job() -> None:
     """每日收盘后市场研判（16:20，独立于每日挖掘；当天已生成则跳过，幂等）"""
     from app.graph.router import run_market_intel
 
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if repo.get_market_intel(today):
         logger.info("今日市场研判已生成，跳过定时触发")
         return
@@ -216,7 +346,7 @@ def pre_market_screen_job() -> None:
     """盘前快筛（工作日 9:25 集合竞价撮合完成后）：交易日校验 + 防重锁 300s。
     检测最近一批候选的竞价异常（大幅低开/高开/可能停牌），异常逐条落库 + 合并一条飞书；
     纯代码检测，无 LLM 调用；无异常不推送不落库。"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         logger.info("今天 %s 非交易日，跳过盘前快筛", today)
         return
@@ -230,7 +360,7 @@ def pre_market_screen_job() -> None:
         logger.info("盘前快筛完成: 检查 %s 只候选，异常 %s 只（%s）",
                     result.get("checked", 0), len(result.get("anomalies") or []),
                     result.get("skipped", "正常"))
-        cache.set("job:last_pre_market", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_pre_market", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
     except Exception as exc:  # noqa: BLE001 盘前快筛失败不阻塞其他任务
         logger.error("盘前快筛失败: %s", exc)
     finally:
@@ -241,7 +371,7 @@ def market_accuracy_job() -> None:
     """市况方向命中率数据沉淀（每日 15:30 收盘定稿后）：回填 market_condition 的
     '次日沪深300涨跌幅' 数据列（幂等；历史行首次运行自动全量回填）。
     纯数据回填，无 LLM 调用；失败不阻塞其他任务。"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         logger.info("今天 %s 非交易日，跳过市况次日指数回填", today)
         return
@@ -252,7 +382,7 @@ def market_accuracy_job() -> None:
         from app.services import market_accuracy
 
         result = market_accuracy.fill_market_condition_next_day()
-        cache.set("job:last_market_accuracy", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_market_accuracy", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
         logger.info("市况次日指数回填完成: %s（今日 %s）", result.get("filled"),
                     result.get("today"))
     except Exception as exc:  # noqa: BLE001 回填失败不阻塞其他任务
@@ -263,7 +393,7 @@ def market_accuracy_job() -> None:
 
 def daily_discover_job() -> None:
     """每日挖掘：防重锁 + 交易日校验 + 全链路"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not cache.acquire_lock("daily_discover", ttl_seconds=7200):
         logger.info("daily_discover 锁被占用，跳过本次")
         return
@@ -283,7 +413,7 @@ def daily_discover_job() -> None:
 
 def paper_execution_job() -> None:
     """收盘后审核模拟复盘；成交仅由盘中执行器使用实时行情完成。"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today) or not cache.acquire_lock("paper_execution", ttl_seconds=3600):
         return
     try:
@@ -300,7 +430,7 @@ def paper_execution_job() -> None:
                         reset_user_context(tokens)
                 except Exception as exc:  # noqa: BLE001 审核失败不伪造通过
                     logger.warning("模拟复盘 AI 审核失败 review#%s: %s", review.get("id"), exc)
-        cache.set("job:last_paper_execution", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_paper_execution", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
         logger.info("模拟复盘审核轮询完成")
     finally:
         cache.release_lock("paper_execution")
@@ -308,7 +438,7 @@ def paper_execution_job() -> None:
 
 def paper_monitor_job() -> None:
     """盘中模拟账户巡检；日历不可用时暂停，所有账户独立失败隔离。"""
-    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    now = _cn_now()
     if not _in_trading_window(now):
         return
     today = now.date().isoformat()
@@ -347,10 +477,10 @@ def paper_monitor_job() -> None:
 
 def monitor_job() -> None:
     """批量持仓监控：交易时段高频（每 N 分钟）全量监控；收盘校验窗口低频兜底"""
-    now = datetime.now()
+    now = _cn_now()
     if not _in_trading_window(now) and not _in_close_check_window(now):
         return
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         return
     if _in_close_check_window(now) and not _in_trading_window(now):
@@ -373,7 +503,7 @@ def monitor_job() -> None:
                     today, user["id"], is_admin=user.get("role") == "admin"))
             finally:
                 reset_user_context(tokens)
-        cache.set("job:last_monitor", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_monitor", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
         if _in_close_check_window(now) and not _in_trading_window(now):
             cache.set(f"job:close_checked:{today}", "1", 86400)
             logger.info("收盘校验完成: %s 持仓", len(results))
@@ -388,10 +518,10 @@ def monitor_job() -> None:
 def portfolio_sentinel_job() -> None:
     """组合哨兵巡检：交易时段每 10 分钟；无持仓正常跳过；异常不抛断。
     与 monitor_job 独立（各自锁/各自频率），互不影响。"""
-    now = datetime.now()
+    now = _cn_now()
     if not _in_trading_window(now):
         return
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         return
     if not cache.acquire_lock("portfolio_sentinel", ttl_seconds=600):
@@ -415,7 +545,7 @@ def portfolio_sentinel_job() -> None:
         if ps.get("skipped"):
             logger.info("组合哨兵跳过（无持仓）: %s", today)
         else:
-            cache.set("job:last_portfolio_sentinel", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+            cache.set("job:last_portfolio_sentinel", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
             logger.info("组合哨兵巡检完成: %s（板块预警 %s / 时间止损 %s）", today,
                         len(ps.get("sector_alerts") or []),
                         len(ps.get("time_stop_alerts") or []))
@@ -438,7 +568,7 @@ def sector_refresh_job() -> None:
         result = refresh_sector_snapshot()
         if result.get("success"):
             cache.set("job:last_sector_refresh",
-                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+                      _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
             logger.info("板块快照刷新完成: %s 条", result.get("rows", 0))
         else:
             logger.warning("板块快照刷新失败: %s", result.get("error"))
@@ -605,7 +735,7 @@ def distribution_phase_job() -> None:
         return
     try:
         from app.services.distribution_phase import compute_distribution_phase
-        trade_date = time.strftime("%Y-%m-%d")
+        trade_date = _today_cn()
         codes = {c.get("stock_code") for c in repo.list_candidates(trade_date, limit=200)
                  if c.get("stock_code")}
         codes |= {h.get("stock_code") for h in repo.list_holdings() if h.get("stock_code")}
@@ -623,7 +753,7 @@ def distribution_phase_job() -> None:
                 logger.warning("派发期判定失败 %s: %s", code, exc)
                 failed += 1
         cache.set("job:last_distribution_phase",
-                  time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+                  _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
         logger.info("派发期判定完成: 共%d只 成功%d 失败%d", len(codes), done, failed)
     except Exception as exc:  # noqa: BLE001 调度入口吞异常
         logger.error("派发期判定异常: %s", exc)
@@ -654,7 +784,7 @@ def quote_snapshot_refresh_job() -> None:
                   "source": ",".join(sorted({str(r.get("source") or "") for r in results}))}
         if result.get("success"):
             cache.set("job:last_quote_snapshot_refresh",
-                      time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+                      _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
             logger.info("持仓价快照刷新完成: %s 条 (source=%s)",
                         result.get("rows", 0), result.get("source"))
         else:
@@ -670,7 +800,7 @@ def _is_previous_trading_day(yesterday: str) -> bool:
     日历为全量静态历（1990~年末含未来日期）：取今天之前的最后一个交易日与昨天比对"""
     try:
         calendar = AkshareSource().fetch_trade_calendar()
-        today = time.strftime("%Y-%m-%d")
+        today = _today_cn()
         past = [d for d in (calendar or []) if d < today]
         return bool(past) and past[-1] == yesterday
     except Exception as exc:  # noqa: BLE001 日历失败时按工作日放行
@@ -683,8 +813,8 @@ def dragon_tiger_job() -> None:
     抓取层纯数据（东财/新浪），研判逻辑在提示词与 services/hot_money.py，此处零判断。"""
     if not settings.dragon_tiger_enable:
         return
-    today = time.strftime("%Y-%m-%d")
-    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    today = _today_cn()
+    yesterday = (_cn_now() - timedelta(days=1)).strftime("%Y-%m-%d")
     if not _is_previous_trading_day(yesterday):
         logger.info("昨日 %s 非交易日，跳过龙虎榜拉取", yesterday)
         return
@@ -734,7 +864,7 @@ def hot_money_win_rate_job() -> None:
 
 def _next_a_share_trade_date(now_dt: datetime | None = None) -> str:
     """下一个A股交易日（简单算法：今天非周末取今天，否则顺延到周一）"""
-    dt = now_dt or datetime.now()
+    dt = now_dt or _cn_now()
     if dt.weekday() < 5:
         return dt.strftime("%Y-%m-%d")
     days = 2 if dt.weekday() == 5 else 1  # 周六顺延2天（到周一），周日顺延1天
@@ -749,7 +879,7 @@ def collect_overnight_factor_job() -> None:
     if not settings.overnight_factor_enabled:
         logger.info("美股隔夜因子功能未开启，跳过采集")
         return
-    now = datetime.now()
+    now = _cn_now()
     if now.weekday() >= 5:
         logger.info("周末无美股隔夜参考，跳过隔夜因子采集")
         return
@@ -789,7 +919,7 @@ def verify_overnight_factor_job() -> None:
     if not settings.overnight_factor_enabled:
         logger.info("美股隔夜因子功能未开启，跳过校验")
         return
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         logger.info("今天 %s 非交易日，跳过隔夜因子校验", today)
         return
@@ -828,9 +958,39 @@ def verify_overnight_factor_job() -> None:
         cache.release_lock("overnight_factor_verify")
 
 
+def _purge_expired_sessions(grace_days: int = 7) -> int:
+    """M15：清理过期 / 已撤销的 UserSession 行（该表原先只增不删，随登录次数无限膨胀）。
+
+    保留 grace_days 天用于事后审计（expires_at 或 revoked_at 落在窗口内的先留着）；
+    单项失败只告警不抛出（维护任务按项降级），返回实际清理行数。
+    """
+    from sqlalchemy import and_, delete, or_
+
+    from app.db.models import UserSession
+    from app.db.session import SessionLocal
+
+    # user_session 的时间列是 naive DateTime（repo 写入同样用 naive 时间）→ 比较值也取
+    # naive 上海墙上时间：既避免 aware -> MySQL DATETIME 的驱动不兼容，口径也与 M6 一致。
+    cutoff = _cn_now().replace(tzinfo=None) - timedelta(days=max(0, int(grace_days)))
+    try:
+        with SessionLocal() as db:
+            removed = db.execute(
+                delete(UserSession).where(
+                    or_(UserSession.expires_at < cutoff,
+                        and_(UserSession.revoked_at.isnot(None),
+                             UserSession.revoked_at < cutoff))
+                )
+            ).rowcount
+            db.commit()
+        return int(removed or 0)
+    except Exception as exc:  # noqa: BLE001 会话清理失败不影响其他维护项
+        logger.warning("过期会话清理失败（不影响其他维护项）: %s", exc)
+        return 0
+
+
 def maintenance_job() -> None:
-    """每周空间维护（低频）：超期新闻清理 + SQLite 真空收缩 + 向量库超期索引清理。
-    仅清理非核心数据（新闻原文），候选/评分/持仓/复盘等关键分析数据不清理。"""
+    """每周空间维护（低频）：超期新闻清理 + 过期会话清理 + SQLite 真空收缩 + 向量库超期索引清理。
+    仅清理非核心数据（新闻原文/过期会话），候选/评分/持仓/复盘等关键分析数据不清理。"""
     if not settings.db_maintenance_enabled:
         return
     if not cache.acquire_lock("db_maintenance", ttl_seconds=3600):
@@ -841,12 +1001,15 @@ def maintenance_job() -> None:
         from app.services.vector_store import get_vector_store
 
         stats = repo.maintenance_db()
+        # M15：user_session 表原先只增不删（每次登录/换 token 一行）→ 维护时顺手清理过期会话。
+        sessions_purged = _purge_expired_sessions()
+        stats["sessions_purged"] = sessions_purged
         cutoff = time.time() - settings.news_retention_days * 86400
         removed = get_vector_store().cleanup_old_news(cutoff)
-        logger.info("空间维护完成: 新闻清理 %s 条，向量索引清理 %s，库体积 %s → %s MB",
-                    stats["news_deleted"], removed,
+        logger.info("空间维护完成: 新闻清理 %s 条，过期会话清理 %s 条，向量索引清理 %s，库体积 %s → %s MB",
+                    stats["news_deleted"], sessions_purged, removed,
                     stats["size_before_mb"], stats["size_after_mb"])
-        cache.set("job:last_maintenance", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_maintenance", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
     except Exception as exc:  # noqa: BLE001 维护失败不阻塞其他任务
         logger.error("空间维护失败: %s", exc)
     finally:
@@ -898,14 +1061,14 @@ def audit_pending_job() -> None:
         result = {"users": results}
         errors = [e for result in results for e in result.get("errors") or []]
         error_text = "; ".join([f"#{e.get('id')}: {e.get('error')}" for e in errors])[:500]
-        cache.set("job:last_audit_pending", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_audit_pending", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
         cache.set("job:last_audit_pending_error", error_text, 86400)
         if error_text:
             logger.warning("建议辩证审核部分失败: %s", result)
         else:
             logger.info("建议辩证审核: %s", result)
     except Exception as exc:  # noqa: BLE001 调度入口绝不外抛
-        cache.set("job:last_audit_pending", time.strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        cache.set("job:last_audit_pending", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
         cache.set("job:last_audit_pending_error", str(exc)[:500], 86400)
         logger.error("建议辩证审核异常: %s", exc)
 
@@ -937,7 +1100,7 @@ def ths_pnl_job() -> None:
     return  # DISABLED 2026-09-16 同花顺下线（原逻辑保留在下方）
     if not settings.ths_pnl_enable:
         return
-    now_tz = datetime.now(ZoneInfo("Asia/Shanghai"))
+    now_tz = _cn_now()
     today = now_tz.strftime("%Y-%m-%d")
     if not _is_trading_day(today):
         return
@@ -959,7 +1122,7 @@ def ths_pnl_job() -> None:
             if snapshot.get("error"):
                 logger.warning("同花顺盈亏采集未成功: %s", snapshot["error"])
             repo.upsert_account_pnl_snapshot(
-                trade_date=time.strftime("%Y-%m-%d"), ts=time.strftime("%H:%M:%S"),
+                trade_date=_cn_now().strftime("%Y-%m-%d"), ts=_cn_now().strftime("%H:%M:%S"),
                 pnl_yk=snapshot.get("pnl_yk"), pnl_pct=snapshot.get("pnl_pct"),
                 sh_pct=snapshot.get("sh_pct"), chart_data=snapshot.get("chart_data") or [],
                 error=snapshot.get("error") or "",
@@ -973,7 +1136,7 @@ def ths_pnl_job() -> None:
 
 def feishu_daily_report_job() -> None:
     """每日收盘日报直发，按绑定用户分别生成并发送。"""
-    if not settings.feishu_daily_report or not _is_trading_day(time.strftime("%Y-%m-%d")):
+    if not settings.feishu_daily_report or not _is_trading_day(_today_cn()):
         return
     from app.services import holding_view  # ths_pnl DISABLED 2026-09-16
     from app.services.feishu_sender import send_text
@@ -984,7 +1147,7 @@ def feishu_daily_report_job() -> None:
     for user in users:
         tokens = set_user_context(user["id"], user.get("role"))
         try:
-            lines = [f"📊 {time.strftime('%Y-%m-%d')} 收盘日报"]
+            lines = [f"📊 {_today_cn()} 收盘日报"]
             snap = {}  # DISABLED 2026-09-16：同花顺已下线，走 fallback 文案
             lines.append(f"今日盈亏: ¥{snap['pnl_yk']:,.0f}（{snap.get('pnl_pct')}%）"
                          if snap.get('pnl_yk') is not None else f"今日盈亏: {snap.get('error') or '未接入'}")
@@ -996,7 +1159,7 @@ def feishu_daily_report_job() -> None:
             lines.append(f"持仓 {len(rows)} 只 | 总市值 ¥{mv:,.0f} | 浮动盈亏 ¥{pnl:,.0f}")
             alerts = [a for a in repo.list_alerts(
                 50, user_id=user["id"], is_admin=user.get("role") == "admin")
-                if str(a.get("created_at", "")).startswith(time.strftime("%Y-%m-%d"))]
+                if str(a.get("created_at", "")).startswith(_today_cn())]
             lines.append(f"今日告警 {len(alerts)} 条")
             recipients = [user.get("feishu_open_id")] if user.get("feishu_open_id") else fallback_ids
             for oid in [x for x in recipients if x]:
@@ -1007,7 +1170,7 @@ def feishu_daily_report_job() -> None:
 
 def signal_scan_job() -> None:
     """买卖点信号全市场扫描（工作日 16:50 收盘后）；非交易日直接返回，不产生任何记录。"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         logger.info("今天 %s 非交易日，跳过买卖点信号扫描", today)
         return
@@ -1031,7 +1194,7 @@ def kline_backfill_job() -> None:
     """夜间本地日线历史回补（逐夜分批，可中断续跑）；不占 16:50 扫描窗口。
 
     只写本地 SQLite；每夜最多 settings.kline_backfill_batch_limit 只（断点靠本地库自身状态）。"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         logger.info("今天 %s 非交易日，跳过夜间日线回补", today)
         return
@@ -1071,14 +1234,23 @@ def kline_backfill_job() -> None:
         _reclaim_memory()
 
 
+def _task_lock_owner(task: str) -> str:
+    """任务锁 owner 标识（M7）：host:pid:task，保证释放时只删自己持有的锁。"""
+    return f"{_leader_owner}:{task}"
+
+
 def kline_ingest_job() -> None:
     """本地日线仓库增量（工作日 16:25）；非交易日直接返回，除权票当场重建历史段。"""
-    today = time.strftime("%Y-%m-%d")
+    today = _today_cn()
     if not _is_trading_day(today):
         logger.info("今天 %s 非交易日，跳过本地日线增量", today)
         return
-    if not cache.acquire_lock("kline_ingest", ttl_seconds=3600):
-        logger.info("kline_ingest 锁被占用，跳过本次")
+    # M7：TTL 由 3600 收窄到 1800 —— 原值让一次崩溃留下的死锁最长占用 1 小时，
+    # 把当日 16:25 增量与后续重试全挡在门外；并改用带 owner 的锁（释放时校验归属，
+    # 避免 TTL 到期后误删别的实例刚抢到的锁）。
+    if not cache.acquire_lock_owner("kline_ingest", _task_lock_owner("kline_ingest"),
+                                    ttl_seconds=1800):
+        logger.info("kline_ingest 锁被占用（或上一实例租约未过期），跳过本次")
         return
     try:
         from app.services.kline_backfill import backfill
@@ -1092,7 +1264,11 @@ def kline_ingest_job() -> None:
     except Exception as exc:  # noqa: BLE001 调度任务整体容错
         logger.error("本地日线增量失败: %s", exc)
     finally:
-        cache.release_lock("kline_ingest")
+        try:
+            # M7：带 owner 校验释放，只释放仍属于本进程的锁
+            cache.release_lock_owner("kline_ingest", _task_lock_owner("kline_ingest"))
+        except Exception as exc:  # noqa: BLE001 释放失败只告警（租约到期自动失效）
+            logger.warning("释放 kline_ingest 锁失败: %s", exc)
         _reclaim_memory()
 
 
@@ -1100,10 +1276,12 @@ def start_scheduler() -> None:
     global scheduler, _leader_acquired
     if scheduler is not None:
         return
-    if settings.multi_user_enabled:
-        if settings.cache_backend != "redis":
-            logger.error("多人模式拒绝启动调度：必须配置共享 Redis")
-            return
+    if settings.multi_user_enabled and settings.cache_backend != "redis":
+        logger.error("多人模式拒绝启动调度：必须配置共享 Redis")
+        return
+    # P0-5：仅多人模式 + 共享 Redis 启用 leader 锁；单用户 + 内存锁无跨进程协调手段，
+    # 保持不选举（多 worker 重复调度属架构限制，见 _leader_lock_enabled 说明）。
+    if _leader_lock_enabled():
         if not _leader_acquired and not cache.acquire_lock_owner(
                 "scheduler:leader", _leader_owner, _leader_ttl_seconds()):
             logger.warning("多人模式当前实例不是调度 leader，跳过 APScheduler")
@@ -1114,61 +1292,61 @@ def start_scheduler() -> None:
             _start_leader_renewal()
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     # 工作日 16:00 候选池 T+N 验证（16:10 每日挖掘之前，验证前一日候选）
-    scheduler.add_job(track_verify_job, "cron",
+    _add_job(track_verify_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=0,
                       id="track_verify", name="候选池T+N验证",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 预测性选股 2.5：每日 16:00 前瞻 T+5 回填（纯统计，复用 track_verify.t5_pct 不新算）
-    scheduler.add_job(fill_forward_view_job, "cron",
+    _add_job(fill_forward_view_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=0,
                       id="forward_view_fill", name="前瞻T+5回填",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 每周日 04:00 前瞻先验校准（回算近 30 日准确率写日志）
-    scheduler.add_job(calibrate_forward_view_job, "cron",
+    _add_job(calibrate_forward_view_job, "cron",
                       day_of_week="sun", hour=4, minute=0,
                       id="forward_view_calibrate", name="前瞻先验校准",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=1800)
     # 工作日 16:10 每日挖掘
-    scheduler.add_job(daily_discover_job, "cron",
+    _add_job(daily_discover_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=10,
                       id="daily_discover", name="每日潜力股挖掘",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=900)
     # 工作日 16:20 市场研判（独立于每日挖掘；当天已生成跳过，幂等）
-    scheduler.add_job(market_intel_job, "cron",
+    _add_job(market_intel_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=20,
                       id="market_intel", name="市场研判",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=900)
     # 工作日 16:25 本地日线仓库增量（批量快照落当日 bar；16:50 扫描只读本地，批 1.5 容量修复）
-    scheduler.add_job(kline_ingest_job, "cron",
+    _add_job(kline_ingest_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=25,
                       id="kline_ingest", name="本地日线增量",
-                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
+                      replace_existing=True, misfire_grace_time=900, max_instances=1)
     # 每夜 00:40 历史回补（逐夜分批、可中断续跑）；**刻意不占 16:50 扫描窗口**
-    scheduler.add_job(kline_backfill_job, "cron",
+    _add_job(kline_backfill_job, "cron",
                       day_of_week="tue-sat", hour=0, minute=40,
                       id="kline_backfill", name="本地日线夜间回补",
-                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
+                      replace_existing=True, misfire_grace_time=1800, max_instances=1)
     # 工作日 16:50 买卖点信号全市场扫描（批 1 只攒数据，不进任何 Agent、不触发交易动作）
-    scheduler.add_job(signal_scan_job, "cron",
+    _add_job(signal_scan_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=50,
                       id="signal_scan", name="买卖点信号扫描",
-                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
-    scheduler.add_job(run_factor_ic_backtest_job, "cron", day=1, hour=2, minute=0,
+                      replace_existing=True, misfire_grace_time=900, max_instances=1)
+    _add_job(run_factor_ic_backtest_job, "cron", day=1, hour=2, minute=0,
                       id="factor_ic_backtest", name="因子 IC 月度回测",
-                      replace_existing=True, misfire_grace_time=3600, max_instances=1)
+                      replace_existing=True, misfire_grace_time=1800, max_instances=1)
     # 工作日 16:30 游资胜率迭代（daily_discover/market_intel 之后；归一化匹配收信号）
-    scheduler.add_job(hot_money_win_rate_job, "cron",
+    _add_job(hot_money_win_rate_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=30,
                       id="hot_money_win_rate", name="游资胜率迭代",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 工作日 16:35 收盘后审核模拟复盘；成交只在盘中进行。
-    scheduler.add_job(paper_execution_job, "cron",
+    _add_job(paper_execution_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=35,
                       id="paper_execution", name="AI模拟复盘审核",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 交易日 9:00-16:00 每 N 分钟触发（函数内过滤：盘中高频 + 15:00-15:30 收盘校验低频）
     monitor_minutes = max(1, int(settings.monitor_interval_minutes))
-    scheduler.add_job(monitor_job, "cron",
+    _add_job(monitor_job, "cron",
                       day_of_week="mon-fri", hour="9-16", minute=f"*/{monitor_minutes}",
                       id="monitor", name="盘中持仓监控",
                       replace_existing=True, misfire_grace_time=300)
@@ -1176,139 +1354,127 @@ def start_scheduler() -> None:
     # 分钟错峰（2026-09-28）：同刻并发调用 akshare 会让 py_mini_racer 内置 V8
     # 二次初始化 → [FATAL:partition_address_space.cc(243)] 进程级崩溃（无任何 Python
     # 异常可捕获）。故把各 5/10/30 分钟任务错开到不同分钟偏移，避免整点合流。
-    scheduler.add_job(paper_monitor_job, "cron",
+    _add_job(paper_monitor_job, "cron",
                       day_of_week="mon-fri", hour="9-15", minute=f"3-59/{max(5, monitor_minutes)}",
                       id="paper_monitor", name="AI模拟盘中监控",
                       replace_existing=True, misfire_grace_time=300, max_instances=1)
     # 交易日 9:00-16:00 每 10 分钟触发（函数内过滤交易时段窗口；组合级风控巡检，
     # 与 monitor 独立锁/独立频率，互不影响）
-    scheduler.add_job(portfolio_sentinel_job, "cron",
+    _add_job(portfolio_sentinel_job, "cron",
                       day_of_week="mon-fri", hour="9-16", minute="4-59/10",
                       id="portfolio_sentinel", name="组合哨兵巡检",
                       replace_existing=True, misfire_grace_time=300)
     # 工作日 9:25 盘前快筛（集合竞价撮合完成后；候选为上一交易日 16:10 生成）
-    scheduler.add_job(pre_market_screen_job, "cron",
+    _add_job(pre_market_screen_job, "cron",
                       day_of_week="mon-fri", hour=9, minute=25,
                       id="pre_market_screen", name="盘前快筛",
                       replace_existing=True, misfire_grace_time=300)
     # 工作日 15:30 市况次日指数回填（收盘定稿后；幂等，首次自动回填全部历史行）
-    scheduler.add_job(market_accuracy_job, "cron",
+    _add_job(market_accuracy_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=30,
                       id="market_accuracy", name="市况次日指数回填",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 经验沉淀：每日 02:00 主跑（与现有任务零冲突）+ 每 30 分钟积压探针（内部积压门判断，轻量）
-    scheduler.add_job(experience_worker_job, "cron", hour=2, minute=0,
+    _add_job(experience_worker_job, "cron", hour=2, minute=0,
                       args=[True], id="experience_worker", name="经验沉淀识别",
-                      replace_existing=True, misfire_grace_time=3600)
-    scheduler.add_job(experience_worker_job, "cron", minute="7-59/30",
+                      replace_existing=True, misfire_grace_time=1800)
+    _add_job(experience_worker_job, "cron", minute="7-59/30",
                       args=[False], id="experience_worker_probe", name="经验沉淀积压探针",
                       replace_existing=True, misfire_grace_time=1800)
     # 通用审核 Agent：每日 03:30 低峰批量辩证审核待审建议（游标增量，幂等）
-    scheduler.add_job(audit_pending_job, "cron", hour=3, minute=30,
+    _add_job(audit_pending_job, "cron", hour=3, minute=30,
                       id="audit_pending", name="建议辩证审核",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=1800)
     # 每周一次空间维护（默认周日 05:30，低频）
-    scheduler.add_job(maintenance_job, "cron",
+    _add_job(maintenance_job, "cron",
                       day_of_week=settings.db_maintenance_day_of_week,
                       hour=settings.db_maintenance_hour, minute=settings.db_maintenance_minute,
                       id="db_maintenance", name="存储空间维护",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=1800)
     # 龙虎榜 T+1 拉取（开关开启时生效；16:30 后抓前一日，游资维度数据链）
     if settings.dragon_tiger_enable:
-        scheduler.add_job(dragon_tiger_job, "cron",
+        _add_job(dragon_tiger_job, "cron",
                           day_of_week="mon-fri",
                           hour=settings.dragon_tiger_hour,
                           minute=settings.dragon_tiger_minute,
                           id="dragon_tiger", name="龙虎榜T+1拉取",
-                          replace_existing=True, misfire_grace_time=3600)
+                          replace_existing=True, misfire_grace_time=600)
     # 飞书每日收盘日报（默认关；开启才注册，避免空转）
     if settings.feishu_daily_report:
-        scheduler.add_job(feishu_daily_report_job, "cron",
+        _add_job(feishu_daily_report_job, "cron",
                           day_of_week="mon-fri",
                           hour=settings.feishu_daily_report_hour,
                           minute=settings.feishu_daily_report_minute,
                           id="feishu_daily_report", name="飞书日报直发",
-                          replace_existing=True, misfire_grace_time=3600)
+                          replace_existing=True, misfire_grace_time=600)
     # 板块快照刷新：每 5 分钟 9:00-15:55（独立锁，不与 monitor 冲突）
-    scheduler.add_job(sector_refresh_job, "cron",
+    _add_job(sector_refresh_job, "cron",
                       day_of_week="mon-fri", hour="9-15", minute="1-59/5",
                       id="sector_refresh", name="板块快照刷新",
                       replace_existing=True, misfire_grace_time=300)
     # 派发期判定：每日 15:30 收盘后逐只落库（6 维自动判定，供 Monitor/Sell/Score 参考）
-    scheduler.add_job(distribution_phase_job, "cron",
+    _add_job(distribution_phase_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=30,
                       id="distribution_phase", name="派发期判定",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 板块轮动数据底座：全板块日快照（收盘后 15:35，删后插当日覆盖）
-    scheduler.add_job(sector_daily_job, "cron",
+    _add_job(sector_daily_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=35,
                       id="sector_daily", name="板块轮动日快照",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # C' 行情结构识别：多窗口结构综合（收盘后 15:40，独立于 C 归因子）
-    scheduler.add_job(sector_regime_job, "cron",
+    _add_job(sector_regime_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=40,
                       id="sector_regime", name="行情结构识别",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # D' 板块前瞻：读取 C' 结构结果，纯代码计算（收盘后 15:45）
-    scheduler.add_job(sector_forward_job, "cron",
+    _add_job(sector_forward_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=45,
                       id="sector_forward", name="板块前瞻预测",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # G' 下一个风口预测：基于 D' 指标派生 top10 外候选（收盘后 15:50）
-    scheduler.add_job(sector_next_hot_job, "cron",
+    _add_job(sector_next_hot_job, "cron",
                       day_of_week="mon-fri", hour=15, minute=50,
                       id="sector_next_hot", name="下一个风口预测",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # E'-1 前瞻验证回填：使用后续真实板块快照校验历史预测（收盘后 16:05）
-    scheduler.add_job(sector_forecast_verify_job, "cron",
+    _add_job(sector_forecast_verify_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=5,
                       id="sector_forecast_verify", name="前瞻验证回填",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 行业消息雷达：观察型 shadow，不进入正式 Agent/候选池
-    scheduler.add_job(sector_radar_job, "cron",
+    _add_job(sector_radar_job, "cron",
                       day_of_week="mon-sun", hour=8, minute=0,
                       id="sector_radar", name="行业消息雷达",
-                      replace_existing=True, misfire_grace_time=3600)
-    scheduler.add_job(sector_radar_shadow_job, "cron",
+                      replace_existing=True, misfire_grace_time=1800)
+    _add_job(sector_radar_shadow_job, "cron",
                       day_of_week="mon-fri", hour=16, minute=25,
                       id="sector_radar_shadow", name="行业消息雷达shadow回填",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     # 持仓价快照刷新：每 5 分钟 9:00-15:55（腾讯批量 → DB 兜底；独立锁）
-    scheduler.add_job(quote_snapshot_refresh_job, "cron",
+    _add_job(quote_snapshot_refresh_job, "cron",
                       day_of_week="mon-fri", hour="9-15", minute="2-59/5",
                       id="quote_snapshot_refresh", name="持仓价快照刷新",
                       replace_existing=True, misfire_grace_time=300)
-    # 同花顺真实账户今日盈亏采集（开关开启才注册；cron 精确 9:15-16:00 窗口、
-    # 按 ths_pnl_poll_seconds 触发，仅工作日；函数内再按交易日+窗口过滤，夜间不空转）
-    # === DISABLED 2026-09-16: 同花顺下线，cron 停注册 ===
-    if False:
-        _poll = max(10, int(settings.ths_pnl_poll_seconds))
-        scheduler.add_job(ths_pnl_job, "cron", day_of_week="mon-fri",
-                          hour=9, minute="15-59", second=f"*/{_poll}",
-                          id="ths_pnl_915", name="同花顺今日盈亏采集",
-                          replace_existing=True, misfire_grace_time=60)
-        scheduler.add_job(ths_pnl_job, "cron", day_of_week="mon-fri",
-                          hour="10-15", minute="*", second=f"*/{_poll}",
-                          id="ths_pnl_mid", name="同花顺今日盈亏采集",
-                          replace_existing=True, misfire_grace_time=60)
-        scheduler.add_job(ths_pnl_job, "cron", day_of_week="mon-fri",
-                          hour=16, minute=0, second=f"*/{_poll}",
-                          id="ths_pnl_1600", name="同花顺今日盈亏采集",
-                          replace_existing=True, misfire_grace_time=60)
+    # === DISABLED 2026-09-16: 同花顺下线（M17）—— 显式下线，不注册 cron，不留死代码 ===
+    # 原实现用 `if False:` 包住 3 条 ths_pnl add_job（21 行永不执行的死代码）：
+    # 静态检查看不见、后人容易误判成「临时关闭」而随手打开，而 ths_pnl_job 函数体首行
+    # 已 `return`（整链路下线），打开也只会白跑。恢复通道：删 ths_pnl_job 首行 return +
+    # 按 settings.ths_pnl_poll_seconds 重建 cron（此处不留裸守卫）。
     from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
     scheduler.add_listener(_record_job_run, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     # 美股隔夜因子：每天 21:30 采集（周末/非交易日函数内跳过，幂等）；
     # 工作日 9:35 校验开盘缺口回填台账（只读观察因子，不参与现有决策）
-    scheduler.add_job(collect_overnight_factor_job, "cron",
+    _add_job(collect_overnight_factor_job, "cron",
                       hour=settings.overnight_factor_hour,
                       minute=settings.overnight_factor_minute,
                       id="overnight_factor_collect", name="美股隔夜因子采集",
-                      replace_existing=True, misfire_grace_time=3600)
-    scheduler.add_job(verify_overnight_factor_job, "cron", day_of_week="mon-fri",
+                      replace_existing=True, misfire_grace_time=1800)
+    _add_job(verify_overnight_factor_job, "cron", day_of_week="mon-fri",
                       hour=9, minute=35,
                       id="overnight_factor_verify", name="美股隔夜因子校验",
-                      replace_existing=True, misfire_grace_time=3600)
+                      replace_existing=True, misfire_grace_time=600)
     scheduler.start()
     logger.info("APScheduler 已启动（Asia/Shanghai）")
 
@@ -1316,11 +1482,15 @@ def start_scheduler() -> None:
 def stop_scheduler() -> None:
     global scheduler, _leader_acquired
     _leader_stop.set()
+    _leader_renew_stop.set()   # P0-5c：进程停止与续约终止是两个事件，都必须置位
     if scheduler is not None:
         scheduler.shutdown(wait=False)
         scheduler = None
     if _leader_acquired:
-        cache.release_lock_owner("scheduler:leader", _leader_owner)
+        try:
+            cache.release_lock_owner("scheduler:leader", _leader_owner)
+        except Exception as exc:  # noqa: BLE001 停机释放失败只告警（租约到期自动失效）
+            logger.warning("释放调度 leader 租约失败: %s", exc)
         _leader_acquired = False
 
 

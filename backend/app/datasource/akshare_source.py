@@ -264,7 +264,13 @@ def _stock_news_em_fixed(code: str) -> pd.DataFrame:
     params = {"cb": "jQuery_fixed_cb",
               "param": json.dumps(inner_param, ensure_ascii=False), "_": "1"}
     headers = {"user-agent": _NEWS_UA, "referer": f"https://so.eastmoney.com/news/s?keyword={code}"}
-    resp = requests.get(url, params=params, headers=headers, timeout=15)
+    # M11b：单值 15s 超时无法区分「连接挂起」与「响应挂起」，按数据源统一配置拆分
+    # （连接超时 5s + 读取超时 min(15s, datasource_read_timeout)）。
+    # 此处保留 requests.get 直连：本模块测试以 monkeypatch.setattr("requests.get", ...) 打桩，
+    # 改走共享会话会绕过桩函数并触发真实网络请求。
+    resp = requests.get(url, params=params, headers=headers,
+                        timeout=(settings.datasource_connect_timeout,
+                                min(settings.datasource_read_timeout, 15)))
     resp.raise_for_status()
     text = resp.text.strip()
     start, end = text.find("("), text.rfind(")")  # JSONP 包裹: jQueryxxx(...)
@@ -347,7 +353,11 @@ def _accepts_timeout(func: Callable) -> bool:
 
     预判签名可避免用 except TypeError 兜底：那会把接口内部抛出的 TypeError 一并吞掉。
     取不到签名（内置/无签名 callable）时按「不接受」处理，走兜底硬超时路径。
+
+    LockedAkshare 代理包装层是 (*args, **kwargs)，会误判为接受 timeout；
+    先剥离 __wrapped__ 还原底层 akshare 原函数签名再判断。
     """
+    func = getattr(func, "__wrapped__", func)
     try:
         params = inspect.signature(func).parameters
     except (TypeError, ValueError):

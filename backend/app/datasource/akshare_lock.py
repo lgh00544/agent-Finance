@@ -32,6 +32,7 @@ class LockedAkshare:
 
         _locked.__name__ = getattr(target, "__name__", str(name))
         _locked.__doc__ = getattr(target, "__doc__", None)
+        _locked.__wrapped__ = target  # 供签名预判（_accepts_timeout）剥离包装层
         return _locked
 
 

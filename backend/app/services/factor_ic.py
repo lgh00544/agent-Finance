@@ -45,6 +45,16 @@ COLLECT_WORKERS = 4
 # 才采用本地序列；新股/停牌/回补未完成一律回退远端，宁慢不错。
 LOCAL_KLINE_FIRST_TOLERANCE_DAYS = 20
 LOCAL_KLINE_LAST_TOLERANCE_DAYS = 10
+# P0-6③：日线复权口径 —— 远端 fetch_daily_kline 默认 qfq（base.py / fallback.py 签名默认，
+# 调用方不传 adjust 即为 qfq）；本地仓库口径元数据由 kline_store.series_adjust 给出
+# （kline_ingest 可能落 "none" 当日不复权快照）。同一票的 close 序列必须单一口径，
+# 否则「目标日 close / 快照日 close - 1」在除权日会凭空多出/少掉一块，前瞻收益与 IC 全部失真。
+# 校验口径不一致时分两级处理：本地不一致 → 不采用本地、回退远端 qfq 整段序列（不丢样本）；
+# 远端返回的也是异口径 → 该票整票弃用：宁可缺样本，不用错样本。
+KLINE_ADJUST = "qfq"
+# P0-7：IC 样本口径净化 —— 脏样本同时污染 IC 与全市场分位数的可比性，宁缺勿错。
+_NEW_STOCK_BARS = 5               # 新股上市前 5 个交易日无涨跌幅限制，样本特性与全市场不可比
+_ST_KEYWORDS = ("ST", "退")        # 名称含 ST/*ST（风险警示）与「退」（退市整理期）→ 整票剔除
 # 落库重试：一次 DB 抖动（TiDB Serverless 实测会瞬时超时）不得让 75 分钟采集作废；
 # 超窗仍失败则把整批落盘（PERSIST_FALLBACK_DIR），由 scripts/persist_factor_ic_fallback.py 补交。
 PERSIST_RETRY_TIMES = 4
@@ -166,11 +176,97 @@ def _shift_date(date: str, days: int) -> str:
     return (datetime.strptime(str(date)[:10], "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
+def _local_adjust(code: str) -> str:
+    """本地日线序列的复权口径元数据（P0-6③）；读不到返回 ""（未知），绝不编造口径。
+
+    替身仓库/老库没有 series_adjust 时返回 ""，调用方按「未知不拦截」处理。
+    """
+    reader = getattr(kline_store, "series_adjust", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(reader(code) or "").strip()
+    except Exception:  # noqa: BLE001 口径探测失败按未知处理，不影响主链路
+        return ""
+
+
+def _frame_adjust(frame) -> str:
+    """frame 自带的口径元数据（P0-6③）：单一口径返回该值，"mixed" 表示区间内混用，读不到 ""。
+
+    远端源目前不返回 adjust 列 → 返回 ""，按 KLINE_ADJUST 默认口径处理（不编造）。
+    """
+    if frame is None or not hasattr(frame, "columns") or "adjust" not in frame.columns:
+        return ""
+    values = {str(value or "").strip() for value in frame["adjust"].tolist()}
+    values.discard("")
+    if not values:
+        return ""
+    return values.pop() if len(values) == 1 else "mixed"
+
+
+def _bar_num(bar, key: str) -> float | None:
+    """bar（Series/dict）中某列的数值；缺列/NaN/非映射对象一律返回 None。"""
+    try:
+        return num(bar.get(key))
+    except Exception:  # noqa: BLE001 缺列或非映射对象视为缺失
+        return None
+
+
+def _is_suspended_bar(bar, has_amount: bool, prev_close: float | None = None) -> bool:
+    """停牌/占位 bar 判定（P0-7a）：量能为 0/NaN，或完全无量且收盘与前收相同。
+
+    停牌日部分源会补一根「收盘照抄前收、volume/amount 为 0 或空」的占位行：用它算前瞻
+    收益会得到 0（假样本），作为目标日又根本不可成交（forward_return 不可实现）。列缺失
+    （如本地仓库 frame 无 amount）时不按该列判停牌，避免误杀正常样本。
+    """
+    volume = _bar_num(bar, "volume")
+    if volume is not None and volume <= 0:
+        return True
+    if has_amount:
+        amount = _bar_num(bar, "amount")
+        if amount is not None and amount <= 0:
+            return True
+    if volume is None and prev_close is not None:
+        close = _bar_num(bar, "close")
+        return close is not None and close == prev_close
+    return False
+
+
+def _is_limit_board(bar) -> bool:
+    """一字板判定（P0-7b）：全天唯一成交价（high == low == close）→ 买卖均不可成交。
+
+    只认「high==low 且收盘就在该价」：high==low 而 close 不等于该价属占位/脏数据
+    （由停牌与 NaN 规则处理），据此拦截会误杀正常样本。
+    """
+    high, low, close = _bar_num(bar, "high"), _bar_num(bar, "low"), _bar_num(bar, "close")
+    if high is None or low is None or close is None:
+        return False
+    return high == low == close
+
+
+def select_st_codes(universe) -> set[str]:
+    """全市场快照 → ST/退市整理期代码集合（P0-7d），代码归一化口径与 select_universe_codes 一致。
+
+    name 列缺失（部分降级快照只有 code）时返回空集：宁可少排除也不误杀，不编造名称。
+    """
+    if universe is None or not hasattr(universe, "columns"):
+        return set()
+    if "name" not in universe.columns or "code" not in universe.columns:
+        return set()
+    excluded = set()
+    for code, name in zip(universe["code"], universe["name"]):
+        text = str(name or "").upper()
+        if any(keyword in text for keyword in _ST_KEYWORDS):
+            excluded.add(str(code).strip().zfill(6))
+    return excluded
+
+
 def _local_kline(code: str, start: str, end: str):
     """本地日线仓库优先：仅当 [start, end] 首尾均被覆盖时采用，否则返回 None 由调用方回退远端。
 
     覆盖容差见 LOCAL_KLINE_*：用以区分「回补未完成」与「该票本就短历史」——新股/长期停牌会判为
     未覆盖而回退远端。宁慢不错：绝不用半段历史算 IC。
+    P0-6③：还要求本地口径与远端默认 KLINE_ADJUST(qfq) 一致，不一致同样不采用本地。
     """
     try:
         frame = kline_store.load_frame(code, start, end)
@@ -186,6 +282,14 @@ def _local_kline(code: str, start: str, end: str):
     tail = min(str(end)[:10], datetime.now().strftime("%Y-%m-%d"))
     if dates[-1] < _shift_date(tail, -LOCAL_KLINE_LAST_TOLERANCE_DAYS):
         return None
+    # P0-6③：load_frame 只保证「区间内不混口径」，不保证与远端默认同口径 —— 本地若是
+    # "none"（当日不复权快照）序列，除权日 close 会跳空，与其余走远端 qfq 的票不可比。
+    # 口径不一致则不采用本地序列，由调用方回退远端 qfq（不丢样本；远端也异口径才整票弃用）。
+    local_adjust = _local_adjust(code)
+    if local_adjust and local_adjust != KLINE_ADJUST:
+        logger.warning("本地日线口径 %s != 远端默认 %s，%s 不采用本地序列（P0-6③）",
+                       local_adjust, KLINE_ADJUST, code)
+        return None
     return frame
 
 
@@ -193,7 +297,14 @@ def _warm_local(code: str, kline) -> None:
     """把远端取到的日K回写本地仓库（best-effort）：首轮付远端成本，后续轮次直接走本地。
 
     只写 qfq 口径（与 fetch_daily_kline 默认口径一致）；本地加速失败绝不影响回测结果。
+    P0-6③：本地已存异口径序列时跳过回写 —— 否则会把本地库搅成 mixed_adjust
+    （load_frame 之后直接抛 MixedAdjustError，本地加速通道整条失效）。
     """
+    local_adjust = _local_adjust(code)
+    if local_adjust and local_adjust != KLINE_ADJUST:
+        logger.warning("本地 %s 已存 %s 口径，跳过 qfq 回写（P0-6③，避免混口径）",
+                       code, local_adjust)
+        return
     try:
         rows = []
         for rec in kline.to_dict("records"):
@@ -212,11 +323,15 @@ def _warm_local(code: str, kline) -> None:
 
 def collect_month_records(source, month_ends: list[str], codes: list[str],
                           budget_seconds: float | None = COLLECT_BUDGET_SECONDS,
-                          stats: dict | None = None) -> dict[str, list[dict]]:
+                          stats: dict | None = None,
+                          exclude_codes=None) -> dict[str, list[dict]]:
     """stats 为可选出参：回填 attempted / budget_exhausted / elapsed，供调用方判断是否采满。
 
     采集按票并发（COLLECT_WORKERS）：只并行「票与票之间」，票内 4 次外呼顺序与产物不变；
     本地日线仓库覆盖区间时优先读本地（kline_store），否则回退远端。
+
+    exclude_codes（可选，P0-7d）：整票剔除的代码集合（ST/退市整理期）。默认 None =
+    不排除任何票，既有调用方与返回结构（{月份: [样本]}）完全不变。
     """
     records = {d[:7]: [] for d in month_ends}
     if stats is not None:
@@ -224,6 +339,11 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
         stats["attempted"] = 0
     if not month_ends or not codes:
         return records
+    # P0-7d：ST/退市整理期混入全市场 IC 样本会污染口径（涨跌幅限制与退市博弈特性都不同），
+    # 在开票前整票剔除 —— 既不浪费外呼预算，也不产生样本。归一化口径与 select_universe_codes 一致。
+    excluded = {str(code).strip().zfill(6) for code in (exclude_codes or ()) if str(code).strip()}
+    if excluded:
+        codes = [code for code in codes if str(code).strip().zfill(6) not in excluded]
     started = time.monotonic()
     deadline = started + budget_seconds if budget_seconds else None
     start = (datetime.strptime(month_ends[0], "%Y-%m-%d") - timedelta(days=45)).strftime("%Y-%m-%d")
@@ -241,9 +361,18 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
                 return
             state["attempted"] += 1
         try:
+            # P0-6③：本地序列若是异口径（如 "none" 当日不复权快照），_local_kline 会返回 None，
+            # 于是这里自动回退远端 qfq 整段序列（时间成本换正确性，不丢样本 —— kline_ingest
+            # 落的当日快照口径本就是 "none"，直接整票弃用会让本地覆盖票样本量掉到 0）；
+            # _warm_local 同时拒绝回写，避免把本地库搅成 mixed_adjust（那会让本地通道整体报废）。
             kline = _local_kline(code, start, end)
             if kline is None:
                 kline = source.fetch_daily_kline(code, start, end)
+                remote_adjust = _frame_adjust(kline)
+                if remote_adjust not in ("", KLINE_ADJUST):
+                    logger.warning("远端日线口径 %s != %s，%s 整票弃用（P0-6③）",
+                                   remote_adjust, KLINE_ADJUST, code)
+                    return
                 if kline is not None and not kline.empty:
                     _warm_local(code, kline)  # 首轮回写本地，下一轮同票即走本地序列
             if kline is None or kline.empty or not {"date", "close"}.issubset(kline.columns):
@@ -256,17 +385,36 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
                    "fund_flow": _fetch_once(source, "fetch_fund_flow", code),
                    "news": _fetch_once(source, "fetch_news", code)}
             rows: list[tuple] = []
+            has_amount = "amount" in kline.columns
             for snapshot in month_ends:
                 hits = kline.index[kline["date"].astype(str).str[:10] == snapshot].tolist()
                 if not hits or hits[0] + FORWARD_DAYS >= len(kline):
                     continue
                 i = hits[0]
+                # P0-7c：上市初期（序列前 _NEW_STOCK_BARS 根）无涨跌幅限制，样本特性与全市场不可比
+                if i < _NEW_STOCK_BARS:
+                    continue
+                bar, target = kline.iloc[i], kline.iloc[i + FORWARD_DAYS]
+                # P0-7a/b：快照 bar 与目标 bar 都必须可成交 —— 停牌占位行/一字板任一命中即丢
+                # 该样本；目标日不可成交时前瞻收益根本不可实现，留着就是假样本（会拉低/抬高 IC）。
+                if _is_suspended_bar(bar, has_amount, _bar_num(kline.iloc[i - 1], "close")):
+                    continue
+                if _is_limit_board(bar):
+                    continue
+                if _is_suspended_bar(target, has_amount,
+                                     _bar_num(kline.iloc[i + FORWARD_DAYS - 1], "close")):
+                    continue
+                if _is_limit_board(target):
+                    continue
                 close, future = num(kline.iloc[i]["close"]), num(kline.iloc[i + FORWARD_DAYS]["close"])
                 if close in (None, 0) or future is None:
                     continue
                 history = kline.iloc[:i + 1]
+                # P0-6④：把快照日作为 as_of 传给 adapter —— 财报/资金流取用叠加披露滞后约束，
+                # 只能用「当时市场已看到」的那一期；不传 as_of 的线上路径行为不变。
                 adapter = DataAdapter(source=source, code=code, kline=history, indicators={
-                    "latest_close": close, "ma20": history["close"].tail(20).mean() if i >= 19 else None}, **aux)
+                    "latest_close": close, "ma20": history["close"].tail(20).mean() if i >= 19 else None},
+                    extra={"as_of": snapshot}, **aux)
                 values = {}
                 for definition in definitions:
                     try:
@@ -397,8 +545,11 @@ def run_factor_ic_backtest_job(months: int = 36) -> dict:
     codes: list[str] = []
     try:
         ends = _month_ends(source.fetch_trade_calendar(), months)
-        codes = select_universe_codes(source.fetch_spot_universe())
-        records = collect_month_records(source, ends, codes, COLLECT_BUDGET_SECONDS, stats=stats)
+        universe = source.fetch_spot_universe()
+        codes = select_universe_codes(universe)
+        # P0-7d：ST/退市整理期整票剔除出 IC 样本（全市场分位数侧不属本仓库，见交付报告）
+        records = collect_month_records(source, ends, codes, COLLECT_BUDGET_SECONDS, stats=stats,
+                                        exclude_codes=select_st_codes(universe))
         if not any(records.values()):  # 零采集早退：零样本批次不得写入 factor_ic_history
             logger.warning("因子 IC 回测零采集：股票池 %d 只、期次 %d 个，跳过回测与落库",
                            len(codes), len(ends))

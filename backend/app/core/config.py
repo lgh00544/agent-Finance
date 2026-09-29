@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     auth_session_ttl_hours: int = 24
     auth_default_username: str = "legacy"
     auth_default_password: str = ""
+    # M14：自助注册门槛（两项默认全关 = 与旧行为完全一致，既有测试语义不变）
+    register_invite_code: str = ""            # REGISTER_INVITE_CODE：非空时注册必须携带匹配邀请码，否则 403
+    register_require_approval: bool = False   # REGISTER_REQUIRE_APPROVAL：true 时新用户 is_active=False，待管理员审核
     redis_namespace: str = "stock-agent"
     scheduler_leader_ttl_seconds: int = 90
     scheduler_leader_renew_seconds: int = 30
@@ -52,6 +55,7 @@ class Settings(BaseSettings):
     mysql_user: str = "root"
     mysql_root_password: str = "change_me"
     mysql_database: str = "stock"
+    mysql_ssl: bool = True  # TiDB Serverless 强制 TLS；本地 MySQL 设 MYSQL_SSL=0 关闭
 
     # ---------- DB 容灾（云端优先，连不上自动落本地）----------
     # DB_BACKEND=mysql 时启动先探测云端；不可达则自动改用本地 SQLite，保证服务不因
@@ -60,6 +64,12 @@ class Settings(BaseSettings):
     db_fallback_to_sqlite: bool = True
     db_probe_timeout_s: int = 5           # 单次云端连接探测超时（秒）
     db_probe_attempts: int = 2            # 探测尝试次数（TiDB Serverless 冷启可能较慢）
+    # M12：连接池容量（原用 QueuePool 默认 pool_size=5/max_overflow=10，撑不住
+    # 信号扫描 8 线程 + APScheduler 多任务并发；溢出连接被丢弃 → QueuePool limit reached）
+    db_pool_size: int = 20                # 常驻连接数
+    db_max_overflow: int = 20             # 突发可临时超出的连接数（池上限 = 40）
+    db_pool_timeout: int = 30             # 取连接最长等待秒数（等待而非立即报错）
+    db_pool_recycle: int = 1800           # 连接回收秒数（仅 MySQL/TiDB，防 wait_timeout 断连）
 
     # ---------- Redis（CACHE_BACKEND=redis 时生效）----------
     redis_host: str = "127.0.0.1"

@@ -3,7 +3,14 @@ ORM 模型 - MySQL8 / SQLite 共用同一套模型
 JSON 字段用 Text 存储（SQLAlchemy JSON 在 SQLite/MySQL 均可，但 MySQL 原生 JSON 列
 对 SQLAlchemy 2.0 友好；统一用 JSON 类型，SQLite 自动映射为 TEXT）。
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# M16：全库时间列都是 naive DateTime，而调度（cron 按北京时间）、行情（交易所时间）
+# 与前端展示全部按 Asia/Shanghai（UTC+8）口径。原 `datetime.now()` 取服务器本地时区，
+# 容器 TZ=UTC 时落库时间整体偏早 8 小时（与行情/调度对不上）。
+# 这里显式取 UTC+8 后 **去掉 tzinfo**，保持 naive DateTime 列契约不变
+# （给 MySQL DATETIME / SQLite 交 aware datetime 会被静默截断或报错，代价更大）。
+_CN_TZ = timezone(timedelta(hours=8))
 
 from sqlalchemy import (
     JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint,
@@ -34,7 +41,8 @@ class Base(DeclarativeBase):
 
 
 def _now() -> datetime:
-    return datetime.now()
+    """当前北京时间（naive，UTC+8）：与调度/行情/展示口径一致（M16）。"""
+    return datetime.now(_CN_TZ).replace(tzinfo=None)
 
 
 class User(Base):
