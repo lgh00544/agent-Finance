@@ -88,3 +88,7 @@ _sp*.txt
 # 数据库连接探针与其输出（含 TiDB 明文口令）
 .workbuddy/batch*_rootcause_*/db_live.py
 .workbuddy/batch*_rootcause_*/_db_live_check.txt
+
+# ===== 修复备份（2026-09-28/29 追加：*.bak-日期 命名，严禁入库）=====
+*.bak-*
+
