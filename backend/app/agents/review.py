@@ -4,6 +4,7 @@ ReviewAgent 卖出复盘 - LangGraph 节点
 【交由模型推理的业务逻辑】逻辑兑现度对比、盈亏归因、经验教训、筛选偏好微调（全部在 LLM）
 流转：collect_review → llm_review；建议驳回后由 llm_rethink_suggestion 驱动重思考迭代
 """
+from app.core import clock
 import logging
 import json
 import time
@@ -94,14 +95,17 @@ def collect_review(state: StockAgentState) -> StockAgentState:
 
         hold_days = (_d(sells[-1].trade_date) - _d(buys[0].trade_date)).days
         sell_amount = sum(t.amount for t in sells)
-        cost = holding.cost
-        if holding.status == "exited" and cost and cost > 0:
-            pnl_pct = round((sell_amount - cost) / cost * 100, 2)
+        # S-5：分母用「生命周期总成本」cost_basis_initial。holding.cost 现在只等于
+        # 当前未卖部分的成本（减仓后变小），用它算整段交易收益会严重高估——
+        # 所以非 exited 分支也必须走同一口径；仅在生命周期成本缺失时才回退 Σ买。
+        basis = getattr(holding, "cost_basis_initial", None) or holding.cost
+        if basis and basis > 0:
+            pnl_pct = round((sell_amount - basis) / basis * 100, 2)
         else:
             buy_amount = sum(t.amount for t in buys)
             if buy_amount > 0:
                 pnl_pct = round((sell_amount - buy_amount) / buy_amount * 100, 2)
-                pnl_caliber = "（cost 缺失，回退 Σ卖−Σ买 口径）"
+                pnl_caliber = "（生命周期成本缺失，回退 Σ卖−Σ买 口径）"
 
     plan = repo.get_plan(getattr(holding, "plan_id", None))
     plan_binding = "holding.plan_id" if plan is not None else "missing"
@@ -267,7 +271,7 @@ def llm_review(state: StockAgentState) -> StockAgentState:
     name = state.get("stock_name") or code
     # 复盘的业务日期必须来自事实包的最后卖出日；任务提交日期只是调度元数据。
     exit_date = str((data.get("holding") or {}).get("exit_date") or
-                    state.get("trade_date") or time.strftime("%Y-%m-%d"))[:10]
+                    state.get("trade_date") or clock.today())[:10]
 
     existing = repo.get_review_for_holding_exit(state["holding_id"], exit_date)
     if existing is not None:
@@ -382,7 +386,7 @@ def llm_rethink_suggestion(review_id: int, reject_reason: str) -> dict:
 
 
 def _today() -> str:
-    return time.strftime("%Y-%m-%d")
+    return clock.today()
 
 
 def paper_review_cycle(facts: dict) -> dict:

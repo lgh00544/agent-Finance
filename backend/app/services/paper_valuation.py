@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from app.core import clock
 import logging
 import math
 import time
@@ -78,14 +79,14 @@ def refresh_account(account_id: int) -> dict:
     codes = [str(row.get("stock_code") or "") for row in positions if row.get("stock_code")]
     if not codes:
         return {"account_id": account_id, "source": "none", "rows": 0,
-                "quote_time": time.strftime("%Y-%m-%d %H:%M:%S"), "errors": []}
+                "quote_time": clock.now_str(), "errors": []}
     try:
         quotes, errors = fetch_quotes(codes)
     except Exception as exc:  # noqa: BLE001
         logger.warning("模拟行情数据源初始化失败: %s", exc)
         quotes, errors = {}, [str(exc)[:200]]
 
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    now = clock.now_str()
     sources = sorted({str(q.get("source") or "unknown") for q in quotes.values()})
     source = sources[0] if len(sources) == 1 else "mixed" if sources else "none"
 

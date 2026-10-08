@@ -4,6 +4,7 @@ MonitorAgent 持仓监控 - LangGraph 节点（每持仓执行一次）
 【交由模型推理的业务逻辑】趋势破坏/支撑压力/突发利空识别、持有/减仓/清仓建议（全部在 LLM）
 流转：collect_quote → llm_signal → push_alert
 """
+from app.core import clock
 import logging
 import time
 
@@ -19,6 +20,7 @@ from app.db import repo
 from app.db.models import Holding
 from app.graph.state import StockAgentState
 from app.services.feishu import push_alert
+from app.services import kline_store
 from app.services.indicator import compute_indicators
 from app.agents.portfolio_sentinel import read_portfolio_overview
 
@@ -36,10 +38,21 @@ def collect_quote(state: StockAgentState) -> StockAgentState:
     """
     code = state["stock_code"]
     source = get_datasource()
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
 
-    kline = source.fetch_daily_kline(code, _days_ago(30), today)
-    indicators = compute_indicators(kline)
+    indicators: dict = {}
+    # A-19/E-6 复权门禁：本地日线池若混口径（qfq/none 并存）会抛 MixedAdjustError，
+    # 指标层宁可降级也不可用被污染的 MA/MACD 参与研判；实时价照常聚合，显式标注降级原因。
+    indicator_error = None
+    try:
+        kline = source.fetch_daily_kline(code, _days_ago(30), today)
+        indicators = compute_indicators(kline)
+    except kline_store.MixedAdjustError as exc:  # noqa: BLE001 复权漂移：指标不可用，降级不阻塞监控
+        indicator_error = "复权口径漂移（MixedAdjustError）：%s" % exc
+        logger.warning("监控指标降级（复权门禁）%s: %s", code, exc)
+    except Exception as exc:  # noqa: BLE001 日线/指标异常：降级不阻塞监控
+        indicator_error = "指标不可用：%s" % exc
+        logger.warning("监控指标计算失败（降级）%s: %s", code, exc)
 
     batch_quote = (state.get("batch_quotes") or {}).get(code)
     if batch_quote and batch_quote.get("price") is not None:
@@ -47,6 +60,8 @@ def collect_quote(state: StockAgentState) -> StockAgentState:
         quote, stale = batch_quote, False
     else:
         quote, stale = _fetch_realtime_quote(source, code, indicators)
+    if isinstance(quote, dict) and indicator_error:
+        quote["indicator_error"] = indicator_error
     # 移动止盈线（批次1）：持仓期最高价跟踪 + 止盈线计算（纯数学，判断在 LLM；失败降级不阻塞）
     _attach_trailing_stop(quote, state)
     state["real_time"] = quote
@@ -142,7 +157,7 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
     """节点2：LLM 信号研判"""
     code = state["stock_code"]
     name = state.get("stock_name") or code
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
     holding = repo.get_holding(state["holding_id"]) if state.get("holding_id") else None
 
     if holding is None:
@@ -215,7 +230,7 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
         f"{n.get('published_at')} {n.get('title')}" for n in (state.get("news_report") or [])) or "（无）"
 
     # 盘中监控 LLM 调用节流（短 TTL 缓存，与监控频率同节奏）
-    cache_key = f"{code}:{today}:{time.strftime('%H')}"
+    cache_key = f"{code}:{today}:{clock.now().strftime('%H')}"
     try:
         output = agent_call(
             agent="monitor",
@@ -235,7 +250,7 @@ def llm_signal(state: StockAgentState) -> StockAgentState:
     # 批4-B 高危复核：仅 agentic_enable 且 LIGHT 判出高危时升级走 ReAct 环核验（info 零额外成本）
     if settings.agentic_enable and output.severity in ("warning", "critical"):
         _recheck_out, _recheck_trace = agentic_call(
-            agent="monitor", cache_key=f"{code}:{today}:{time.strftime('%H')}:agentic",
+            agent="monitor", cache_key=f"{code}:{today}:{clock.now().strftime('%H')}:agentic",
             system_prompt=_AGENTIC_TOOL_NOTE + monitor_prompt.SYSTEM_PROMPT,
             user_prompt=monitor_prompt.build_user_prompt(
                 holding_info, _compact(quote_data), news_context),
@@ -282,7 +297,7 @@ def push_alert_node(state: StockAgentState) -> StockAgentState:
     """节点3：告警去重 + 飞书推送 + 落库【刚性代码逻辑】"""
     code = state["stock_code"]
     name = state.get("stock_name") or code
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
     signal = state.get("holding_signal") or {}
 
     if not signal:
@@ -342,7 +357,7 @@ def _compact(data) -> str:
 def _days_ago(n: int) -> str:
     import datetime
 
-    return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
+    return (clock.today_date() - datetime.timedelta(days=n)).isoformat()
 
 
 def paper_monitor_position(position: dict, quote: dict, context: dict) -> dict:

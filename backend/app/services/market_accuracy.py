@@ -7,6 +7,7 @@
 基准固定沪深300（东财 stock_zh_index_daily_em 接口，secid 需带交易所前缀 sh000300）。
 失败/缺数据逐行跳过，不报错不阻塞；幂等由 next_day_index_pct IS NULL 查询条件保证。
 """
+from app.core import clock
 import logging
 import time
 from datetime import datetime, timedelta
@@ -23,7 +24,7 @@ _BENCH_NAME = "沪深300"
 
 
 def _today() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return clock.now().strftime("%Y-%m-%d")
 
 
 def collect_unfilled_market_conditions() -> list[dict]:

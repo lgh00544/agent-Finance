@@ -4,6 +4,7 @@ ScoreAgent 六因子透明评分 - LangGraph 节点
 【交由模型推理的业务逻辑】六因子评分、A/B/C 分级、潜力标识、交叉验证、风险清单（全部在 LLM）
 流转：collect_data → llm_score
 """
+from app.core import clock
 import json
 import logging
 import time
@@ -100,7 +101,7 @@ def collect_data(state: StockAgentState) -> StockAgentState:
     """节点1：聚合个股全部原始数据【刚性代码逻辑】"""
     code = state["stock_code"]
     source = get_datasource()
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
 
     # 行情与指标
     kline = source.fetch_daily_kline(code, _days_ago(_KLINE_DAYS), today)
@@ -283,7 +284,7 @@ def llm_score(state: StockAgentState) -> StockAgentState:
     """节点2：LLM 六因子透明评分 + 落库"""
     code = state["stock_code"]
     name = state.get("stock_name") or code
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
 
     preference = repo.get_latest_preference()
     preference_text = ""
@@ -308,7 +309,8 @@ def llm_score(state: StockAgentState) -> StockAgentState:
         "cycle_attribution": state.get("cycle_attribution"),
     }
 
-    score_cache_key = f"{code}:{today}:v4:f{FACTOR_REGISTRY_VERSION}:h{repo.hot_money_fingerprint()}"
+    # P-11（F-6）：缓存指纹用运行期因子注册表真实状态，而非静态版本常量 —— 人工拍板改状态/权重即失效重建
+    score_cache_key = f"{code}:{today}:v4:f{factor_registry.fingerprint()}:h{repo.hot_money_fingerprint()}"
     score_user_prompt = score_prompt.build_user_prompt(
         _compact(data_pack), preference_text,
         discover_context=state.get("discover_context") or "",
@@ -391,4 +393,4 @@ def _compact(data: dict) -> str:
 def _days_ago(n: int) -> str:
     import datetime
 
-    return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
+    return (clock.today_date() - datetime.timedelta(days=n)).isoformat()

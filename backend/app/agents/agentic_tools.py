@@ -5,6 +5,7 @@ TOOLS(OpenAI function schema) + TOOL_FUNCS(name -> 可调用只读函数) 分离
 """
 from __future__ import annotations
 
+from app.core import clock
 import math
 import json
 import time
@@ -49,7 +50,7 @@ def _get_quote(code: str) -> dict:
 
 def _get_daily_kline(code: str, days: int = 30) -> dict:
     ds = get_datasource()
-    end = date.today()
+    end = clock.today_date()
     start = end - timedelta(days=int(days) * 2 + 10)
     df = ds.fetch_daily_kline(code, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
     if df is None or df.empty:
@@ -96,7 +97,7 @@ def _search_knowledge(code: str, query: str, top_k: int = 5) -> dict:
 
 
 def _get_sector_regime(trade_date: str = "") -> dict:
-    d = trade_date or time.strftime("%Y-%m-%d")
+    d = trade_date or clock.today()
     row = repo.get_sector_regime_forecast(d)
     return {"regime": row} if row else {"regime": None, "note": "no_data", "trade_date": d}
 
@@ -111,13 +112,13 @@ def _get_factor_calibration(period: str = "t5") -> dict:
 def _get_distribution_phase(code: str, trade_date: str = "") -> dict:
     from app.services import distribution_phase
 
-    d = trade_date or time.strftime("%Y-%m-%d")
+    d = trade_date or clock.today()
     result = distribution_phase.compute_distribution_phase(code, d)
     return {"stock_code": code, "trade_date": d, "distribution_phase": result}
 
 
 def _get_capital_view(code: str, trade_date: str = "") -> dict:
-    d = trade_date or time.strftime("%Y-%m-%d")
+    d = trade_date or clock.today()
     raw = cache.get(f"capital_view:{d}:{code}")
     if raw:
         try:
@@ -166,7 +167,7 @@ def _get_position_risk(code: str = "") -> dict:
 def _get_hot_money_context(code: str, stock_name: str = "", trade_date: str = "") -> dict:
     from app.services import hot_money
 
-    d = trade_date or time.strftime("%Y-%m-%d")
+    d = trade_date or clock.today()
     agg = hot_money.aggregate_for_stock(code, stock_name, d, trace=False)
     text = hot_money.build_hot_money_context({code: agg}, d) if agg else ""
     return {"stock_code": code, "trade_date": d, "aggregate": agg,

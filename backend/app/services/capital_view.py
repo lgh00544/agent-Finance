@@ -10,6 +10,7 @@ Schema: {recent_actors, coordination, wash_suspect, stats_30d, theme_resonance,
 - 未知营业部不硬绑席位映射 → 不入 recent_actors，留给 LLM 研判占位（铁律4）。
 结果 86400s 缓存（SimpleCache.get_or_set），force 由路由删键击穿。
 """
+from app.core import clock
 import json
 import logging
 import time
@@ -89,8 +90,8 @@ def _flows_for_stock(stock_code: str) -> list:
 def _kline(code: str) -> list:
     """日K → [(date, close)] 升序；空/异常返回 []"""
     try:
-        start = (datetime.now() - timedelta(days=_FETCH_DAYS + 30)).strftime("%Y-%m-%d")
-        k = get_datasource().fetch_daily_kline(code, start, time.strftime("%Y-%m-%d"))
+        start = (clock.now() - timedelta(days=_FETCH_DAYS + 30)).strftime("%Y-%m-%d")
+        k = get_datasource().fetch_daily_kline(code, start, clock.today())
         rows = []
         for _, r in k.iterrows():
             try:
@@ -269,7 +270,7 @@ def _dragon_tiger_rows(flows: list, trade_date: str) -> list:
 
 def compute_capital_view(stock_code: str, trade_date: str | None = None) -> dict:
     """资本视图主入口：三维 + stats 计算 → 4 表落库 → 返回（86400s 缓存；force 路由删键）。"""
-    trade_date = trade_date or time.strftime("%Y-%m-%d")
+    trade_date = trade_date or clock.today()
     return SimpleCache().get_or_set(
         f"capital_view:{trade_date}:{stock_code}", _TTL,
         lambda: _compute(stock_code, trade_date))

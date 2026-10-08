@@ -34,7 +34,8 @@ SYSTEM = """你是一名 A 股板块启动归因分析师。给定某板块当�
   "falsification": {
     "t1_invalid_if": ["T+1 失效条件"],
     "t3_invalid_if": ["T+3 失效条件"],
-    "t5_invalid_if": ["T+5 失效条件"]
+    "t5_invalid_if": ["T+5 失效条件"],
+    "falsification_triggered": false
   }
 }
 铁律（K227 数据纪律）：
@@ -44,7 +45,9 @@ SYSTEM = """你是一名 A 股板块启动归因分析师。给定某板块当�
 - causal_chain 每条 evidence_keys 必须引用给定证据 JSON 内的真实字段名；没有可回指证据时不要写 verified_cause；
 - 时间不明确用 unknown；长期政策只能用 background_support，不得写成当日直接催化；
 - 没有消息/政策/产业证据时，不能把资金上涨写成基本面原因；
-- 仅基于给定证据做归因，禁止 hallucination；reason_chain 至少 1 条，causal_chain 可为空。"""
+- 仅基于给定证据做归因，禁止 hallucination；reason_chain 至少 1 条，causal_chain 可为空；
+- falsification_triggered 只有在「上述反证条件已由给定证据明确证实」时才置 true，
+  条件文本非空不代表已触发；无法判断时一律 false（下游只按该布尔决定是否降级前瞻）。"""
 
 
 def build_prompt(evidence: dict) -> str:

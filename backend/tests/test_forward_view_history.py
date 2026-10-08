@@ -124,7 +124,7 @@ def test_compute_forward_view_accuracy():
                ("620004", "强", "wrong"), ("620005", "弱", "correct"),
                ("620006", "弱", "neutral"), ("620007", "弱", "neutral")]
     for code, view, bucket in buckets:
-        rid = repo.upsert_forward_view(code, "2026-08-20", view, {})
+        rid = repo.upsert_forward_view(code, "2026-10-02", view, {})
         repo.update_forward_view_actual(rid, 1.0 if bucket == "correct" else 5.0, bucket)
     stats = fvh.compute_recent_forward_view_accuracy(lookback_days=30)
     assert stats["strong_n"] == 4 and stats["strong"] == 0.75
@@ -149,7 +149,7 @@ def test_get_forward_calibration_text_no_samples():
 
 def test_get_forward_calibration_text_with_data():
     """有样本 → 文本含 前瞻强/弱 准确率与样本数"""
-    rid = repo.upsert_forward_view("630001", "2026-08-20", "强", {})
+    rid = repo.upsert_forward_view("630001", "2026-10-02", "强", {})
     repo.update_forward_view_actual(rid, 5.0, "correct")
     text_val = fvh.get_forward_calibration_text(lookback_days=30)
     assert "前瞻强 准确率 100%" in text_val and "（1 样本）" in text_val
@@ -162,7 +162,7 @@ def test_score_prompt_forward_section_injects():
     from agent_prompts import score_prompt
     out_empty = score_prompt.build_user_prompt('{"k": 1}', '')
     assert "前瞻先验校准" in out_empty and "样本不足" in out_empty  # 缺样本不编造
-    rid = repo.upsert_forward_view("650001", "2026-08-20", "强", {})
+    rid = repo.upsert_forward_view("650001", "2026-10-02", "强", {})
     repo.update_forward_view_actual(rid, 5.0, "correct")
     cache.delete("forward:calibration:30")  # 清 TTL 缓存使统计重算（否则读到上一步缓存）
     out_full = score_prompt.build_user_prompt('{"k": 1}', '')

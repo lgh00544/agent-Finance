@@ -17,6 +17,21 @@ ROOT_DIR = Path(__file__).resolve().parents[2]  # backend/
 PROJECT_DIR = ROOT_DIR.parent                     # D:\self
 FACTOR_REGISTRY_VERSION = "v1"
 
+# ==================== L0 风控红线常量（唯一源；业务模块禁止再定义字面量） ====================
+# S-4：修复前 C1/C2 在不同模块指向互相矛盾的测量对象（take_profit/plan_quant 的
+# 「C1 单票 30%」vs red_line_check/position 的「C1 单只占比 60%」）。这里按测量对象拆名，
+# 各计算模块一律 import 本处常量；本次只做「同名同源」，不改任何既有阈值数值。
+#   GRADE_POSITION_CAP        分级单票仓位上限（比例：A/B/C）
+#   C1_CONCENTRATION_CAP      单只占总资产上限（%，集中度告警线）
+#   C2_TOTAL_POSITION_CAP     总仓位上限（%）
+#   C2_INTRADAY_DRAWDOWN_PCT  单票日内回撤触发线（%，相对成本）
+#   C3_STOP_FACTOR            C3 硬止损系数（止损 = 成本 × 该系数）
+GRADE_POSITION_CAP: dict[str, float] = {"A": 0.30, "B": 0.20, "C": 0.10}
+C1_CONCENTRATION_CAP: float = 60.0
+C2_TOTAL_POSITION_CAP: float = 60.0
+C2_INTRADAY_DRAWDOWN_PCT: float = 30.0
+C3_STOP_FACTOR: float = 0.92
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -48,6 +63,11 @@ class Settings(BaseSettings):
     # 高频读接口结果缓存（秒）：候选/评分/建仓/持仓/告警/复盘列表短缓存，
     # 写操作自动失效保证一致；设为 0 关闭（数据变更需即时可见的场景可关）
     db_query_cache_ttl: int = 60
+
+    # ---------- S-7 建仓链评分新鲜度 ----------
+    # 建仓只允许消费「不晚于 trade_date」且距今 ≤ N 个交易日的评分；超期降级为
+    # 「未评级」，禁止用陈旧评级为建仓计划背书（评分日期缺失时不判 stale，只记日志）。
+    score_freshness_max_trading_days: int = 3
 
     # ---------- MySQL（DB_BACKEND=mysql 时生效）----------
     mysql_host: str = "127.0.0.1"

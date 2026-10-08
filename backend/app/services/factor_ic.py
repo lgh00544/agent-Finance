@@ -21,7 +21,9 @@ except ImportError:
 from app.core.config import settings
 from app.datasource.base import DataSourceError
 from app.datasource.fallback import get_datasource
-from app.db.models import FactorIcHistory
+from app.db.models import FactorIcHistory, _now
+from app.db.repo import list_sector_daily_snapshot_on_or_before
+
 from app.db.session import SessionLocal
 from app.factors import factor_registry
 from app.factors.data_adapter import DataAdapter, num
@@ -107,7 +109,10 @@ def run_backtest(month_records: dict[str, list[dict]], definitions=None) -> list
         monthly = []
         for period in periods:
             rows = month_records[period]
-            values = [r.get("factor_values", {}).get(definition.id) for r in rows]
+            # S-9/F-9：负向因子（估值/负债率/拥挤度，direction=-1）对原始值取反后再算 IC，
+            # 保证「IC>0 即预示未来收益更高」方向一致；rank IC 对单调反转不变。
+            values = [num(v) * definition.direction if num(v) is not None else None
+                      for v in (r.get("factor_values", {}).get(definition.id) for r in rows)]
             returns = [r.get("forward_return") for r in rows]
             monthly.append({"period": period, "ic": calc_ic(values, returns),
                             "sample_size": sum(num(v) is not None and num(r) is not None
@@ -138,7 +143,7 @@ def run_backtest(month_records: dict[str, list[dict]], definitions=None) -> list
 
 def _month_ends(calendar: list[str], months: int) -> list[str]:
     # 交易日历含未来日期（如 2026-12-31），未来月份无行情可采，须先剔除再取最近 N 个月
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now().strftime("%Y-%m-%d")
     days = [value for value in sorted({str(item)[:10] for item in calendar}) if value <= today]
     if not days:
         return []
@@ -151,7 +156,12 @@ def _month_ends(calendar: list[str], months: int) -> list[str]:
 
 
 def select_universe_codes(universe, limit: int = UNIVERSE_LIMIT) -> list[str]:
-    """全市场快照 → 确定性抽样股票池：按代码排序等距取样，跨板块均匀且可复现。"""
+    """全市场快照 → 确定性抽样股票池：按代码排序等距取样，跨板块均匀且可复现。
+
+    S-9/F-3 局限声明：股票池取自「当前」全市场快照（无法回溯历史成分股），
+    退市/后期 ST 票不在快照内 —— 样本存在幸存者偏差，属数据源客观限制，
+    结果以 pool_basis=spot_snapshot 标注，不得当作无偏全市场结论使用。
+    """
     if universe is None or not hasattr(universe, "columns") or "code" not in universe.columns:
         return []
     codes = sorted({str(code).strip().zfill(6) for code in universe["code"].dropna()})
@@ -248,6 +258,9 @@ def select_st_codes(universe) -> set[str]:
     """全市场快照 → ST/退市整理期代码集合（P0-7d），代码归一化口径与 select_universe_codes 一致。
 
     name 列缺失（部分降级快照只有 code）时返回空集：宁可少排除也不误杀，不编造名称。
+
+    S-9/F-3 局限声明：ST 判定只能用「当前」快照名称；历史月份该票是否 ST 无法
+    回溯（名称会变化），存在近似偏差，与 select_universe_codes 的幸存者偏差同源。
     """
     if universe is None or not hasattr(universe, "columns"):
         return set()
@@ -279,7 +292,7 @@ def _local_kline(code: str, start: str, end: str):
     dates = [str(value)[:10] for value in frame["date"].tolist()]
     if dates[0] > _shift_date(start, LOCAL_KLINE_FIRST_TOLERANCE_DAYS):
         return None
-    tail = min(str(end)[:10], datetime.now().strftime("%Y-%m-%d"))
+    tail = min(str(end)[:10], _now().strftime("%Y-%m-%d"))
     if dates[-1] < _shift_date(tail, -LOCAL_KLINE_LAST_TOLERANCE_DAYS):
         return None
     # P0-6③：load_frame 只保证「区间内不混口径」，不保证与远端默认同口径 —— 本地若是
@@ -324,7 +337,8 @@ def _warm_local(code: str, kline) -> None:
 def collect_month_records(source, month_ends: list[str], codes: list[str],
                           budget_seconds: float | None = COLLECT_BUDGET_SECONDS,
                           stats: dict | None = None,
-                          exclude_codes=None) -> dict[str, list[dict]]:
+                          exclude_codes=None,
+                          extra_definitions=None) -> dict[str, list[dict]]:
     """stats 为可选出参：回填 attempted / budget_exhausted / elapsed，供调用方判断是否采满。
 
     采集按票并发（COLLECT_WORKERS）：只并行「票与票之间」，票内 4 次外呼顺序与产物不变；
@@ -348,8 +362,7 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
     deadline = started + budget_seconds if budget_seconds else None
     start = (datetime.strptime(month_ends[0], "%Y-%m-%d") - timedelta(days=45)).strftime("%Y-%m-%d")
     end = (datetime.strptime(month_ends[-1], "%Y-%m-%d") + timedelta(days=45)).strftime("%Y-%m-%d")
-    definitions = factor_registry.list_active()
-    sectors = _fetch_once(source, "fetch_industry_spot")  # 全市场板块：整跑共用一份
+    definitions = factor_registry.list_active() + list(extra_definitions or [])
     guard = threading.Lock()
     state = {"attempted": 0, "stopped": False}
 
@@ -380,7 +393,9 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
             kline = kline.sort_values("date").reset_index(drop=True)
             # 外挂数据每票只取一次（36 个月快照共用一份）；quote 置空：
             # 实时快照对历史月份属前视数据，且单次可达 88s（全市场快照兜底）。
-            aux = {"quote": {}, "sectors": sectors,
+            # S-9/F-2：sectors 不再整跑共用当日快照 —— 板块因子走 sector_daily_snapshot
+            # 历史（快照日 ≤ 月末的最近交易日），f22/f23/f25 无历史字段时诚实 data_missing。
+            aux = {"quote": {},
                    "financial": _fetch_once(source, "fetch_financial", code),
                    "fund_flow": _fetch_once(source, "fetch_fund_flow", code),
                    "news": _fetch_once(source, "fetch_news", code)}
@@ -412,9 +427,17 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
                 history = kline.iloc[:i + 1]
                 # P0-6④：把快照日作为 as_of 传给 adapter —— 财报/资金流取用叠加披露滞后约束，
                 # 只能用「当时市场已看到」的那一期；不传 as_of 的线上路径行为不变。
+                # S-9/F-2：sectors 注入该月历史板块快照（无历史则空表 → 板块因子 data_missing）。
+                # 板块快照属辅助数据：查询失败（表缺失/空库）只降级空表并告警，绝不因此整票丢样本。
+                try:
+                    sectors = list_sector_daily_snapshot_on_or_before(snapshot)
+                except Exception as _sec_exc:  # noqa: BLE001 辅助数据故障不致命
+                    logger.warning("板块历史快照查询失败(%s) 降级空表：%s", snapshot, _sec_exc)
+                    sectors = []
                 adapter = DataAdapter(source=source, code=code, kline=history, indicators={
                     "latest_close": close, "ma20": history["close"].tail(20).mean() if i >= 19 else None},
-                    extra={"as_of": snapshot}, **aux)
+                    extra={"as_of": snapshot},
+                    sectors=sectors, **aux)
                 values = {}
                 for definition in definitions:
                     try:
@@ -451,7 +474,7 @@ def _dump_persist_fallback(rows: list[dict], error: Exception | None) -> str:
         target_dir = Path(PERSIST_FALLBACK_DIR or settings.data_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         path = target_dir / ("factor_ic_persist_fallback_%s.json"
-                             % datetime.now().strftime("%Y%m%d_%H%M%S"))
+                             % _now().strftime("%Y%m%d_%H%M%S"))
         path.write_text(json.dumps({"error": str(error), "rows": rows}, ensure_ascii=False, default=str),
                         encoding="utf-8")
         logger.error("因子 IC 落库失败，已把 %d 行落盘待补交：%s", len(rows), path)
@@ -557,10 +580,21 @@ def run_factor_ic_backtest_job(months: int = 36) -> dict:
                     "max_sample": 0, "target_samples": COLLECT_TARGET_SAMPLES,
                     "budget_seconds": COLLECT_BUDGET_SECONDS,
                     "budget_exhausted": bool(stats.get("budget_exhausted")),
+                    "pool_basis": "spot_snapshot",
                     "sufficient": False, "error_kind": None, "skipped": True,
                     "reason": _job_reason(codes, 0, 0, stats)}
         results = run_backtest(records)
         persisted = persist_history(results)
+        # A-14/F-6 回流：连续 ROLLING_MONTHS 个月 IC<0.02 的因子写回 factor_registry（deprecated），
+        # 在线打分 list_active() 自动剔除；版本指纹变更 → 缓存键失效，无需手动干预。
+        deprecated_ids = sorted({r["factor_id"] for r in results
+                                 if r.get("status") == "deprecated_candidate"})
+        for fid in deprecated_ids:
+            try:
+                factor_registry.set_factor_status(fid, "deprecated")
+                logger.info("因子 IC 结论回流：%s 置为 deprecated", fid)
+            except Exception as exc:  # noqa: BLE001 单因子写回失败不阻断批次
+                logger.warning("因子 %s 状态写回失败: %s", fid, exc)
     except Exception as exc:  # noqa: BLE001 取数异常转结构化结果，避免 cron/脚本裸崩
         error_kind = _classify_error(exc)
         logger.warning("因子 IC 回测取数失败（%s）：%s", error_kind, exc)
@@ -568,6 +602,7 @@ def run_factor_ic_backtest_job(months: int = 36) -> dict:
                 "max_sample": 0, "target_samples": COLLECT_TARGET_SAMPLES,
                 "budget_seconds": COLLECT_BUDGET_SECONDS,
                 "budget_exhausted": bool(stats.get("budget_exhausted")),
+                "pool_basis": "spot_snapshot",
                 "sufficient": False, "error_kind": error_kind,
                 "reason": _job_reason([], 0, 0, stats, error_kind=error_kind, error_msg=str(exc))}
     samples = [row["sample_size"] for row in results]
@@ -577,6 +612,7 @@ def run_factor_ic_backtest_job(months: int = 36) -> dict:
             "collected_codes": collected, "max_sample": max_sample,
             "target_samples": COLLECT_TARGET_SAMPLES, "budget_seconds": COLLECT_BUDGET_SECONDS,
             "budget_exhausted": bool(stats.get("budget_exhausted")),
+            "pool_basis": "spot_snapshot",
             "sufficient": max_sample >= MIN_SAMPLE, "error_kind": None,
             "reason": _job_reason(codes, collected, max_sample, stats)}
 

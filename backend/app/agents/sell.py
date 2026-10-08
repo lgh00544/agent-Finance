@@ -4,6 +4,7 @@ SellAgent 卖出决策 - LangGraph 节点（每持仓执行一次，人工按需
 【交由模型推理的业务逻辑】卖出时机、减仓/清仓判断、卖出价位区间（全部在 LLM）
 流转：collect_sell_input → llm_sell
 """
+from app.core import clock
 import json
 import logging
 import time
@@ -38,7 +39,7 @@ def collect_sell_input(state: StockAgentState) -> StockAgentState:
     state["stock_name"] = holding.stock_name
 
     source = get_datasource()
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
     kline = source.fetch_daily_kline(code, _days_ago(_KLINE_DAYS), today)
     indicators = compute_indicators(kline)
 
@@ -165,7 +166,7 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
         return state
     code = state["stock_code"]
     name = state.get("stock_name") or code
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
     data = state["sell_input"]
 
     holding_info = (
@@ -239,7 +240,7 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
         # 落库前删两字段：sell_decision 表本体不写 thinking，仅 trace 透传（覆盖 insert 内部空 ext_info 行）
         clean = {k: v for k, v in decision.items() if k not in ("model_thinking", "tool_trace")}
         repo.insert_sell_decision(state["holding_id"], code, name, clean)
-        reasoning_trace.trace_sell(code, name, time.strftime("%Y-%m-%d"), decision)
+        reasoning_trace.trace_sell(code, name, clock.today(), decision)
     else:
         repo.insert_sell_decision(state["holding_id"], code, name, decision)
     state["sell_decision"] = decision
@@ -253,7 +254,7 @@ def llm_sell(state: StockAgentState) -> StockAgentState:
 def _days_ago(n: int) -> str:
     import datetime
 
-    return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
+    return (clock.today_date() - datetime.timedelta(days=n)).isoformat()
 
 
 def paper_sell_position(position: dict, quote: dict, context: dict,

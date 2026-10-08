@@ -1,6 +1,7 @@
 """intent→调用映射 + format：复用 routes.py 现有端点背后的实现，不新建业务逻辑。
 长任务（score/sell/discover/trigger）先回执，task_queue 异步执行完成后直发结果。
 【刚性约束】只做查询/分析/任务触发，不调用任何交易/落单接口。"""
+from app.core import clock
 import hashlib
 import logging
 import time
@@ -218,7 +219,7 @@ def _fmt_discover(params: dict, hint: str) -> str:
 def _fmt_trigger(params: dict, hint: str) -> str:
     """手动触发选股（长任务）：跑 daily pipeline 出统计"""
     return f"选股执行完成：" + _pipeline_summary(graph_router.run_daily_pipeline()) + \
-        f"（{time.strftime('%Y-%m-%d')}）"
+        f"（{clock.today()}）"
 
 
 def _fmt_market(params: dict, hint: str) -> str:

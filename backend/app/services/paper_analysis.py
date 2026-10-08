@@ -57,7 +57,11 @@ class PaperActionOutput(BaseModel):
 class PaperSizeOutput(BaseModel):
     """AI 模拟单票目标仓位比例；只影响模拟账本，不修改任何正式规则。"""
 
-    allocation_pct: float = Field(ge=0, le=100, description="目标仓位占总资金比例 %（5~40）")
+    allocation_pct: float = Field(
+        ge=0, le=100,
+        description=("目标仓位占总资金比例：0-100 百分数（如 25）；也接受 0-1 小数，"
+                     "归一化阈值 value > 1 视为百分数（÷100）后收敛到 (0, 1]，"
+                     "不再设 5~40 代码上下限"))
     confidence: str = Field(pattern="^(high|medium|low)$")
     reasons: list[str] = Field(default_factory=list)
     risk_note: str = ""

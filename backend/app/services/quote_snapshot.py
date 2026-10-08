@@ -4,6 +4,7 @@
 数据源优先：腾讯 qt.gtimg.cn 批量（N 只 = 1 次 HTTP）→ 失败再试东财全市场快照过滤。
 作用：持仓监控页 read 路径先读 DB（<50ms），akshare hang 不影响前端（15s 超时不再触发）。
 """
+from app.core import clock
 import logging
 import time
 
@@ -43,7 +44,7 @@ def refresh_quote_snapshot(user_id: int | None = None, *, is_admin: bool = False
                                   is_admin=is_admin) or []
     if not holdings:
         return {"success": True, "rows": 0, "error": None, "source": "none",
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                "updated_at": clock.now_str()}
 
     codes = [h["stock_code"] for h in holdings]
     code_set = set(codes)
@@ -84,9 +85,9 @@ def refresh_quote_snapshot(user_id: int | None = None, *, is_admin: bool = False
 
     if not prices:
         return {"success": False, "rows": 0, "error": error or "持仓行情为空",
-                "source": source, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                "source": source, "updated_at": clock.now_str()}
 
-    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    now_str = clock.now_str()
     rows = [{
         "stock_code": c,
         "name": name_by_code.get(c, ""),

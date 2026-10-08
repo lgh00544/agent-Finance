@@ -1,7 +1,9 @@
 """E'-1 行情结构前瞻后验验证：只读预测与后续快照，回填命中结果。"""
+import logging
 import time
 
 from app.db import repo
+from app.db.models import _now
 
 HORIZON_DAYS = {"t1": 1, "t3": 3, "t5": 5}
 
@@ -56,9 +58,12 @@ def _switch_sector(forecasts: list[dict], mainline: str | None) -> str | None:
     return cand.get("sector_name") if cand else None
 
 
-def _posterior_regime(days_rows: list[list[dict]]) -> str:
+def _posterior_regime(days_rows: list[list[dict]]) -> str | None:
+    """后验行情结构：少于 2 个交易日样本不判定（避免单日假阳性）。"""
     if not days_rows:
         return "chaos"
+    if len(days_rows) < 2:
+        return None
     top5_sets = [set(_top(rows, 5)) for rows in days_rows]
     overlap = len(set.intersection(*top5_sets)) if len(top5_sets) > 1 else len(top5_sets[0])
     leaders = [rows[0]["sector_name"] for rows in days_rows if rows]
@@ -117,7 +122,12 @@ def _causal_review(forecasts: list[dict], horizon: str, mainline: str | None,
 def evaluate_forecast(regime: dict | None, forecasts: list[dict],
                       rows_by_date: dict[str, list[dict]], horizon: str,
                       verify_date: str | None) -> dict:
-    """按审核映射表计算单个 horizon 的命中结果。"""
+    """按审核映射表计算单个 horizon 的命中结果。
+
+    口径差异（SC-5）：regime_hit 验证 C'（行情结构预测 current_regime）对后验结构的命中；
+    mainline_hit 验证 D'（板块级前瞻）所选主线/切换板块的走势命中。C' 的 forward_bias_* 与
+    D' 的逐板块 forward_bias 来源不同，三者只并列展示，不互相替代、不合成单一总分。
+    """
     need_days = HORIZON_DAYS[horizon]
     if len(rows_by_date) < need_days:
         mainline = _mainline_sector(regime, forecasts)
@@ -128,6 +138,7 @@ def evaluate_forecast(regime: dict | None, forecasts: list[dict],
             "mainline_hit": None,
             "regime_forecast": (regime or {}).get("current_regime"),
             "miss_reason": "data_insufficient",
+            "uncertain": False,
             "detail": {"required_days": need_days, "actual_days": len(rows_by_date),
                        "causal_review": _causal_review(forecasts, horizon, mainline, None)},
         }
@@ -186,16 +197,36 @@ def evaluate_forecast(regime: dict | None, forecasts: list[dict],
         else:
             hit = bool(final_switch and final_switch["rank_no"] <= 5)
     else:
-        hit = True
+        # uncertain / 无有效预测：不硬算命中，独立标注
+        return {
+            "verify_date": verify_date,
+            "regime_hit": None if posterior is None else (regime or {}).get("current_regime") == posterior,
+            "top5_continue_rate": top5_continue_rate,
+            "mainline_hit": None,
+            "regime_forecast": (regime or {}).get("current_regime"),
+            "miss_reason": "uncertain",
+            "uncertain": True,
+            "detail": {
+                "prediction": prediction,
+                "posterior_regime": posterior,
+                "mainline_sector": mainline,
+                "switch_sector": switch_sector,
+                "mainline_change_sum": mainline_sum,
+                "switch_change_sum": switch_sum,
+                "causal_review": _causal_review(forecasts, horizon, mainline, None),
+            },
+        }
 
-    regime_hit = (regime or {}).get("current_regime") == posterior
+    regime_hit = (None if posterior is None else
+                  (regime or {}).get("current_regime") == posterior)
     return {
         "verify_date": verify_date,
         "regime_hit": regime_hit,
         "top5_continue_rate": top5_continue_rate,
         "mainline_hit": hit,
         "regime_forecast": (regime or {}).get("current_regime"),
-        "miss_reason": "" if hit and regime_hit else "rule_miss",
+        "miss_reason": "" if hit and regime_hit is not False else "rule_miss",
+        "uncertain": False,
         "detail": {
             "prediction": prediction,
             "posterior_regime": posterior,
@@ -208,27 +239,71 @@ def evaluate_forecast(regime: dict | None, forecasts: list[dict],
     }
 
 
+def _trading_days_after(target: str, n: int) -> list[str]:
+    """目标日期之后 n 个交易日（akshare 全量静态日历；不可用时返回空表）。"""
+    try:
+        from app.datasource.akshare_source import AkshareSource
+        calendar = AkshareSource().fetch_trade_calendar()
+        if calendar:
+            return sorted(d for d in calendar if d > target)[:n]
+    except Exception as exc:  # noqa: BLE001 日历不可用退化为快照日窗口
+        logging.getLogger(__name__).warning("交易日历获取失败: %s", exc)
+    return []
+
+
+def _already_verified(target: str) -> bool:
+    """T5 窗口已回填（verify_date 非空）视为该预测日验证闭环。"""
+    rows = repo.list_sector_forecast_verify(target)
+    for row in rows:
+        if row.get("verify_horizon") == "t5" and row.get("verify_date"):
+            return True
+    return False
+
+
 def run_sector_forecast_verify(forecast_date: str | None = None) -> dict:
-    """回填指定预测日；未指定时默认找已有预测日中可验证的最新一日。"""
+    """回填前瞻验证：指定日期只回填该日；未指定时扫描全部待回填（幂等增量）。
+
+    窗口按交易日历取目标日之后第 N 个交易日；日历不可用时退化为快照日序列。
+    已回填 T5 的预测日自动跳过，避免重复覆盖。
+    """
+    logger = logging.getLogger(__name__)
     dates_desc = repo.list_sector_daily_dates(limit=120)
     dates = sorted(dates_desc)
-    target = forecast_date
-    if target is None:
-        today = time.strftime("%Y-%m-%d")
-        older = [d for d in dates if d < today]
-        target = older[-1] if older else None
-    if not target or target not in dates:
-        return {"success": False, "forecast_date": target, "error": "预测日无全板块日快照"}
-    start = dates.index(target) + 1
-    later_dates = dates[start:start + max(HORIZON_DAYS.values())]
-    regime = repo.get_sector_regime_forecast(target)
-    forecasts = repo.list_sector_forward_forecast(target)
-    rows = []
-    for horizon, need_days in HORIZON_DAYS.items():
-        window_dates = later_dates[:need_days]
-        rows_by_date = {d: repo.list_sector_daily_by_date(d) for d in window_dates}
-        verify_date = window_dates[-1] if len(window_dates) >= need_days else None
-        item = evaluate_forecast(regime, forecasts, rows_by_date, horizon, verify_date)
-        rows.append({"forecast_date": target, "verify_horizon": horizon, **item})
-    count = repo.upsert_sector_forecast_verify(rows)
-    return {"success": True, "forecast_date": target, "count": count, "rows": rows}
+    if forecast_date is not None:
+        targets = [forecast_date] if forecast_date in dates else []
+    else:
+        today = _now().strftime("%Y-%m-%d")
+        targets = [d for d in dates if d < today and not _already_verified(d)]
+    if not targets:
+        return {"success": True, "forecast_date": forecast_date,
+                "count": 0, "skipped": True,
+                "error": None if forecast_date is None else "预测日无全板块日快照"}
+    results, total = [], 0
+    for target in targets:
+        start = dates.index(target) + 1
+        later_dates = _trading_days_after(target, max(HORIZON_DAYS.values()))
+        if not later_dates:
+            later_dates = dates[start:start + max(HORIZON_DAYS.values())]
+        regime = repo.get_sector_regime_forecast(target)
+        forecasts = repo.list_sector_forward_forecast(target)
+        rows = []
+        for horizon, need_days in HORIZON_DAYS.items():
+            window_days = later_dates[:need_days]
+            rows_by_date = {d: r for d in window_days
+                            if (r := repo.list_sector_daily_by_date(d))}
+            effective_dates = sorted(rows_by_date)
+            # B 支线：verify_date 只取实际有快照的交易日；样本不足时保持 None，
+            # 避免误判为已回填而永久跳过补充（_already_verified 只看 verify_date 非空）。
+            verify_date = effective_dates[-1] if len(effective_dates) >= need_days else None
+            item = evaluate_forecast(regime, forecasts, rows_by_date, horizon, verify_date)
+            if len(rows_by_date) < need_days:
+                item["detail"]["missing_dates"] = [
+                    d for d in window_days if d not in rows_by_date]
+            rows.append({"forecast_date": target, "verify_horizon": horizon, **item})
+        count = repo.upsert_sector_forecast_verify(rows)
+        total += count
+        results.append({"forecast_date": target, "count": count,
+                        "regime": (regime or {}).get("current_regime")})
+        logger.info("前瞻验证回填 %s: %s 行", target, count)
+    return {"success": True, "forecast_date": targets[-1],
+            "count": total, "rows": results}

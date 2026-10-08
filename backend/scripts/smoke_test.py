@@ -4,6 +4,7 @@
 用法: python backend/scripts/smoke_test.py [--skip-discover]
 退出码: 0=全链路通过, 1=存在失败环节或未配置密钥
 """
+from app.core import clock
 import argparse
 import logging
 import os
@@ -62,7 +63,7 @@ def main() -> int:
         nonlocal ok
         ok = _stage(name, fn) and ok
 
-    today = time.strftime("%Y-%m-%d")
+    today = clock.today()
 
     # 1) DiscoverAgent 全市场挖掘（可选）
     if not args.skip_discover:

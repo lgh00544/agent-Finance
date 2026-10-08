@@ -555,11 +555,74 @@ def portfolio_sentinel_job() -> None:
         cache.release_lock("portfolio_sentinel")
 
 
+def take_profit_job() -> None:
+    """确定性止盈/止损通道定时执行（与 monitor 同频，纯计算零 LLM）。
+
+    现价触及 C3/计划止损、跌破移动止盈线、到达 TP1 时，由 take_profit 内部
+    直接落 alert_log 并推送（先于任何 LLM 研判，S-1）；计划点位按 10 分钟缓存，
+    但告警检查每轮都跑，因此触发延迟不超过一次调度周期。
+    """
+    now = _cn_now()
+    if not _in_trading_window(now) and not _in_close_check_window(now):
+        return
+    today = _today_cn()
+    if not _is_trading_day(today):
+        return
+    if not cache.acquire_lock("take_profit", ttl_seconds=300):
+        logger.info("take_profit 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.take_profit import build_plans
+
+        result = build_plans()  # 计划缓存 10 分钟；告警检查每轮执行
+        cache.set("job:last_take_profit", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        logger.info("止盈/止损确定性通道完成: %s 持仓", len(result.get("rows") or []))
+    except Exception as exc:  # noqa: BLE001 定时任务整体容错
+        logger.error("止盈/止损确定性通道失败: %s", exc)
+    finally:
+        cache.release_lock("take_profit")
+
+
+def red_line_job() -> None:
+    """持仓红线扫描（每 10 分钟，交易时段）：与 GET /red_line_check 同一条链路。
+
+    越限（C1 集中度 / C2 日内回撤 / C3 硬止损 / C4 突破前高）落 alert_log
+    （source='red_line'）并推送，确定性通道先于 LLM；去重投递成功后置位，
+    失败下一轮自动重试（S-1/S-11）。缺数据字段显式 null，不伪造。
+    """
+    now = _cn_now()
+    if not _in_trading_window(now):
+        return
+    today = _today_cn()
+    if not _is_trading_day(today):
+        return
+    if not cache.acquire_lock("red_line", ttl_seconds=600):
+        logger.info("red_line 锁被占用，跳过本次")
+        return
+    try:
+        from app.services.red_line_check import scan_red_line
+
+        result = scan_red_line(today)
+        cache.set("job:last_red_line", _cn_now().strftime("%Y-%m-%d %H:%M:%S"), 86400)
+        logger.info("红线扫描完成: %s 持仓，越限落库 %s 条（去重 %s / 失败 %s）",
+                    len(result.get("rows") or []),
+                    (result.get("alerts") or {}).get("emitted"),
+                    (result.get("alerts") or {}).get("deduplicated"),
+                    (result.get("alerts") or {}).get("failed"))
+    except Exception as exc:  # noqa: BLE001 定时任务整体容错
+        logger.error("红线扫描失败: %s", exc)
+    finally:
+        cache.release_lock("red_line")
+
+
 def sector_refresh_job() -> None:
     """板块快照刷新：每 5 分钟 9:00-15:55；与 monitor_job 独立锁互不干扰
 
     注：jobs.py:15 已 `from app.cache import cache`，直接用 cache.xxx。
     """
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_refresh: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_refresh", ttl_seconds=240):
         logger.info("sector_refresh 锁被占用，跳过本次")
         return
@@ -580,6 +643,9 @@ def sector_refresh_job() -> None:
 
 def sector_daily_job() -> None:
     """全板块日快照：工作日 15:35 收盘后刷新（删后插当日覆盖；独立锁防并发）"""
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_daily: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_daily", ttl_seconds=600):
         logger.info("sector_daily 锁被占用，跳过本次")
         return
@@ -606,6 +672,9 @@ def sector_daily_job() -> None:
 
 def sector_regime_job() -> None:
     """行情结构识别：15:40 独立运行，不依赖 C 归因子。"""
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_regime: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_regime", ttl_seconds=900):
         logger.info("sector_regime 锁被占用，跳过本次")
         return
@@ -628,6 +697,9 @@ def sector_regime_job() -> None:
 
 def sector_forward_job() -> None:
     """板块前瞻：15:45 读取 C' 结构结果，独立执行 D' 纯代码计算。"""
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_forward: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_forward", ttl_seconds=900):
         logger.info("sector_forward 锁被占用，跳过本次")
         return
@@ -649,6 +721,9 @@ def sector_forward_job() -> None:
 
 def sector_forecast_verify_job() -> None:
     """前瞻验证回填：16:05 用后续真实快照验证历史 C'/D' 预测。"""
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_forecast_verify: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_forecast_verify", ttl_seconds=900):
         logger.info("sector_forecast_verify 锁被占用，跳过本次")
         return
@@ -670,6 +745,9 @@ def sector_forecast_verify_job() -> None:
 
 def sector_next_hot_job() -> None:
     """下一个风口预测：15:50 基于 D' 指标派生 top10 外候选。"""
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_next_hot: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_next_hot", ttl_seconds=900):
         logger.info("sector_next_hot 锁被占用，跳过本次")
         return
@@ -691,6 +769,9 @@ def sector_next_hot_job() -> None:
 
 def sector_radar_job() -> None:
     """行业消息雷达：观察型抓取 + K228 解读，失败不影响正式 Agent。"""
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_radar: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_radar", ttl_seconds=1800):
         logger.info("sector_radar 锁被占用，跳过本次")
         return
@@ -709,6 +790,9 @@ def sector_radar_job() -> None:
 
 def sector_radar_shadow_job() -> None:
     """行业消息雷达 shadow 回填：只做观测统计，不改变候选池。"""
+    if not _is_trading_day(_today_cn()):
+        logger.info("sector_radar_shadow: 非交易日跳过")
+        return
     if not cache.acquire_lock("sector_radar_shadow", ttl_seconds=1800):
         logger.info("sector_radar_shadow 锁被占用，跳过本次")
         return
@@ -1364,6 +1448,18 @@ def start_scheduler() -> None:
                       day_of_week="mon-fri", hour="9-16", minute="4-59/10",
                       id="portfolio_sentinel", name="组合哨兵巡检",
                       replace_existing=True, misfire_grace_time=300)
+    # 确定性风控通道（S-1）：与 monitor 同频但**错峰**（take_profit +2 分钟、
+    # red_line 每 10 分钟落在 7/17/…/57 分），避免同刻并发 akshare 触发
+    # py_mini_racer 内置 V8 二次初始化崩溃（见上方 2026-09-28 错峰说明）。
+    # 两者都是纯计算 + 确定性落库/推送，先于 LLM 研判。
+    _add_job(take_profit_job, "cron",
+                      day_of_week="mon-fri", hour="9-16", minute=f"2-59/{monitor_minutes}",
+                      id="take_profit", name="止盈止损确定性通道",
+                      replace_existing=True, misfire_grace_time=300)
+    _add_job(red_line_job, "cron",
+                      day_of_week="mon-fri", hour="9-15", minute="7-59/10",
+                      id="red_line", name="持仓红线扫描",
+                      replace_existing=True, misfire_grace_time=300)
     # 工作日 9:25 盘前快筛（集合竞价撮合完成后；候选为上一交易日 16:10 生成）
     _add_job(pre_market_screen_job, "cron",
                       day_of_week="mon-fri", hour=9, minute=25,
@@ -1508,6 +1604,10 @@ def job_status() -> list[dict]:
                 "next_run": cache.get("job:last_paper_monitor")})
     out.append({"id": "last_monitor", "name": "最近监控", "next_run": cache.get("job:last_monitor")})
     out.append({"id": "last_portfolio_sentinel", "name": "最近组合哨兵", "next_run": cache.get("job:last_portfolio_sentinel")})
+    out.append({"id": "last_take_profit", "name": "最近止盈止损通道",
+                "next_run": cache.get("job:last_take_profit")})
+    out.append({"id": "last_red_line", "name": "最近红线扫描",
+                "next_run": cache.get("job:last_red_line")})
     out.append({"id": "last_track_verify", "name": "最近候选验证", "next_run": cache.get("job:last_track_verify")})
     out.append({"id": "last_pre_market", "name": "最近盘前快筛", "next_run": cache.get("job:last_pre_market")})
     out.append({"id": "last_market_accuracy", "name": "最近市况回填", "next_run": cache.get("job:last_market_accuracy")})

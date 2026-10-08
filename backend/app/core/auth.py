@@ -3,6 +3,7 @@
 多人开关关闭时完全兼容旧单用户入口；开启后除登录/健康检查外均要求
 Bearer session token。授权只从认证上下文读取，不信任请求体中的 user_id。
 """
+from app.core import clock
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 import hashlib
@@ -148,7 +149,7 @@ def issue_token(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     # M16 配套：expires_at 必须与 models._now() 用同一时钟（北京时间 naive）。
     # 否则 TZ=UTC 容器里 expires_at 落在 UTC 口径、repo.get_user_by_token 用北京口径
-    # 比较，24h 会话实际 16h 就失效（repo 里较多 datetime.now() 与库列混用，详见修复报告）。
+    # 比较，24h 会话实际 16h 就失效（repo 里较多 clock.now() 与库列混用，详见修复报告）。
     expires_at = _now() + timedelta(hours=max(1, settings.auth_session_ttl_hours))
     repo.create_user_session(user_id, token, expires_at)
     return token

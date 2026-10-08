@@ -7,6 +7,7 @@ sync_manager 判断：有标记时禁止云端→本地覆盖，必须先合并�
 """
 from __future__ import annotations
 
+from app.core import clock
 import json
 import os
 from datetime import datetime
@@ -40,7 +41,7 @@ def read() -> dict | None:
 def mark(reason: str, requested: str, active: str, db_path: str = "") -> dict:
     """写入降级标记；已存在则保留最初的 degraded_since（记录降级起点，供水位合并用）。"""
     existing = read() or {}
-    now = datetime.now().isoformat(timespec="seconds")
+    now = clock.now().isoformat(timespec="seconds")
     info = {
         "degraded_since": existing.get("degraded_since") or now,
         "last_seen": now,

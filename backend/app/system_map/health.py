@@ -5,6 +5,7 @@ execute Agents, submit tasks, mutate governance state, or create new records.
 """
 from __future__ import annotations
 
+from app.core import clock
 from collections import Counter
 from datetime import datetime
 
@@ -24,7 +25,7 @@ from app.system_map import collaboration, integrity, registry
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return clock.now().isoformat(timespec="seconds")
 
 
 def _module(name: str, status: str, *, counts: dict | None = None,
@@ -135,7 +136,7 @@ def _experience() -> dict:
     queue_statuses = Counter((row.status or "unknown").strip() or "unknown" for row in pending)
     expired = sum(
         1 for row in experiences
-        if row.expires_at is not None and row.expires_at <= datetime.now()
+        if row.expires_at is not None and row.expires_at <= clock.now()
     )
     return _module(
         "experience_memory",

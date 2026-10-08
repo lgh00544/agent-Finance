@@ -4,7 +4,7 @@ from app.services import dashboard
 
 
 def test_tradeable_view_ready_and_pending(monkeypatch):
-    monkeypatch.setattr(dashboard.time, "strftime", lambda fmt: "2026-09-08")
+    monkeypatch.setattr(dashboard.clock, "today", lambda: "2026-09-08")
     monkeypatch.setattr(dashboard.repo, "list_candidate_tradeable", lambda date, limit: [
         {"stock_code": "600001", "is_tradeable": True},
         {"stock_code": "600002", "is_tradeable": False},
@@ -20,7 +20,7 @@ def test_tradeable_view_ready_and_pending(monkeypatch):
 
 
 def test_tradeable_view_error_is_not_zero_opportunity(monkeypatch):
-    monkeypatch.setattr(dashboard.time, "strftime", lambda fmt: "2026-09-08")
+    monkeypatch.setattr(dashboard.clock, "today", lambda: "2026-09-08")
 
     def _boom(date, limit):
         raise RuntimeError("db unavailable")

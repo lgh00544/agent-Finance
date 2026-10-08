@@ -7,6 +7,7 @@ import time
 
 from app.core.config import settings
 from app.db import repo
+from app.db.models import _now
 
 logger = logging.getLogger(__name__)
 TOP_N = 5
@@ -101,7 +102,7 @@ def _metrics(today, dates):
 
 def judge_regime(trade_date: str | None = None) -> dict:
     """综合 3/10/20/60 日窗口，判定当前结构并落库。"""
-    today = trade_date or time.strftime("%Y-%m-%d")
+    today = trade_date or _now().strftime("%Y-%m-%d")
     dates = repo.list_sector_daily_dates(limit=60)
     if today in dates:
         dates = dates[dates.index(today):]

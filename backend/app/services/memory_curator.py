@@ -6,6 +6,7 @@ summary to active automatically.
 """
 from __future__ import annotations
 
+from app.core import clock
 import difflib
 import json
 from datetime import datetime
@@ -105,7 +106,7 @@ def run_curator(dry_run: bool = True, limit: int = 100, user_id: int | None = No
     if not _cfg_bool("memory_curator_enabled"):
         return {"dry_run": dry_run, "skipped": True, "reason": "disabled", "actions": []}
 
-    now = datetime.now()
+    now = clock.now()
     limit = min(max(int(limit), 1), 500)
     retention_days = _cfg_int("memory_retention_days")
     low_confidence = _cfg_float("memory_low_confidence_threshold")

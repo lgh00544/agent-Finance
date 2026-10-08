@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from app.core.config import settings
 from app.datasource.fallback import get_datasource
 from app.db import repo
+from app.db.models import _now
 from app.llm.structured import ModelLevel, llm_call_json
 from app.services import sector_dict
 
@@ -166,7 +167,7 @@ def run_interpret(sector_code: str, article_ids: list[int]) -> dict:
     repo.add_sector_news_shadow({
         "interpret_id": iid, "sector_code": sector_code,
         "sector_name": first_sector.get("sector_name", sector_code),
-        "signal_date": str(articles[0].get("published_at") or "")[:10] or time.strftime("%Y-%m-%d"),
+        "signal_date": str(articles[0].get("published_at") or "")[:10] or _now().strftime("%Y-%m-%d"),
         "base_index_value": _sector_close(first_sector.get("sector_name", sector_code),
                                           str(articles[0].get("published_at") or "")[:10]),
     })
@@ -260,7 +261,7 @@ def _interpret_prompt(sector_code: str, articles: list[dict]) -> str:
 
 def _sector_close(sector_name: str, day: str) -> float | None:
     if not day:
-        day = time.strftime("%Y-%m-%d")
+        day = _now().strftime("%Y-%m-%d")
     ds = get_datasource()
     start = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     hist = ds.fetch_industry_hist(sector_name, start, day)
@@ -275,7 +276,7 @@ def _shadow_values(ds, row: dict) -> dict:
     if not signal_date:
         return {}
     start = (datetime.strptime(signal_date, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
-    end = time.strftime("%Y-%m-%d")
+    end = _now().strftime("%Y-%m-%d")
     hist = ds.fetch_industry_hist(row["sector_name"], start, end)
     if hist is None or hist.empty or "close" not in hist.columns:
         return {}

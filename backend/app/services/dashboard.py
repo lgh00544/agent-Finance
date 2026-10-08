@@ -4,6 +4,7 @@
 各模块独立执行（ThreadPoolExecutor 并行，探活等慢操作不再串行阻塞），
 单模块失败仅标注 error，不影响其余模块与整体响应。
 """
+from app.core import clock
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,7 +46,7 @@ def _agent_suggestions() -> list:
 def _module_tradeable_view() -> dict:
     """当日可建仓判定视图（只读：只取已落库判定，不触发 ensure_if_missing 懒补算；
     补算留给候选池页/每日挖掘，首页首屏零额外计算）"""
-    trade_date = time.strftime("%Y-%m-%d")
+    trade_date = clock.today()
     try:
         items = repo.list_candidate_tradeable(trade_date, limit=50)
         return {"status": "ready" if items else "pending", "date": trade_date,
@@ -87,4 +88,4 @@ def build_dashboard() -> dict:
         futures = {pool.submit(_module, fn): name for name, fn in modules.items()}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
-    return {"checked_at": time.strftime("%Y-%m-%d %H:%M:%S"), "modules": results}
+    return {"checked_at": clock.now_str(), "modules": results}

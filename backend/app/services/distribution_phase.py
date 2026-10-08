@@ -3,6 +3,7 @@
 【刚性代码逻辑】只算 6 维分数 + phase 映射 + 缺失标注；不做最终买卖决策（LLM 保留一票否决）。
 6 维阈值均参考权重（K175），非死条件；缺失数据 → null + missing_data，不补零不补均值。
 """
+from app.core import clock
 import json
 import time
 from datetime import datetime, timedelta
@@ -18,8 +19,8 @@ _TR = {"time": 0.5, "space": 20.0, "vp": 0.3, "cap": 0, "pattern": 1}
 def _kline(code: str, days: int = 260) -> list | None:
     """日K → [(date, close, volume)] 升序；空/异常返回 None"""
     try:
-        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        k = get_datasource().fetch_daily_kline(code, start, time.strftime("%Y-%m-%d"))
+        start = (clock.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        k = get_datasource().fetch_daily_kline(code, start, clock.today())
         rows = []
         for _, r in k.iterrows():
             try:
@@ -101,11 +102,27 @@ def policy_dimension() -> dict:
     return {"value": None, "triggered": False}  # 外部输入占位，无数据
 
 
+def _phase_stage() -> str:
+    """盘中/收盘阶段：收盘后（>=15:00）强制用收盘判定键，盘中用盘中键，互不复用。"""
+    now = clock.now()
+    return "close" if (now.hour, now.minute) >= (15, 0) else "intraday"
+
+
 def compute_distribution_phase(symbol: str, trade_date: str) -> dict:
-    """主入口：6 维计算 → phase/confidence → 结构体（带 86400s 缓存）。
-    返回 {phase, phase_label, confidence, six_dim, missing_data, trade_date}"""
+    """主入口：6 维计算 → phase/confidence → 结构体。
+
+    DB 优先：收盘后已由 distribution_phase_job 落库的判定直接复用（distribution_phase_log）；
+    未落库时按阶段缓存键（intraday/close）区分，收盘后强制重算，避免盘中值污染收盘判定。
+    返回 {phase, phase_label, confidence, six_dim, missing_data, trade_date}
+    """
     key = f"distribution_phase:{trade_date}:{symbol}"
-    raw = cache.get(key)
+    if _phase_stage() == "close":
+        from app.db import repo as _repo
+        row = _repo.get_distribution_phase(trade_date, symbol)
+        if row:
+            return row
+    staged_key = f"{key}:{_phase_stage()}"
+    raw = cache.get(staged_key)
     if raw:
         try:
             return json.loads(raw)
@@ -127,5 +144,6 @@ def compute_distribution_phase(symbol: str, trade_date: str) -> dict:
     label = _PHASE_LABELS[phase] + ("?" if confidence == "低" else "")
     out = {"phase": phase, "phase_label": label, "confidence": confidence,
            "six_dim": dims, "missing_data": missing, "trade_date": trade_date}
-    cache.set(key, json.dumps(out, ensure_ascii=False), 86400)
+    cache.set(staged_key, json.dumps(out, ensure_ascii=False), 86400)
+    cache.set(key, json.dumps(out, ensure_ascii=False), 86400)  # 兼容红线 K226 原键读取
     return out

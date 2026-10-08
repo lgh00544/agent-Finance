@@ -11,6 +11,7 @@
 【刚性代码逻辑】本模块只做：范围解析、上下文注入、LLM 调用、消息与调整留痕；
 全部判定与调整方案由 LLM 结构化输出，是否生效由用户人工确认。
 """
+from app.core import clock
 import hashlib
 import logging
 
@@ -253,7 +254,7 @@ def rollback_batch_adjust(batch_id: int, reason: str = "") -> dict:
     from datetime import datetime
     repo.update_batch_adjust_status(batch_id, "rolled_back",
                                     rollback_reason=reason.strip(),
-                                    rollback_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                                    rollback_time=clock.now().strftime("%Y-%m-%d %H:%M:%S"))
     # 删除覆盖后立即重判落库，恢复原判定（幂等）
     ensure_tradeable(trade_date)
     return {"batch_id": batch_id, "status": "rolled_back", "removed": removed,

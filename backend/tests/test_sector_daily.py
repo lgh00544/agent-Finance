@@ -5,6 +5,7 @@
 2. upsert 删后插幂等（同 trade_date 覆盖不重复）
 3. 缺字段如实 NULL（K227 不编造）
 """
+from app.core import clock
 import time
 from unittest import mock
 
@@ -16,7 +17,7 @@ from app.db import repo
 from app.db.session import init_db
 from app.services import market_view, sector_daily
 
-TODAY = time.strftime("%Y-%m-%d")
+TODAY = clock.today()
 
 
 @pytest.fixture(scope="module", autouse=True)

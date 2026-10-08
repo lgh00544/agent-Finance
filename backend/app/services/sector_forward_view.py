@@ -6,6 +6,7 @@ import time
 
 from app.core.config import settings
 from app.db import repo
+from app.db.models import _now
 
 logger = logging.getLogger(__name__)
 TOP_N = 10
@@ -26,6 +27,7 @@ def _top(rows):
 
 
 def _history(name, days=10):
+    """最近 N 条快照（按行数取窗口，不是交易日窗口；SC-18 口径标注）。"""
     return repo.list_sector_daily_history(name, days)
 
 
@@ -109,11 +111,12 @@ def _apply_causal_adjustment(continuation, chase, causal):
 
 
 def _falsification_triggered(causal: dict | None) -> bool:
-    """仅接受证据中明确的布尔触发标记；不从自然语言反证条件臆测触发。"""
+    """仅接受证据中明确的布尔触发标记；统一以 falsification_triggered 为准（B 支线布尔键统一），
+    兼容旧数据遗留的 triggered/active 布尔，不从自然语言反证条件臆测触发。"""
     flags = (causal or {}).get("falsification") or {}
-    return any(flags.get(key) is True for key in (
-        "falsification_triggered", "triggered", "active",
-    ))
+    return (flags.get("falsification_triggered") is True
+            or flags.get("triggered") is True
+            or flags.get("active") is True)
 
 
 def _downgrade_bias(bias: str) -> str:
@@ -228,7 +231,7 @@ def _fetch_boxes(names: list[str]) -> dict:
 
 def run_sector_forward(trade_date: str | None = None) -> dict:
     """读取 C' 结构结果，按 D' 硬公式计算 top10 三窗口前瞻并落库。"""
-    today = trade_date or time.strftime("%Y-%m-%d")
+    today = trade_date or _now().strftime("%Y-%m-%d")
     regime = repo.get_sector_regime_forecast(today)
     rows = repo.list_sector_daily_by_date(today)[:TOP_N]
     if not rows:

@@ -43,12 +43,27 @@ class CacheBackend(ABC):
 
     # ---------- 告警去重 ----------
     def alert_deduplicated(self, dedup_key: str, ttl_seconds: int) -> bool:
-        """返回 True 表示该 key 已存在（重复），调用方应跳过推送"""
+        """返回 True 表示该 key 已存在（重复），调用方应跳过推送。
+
+        ⚠️ 本方法**先占位后投递**：占位一旦写入，投递失败也会把重试机会一并吞掉。
+        S-11：确定性告警通道必须改用 alert_seen()（只读探测）+ alert_mark()
+        （投递成功后置位），才能做到「成功才去重、失败自动重试」；
+        既有 LLM 告警调用方语义不变，保持兼容。
+        """
         key = f"alert:{dedup_key}"
         if self.get(key) is not None:
             return True
         self.set(key, "1", ttl_seconds)
         return False
+
+    # ---------- 投递成功后置位（S-11 告警投递可靠性） ----------
+    def alert_seen(self, dedup_key: str) -> bool:
+        """只读探测：该告警是否已成功投递过（不占位、不改变任何状态）"""
+        return self.get(f"alert:{dedup_key}") is not None
+
+    def alert_mark(self, dedup_key: str, ttl_seconds: int) -> None:
+        """投递成功后置位去重键；投递失败禁止调用（否则重试机会被吞掉）"""
+        self.set(f"alert:{dedup_key}", "1", ttl_seconds)
 
     # ---------- 分布式锁（防调度重叠）----------
     @abstractmethod

@@ -1,5 +1,6 @@
 """LLM 调用层优化测试：双模型分场景路由 + 降级重试 + 参数恒定 + Prompt 段序固定 + 调用统计
 （用假客户端验证调用层自身，不测业务结论；不触网）"""
+from app.core import clock
 import time
 
 from pydantic import BaseModel
@@ -313,7 +314,7 @@ def test_llm_stats_record_and_snapshot(monkeypatch):
     assert snap["models"][0]["model"] == "deepseek-v4-flash"
     assert snap["models"][0]["calls"] == 2 and snap["models"][0]["pct"] == 66.7
     assert snap["models"][1]["calls"] == 1 and snap["models"][1]["pct"] == 33.3
-    assert snap["date"] == time.strftime("%Y-%m-%d") and snap["checked_at"]
+    assert snap["date"] == clock.today() and snap["checked_at"]
 
 
 def test_llm_stats_empty_day(monkeypatch):

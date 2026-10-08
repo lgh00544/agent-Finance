@@ -2,6 +2,7 @@
 图间流转编排：discover→score→position 主链路；monitor 独立轮询；review 独立触发
 【刚性代码逻辑】只做流转调度与结果落库，不包含任何市场判断。
 """
+from app.core import clock
 import logging
 import time
 
@@ -78,7 +79,7 @@ def _record_pending_experience(kind: str, state: dict) -> None:
         summary, artifacts = _exp_summary(kind, state)
         if not summary:
             return
-        trade_date = state.get("trade_date") or time.strftime("%Y-%m-%d")
+        trade_date = state.get("trade_date") or clock.today()
         from app.db import repo
         repo.add_pending_experience(f"{kind}:{trade_date}", stage_map[kind], summary, artifacts)
     except Exception:  # noqa: BLE001 热路径钩子绝不抛异常影响主任务
@@ -87,7 +88,7 @@ def _record_pending_experience(kind: str, state: dict) -> None:
 
 def run_discover(trade_date: str | None = None) -> StockAgentState:
     """每日潜力股挖掘：硬过滤 → LLM 初选 → 新闻核实 → 最终候选落库"""
-    date_key = trade_date or time.strftime("%Y-%m-%d")
+    date_key = trade_date or clock.today()
     graph = get_graph("discover")
     state = _new_state(trade_date=date_key)
     result = graph.invoke(state)
@@ -113,7 +114,7 @@ def run_score(code: str, stock_name: str = "", trade_date: str | None = None) ->
     """单股多维打分"""
     graph = get_graph("score")
     state = _new_state(stock_code=code, stock_name=stock_name or code,
-                       trade_date=trade_date or time.strftime("%Y-%m-%d"))
+                       trade_date=trade_date or clock.today())
     result = graph.invoke(state)
     _record_pending_experience("score", result)
     return result
@@ -134,19 +135,28 @@ def run_position(code: str, stock_name: str = "", trade_date: str | None = None,
     4) source 来源标记：candidate=每日候选池联动 / manual=手动生成。"""
     from app.db import repo
 
-    today = trade_date or time.strftime("%Y-%m-%d")
-    score_row = repo.get_latest_score(code)
+    today = trade_date or clock.today()
+    # S-7：建仓链只消费「不晚于 trade_date 且未过期」的评分（as_of=trade_date）。
+    # 超过 settings.score_freshness_max_trading_days 个交易日 → 降级「未评级」，禁止建仓。
+    score_row, score_meta = repo.get_score_for_position(code, today)
     if score_row is None:
-        logger.info("建仓标的无评分，自动先执行评分: %s", code)
+        logger.info("建仓标的无可用评分，自动先执行评分: %s", code)
         run_score(code, stock_name, today)
-        score_row = repo.get_latest_score(code)
-    grade = (score_row.grade or "") if score_row else ""
+        score_row, score_meta = repo.get_score_for_position(code, today)
+    if score_row is not None and score_meta.get("stale"):
+        logger.warning(
+            "建仓标的评分过期（评分日 %s，距 %s %s 个交易日 > %s 天）→ 降级为未评级: %s",
+            score_meta.get("score_date"), today, score_meta.get("age_trading_days"),
+            score_meta.get("max_trading_days"), code)
+        grade = "未评级"
+    else:
+        grade = (score_row.grade or "") if score_row else ""
     if not score_row or grade not in ("A", "B"):
         cur = grade or "无评级"
         raise ValueError(f"评级不足（当前 {cur}），暂不生成建仓计划；仅 B 级及以上评级标的可生成，"
                          f"可先在「评分报告」页完成/确认评分")
     if grade == "B":
-        existing = repo.get_latest_plan(code)
+        existing = repo.get_latest_plan(code, user_id=repo._context_user_id())
         if existing is not None and existing.plan_date == today:
             age = (time.time() - existing.created_at.timestamp()) if existing.created_at else 9999.0
             if age < _PLAN_CACHE_TTL_30M:
@@ -175,7 +185,7 @@ def run_monitor(holding_id: int, trade_date: str | None = None,
     graph = get_graph("monitor")
     state = _new_state(holding_id=holding_id, stock_code=holding.stock_code,
                        stock_name=holding.stock_name,
-                       trade_date=trade_date or time.strftime("%Y-%m-%d"),
+                       trade_date=trade_date or clock.today(),
                        batch_quotes=batch_quotes)
     result = graph.invoke(state)
     _record_pending_experience("monitor", result)
@@ -219,7 +229,7 @@ def run_sell_decision(holding_id: int, trade_date: str | None = None,
     graph = get_graph("sell")
     state = _new_state(holding_id=holding_id, stock_code=holding.stock_code,
                        stock_name=holding.stock_name,
-                       trade_date=trade_date or time.strftime("%Y-%m-%d"))
+                       trade_date=trade_date or clock.today())
     result = graph.invoke(state)
     _record_pending_experience("sell", result)
     return result
@@ -228,7 +238,7 @@ def run_sell_decision(holding_id: int, trade_date: str | None = None,
 def run_review(holding_id: int, trade_date: str | None = None) -> StockAgentState:
     """卖出复盘"""
     graph = get_graph("review")
-    state = _new_state(holding_id=holding_id, trade_date=trade_date or time.strftime("%Y-%m-%d"))
+    state = _new_state(holding_id=holding_id, trade_date=trade_date or clock.today())
     result = graph.invoke(state)
     _record_pending_experience("review", result)
     return result
@@ -238,7 +248,7 @@ def run_market_intel(trade_date: str | None = None) -> StockAgentState:
     """市场研判底座（独立触发：每日收盘后 1 次 + 手动入口）。
     产出 market_intel 落库，作为全部 agent 的参考维度注入，不强制改变任何判级。"""
     graph = get_graph("market_intel")
-    state = _new_state(trade_date=trade_date or time.strftime("%Y-%m-%d"))
+    state = _new_state(trade_date=trade_date or clock.today())
     return graph.invoke(state)
 
 
@@ -246,7 +256,7 @@ def run_portfolio_sentinel(trade_date: str | None = None) -> StockAgentState:
     """组合哨兵巡检（独立触发：交易时段每 10 分钟自动 + 手动入口）。
     与 MonitorAgent 零耦合；无持仓时正常跳过（skipped=True），不报错。"""
     graph = get_graph("portfolio_sentinel")
-    state = _new_state(trade_date=trade_date or time.strftime("%Y-%m-%d"))
+    state = _new_state(trade_date=trade_date or clock.today())
     return graph.invoke(state)
 
 
@@ -277,7 +287,7 @@ def run_daily_pipeline(trade_date: str | None = None) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from app.services import task_queue
 
-    date_key = trade_date or time.strftime("%Y-%m-%d")
+    date_key = trade_date or clock.today()
     discover_result = run_discover(date_key)
     candidates = discover_result.get("candidates") or []
 

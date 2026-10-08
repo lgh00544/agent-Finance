@@ -30,8 +30,12 @@ class _FakeGraph:
         return {**state, **self._result}
 
 
-def _fake_score(grade: str = "B", score: float = 75.0):
-    return types.SimpleNamespace(stock_code="600001", grade=grade, score=score)
+def _fake_score(grade: str = "B", score: float = 75.0,
+                trade_date: str = "2026-08-09"):
+    # S-7：建仓链读评分时带 as_of=trade_date 并判定交易日新鲜度，
+    # 因此假评分必须带 trade_date（与本文件各用例的 trade_date 一致）
+    return types.SimpleNamespace(stock_code="600001", grade=grade, score=score,
+                                 trade_date=trade_date)
 
 
 def _fake_plan(plan_date: str, age_seconds: float):
@@ -42,14 +46,15 @@ def _fake_plan(plan_date: str, age_seconds: float):
 
 def test_c_grade_rejected(monkeypatch):
     """C 级及以下 → 拒绝生成，明确提示评级不足"""
-    monkeypatch.setattr(repo, "get_latest_score", lambda code: _fake_score(grade="C"))
+    monkeypatch.setattr(repo, "get_latest_score",
+                        lambda code, as_of=None: _fake_score(grade="C"))
     with pytest.raises(ValueError, match="评级不足"):
         router.run_position("600001", trade_date="2026-08-09")
 
 
 def test_no_grade_rejected(monkeypatch):
     """无评级记录（自动评分后仍无评级）→ 拒绝生成"""
-    monkeypatch.setattr(repo, "get_latest_score", lambda code: None)
+    monkeypatch.setattr(repo, "get_latest_score", lambda code, as_of=None: None)
     monkeypatch.setattr(router, "run_score", lambda code, name="", date=None: None)
     with pytest.raises(ValueError, match="评级不足"):
         router.run_position("600001", trade_date="2026-08-09")
@@ -59,7 +64,7 @@ def test_auto_score_before_grade_check(monkeypatch):
     """无评分标的 → 自动先跑一次 ScoreAgent，评分后达 B 级则放行生成"""
     calls = {"n": 0}
 
-    def _score_then_grade(code):
+    def _score_then_grade(code, as_of=None):
         if calls["n"] == 0:  # 首次查询无评分 → 触发自动评分
             return None
         return _fake_score(grade="B")
@@ -81,7 +86,8 @@ def test_auto_score_before_grade_check(monkeypatch):
 
 def test_b_grade_30min_cache_hit(monkeypatch):
     """B 级：当日已有计划且 30 分钟内 → 直接复用缓存，不进入图执行（零 LLM 调用）"""
-    monkeypatch.setattr(repo, "get_latest_score", lambda code: _fake_score(grade="B"))
+    monkeypatch.setattr(repo, "get_latest_score",
+                        lambda code, as_of=None: _fake_score(grade="B"))
     monkeypatch.setattr(repo, "get_latest_plan",
                         lambda code: _fake_plan("2026-08-09", age_seconds=120))
 
@@ -95,7 +101,8 @@ def test_b_grade_30min_cache_hit(monkeypatch):
 
 def test_b_grade_cache_expired_regenerates(monkeypatch):
     """B 级：超过 30 分钟 → 缓存失效，重新进入图执行生成新计划"""
-    monkeypatch.setattr(repo, "get_latest_score", lambda code: _fake_score(grade="B"))
+    monkeypatch.setattr(repo, "get_latest_score",
+                        lambda code, as_of=None: _fake_score(grade="B"))
     monkeypatch.setattr(repo, "get_latest_plan",
                         lambda code: _fake_plan("2026-08-09", age_seconds=3600))
     monkeypatch.setattr(router, "get_graph",
@@ -106,7 +113,8 @@ def test_b_grade_cache_expired_regenerates(monkeypatch):
 
 def test_a_grade_always_realtime(monkeypatch):
     """A 级：即使当日已有计划也实时重新计算（不命中缓存）"""
-    monkeypatch.setattr(repo, "get_latest_score", lambda code: _fake_score(grade="A", score=88))
+    monkeypatch.setattr(repo, "get_latest_score",
+                        lambda code, as_of=None: _fake_score(grade="A", score=88))
     monkeypatch.setattr(repo, "get_latest_plan",
                         lambda code: _fake_plan("2026-08-09", age_seconds=10))
     monkeypatch.setattr(router, "get_graph",

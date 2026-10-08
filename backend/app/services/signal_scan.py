@@ -1,4 +1,5 @@
 """买卖点信号全市场扫描：只攒数据，不发通知、不进 Agent、不触发任何交易动作。"""
+from app.core import clock
 import logging
 import threading
 import time
@@ -267,7 +268,7 @@ def scan_signal_triggers(trade_date: str | None = None, local_only: bool | None 
     if not market_hours.is_trading_day():
         return {"trade_date": "", "universe": 0, "records": 0, "errors": 0, "dropped": 0,
                 "reason": "not_trading_day"}
-    day = trade_date or datetime.now().strftime("%Y-%m-%d")
+    day = trade_date or clock.now().strftime("%Y-%m-%d")
     source = get_datasource()
     try:
         spot = source.fetch_spot_universe()

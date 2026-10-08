@@ -5,6 +5,7 @@ LLM（若上层提供）只能产生买卖意图；本模块是确定性账本�
 """
 from __future__ import annotations
 
+from app.core import clock
 import math
 import copy
 import hashlib
@@ -17,6 +18,45 @@ from app.db import repo
 
 logger = logging.getLogger(__name__)
 
+# ==================== B-14（E-8）paper 仓位上限 ↔ live 红线口径映射 ====================
+# 本模块的仓位常量只服务模拟盘（只写 paper_* 表，见模块 docstring）；live 侧的同类
+# 口径一律取自 app/core/config.py（S-4 收敛后的唯一源，业务模块禁止再定义第二份字面量）。
+#
+# 【paper 侧实数】单位是「比例」而不是百分数：
+#   CANDIDATE_POOL_ALLOCATION         0.10  候选池默认资金档（历史常量，代码中已无引用，
+#                                           首仓兜底实际由 CANDIDATE_POOL_INITIAL_ALLOCATION 承担）
+#   CANDIDATE_POOL_INITIAL_ALLOCATION 0.10  候选池首仓目标占比（_candidate_pool_shares /
+#                                           _candidate_target_allocation 的兜底档）
+#   CANDIDATE_POOL_ADD_ALLOCATION     0.10  候选池每次加仓目标占比（只写入 control_plan
+#                                           审计快照，不做运行时拦截）
+#   CANDIDATE_POOL_MAX_ALLOCATION     0.20  候选池单票累计上限 = 首仓 0.10 + 加仓 0.10
+#                                           （同样只入 control_plan 快照，非运行时限额闸门）
+#   POSITION_TARGET_MAX               1.0   目标仓位归一化上限（1.0 = 不超本金），实际可买量
+#                                           由现金、整手与费用收敛（_normalize_target_allocation /
+#                                           _position_shares / _candidate_pool_allocation_shares）
+#   -> paper 单票目标仓位区间约 10% ~ 20%，且不设总仓位上限。
+#
+# 【live 侧实数】唯一源 app/core/config.py：
+#   GRADE_POSITION_CAP                {"A": 0.30, "B": 0.20, "C": 0.10}（比例）
+#                                     分级单票仓位上限，由 plan_quant.GRADE_CAP_PCT /
+#                                     take_profit.C1_SINGLE_CAP 消费
+#                                     （实际只有 A/B 级可生成建仓计划）
+#   C1_CONCENTRATION_CAP              60.0（%）单只占总资产集中度告警线
+#                                     （red_line_check.C1_CAP_PCT）
+#   C2_TOTAL_POSITION_CAP             60.0（%）总仓位上限
+#                                     （plan_quant.C2_TOTAL_CAP / take_profit.py）
+#   C2_INTRADAY_DRAWDOWN_PCT          30.0（%）单票日内回撤触发线（相对成本）
+#   C3_STOP_FACTOR                    0.92       硬止损系数（止损 = 成本 x 0.92）
+#   settings.max_single_position_pct  40.0（%）仅提示词/展示口径（agents/position.py），非计算源
+#
+# 【映射与差异原因（有意保留，本批次不收敛）】
+#   paper 首仓 10%    <-> live C 级 10%（GRADE_POSITION_CAP["C"]）
+#   paper 单票上限 20% <-> live B 级 20%（GRADE_POSITION_CAP["B"]）
+#   paper 无 A 级 30% 档：候选池账户不做评级分级，只按候选池档位铺仓。
+#   live 另有 C2 总仓位 60%、C1 单只 60% 两条红线；paper 侧没有对应红线，因为模拟盘
+#   各自独立账户与独立初始资金，允许满仓演练，不与 live 资金/仓位联动。
+#   B-14（E-8）本批次只补口径说明，不改任何数值常量：改数值会改变模拟盘既有行为并
+#   打破既有测试，口径收敛需另行拍板后单独提交。
 LOT_SIZE = 100
 COMMISSION_RATE = 0.0003
 COMMISSION_MIN = 5.0
@@ -63,6 +103,12 @@ def _num(value, default: float = 0.0) -> float:
 
 def _normalize_target_allocation(value) -> float | None:
     """把 AI/调用方给的目标仓位比例归一化为 (0, 1] 内的小数；无效值返回 None。
+
+    E-16 单位双接受 + 归一化规则（仅固化口径，行为不变）：
+    - 入参允许 0-1 小数（如 0.25）与 0-100 百分数（如 25）两种单位；
+    - 判定阈值：value > 1 视为百分数 → ÷100；value ≤ 1 视为小数，原样使用；
+    - 出口统一为 (0, 1] 小数，再 min(·, POSITION_TARGET_MAX=1.0) 收敛；
+      ≤0 / 非数值 → None（不猜测单位，也不默认成任何仓位）。
 
     不再设 5%~40% 代码上下限：过小的比例在整手换算时自然落空，
     过大的比例由可用现金与费用约束收敛。
@@ -163,12 +209,12 @@ def _limit_block(side: str, code: str, snapshot: dict) -> str:
 
 
 def live_session_open(trade_date: str) -> bool:
-    now = datetime.now()
+    now = clock.now()
     if trade_date != now.date().isoformat() or now.weekday() >= 5:
         return False
     from app.scheduler.jobs import _is_trading_day
-    clock = now.strftime("%H:%M")
-    return _is_trading_day(trade_date) and ("09:30" <= clock < "11:30" or "13:00" <= clock < "15:00")
+    hhmm = now.strftime("%H:%M")
+    return _is_trading_day(trade_date) and ("09:30" <= hhmm < "11:30" or "13:00" <= hhmm < "15:00")
 
 
 def _live_quote_block(snapshot: dict, trade_date: str) -> str:
@@ -179,7 +225,7 @@ def _live_quote_block(snapshot: dict, trade_date: str) -> str:
         try:
             observed = datetime.fromisoformat(raw)
             if observed.tzinfo is None:
-                observed = observed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                observed = observed.replace(tzinfo=clock.now_aware().tzinfo)
             if observed.date().isoformat() != trade_date or observed.strftime("%H:%M") < "14:50":
                 return "market_closed"
         except (TypeError, ValueError):
@@ -429,7 +475,7 @@ def _paper_market_sync(trade_date: str, tradeable: list[dict], candidates: dict,
     """实时 paper 专用的市场节奏补充层；不写正式候选池或真实账户。"""
     from app.datasource.fallback import get_datasource
 
-    if trade_date != date.today().isoformat():
+    if trade_date != clock.today():
         return tradeable, {"status": "historical_or_frozen"}
     try:
         ds = get_datasource()
@@ -457,7 +503,7 @@ def _paper_market_sync(trade_date: str, tradeable: list[dict], candidates: dict,
         breadth = up / max(up + down, 1)
         benchmark = mean(index_changes)
         context = {"status": "observed", "benchmark_change_pct": round(benchmark, 2),
-                   "breadth": round(breadth, 4), "as_of": datetime.now().isoformat()}
+                   "breadth": round(breadth, 4), "as_of": clock.now().isoformat()}
         if benchmark < PAPER_MARKET_SYNC_INDEX_PCT or breadth < PAPER_MARKET_SYNC_BREADTH:
             context["status"] = "no_rotation"
             return tradeable, context
@@ -561,7 +607,7 @@ def run(account_id: int, trade_date: str, *, facts: dict | None = None,
     mode = (facts or {}).get("mode") or ("live_paper" if facts is None else "historical_replay")
     if mode not in {"live_paper", "historical_replay"}:
         raise ValueError("未知模拟事实模式")
-    if facts is None and trade_date != date.today().isoformat():
+    if facts is None and trade_date != clock.today():
         raise ValueError("历史回放必须提供冻结事实，不能读取当前数据库补齐历史")
     requested_sides = dict(requested_sides or {})
     requested_shares = dict(requested_shares or {})

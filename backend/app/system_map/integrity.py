@@ -5,6 +5,7 @@ not execute Agents, workflows, tools, database statements, or external calls.
 """
 from __future__ import annotations
 
+from app.core import clock
 from datetime import datetime
 
 
@@ -17,7 +18,7 @@ HANDLER_AGENT_ALIASES = {"market": "market_intel", "trigger": "discover"}
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return clock.now().isoformat(timespec="seconds")
 
 
 def _issue(kind: str, severity: str, source: str, item: str, message: str,

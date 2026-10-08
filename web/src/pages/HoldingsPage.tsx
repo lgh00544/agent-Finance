@@ -47,9 +47,12 @@ import type { Holding } from '@/types'
 const { Text } = Typography
 
 // ===== 知识库风控红线（仅前端黄色提示，不阻断；最终以后端为准） =====
-const C3_LOSS_PCT = 0.92   // C3 止损 = 成本 × 0.92（永久红线）
-const C1_CAP_PCT = 60.0    // C1：总仓位上限
-const C2_CAP_PCT = 30.0    // C2：单票仓位上限
+// S-4：常量名与后端 core.config 唯一源对齐 —— 修复前前端把「C1 60%」写成总仓位上限、
+// 「C2 30%」写成单票上限，与后端口径正好互相矛盾（后端起唯一裁决作用）
+const C3_LOSS_PCT = 0.92            // C3 止损 = 成本 × 0.92（永久红线）
+const C1_CONCENTRATION_CAP = 60.0   // C1：单只占总资产上限（集中度告警线）
+const C2_TOTAL_POSITION_CAP = 60.0  // C2：总仓位上限
+const GRADE_POSITION_CAP_A = 30.0   // 分级单票仓位上限（A 级；B 级 20% / C 级 10%）
 const E2_INDEX_BAR = 4000.0 // E2：沪指 < 4000 = 防御期，仓位软上限 20%
 const E2_SOFT_CAP = 20.0
 
@@ -140,8 +143,15 @@ function positionWarnings(opts: {
   const c2 = mv_new / totalCapital * 100
   const c1 = mv_total_new / totalCapital * 100
   const warns: string[] = []
-  if (c2 > C2_CAP_PCT) warns.push(`单票仓位将达 ${c2.toFixed(1)}%，超过 C2 上限 ${C2_CAP_PCT.toFixed(0)}%（C2）`)
-  if (c1 > C1_CAP_PCT) warns.push(`总仓位将达 ${c1.toFixed(1)}%，超过 C1 上限 ${C1_CAP_PCT.toFixed(0)}%（C1）`)
+  if (c2 > GRADE_POSITION_CAP_A) {
+    warns.push(`单票仓位将达 ${c2.toFixed(1)}%，超过 A 级单票上限 ${GRADE_POSITION_CAP_A.toFixed(0)}%（分级仓位红线）`)
+  }
+  if (c2 > C1_CONCENTRATION_CAP) {
+    warns.push(`单票占总资产将达 ${c2.toFixed(1)}%，超过 C1 集中度上限 ${C1_CONCENTRATION_CAP.toFixed(0)}%`)
+  }
+  if (c1 > C2_TOTAL_POSITION_CAP) {
+    warns.push(`总仓位将达 ${c1.toFixed(1)}%，超过 C2 总仓位上限 ${C2_TOTAL_POSITION_CAP.toFixed(0)}%`)
+  }
   if (shanghai != null && shanghai < E2_INDEX_BAR && c1 > E2_SOFT_CAP) {
     warns.push(`防御期（沪指 ${shanghai.toFixed(0)} < ${E2_INDEX_BAR.toFixed(0)}）仓位软上限 ${E2_SOFT_CAP.toFixed(0)}%，当前预计 ${c1.toFixed(1)}%`)
   }

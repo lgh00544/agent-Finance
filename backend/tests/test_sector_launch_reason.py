@@ -3,6 +3,7 @@
 3 例：①证据采集字段齐全（含缺数据如实 None）②reason_chain 每条引用 evidence 真实字段（K227）
 ③同 trade_date 删后插幂等。
 """
+from app.core import clock
 import json
 from datetime import date
 from unittest import mock
@@ -25,7 +26,7 @@ def _db_ready():
 
 
 def _seed_snapshot(names):
-    today = date.today().isoformat()
+    today = clock.today_date().isoformat()
     repo.upsert_sector_daily_snapshot([
         {"trade_date": today, "sector_name": n, "change_pct": float(5 - i),
          "rank_no": i + 1, "up_count": 30, "down_count": 10,

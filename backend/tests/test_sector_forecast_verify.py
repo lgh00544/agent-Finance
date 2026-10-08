@@ -53,6 +53,7 @@ def test_t3_switch_hit_when_new_sector_stays_top5_and_mainline_weakens():
 def test_data_insufficient_marks_nulls(monkeypatch):
     monkeypatch.setattr(sfv.repo, "list_sector_daily_dates",
                         lambda limit=120: ["2026-08-29", "2026-08-28"])
+    monkeypatch.setattr(sfv, "_trading_days_after", lambda target, n: [])
     monkeypatch.setattr(sfv.repo, "get_sector_regime_forecast",
                         lambda d: {"current_regime": "rotation", "forward_bias_t5": "uncertain"})
     monkeypatch.setattr(sfv.repo, "list_sector_forward_forecast",
@@ -101,3 +102,81 @@ def test_verify_keeps_causal_snapshot_without_overclaiming_failure():
     assert review["status"] == "market_not_validated"
     assert review["falsification"]["t1_invalid_if"] == "龙头走弱"
     assert "不自动证明" in review["note"]
+
+
+def test_uncertain_prediction_marks_independent_field():
+    regime = {
+        "current_regime": "rotation",
+        "forward_bias_t1": None,
+        "forward_bias_t3": "uncertain",
+        "evidence": {"leader_streak_sector": "半导体"},
+    }
+    forecasts = [{"sector_name": "半导体", "rank_no": 1, "forecast_horizon": "t1"}]
+    actual = {"2026-08-29": [_row("半导体", 2, 2.0), *_rows(["A", "B", "C", "D"])],
+              "2026-08-30": [_row("半导体", 3, 1.0), *_rows(["E", "F", "G", "H"])],
+              "2026-08-31": [_row("半导体", 4, 0.5), *_rows(["I", "J", "K", "L"])]}
+
+    result = sfv.evaluate_forecast(regime, forecasts, actual, "t3", "2026-08-30")
+
+    assert result["mainline_hit"] is None
+    assert result["miss_reason"] == "uncertain"
+    assert result["uncertain"] is True
+    assert result["detail"]["prediction"] == "uncertain"
+
+
+def test_posterior_regime_single_day_returns_none():
+    assert sfv._posterior_regime([]) == "chaos"
+    assert sfv._posterior_regime([_rows(["A", "B", "C", "D", "E"])]) is None
+    two_days = [_rows(["A", "B", "C", "D", "E"]),
+                [_row("A", 1), _row("B", 2), _row("C", 3), _row("D", 4), _row("E", 5)]]
+    assert sfv._posterior_regime(two_days) == "mainline"
+
+
+def test_run_verify_backfills_all_pending_and_skips_verified(monkeypatch):
+    dates = ["2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"]
+    monkeypatch.setattr(sfv.repo, "list_sector_daily_dates",
+                        lambda limit=120: list(reversed(dates)))
+    monkeypatch.setattr(sfv, "_trading_days_after",
+                        lambda target, n: [d for d in dates if d > target][:n])
+    monkeypatch.setattr(sfv.repo, "get_sector_regime_forecast",
+                        lambda d: {"current_regime": "rotation",
+                                   "forward_bias_t1": "uncertain"})
+    monkeypatch.setattr(sfv.repo, "list_sector_forward_forecast",
+                        lambda d: [{"sector_name": "A", "rank_no": 1,
+                                    "forecast_horizon": "t1"}])
+    monkeypatch.setattr(sfv.repo, "list_sector_daily_by_date",
+                        lambda d: _rows(["A", "B", "C", "D", "E"]))
+    monkeypatch.setattr(sfv.repo, "list_sector_forecast_verify", lambda d: [])
+    all_rows = []
+    monkeypatch.setattr(sfv.repo, "upsert_sector_forecast_verify",
+                        lambda rows: all_rows.extend(rows) or len(rows))
+
+    result = sfv.run_sector_forecast_verify(None)
+
+    assert result["success"] is True
+    # 4 个预测日全部回填：25 无后续窗口 data_insufficient，其余 3 个正常落值
+    assert len(all_rows) == 12
+    assert all(r["forecast_date"] in dates for r in all_rows)
+    assert len({r["forecast_date"] for r in all_rows}) == 4
+
+
+def test_run_verify_skips_target_with_t5_done(monkeypatch):
+    dates = ["2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"]
+    monkeypatch.setattr(sfv.repo, "list_sector_daily_dates",
+                        lambda limit=120: list(reversed(dates)))
+    monkeypatch.setattr(sfv, "_trading_days_after",
+                        lambda target, n: [d for d in dates if d > target][:n])
+    monkeypatch.setattr(sfv.repo, "list_sector_daily_by_date",
+                        lambda d: _rows(["A", "B", "C", "D", "E"]))
+    monkeypatch.setattr(sfv.repo, "list_sector_forecast_verify", lambda d: [
+        {"verify_horizon": "t5", "verify_date": "2026-08-30"},
+    ])
+    saved = {}
+    monkeypatch.setattr(sfv.repo, "upsert_sector_forecast_verify",
+                        lambda rows: saved.update({"rows": rows}) or len(rows))
+
+    result = sfv.run_sector_forecast_verify(None)
+
+    assert result["success"] is True
+    assert result["skipped"] is True
+    assert "rows" not in saved

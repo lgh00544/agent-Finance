@@ -2,6 +2,7 @@
 用法: .venv/Scripts/python backend/scripts/fetch_dragon_tiger.py [YYYY-MM-DD]
 不传日期默认取最近一个交易日（T+1 语义：抓前一日）。
 """
+from app.core import clock
 import os
 import sys
 import time
@@ -20,7 +21,7 @@ from app.db import repo  # noqa: E402
 
 def _last_trade_date() -> str:
     """最近交易日（日历为全量静态历（1990~年末），取今天之前的最后一个交易日；失败回退工作日）"""
-    today = date.today().strftime("%Y-%m-%d")
+    today = clock.today_date().strftime("%Y-%m-%d")
     try:
         from app.datasource.akshare_source import AkshareSource
         cal = AkshareSource().fetch_trade_calendar()
@@ -29,7 +30,7 @@ def _last_trade_date() -> str:
             return past[-1]
     except Exception:  # noqa: BLE001
         pass
-    return (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return (clock.today_date() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def main() -> int:

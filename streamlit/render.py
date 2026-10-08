@@ -590,7 +590,9 @@ def trace_line(label: str, time_str: str | None = None, source: str | None = Non
     if source:
         parts.append(f"数据源：{source}")
     if confidence is not None and str(confidence).strip():
-        parts.append(f"置信度：{confidence}")
+        # C-5：置信度原值直接透传，量纲随来源不同（0-1 小数 / 0-100 分制），
+        # 展示层显式标注量纲，避免把 0.8 与 80 当同一量级；字段名与数值一律不改。
+        parts.append(f"置信度：{confidence}（原值，量纲随来源：0-1 或 0-100）")
     if not parts:
         return
     cls = " class='hl'" if highlight else ""
@@ -1069,11 +1071,11 @@ def position_plan_card(key: str, label: str, plan: dict,
         st.markdown(f"- 当前持仓：{plan.get('shares') or '—'} 股，成本 "
                     f"{plan.get('cost') or '—'} 元，单票仓位 "
                     f"{plan.get('single_pct') if plan.get('single_pct') is not None else '—'}%"
-                    f"（C1 单票上限 {plan.get('c1_cap_pct', 30)}%，"
+                    f"（分级单票上限 {plan.get('c1_cap_pct', 30)}%，"
                     f"{'符合' if plan.get('c1_ok') else '**超限需减仓**'}）")
         if plan.get("total_pct") is not None:
             st.markdown(f"- 总仓位约束：当前整体仓位 {plan['total_pct']}%"
-                        f"（C2 总仓上限 {plan.get('c2_cap_pct', 60)}%"
+                        f"（C2 总仓位上限 {plan.get('c2_cap_pct', 60)}%"
                         f"，{'符合' if plan['total_pct'] <= plan.get('c2_cap_pct', 60) else '**超限**'}）")
         st.markdown(f"- 加仓条件：{plan.get('add_condition') or '（当前不满足加仓前提）'}")
         st.markdown(f"- 减仓条件：{plan.get('reduce_condition') or '（除止盈分档外暂无波段减仓触发）'}")
@@ -1081,8 +1083,9 @@ def position_plan_card(key: str, label: str, plan: dict,
         section_title("计算依据说明")
         st.markdown("- 止盈位计算逻辑：基于前期高点压力位、黄金分割位（0.618）、"
                     "成本加 8%~10% 保守区间综合得出，并结合量能/板块热度/游资动向动态调整")
-        st.markdown("- 仓位建议依据：基于标的走势、市况评分与 C1 单票上限 / C2 总仓上限红线")
-        st.markdown("- 引用规则：C1 单票仓位上限 30% / C2 总仓位上限 60% / C3 硬止损（成本×0.92）"
+        st.markdown("- 仓位建议依据：基于标的走势、市况评分与分级单票上限 / C2 总仓位上限红线")
+        st.markdown("- 引用规则：分级单票仓位上限 A 级 30%（B 级 20% / C 级 10%）/ "
+                    "C1 单只集中度上限 60% / C2 总仓位上限 60% / C3 硬止损（成本×0.92）"
                     "/ 分档锁利与移动止盈 / 波段操作（跌破 MA10 且量能放大先减半）——"
                     "对应知识库风控与止盈仓位规则条目")
         st.caption("计算结果已写入推理留痕（source_module=position_monitor），"

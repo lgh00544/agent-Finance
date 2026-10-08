@@ -4,6 +4,7 @@ DiscoverAgent 潜力发掘 - LangGraph 节点
 【交由模型推理的业务逻辑】市况评分、波段潜力判断、候选理由、风险初判（全部在 LLM）
 流转：market_condition → hard_filter → llm_shortlist → enrich_news → enrich_data → llm_final → 落库
 """
+from app.core import clock
 import logging
 
 import pandas as pd
@@ -846,10 +847,10 @@ def llm_final(state: StockAgentState) -> StockAgentState:
 def _today() -> str:
     import time
 
-    return time.strftime("%Y-%m-%d")
+    return clock.today()
 
 
 def _days_ago(n: int) -> str:
     import datetime
 
-    return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
+    return (clock.today_date() - datetime.timedelta(days=n)).isoformat()

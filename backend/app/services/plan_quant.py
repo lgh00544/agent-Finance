@@ -1,8 +1,10 @@
 """建仓计划量化计算层（LLM 输出 → 可执行数值计划，纯计算零 LLM 调用）
 
-【核心原则】所有数值基于账户真实可用资金、C1/C2 风控红线、标的评级，精确可落地：
-- 单票仓位上限按评级分级：A 级 30% / B 级 20% / C 级 10%（C1 红线，仅 B+ 可生成故实际 A/B）；
-- C2 总仓位上限 60%：账户可用资金 = 总资产×60% − 当前持仓市值（不足自动缩减各档金额）；
+【核心原则】所有数值基于账户真实可用资金、L0 风控红线、标的评级，精确可落地：
+- 单票仓位上限按评级分级：A 级 30% / B 级 20% / C 级 10%
+  （GRADE_POSITION_CAP，S-4 后唯一源在 core.config；仅 B+ 可生成故实际 A/B）；
+- C2 总仓位上限 60%（C2_TOTAL_POSITION_CAP）：
+  账户可用资金 = 总资产×60% − 当前持仓市值（不足自动缩减各档金额）；
 - 股数一律 100 股整数倍（A 股一手），金额/价格 2 位小数；
 - 初始止损 = max(LLM 止损, C3 成本×0.92)（更严为准，跌破无条件离场）；
 - 盈亏比 = (止盈−成本) / (成本−止损)，不足 3:1 → 仓位自动降档并标注风险；
@@ -10,18 +12,20 @@
 
 【接入】position.py llm_plan 落库前调用，结果写入 detail.quant，展示层直接读取。
 """
+from app.core import clock
 import logging
 import re
 import time
 
-from app.core.config import settings
+from app.core.config import C2_TOTAL_POSITION_CAP, GRADE_POSITION_CAP, settings
 from app.services import holding_view
 
 logger = logging.getLogger(__name__)
 
-# 分级单票仓位上限（C1 红线，规格硬性规则：A 级 30% / B 级 20% / C 级 10%）
-GRADE_CAP_PCT = {"A": 0.30, "B": 0.20, "C": 0.10}
-C2_TOTAL_CAP = 0.60          # C2 总仓位上限 60%
+# 分级单票仓位上限 / C2 总仓位上限：S-4 后唯一源在 core.config，此处只做本模块别名，
+# 禁止再写第二份字面量（否则又会出现「同名不同值」的口径漂移）
+GRADE_CAP_PCT = GRADE_POSITION_CAP            # A 级 30% / B 级 20% / C 级 10%
+C2_TOTAL_CAP = C2_TOTAL_POSITION_CAP / 100    # C2 总仓位上限 60%（比例）
 BREAKEVEN_MIN = 3.0          # 盈亏比硬性要求 ≥3:1
 REDUCE_FACTOR = 0.7          # 盈亏比不足时仓位自动降低比例
 LOT = 100                    # A 股一手 100 股
@@ -136,7 +140,7 @@ def quantify(code: str, name: str, grade: str, output_batches: list,
 
     return {
         "current_price": _round2(price),
-        "price_date": latest_date or time.strftime("%Y-%m-%d"),
+        "price_date": latest_date or clock.today(),
         "total_capital": _round2(total_capital),
         "available_capital": _round2(available),
         "position_cap_pct": cap_pct * 100,

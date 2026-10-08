@@ -14,6 +14,7 @@
 【刚性代码逻辑】只做调度封装与状态管理，任务执行体由调用方（业务模块）提供，
 本模块不包含任何市场判断。
 """
+from app.core import clock
 import logging
 import json
 import os
@@ -27,6 +28,7 @@ from typing import Any, Callable
 
 from app.cache import cache
 from app.core.config import settings
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -85,15 +87,29 @@ def submit_with_attempt_context(executor: Any, fn: Callable[..., Any],
     return executor.submit(ctx.run, fn, *args, **kwargs)
 
 
-def guarded_commit(db) -> None:
-    """在取消/超时栅栏内提交，确保取消返回后不再产生核心业务写入。"""
+def guarded_commit(db, *, retries: int = 3) -> None:
+    """在取消/超时栅栏内提交，确保取消返回后不再产生核心业务写入。
+
+    IntegrityError（唯一键冲突/并发 upsert 竞态）自动回滚重试（限次，指数退避），
+    兼容 _upsert_stmt 的并发写；重试耗尽或非唯一键异常一律原样上抛，不吞错。
+    """
     with _publish_fence:
-        try:
-            ensure_attempt_active()
-            db.commit()
-        except AttemptInvalidated:
-            db.rollback()
-            raise
+        ensure_attempt_active()
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                db.commit()
+                return
+            except AttemptInvalidated:
+                db.rollback()
+                raise
+            except IntegrityError as exc:
+                db.rollback()
+                last_exc = exc
+                if attempt >= retries:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        raise last_exc  # 类型收口，实际不会到达
 
 
 def _watchdog_loop() -> None:
@@ -134,7 +150,7 @@ def _replace_executor_locked() -> None:
 
 
 def _now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    return clock.now_str()
 
 
 def submit(kind: str, label: str, fn: Callable, params: dict | None = None) -> str:

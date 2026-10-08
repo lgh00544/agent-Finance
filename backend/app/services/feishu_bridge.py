@@ -1,5 +1,6 @@
 """飞书机器人桥：长连接收文本 + 白名单校验 + 会话上下文 + 智能路由分发回复；ENABLE=false 零加载。
 lark-oapi 的 import 与 ws.Client 全部在桥线程内完成（避免主线程 asyncio loop 绑定冲突）。"""
+from app.core import clock
 import json
 import logging
 import re
@@ -81,7 +82,7 @@ def _start_draft_cleanup() -> None:
 
 def _on_message(data) -> None:
     global _last_event_at
-    _last_event_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    _last_event_at = clock.now_str()
     try:
         event = data.event
         sender = (event.sender.sender_id.open_id
@@ -272,7 +273,7 @@ def _apply_pending(open_id: str, pending: dict) -> str:
     rows = pending["result"].get("recognized") or []
     _pending.pop(open_id, None)
     saved = 0
-    today = time.strftime("%Y-%m-%d")
+    today = clock.today()
     for r in rows:
         try:
             code = str(r.get("stock_code") or "").strip()

@@ -8,6 +8,7 @@ import logging
 import time
 
 from app.db import repo
+from app.db.models import _now
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ def refresh_sector_daily_snapshot(trade_date: str | None = None) -> dict:
     from app.datasource.akshare_source import AkshareSource
     # 领涨股代码解析链（复用 sector_snapshot 既有逻辑，供批C 连板/资金/新闻证据取数）
     from app.services.market_view import _leading_from_cons, _spot_name_map
-    today = trade_date or time.strftime("%Y-%m-%d")
+    today = trade_date or _now().strftime("%Y-%m-%d")
     try:
         board_df = AkshareSource().fetch_industry_spot()
     except Exception as exc:  # noqa: BLE001

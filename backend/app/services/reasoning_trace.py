@@ -22,6 +22,17 @@ from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
 
+# E-15/A-21 置信度口径统一：无量化评分来源的推理节点不硬填 0.0 冒充"低置信"，
+# 统一使用 _UNKNOWN_CONFIDENCE 标记"未知"；读取侧/前端应按未知展示，勿解读为否定结论。
+#
+# confidence 列目前存在 4 种取值域，消费方必须先判来源再比较：
+#   ① 0-1 小数：trace_candidate ← _conf(detail["confidence_pct"])（唯一来自模型自评的数值）；
+#   ② 0.0 占位：_UNKNOWN_CONFIDENCE，含义是「该路径无模型自评置信度」；等于 0.0 只是
+#      因为该列是 NOT NULL FLOAT，禁止解读为「低置信」；
+#   ③ 上游聚合值：trace_hot_money ← float(agg["confidence"] or 0.0)（游资多源校验置信度，0-1）；
+#   ④ 类别文本：sell 的 high/medium/low 只进 final_conclusion，不写入 confidence 列。
+_UNKNOWN_CONFIDENCE = 0.0
+
 _BATCH_SIZE = 5          # 攒满 5 条即批量提交
 _FLUSH_SECONDS = 1.0     # 兜底间隔：满 1 秒未凑满也提交
 _MAX_RETRY = 3           # 批量写入失败重试次数（指数退避）
@@ -245,7 +256,8 @@ def trace_score(stock_code: str, stock_name: str, trade_date: str,
         "risk_reasoning": _line(*(risk_list or [])),
         "rule_refs": "",
         "final_conclusion": _j(final_conclusion),
-        "confidence": 0.0,
+        # 占位：该路径无模型自评置信度（ScoreAgent 只产出 0-100 分与等级，无数值置信度）
+        "confidence": _UNKNOWN_CONFIDENCE,
         "data_source": "行情/财务/资金流/新闻原始数据 + LLM 六因子透明评分",
         "ext_info": _j({"model_thinking": model_thinking, "tool_trace": tool_trace}),
     })
@@ -273,7 +285,8 @@ def trace_plan(stock_code: str, stock_name: str, plan_date: str,
                                 "dimensions": {d.get("dim", ""): d.get("verdict", "")
                                                for d in (detail.get("dimensions") or [])
                                                if isinstance(d, dict)}}),
-        "confidence": 0.0,
+        # 占位：该路径无模型自评置信度（PositionAgent 只产出分批/止损止盈方案）
+        "confidence": _UNKNOWN_CONFIDENCE,
         "data_source": "评分 + 大盘指数原始K线 + 资金约束 + LLM 方案",
         "ext_info": "",
     })
@@ -298,7 +311,8 @@ def trace_alert(stock_code: str, stock_name: str, trade_date: str,
         "rule_refs": "",
         "final_conclusion": _j({"alert_type": alert_type, "severity": severity,
                                 "action": action, "message": message}),
-        "confidence": 0.0,
+        # 占位：该路径无模型自评置信度（MonitorAgent 只产出 severity/动作，非置信度）
+        "confidence": _UNKNOWN_CONFIDENCE,
         "data_source": "实时行情/公告/指标 + LLM 信号研判",
         "ext_info": _j(_ext),
     })
@@ -359,7 +373,8 @@ def trace_hot_money_review(stock_code: str, stock_name: str, exit_date: str,
             "signal_effective": bool(review.get("signal_effective")),
             "classification": review.get("classification", ""),
         }),
-        "confidence": 0.0,
+        # 占位：该路径无模型自评置信度（复盘归类只产出有效/无效判定）
+        "confidence": _UNKNOWN_CONFIDENCE,
         "data_source": "历史游资信号留痕 + 实际走势 vs 大盘 + LLM 复盘归类",
         "ext_info": "",
     })
@@ -378,7 +393,8 @@ def trace_review(stock_code: str, stock_name: str, exit_date: str,
         "risk_reasoning": "",
         "rule_refs": "",
         "final_conclusion": _j(feedback),
-        "confidence": 0.0,
+        # 占位：该路径无模型自评置信度（ReviewAgent 只产出经验教训与偏好微调）
+        "confidence": _UNKNOWN_CONFIDENCE,
         "data_source": "建仓计划 + 全程行情 + 交易记录 + LLM 复盘",
         "ext_info": "",
     })
@@ -408,7 +424,9 @@ def trace_sell(stock_code: str, stock_name: str, trade_date: str, decision: dict
                                 "dimensions": {d.get("dim", ""): d.get("verdict", "")
                                                for d in (decision.get("dimensions") or [])
                                                if isinstance(d, dict)}}),
-        "confidence": 0.0,
+        # 占位：该路径无模型自评置信度——SellOutput.confidence 是 high/medium/low 类别文本
+        # （schemas.py），已随决策进 final_conclusion，无法无损映射为 0-1 数值，故不臆造。
+        "confidence": _UNKNOWN_CONFIDENCE,
         "data_source": "持仓实时行情/近期监控信号 + LLM 卖出决策",
         "ext_info": _j({"model_thinking": model_thinking, "tool_trace": tool_trace}),
     })

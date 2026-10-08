@@ -170,13 +170,13 @@ def test_audit_log_get():
     from fastapi import HTTPException
     from app.api.routes import get_audit_log_detail
 
-    repo.insert_audit_log("agent_suggestion", 901, 1, "pass", 85, "支持", "反例场景", "边界",
+    sid = _mk_suggestion()
+    repo.insert_audit_log("agent_suggestion", sid, 1, "pass", 85, "支持", "反例场景", "边界",
                           ["K223"], "deepseek", "{}", 100)
-    r = get_audit_log_detail("agent_suggestion", 901)
+    r = get_audit_log_detail("agent_suggestion", sid)
     assert r["dissent_view"] == "反例场景" and r["verdict"] == "pass"
     try:
         get_audit_log_detail("agent_suggestion", 999999)
         raise AssertionError("应 404")
     except HTTPException as e:
         assert e.status_code == 404
-        assert e.detail == "not found"

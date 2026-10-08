@@ -1,4 +1,5 @@
 """模拟账本最小闭环：规则在代码层验证，且不污染真实 Holding。"""
+from app.core import clock
 import pytest
 import pandas as pd
 
@@ -186,7 +187,7 @@ def test_paper_market_sync_adds_relative_strength_only_on_live_rotation(monkeypa
                                  "change_pct": [2.0, 1.3]})
 
     monkeypatch.setattr(fallback, "get_datasource", lambda: Source())
-    today = paper_execution.date.today().isoformat()
+    today = paper_execution.clock.today_date().isoformat()
     rows, context = paper_execution._paper_market_sync(
         today, [],
         {"600001": {"stock_name": "强势股"}, "600002": {"stock_name": "普通股"}},
@@ -220,7 +221,7 @@ def test_live_buy_gate_records_missing_facts_without_touching_replay():
 def test_live_buy_missing_facts_is_rejected_and_audited(monkeypatch):
     account = repo.create_paper_account("实时复核闸门账户", 100_000, "candidate_pool")
     monkeypatch.setattr(paper_execution, "_live_quote_block", lambda *_: "")
-    today = paper_execution.date.today().isoformat()
+    today = paper_execution.clock.today_date().isoformat()
     facts = {**_facts(), "mode": "live_paper", "market_context": {"band": "进取期"},
              "contexts": {"688901": {"id": 123, "facts": {"fact_as_of": today}}}}
     out = paper_execution.run(
@@ -237,7 +238,7 @@ def test_live_buy_missing_facts_is_rejected_and_audited(monkeypatch):
 def test_live_buy_without_market_sync_is_rejected(monkeypatch):
     account = repo.create_paper_account("实时市况闸门账户", 100_000, "candidate_pool")
     monkeypatch.setattr(paper_execution, "_live_quote_block", lambda *_: "")
-    today = paper_execution.date.today().isoformat()
+    today = paper_execution.clock.today_date().isoformat()
     facts = {**_facts(), "mode": "live_paper", "market_context": {"status": "unavailable"},
              "contexts": {"688901": {"facts": {
                  "get_daily_kline": {"rows": [{"close": 10}]},

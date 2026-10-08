@@ -4,6 +4,7 @@ PositionAgent 仓位规划 - LangGraph 节点
 【交由模型推理的业务逻辑】分批区间/资金配比/止损止盈/市场强弱（全部在 LLM）
 流转：collect_plan_input → llm_plan
 """
+from app.core import clock
 import hashlib
 import json
 import logging
@@ -12,7 +13,10 @@ import time
 from app.agents.common import ModelLevel, agent_call
 from agent_prompts import position_prompt
 from app.agents.schemas import PositionOutput
-from app.core.config import settings
+from app.core.config import (
+    C1_CONCENTRATION_CAP, C2_INTRADAY_DRAWDOWN_PCT, C2_TOTAL_POSITION_CAP, C3_STOP_FACTOR,
+    GRADE_POSITION_CAP, settings,
+)
 from app.datasource.base import DataSource
 from app.datasource.fallback import get_datasource
 from app.db import repo
@@ -27,10 +31,16 @@ def collect_plan_input(state: StockAgentState) -> StockAgentState:
     """节点1：聚合建仓所需全部原始数据【刚性代码逻辑】"""
     code = state["stock_code"]
     source = get_datasource()
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
 
-    # 最新评分（数据库为准，经 repo 网关）
-    score_row = repo.get_latest_score(code)
+    # 最新评分（数据库为准，经 repo 网关）；S-7：只允许使用不晚于 trade_date 且未过期的
+    # 评分（as_of=trade_date），超期一律降级为「未评级」，不由陈旧评级驱动建仓
+    score_row, score_meta = repo.get_score_for_position(code, today)
+    if score_row is not None and score_meta.get("stale"):
+        logger.warning(
+            "建仓评分已过期（评分日 %s，距 %s %s 个交易日 > %s 天）→ 降级为未评级: %s",
+            score_meta.get("score_date"), today, score_meta.get("age_trading_days"),
+            score_meta.get("max_trading_days"), code)
 
     # 大盘近 60 日
     index_kline = source.fetch_index_daily("sh000001", _days_ago(90), today)
@@ -39,11 +49,17 @@ def collect_plan_input(state: StockAgentState) -> StockAgentState:
     kline = source.fetch_daily_kline(code, _days_ago(120), today)
     indicators = compute_indicators(kline)
 
+    # S-7：过期/缺失评分统一降级为「未评级」（plan_quant 走 C 级默认档，不按 A/B 放量）
+    _stale = bool(score_meta.get("stale") or score_row is None)
     state["score_result"] = {
         "score": float(score_row.score) if score_row else None,
-        "grade": score_row.grade if score_row else None,
+        "grade": "未评级" if _stale else score_row.grade,
         "detail": score_row.detail if score_row else {},
         "risk_list": score_row.risk_list if score_row else [],
+        "score_date": score_meta.get("score_date"),
+        "as_of": today,
+        "stale": _stale,
+        "age_trading_days": score_meta.get("age_trading_days"),
     }
     state["basic_info"] = {
         "index_kline": index_kline.tail(60).to_dict(orient="records") if not index_kline.empty else [],
@@ -57,13 +73,14 @@ def collect_plan_input(state: StockAgentState) -> StockAgentState:
     try:
         from app.services.capital_view import compute_capital_view
         _cv = compute_capital_view(code, today)
+        # S-4：红线阈值不再写字面量，统一从 core.config 唯一常量源读取
         red_line_ref = {
-            "c1_cap_threshold_pct": 60.0,
-            "c2_drawdown_threshold_pct": -30.0,
-            "c3_stop_loss_factor": 0.92,
+            "c1_cap_threshold_pct": C1_CONCENTRATION_CAP,
+            "c2_drawdown_threshold_pct": -C2_INTRADAY_DRAWDOWN_PCT,
+            "c3_stop_loss_factor": C3_STOP_FACTOR,
             "wash_suspect": (bool(_cv.get("wash_suspect"))
                              if _cv and _cv.get("wash_suspect") is not None else None),
-            "k192_note": "建仓按 K192 试探仓：主力成本附近建仓、100 整数倍、C3=成本×0.92（吸筹末期待拉升）",
+            "k192_note": f"建仓按 K192 试探仓：主力成本附近建仓、100 整数倍、C3=成本×{C3_STOP_FACTOR}（吸筹末期待拉升）",
         }
     except Exception as exc:  # noqa: BLE001 红线参考读取失败不阻塞建仓规划
         logger.warning("K 红线参考读取失败（跳过注入）: %s", exc)
@@ -76,7 +93,7 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
     """节点2：LLM 生成分批建仓方案 + 落库"""
     code = state["stock_code"]
     name = state.get("stock_name") or code
-    today = state.get("trade_date") or time.strftime("%Y-%m-%d")
+    today = state.get("trade_date") or clock.today()
     info = state.get("basic_info") or {}
 
     score_info = (
@@ -87,7 +104,13 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
     )
     index_data = _compact(info.get("index_kline", [])[:60])
     capital_constraints = (
-        f"总资金: {info.get('capital')} 元；单标的仓位上限: {info.get('max_single_pct')}%；"
+        f"总资金: {info.get('capital')} 元；"
+        # S-4：单标的仓位上限以 L0 分级红线为准（A 级 30%），不再引用可被 .env 覆盖的
+        # 展示用 settings.max_single_position_pct（默认 40%，与 30% 红线自相矛盾）
+        f"单标的仓位上限（L0 分级红线）: A 级 {GRADE_POSITION_CAP['A'] * 100:.0f}% / "
+        f"B 级 {GRADE_POSITION_CAP['B'] * 100:.0f}% / "
+        f"C 级 {GRADE_POSITION_CAP['C'] * 100:.0f}%；"
+        f"C2 总仓位上限（L0 红线）: {C2_TOTAL_POSITION_CAP:.0f}%；"
         f"交易风格: {info.get('trade_style')}"
     )
     _rl = info.get("red_line_ref") or {}
@@ -130,7 +153,7 @@ def llm_plan(state: StockAgentState) -> StockAgentState:
     grade = (state.get("score_result") or {}).get("grade") or ""
     data_as_of = str(indicators.get("latest_date") or "")
     freshness = _data_freshness(data_as_of, today)
-    analysis_generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    analysis_generated_at = clock.now_str()
     # 量化计算（纯计算零 LLM）：金额/股数（100 整数倍）/分级 C1 上限/盈亏比/资金缩减
     quant = plan_quant.quantify(
         code, name, grade,
@@ -192,4 +215,4 @@ def _compact(data) -> str:
 def _days_ago(n: int) -> str:
     import datetime
 
-    return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
+    return (clock.today_date() - datetime.timedelta(days=n)).isoformat()

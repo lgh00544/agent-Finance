@@ -11,6 +11,7 @@
   胜率 < 40% → 降档建议（一线→二线→观察）；≥ 60% → 升档建议；40%~60% 保持；
   观察档连续误判 → 建议在候选/评分提示词标注"谨慎/反向参考"（人工决定是否写入）。
 """
+from app.core import clock
 import logging
 import time
 
@@ -119,7 +120,7 @@ def real_price_lookup(stock_code: str, trade_date: str) -> tuple | None:
 
         src = get_datasource()
         start = f"{trade_date[:4]}0101"
-        end = time.strftime("%Y-%m-%d")
+        end = clock.today()
         stock = src.fetch_daily_kline(stock_code, start, end)
         index = bench_index_frame(src, start, end)
         return _forward_5d_returns(stock, index, trade_date)
@@ -197,7 +198,7 @@ def run_win_rate_iteration(price_lookup=None) -> dict:
     2) 统计事实落库（win_rate_5d/last_review_at，可追溯）；
     3) 生成降/升档建议落 agent_suggestion（pending 待人工审核），不自动改档位。
     返回 {"updated": [...], "suggestions": [...], "errors": [...]}"""
-    now_str = time.strftime("%Y-%m-%d %H:%M")
+    now_str = clock.now_str("%Y-%m-%d %H:%M")
     updated, suggestions, errors = [], [], []
     for profile in repo.list_hot_money_profiles():
         try:

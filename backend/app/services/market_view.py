@@ -6,6 +6,7 @@
   匹配失败时降级拉该板块成分股，按涨跌幅取最大者（缓存复用，不重复请求）；
 - 数据源失败返回空表 + error 标注，由前端显示「数据加载中/上次缓存值」。
 """
+from app.core import clock
 import concurrent.futures
 import logging
 import time
@@ -32,7 +33,7 @@ _INDEX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_p
 
 def index_quotes() -> dict:
     """三大指数实时行情 + 更新时间；失败返回空列表 + error 标注（前端降级展示）"""
-    now_min = time.strftime("%Y-%m-%d %H:%M")
+    now_min = clock.now_str("%Y-%m-%d %H:%M")
     try:
         ds = get_datasource()
         fut = _INDEX_POOL.submit(ds.fetch_index_spot)

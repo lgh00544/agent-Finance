@@ -1,8 +1,13 @@
-"""G' 下一个风口预测：调用 D' _score() 派生 top10 外候选。"""
+"""G' 下一个风口预测（观察型 shadow，A-24：不进入正式 Agent 注入，仅前端展示与人工复盘）：
+调用 D' _score() 派生 top10 外候选，输出带 observation_shadow 标记。
+
+观察型支线：无 verify（不参与 E'-1 回验）、不进决策链，仅作人工复盘参考。
+"""
 import logging
 import time
 
 from app.db import repo
+from app.db.models import _now
 from app.services import sector_forward_view
 
 logger = logging.getLogger(__name__)
@@ -77,13 +82,20 @@ def _causal_evidence(score: dict, causal: dict | None) -> dict:
 
 
 def judge_next_hot(trade_date: str | None = None) -> dict:
-    """预测当前 top10 外、未来 1-3 日最可能进 top5 的前 5 板块。"""
-    today = trade_date or time.strftime("%Y-%m-%d")
+    """预测当前 top10 外、未来 1-3 日最可能进 top5 的前 5 板块。
+
+    观察型支线：无 verify、不进决策链，仅作人工复盘参考。
+    缺行情结构或缺候选快照时直接跳过且不写库（A-25/SC-7）：
+    upsert_sector_next_hot 是「先 DELETE 当日再插入」，传空列表等于静默清空既有结果。
+    """
+    today = trade_date or _now().strftime("%Y-%m-%d")
     regime = repo.get_sector_regime_forecast(today)
     rows = [r for r in repo.list_sector_daily_by_date(today) if 11 <= int(r.get("rank_no") or 0) <= 80]
     if not regime or not rows:
-        repo.upsert_sector_next_hot([], trade_date=today)
-        return {"success": True, "trade_date": today, "count": 0, "rows": []}
+        reason = "行情结构预测缺失" if not regime else "top10 外候选快照缺失"
+        logger.warning("下一个风口预测跳过（不写库，保留既有结果）: %s %s", today, reason)
+        return {"success": False, "trade_date": today, "count": 0, "rows": [],
+                "skipped": True, "error": reason}
     names = [r["sector_name"] for r in rows]
     try:
         from app.datasource.akshare_source import AkshareSource
@@ -102,6 +114,7 @@ def judge_next_hot(trade_date: str | None = None) -> dict:
                     "switch_candidate": score.get("switch_candidate"),
                     "current_rank": row.get("rank_no"),
                     "sector_tag": score.get("sector_tag", "none"),
+                    "observation_shadow": True,
                     **_causal_evidence(score, causal)}
         if hot is None:
             evidence["data_insufficient"] = True

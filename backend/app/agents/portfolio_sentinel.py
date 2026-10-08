@@ -8,6 +8,7 @@ PortfolioSentinel 组合哨兵 - LangGraph 单节点（交易时段每 10 分钟
 流转：portfolio_sentinel_node（collect → agent_call(LIGHT) → 落库推送）
 数据纪律：各数据段独立 try/except，缺失字段标注「数据不足」绝不编造；无持仓正常跳过不报错。
 """
+from app.core import clock
 import json
 import logging
 import re
@@ -42,7 +43,7 @@ _ALERT_RED = "red"
 
 
 def _today() -> str:
-    return time.strftime("%Y-%m-%d")
+    return clock.today()
 
 
 def _hold_days(entry_date) -> int:
@@ -147,7 +148,12 @@ def collect_portfolio_data() -> dict | None:
     for h in holdings:
         quote = quotes.get(h.stock_code) or {}
         price = quote.get("price")
-        cost = float(h.cost or (h.entry_price or 0) * (h.shares or 0))
+        # S-5 不变量：当前持仓成本 = entry_price × shares；历史脏数据（减仓未重算 cost）
+        # 会虚增组合总成本、压低组合盈亏，故偏差 ≥0.01 元时以不变量为准
+        inv_cost = float((h.entry_price or 0) * (h.shares or 0))
+        cost = float(h.cost or inv_cost)
+        if inv_cost > 0 and abs(cost - inv_cost) >= 0.01:
+            cost = inv_cost
         total_cost += cost
         mv = pnl_pct = None
         if price is not None and price > 0:

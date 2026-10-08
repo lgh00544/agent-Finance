@@ -6,6 +6,7 @@
   避免 qfq 基准漂移导致指标静默失真（核验结论 v2 §11.4 硬要求）。
 - 单只失败只计数不抛出；批间 sleep 控速，避免触发源站反爬。
 """
+from app.core import clock
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -21,7 +22,7 @@ SLEEP_BETWEEN = 0.5
 def fetch_history(code: str, source=None, lookback_days: int = LOOKBACK_DAYS,
                   end_date: str | None = None, name: str = "") -> list[dict]:
     """拉一只票历史日线（qfq）→ 本地行列表；空/异常返回 []（不抛出）"""
-    end = end_date or time.strftime("%Y-%m-%d")
+    end = end_date or clock.today()
     start = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     try:
         if source is None:

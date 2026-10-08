@@ -10,6 +10,7 @@
 红线：不调 LLM 预测数字（纯统计）；缺数据诚实 null/missing_data，不补 0 不补均值；
 不改 6 因子权重；不覆盖 K 红线研判。
 """
+from app.core import clock
 import logging
 from datetime import date, timedelta
 
@@ -44,7 +45,7 @@ def save_forward_view(stock_code: str, trade_date: str, horizon_bias: str,
 def fill_forward_view_actual() -> dict:
     """每日 16:00 回填 t5_pct_actual（范围：选入日 ≤ today-5 且 IS NULL）。
     实际涨跌复用 track_verify.t5_pct（不新算）；无追踪行/无值 → 诚实留空跳过（不补 0）。"""
-    cutoff = (date.today() - timedelta(days=5)).strftime("%Y-%m-%d")
+    cutoff = (clock.today_date() - timedelta(days=5)).strftime("%Y-%m-%d")
     pending = repo.list_unfilled_forward_view(cutoff_date=cutoff)
     filled = 0
     for row in pending:

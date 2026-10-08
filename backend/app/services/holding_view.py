@@ -5,6 +5,7 @@
 - 不修改任何持仓/计划记录，去重合并由前端展示层完成（原始数据完整保留）；
 - 行情失败时字段为 None（前端显示警示，不伪造 0 值）。
 """
+from app.core import clock
 import logging
 import time
 
@@ -64,11 +65,21 @@ def _round2(value: float) -> float:
 def build_holding_view(user_id: int | None = None, *, is_admin: bool = False) -> dict:
     """持仓列表视图：原始记录 + 实时行情 + 参考止损/止盈 + 目标仓位%。
 
-    返回 {rows, quote_time, quote_error}：rows 为 repo 原始记录基础上追加
-    current_price/market_value/pnl_amount/pnl_pct/stop_loss_source/take_profit_source，
-    并补全 stop_loss/take_profit（人工设置优先 → 关联建仓计划 → 默认风控比例）。
+    返回 {rows, quote_time, quote_error, source, total_capital}：rows 为 repo 原始记录
+    （list_holdings 原样透传 target_pct / high_price / cost_basis_initial 等 DB 字段）
+    基础上追加 current_price/market_value/pnl_amount/pnl_pct/stop_loss_source/
+    take_profit_source，并补全 stop_loss/take_profit
+    （人工设置优先 → 关联建仓计划 → 默认风控比例）。
+
+    字段口径（E-12/E-13/E-14；新增键一律不改变旧键取值）：
+    - target_pct / position_weight_pct：实时市值权重% = 当前市值 ÷ settings.total_capital
+      × 100（旧语义原样保留，前端与 test_holding_view 依赖此口径）；
+    - db_target_pct：DB 原始记录里的建仓目标占比（旧 target_pct 被覆写前的那把尺子）；
+    - target_pct_source：占比分母来源标注（'market_value/total_capital'）；
+    - pnl_pct：**未实现**浮盈率，分母 = entry_price；与 review.py 的已实现口径
+      （分母 cost_basis_initial）不是同一个量，跨模块比较前先看分母。
     """
-    now_min = time.strftime("%Y-%m-%d %H:%M")
+    now_min = clock.now_str("%Y-%m-%d %H:%M")
     try:
         rows = repo.list_holdings(status="holding", user_id=user_id, is_admin=is_admin)
     except TypeError:
@@ -112,15 +123,32 @@ def build_holding_view(user_id: int | None = None, *, is_admin: bool = False) ->
             r.get("take_profit"), entry_price, plans.get(r.get("plan_id")),
             latest_plan_by_code.get(code), settings.default_take_profit_pct, False)
 
-        target_pct = None
+        # E-12 双语义拆名 + 向后兼容：旧键 target_pct 的语义与取值**保持不变**
+        #   target_pct          = 实时市值权重%（= market_value / total_capital × 100，
+        #                         前端与 backend/tests/test_holding_view.py 依赖此口径）
+        #   position_weight_pct = 与 target_pct 同值的显式别名（新代码请用这个）
+        #   db_target_pct       = DB 原始记录里的建仓目标占比（新增键，不再被覆写）
+        #   target_pct_source   = 占比分母来源标注，避免与 DB 口径混淆
+        db_target_pct = r.get("target_pct")
+        position_weight_pct = None
         if market_value is not None and settings.total_capital > 0:
-            target_pct = round(market_value / settings.total_capital * 100, 1)
+            position_weight_pct = round(market_value / settings.total_capital * 100, 1)
 
+        # E-13 分母口径固化（不改数值）：本行 pnl_pct = (现价 − entry_price) / entry_price × 100，
+        # 是**未实现**浮盈率（分母=持仓成本价，加仓后由 repo 重算 entry_price）；
+        # 与 review.py 的**已实现**口径
+        # pnl_pct = (卖出金额 − cost_basis_initial) / cost_basis_initial × 100 不是同一个量。
+        # E-14 占比分母标注：target_pct / position_weight_pct 的分母是配置基准本金
+        # settings.total_capital（固定基准），不是账户实时总资产；
+        # red_line_check 的 C1 用 account_total_asset()（有券商基线取真实总资产），两边口径不同。
         out.append({**r, "current_price": price, "market_value": market_value,
                     "pnl_amount": pnl_amount, "pnl_pct": pnl_pct,
                     "stop_loss": stop_loss, "stop_loss_source": sl_src,
                     "take_profit": take_profit, "take_profit_source": tp_src,
-                    "target_pct": target_pct})
+                    "target_pct": position_weight_pct,
+                    "position_weight_pct": position_weight_pct,
+                    "db_target_pct": db_target_pct,
+                    "target_pct_source": "market_value/total_capital"})
     return {"rows": out, "quote_time": now_min, "quote_error": quote_error,
             "source": source, "total_capital": settings.total_capital}
 
@@ -136,12 +164,50 @@ def build_account_summary(user_id: int | None = None, *, is_admin: bool = False)
     view = build_holding_view(user_id, is_admin=is_admin)
     rows = view["rows"]
 
-    total_cost = sum(float(r.get("cost") or 0) for r in rows)
+    # S-5：总成本按不变量口径 = Σ(entry_price × shares)；历史脏数据（减仓未重算 cost）
+    # 在此被纠正，避免「已卖出部分的成本」继续计入账户总成本
+    def _position_cost(r: dict) -> float:
+        entry = float(r.get("entry_price") or 0)
+        held = float(r.get("shares") or 0)
+        if entry > 0 and held > 0:
+            return round(entry * held, 2)
+        return float(r.get("cost") or 0)
+
+    total_cost = sum(_position_cost(r) for r in rows)
     mv_known = any(r.get("market_value") is not None for r in rows)
     market_value = sum(float(r.get("market_value") or 0) for r in rows
                        if r.get("market_value") is not None)
     pnl = sum(float(r.get("pnl_amount") or 0) for r in rows
               if r.get("pnl_amount") is not None)
+
+    # A-27 已实现盈亏：按 trade_record 移动加权成本法聚合卖出收益，
+    # 与持仓浮盈（pnl_amount）分开口径；行情不可用时该值仍有效（不依赖报价）。
+    def _realized_pnl(holding_id: int) -> float:
+        shares = 0.0
+        avg_cost = 0.0
+        realized = 0.0
+        try:
+            trades = repo.get_trades(holding_id)
+        except Exception:  # noqa: BLE001 单持仓失败不阻断摘要
+            return 0.0
+        for t in trades:
+            qty = float(t.shares or 0)
+            price = float(t.price or 0)
+            if qty <= 0:
+                continue
+            if t.side == "buy":
+                new_total = shares + qty
+                if new_total > 0:
+                    avg_cost = (avg_cost * shares + price * qty) / new_total
+                shares = new_total
+            elif t.side == "sell":
+                sell_qty = min(qty, shares)
+                realized += (price - avg_cost) * sell_qty
+                shares -= sell_qty
+        return realized
+
+    realized_pnl = sum(_realized_pnl(int(r.get("holding_id") or r.get("id") or 0))
+                       for r in rows)
 
     try:
         baseline = repo.get_latest_account_baseline(user_id, is_admin=is_admin)
@@ -160,17 +226,26 @@ def build_account_summary(user_id: int | None = None, *, is_admin: bool = False)
             position_pct = market_value / total_asset * 100 if total_asset > 0 else 0.0
         base = total_asset - pnl
         pnl_pct = pnl / base * 100 if base > 0 else 0.0
+        # A-27 口径自洽：pnl_amount 继续保持「未实现浮盈」语义（向后兼容，不改数值），
+        # 另给 pnl_amount_total = 未实现 + 已实现，作为唯一可比较的「总盈亏」口径；
+        # total_asset 的估算路径仍以配置本金为基准（不叠加已实现，避免与券商基线双计）。
         return {"total_asset": _round2(total_asset), "total_cost": _round2(total_cost),
                 "market_value": _round2(market_value), "pnl_amount": _round2(pnl),
+                "pnl_amount_total": _round2(pnl + realized_pnl),
                 "pnl_pct": _round2(pnl_pct), "position_pct": _round2(position_pct),
+                "realized_pnl": _round2(realized_pnl),
                 "available_cash": _round2(available_cash), "source": source,
                 "baseline": baseline, "quote_time": view["quote_time"],
                 "quote_error": view["quote_error"]}
 
     # 行情整体失败且存在持仓：市价相关项不展示（前端显示「—」并标注失败原因）
+    # A-27：行情整体失败时浮盈不可知（pnl_amount=None，不伪造 0），但已实现盈亏仍有效，
+    # 故 pnl_amount_total 只落已实现部分并在口径上与上一条分支保持一致（键恒存在）。
     return {"total_asset": float(baseline["total_asset"]) if baseline else None,
             "total_cost": _round2(total_cost), "market_value": None, "pnl_amount": None,
+            "pnl_amount_total": _round2(realized_pnl),
             "pnl_pct": None, "position_pct": float(baseline["position_pct"]) if baseline else None,
+            "realized_pnl": _round2(realized_pnl),
             "available_cash": float(baseline["available_cash"]) if baseline else None,
             "source": source, "baseline": baseline,
             "quote_time": view["quote_time"], "quote_error": view["quote_error"]}
@@ -182,7 +257,7 @@ def build_today_pnl_estimate(user_id: int | None = None, *, is_admin: bool = Fal
         rows = repo.list_holdings(status="holding", user_id=user_id, is_admin=is_admin)
     except TypeError:
         rows = repo.list_holdings(status="holding")
-    quote_time = time.strftime("%Y-%m-%d %H:%M")
+    quote_time = clock.now_str("%Y-%m-%d %H:%M")
     if not rows:
         return {"pnl_amount": None, "pnl_pct": None, "covered": 0, "total": 0,
                 "source": "estimate", "quote_time": quote_time, "error": "当前无持仓"}

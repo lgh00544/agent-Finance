@@ -10,6 +10,7 @@
   - 存储复用 news_article 表 + repo.add_news（按 code+title 去重入库）
   - 节流复用项目 cache（fetch_news 自身 600s 缓存 + 本服务当日抓取标记）
 """
+from app.core import clock
 import logging
 import re
 from datetime import datetime, timedelta
@@ -57,7 +58,7 @@ def classify_announcement(title: str) -> str:
 
 def _days_left_today() -> int:
     """距今日 24:00 剩余秒数（当日标记缓存 TTL 用）"""
-    now = datetime.now()
+    now = clock.now()
     return int((now.replace(hour=23, minute=59, second=59) - now).total_seconds()) + 1
 
 

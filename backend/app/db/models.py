@@ -248,7 +248,11 @@ class Holding(Base):
     entry_price: Mapped[float] = mapped_column(Float)                # 平均建仓成本价
     shares: Mapped[int] = mapped_column(Integer)                     # 当前股数
     high_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 持仓期最高价（移动止盈线基准；旧数据 NULL 降级以当前价为基准）
-    cost: Mapped[float] = mapped_column(Float, default=0.0)          # 总成本（元）
+    # 当前持仓总成本（元）= entry_price × shares（S-5 不变量，减仓/清仓事务内重算）
+    cost: Mapped[float] = mapped_column(Float, default=0.0)
+    # S-5：生命周期总成本（自建仓起累计买入成本，减仓/清仓都不回退）——
+    # 复盘盈亏分母与账户总成本展示的权威口径；旧数据由启动迁移回填为当时的 cost
+    cost_basis_initial: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     stop_loss: Mapped[float] = mapped_column(Float, default=0.0)     # 止损参考价（Plan/人工）
     take_profit: Mapped[float] = mapped_column(Float, default=0.0)   # 止盈参考价
     target_pct: Mapped[float] = mapped_column(Float, default=0.0)    # 目标仓位 %
@@ -271,6 +275,9 @@ class TradeRecord(Base):
     price: Mapped[float] = mapped_column(Float)
     shares: Mapped[int] = mapped_column(Integer)
     amount: Mapped[float] = mapped_column(Float)                     # 成交金额
+    commission: Mapped[float | None] = mapped_column(Float, nullable=True)   # 佣金（元）；E-8/E-7 净额口径，NULL=未录入无费用
+    slippage: Mapped[float | None] = mapped_column(Float, nullable=True)     # 滑点（每股元，留痕）
+    net_amount: Mapped[float | None] = mapped_column(Float, nullable=True)   # 净额（buy=含费用支出；sell=扣费后净得）
     trade_date: Mapped[str] = mapped_column(String(10))
     note: Mapped[str] = mapped_column(Text, default="")
     before_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 操作前股数（K223 留痕）
@@ -646,6 +653,8 @@ class RuleChange(Base):
     risk_note: Mapped[str] = mapped_column(Text, default="")
     file_path: Mapped[str] = mapped_column(String(255), default="")
     insert_position: Mapped[str] = mapped_column(String(32), default="")
+    effective_from: Mapped[str] = mapped_column(String(10), default="")  # 生效起始日（''=即刻生效，A-22 生命周期）
+    expires_at: Mapped[str] = mapped_column(String(10), default="")      # 到期日（''=永久有效；超过则读取侧自动失效）
     status: Mapped[str] = mapped_column(String(16), default="active")  # active=生效中 / rolled_back=已回滚
     rollback_reason: Mapped[str] = mapped_column(Text, default="")
     rollback_time: Mapped[str] = mapped_column(String(16), default="")  # YYYY-MM-DD HH:mm

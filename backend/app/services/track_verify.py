@@ -19,6 +19,8 @@
 - 建议生成 LLM 为主、确定性模板兜底，来源强制标记（llm/template）；
 - 主链路幂等：初始化天然去重 + 唯一约束，重复执行安全。
 """
+from app.core import clock
+from datetime import timedelta
 import hashlib
 import json
 import logging
@@ -116,7 +118,7 @@ def compute_tn_metrics(dates: list[str], closes: list[float],
 def confirmed_kline_points(dates: list[str], closes: list[float],
                            now: datetime | None = None) -> tuple[list[str], list[float]]:
     """过滤未确认日K：盘中数据源可能返回当天正在形成的日K，16:00 前不得用于 T+N。"""
-    now = now or datetime.now()
+    now = now or clock.now()
     today = now.strftime("%Y-%m-%d")
     include_today = now.hour >= _CLOSE_CONFIRM_HOUR
     pairs = [
@@ -420,7 +422,7 @@ def build_horizon_context(shortlist: list[dict], data_enrichment: dict,
                 from app.services.forward_view_history import save_forward_view
                 save_forward_view(
                     stock_code=code,
-                    trade_date=trade_date or date.today().isoformat(),
+                    trade_date=trade_date or clock.today(),
                     horizon_bias=cand.get("horizon_bias") or "",
                     horizon_clarity=cand.get("horizon_clarity") or "",
                     signals={"position": pos_line, "money": money_line,
@@ -915,7 +917,7 @@ def _default_price_lookup(stock_code: str, select_date: str):
 
     src = get_datasource()
     start = f"{select_date[:4]}0101"
-    end = time.strftime("%Y-%m-%d")
+    end = clock.today()
     return src.fetch_daily_kline(stock_code, start, end)
 
 
@@ -1109,8 +1111,8 @@ def _daily_closes(codes: list[str], days: int) -> dict[str, dict[str, float]]:
         return out
     from app.datasource.fallback import get_datasource
 
-    end = time.strftime("%Y-%m-%d")
-    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days + 20) * 86400))  # +20 缓冲覆盖周末/停牌
+    end = clock.today()
+    start = (clock.now() - timedelta(days=days + 20)).strftime("%Y-%m-%d")  # +20 缓冲覆盖周末/停牌
     src = get_datasource()
     for code in codes:
         try:
@@ -1158,7 +1160,7 @@ def build_portfolio_attribution(period_days: int = 30) -> dict:
 
     closes = _daily_closes([it["code"] for it in items], period_days)
     dates = sorted(set().union(*[set(c) for c in closes.values()]) if closes else [])
-    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - period_days * 86400))
+    start = (clock.now() - timedelta(days=period_days)).strftime("%Y-%m-%d")
     curve = [p for p in _curve_points(items, closes, dates, total_cost) if p["date"] >= start]
 
     contributors = []
@@ -1167,7 +1169,7 @@ def build_portfolio_attribution(period_days: int = 30) -> dict:
         holding_days = None
         if it["entry_date"]:
             try:
-                holding_days = max(0, (date.today() - date.fromisoformat(it["entry_date"])).days)
+                holding_days = max(0, (clock.today_date() - date.fromisoformat(it["entry_date"])).days)
             except ValueError:
                 holding_days = None
         contributors.append({
@@ -1211,7 +1213,7 @@ def build_stock_cycle_attribution(stock_code: str) -> dict:
         return empty
 
     from datetime import date
-    today = date.today()
+    today = clock.today_date()
     cycles = []
     for h in holdings:
         trades = repo.get_trades(h["id"])

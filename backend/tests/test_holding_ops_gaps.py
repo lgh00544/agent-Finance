@@ -22,7 +22,8 @@ def _db_ready():
 
 def _holding(entry_price=10.0, shares=1000):
     return repo.insert_holding("600004", "测试股D", "2026-07-01",
-                               entry_price, shares, entry_price * shares)
+                               entry_price, shares, entry_price * shares,
+                               user_id=repo.ensure_default_user())
 
 
 def _get(hid):

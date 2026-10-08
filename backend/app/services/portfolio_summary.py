@@ -1,4 +1,5 @@
 """每日组合总结（daily-summary）：从组合归因派生 + 持仓最新浮盈亏聚合。纯计算零 LLM。"""
+from app.core import clock
 import time
 
 from app.services.holding_view import build_holding_view
@@ -14,7 +15,7 @@ def build_daily_summary(days: int = 30) -> dict:
     pnl_amount = sum(float(r.get("pnl_amount") or 0) for r in rows)
     market_value = round(total_cost + pnl_amount, 2)
     latest = curve[-1] if curve else None
-    current = {"date": time.strftime("%Y-%m-%d"),
+    current = {"date": clock.today(),
                "pnl_pct": latest.get("total_pnl_pct") if latest else None,
                "pnl_amount": round(pnl_amount, 2), "market_value": market_value}
     series = [{"date": p["date"], "pnl_pct": p["total_pnl_pct"]} for p in curve]

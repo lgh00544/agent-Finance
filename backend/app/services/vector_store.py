@@ -7,6 +7,7 @@
 新闻/公告原文存于数据库 news_article 表（真源），本模块仅做索引与检索。
 【刚性代码逻辑】只负责存储与检索，检索结果交由 LLM 研判。
 """
+from app.core import clock
 import logging
 from typing import Any
 
@@ -214,7 +215,7 @@ class VectorStore:
                     stmt = stmt.where(PrivateKnowledge.methodology_type == methodology_type)
                 if market_scope:
                     stmt = stmt.where(PrivateKnowledge.market_scope == market_scope)
-                now = datetime.now()
+                now = clock.now()
                 stmt = stmt.where(
                     or_(PrivateKnowledge.valid_from.is_(None), PrivateKnowledge.valid_from <= now),
                     or_(PrivateKnowledge.valid_to.is_(None), PrivateKnowledge.valid_to > now),

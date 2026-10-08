@@ -28,7 +28,7 @@ cron 每月 1 号 02:00 触发 run_factor_ic_backtest
   ↓
 取过去 36 个月交易日历（DAGGER 月末对齐）
   ↓
-对每月 1 天的"当日" 截面：
+对每月最后一个交易日（月末）的"当日" 截面：
   - 调 25 因子（via factor_registry.list_active）
   - 对每只 A 股（约 5000 只，sql 拉 stock_basic）跑 DataAdapter → 25 因子值
   - 拿当日 close / 未来 20 日 close → 算 20 日 forward_return
@@ -42,6 +42,15 @@ cron 每月 1 号 02:00 触发 run_factor_ic_backtest
   ↓
 前端调 GET /api/factor-ic-history 展示
 ```
+
+> **口径更正（批次 20 · C-8，2026-10-06）**：本方案 §1.1 数据流原写「对每月 1 天的"当日" 截面」，
+> 与实现不一致 —— `backend/app/services/factor_ic.py::_month_ends`（`:144-155`）按交易日历归并
+> `latest[value[:7]] = value`，取的是**每月最后一个交易日（月末）** 的截面，并剔除「月末之后
+> 剩余交易日不足 FORWARD_DAYS（20 日）」的尾部期次；`run_factor_ic_backtest_job`（`:570`）以
+> `_month_ends(source.fetch_trade_calendar(), months)` 为唯一期次来源。原文的「每月 1 号」指
+> **cron 调度日**（02:00 触发），不是截面日期；与 `因子IC月度回测_批2_v2.md:60`「每月月末」表述一致。
+> **历史结论（IC/IR/胜率与因子启停判定）不受影响**，仅口径表述以本更正为准；上方 §1.1 对应行
+> 已同步改为「每月最后一个交易日（月末）」，本次不删除任何历史记录。
 
 ### 1.2 新增对象
 

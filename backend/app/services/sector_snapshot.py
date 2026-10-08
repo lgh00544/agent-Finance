@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 
 from app.db import repo
+from app.db.models import _now
 
 logger = logging.getLogger(__name__)
 
@@ -26,17 +27,17 @@ def refresh_sector_snapshot() -> dict:
     # lazy import 规避循环：market_view.hot_sectors() → sector_snapshot.get_hot_sectors_with_fallback()
     #                          ← sector_snapshot.refresh_sector_snapshot() → market_view._spot_name_map
     from app.services.market_view import _spot_name_map, _leading_from_cons
-    today = time.strftime("%Y-%m-%d")
+    today = _now().strftime("%Y-%m-%d")
     try:
         ds = AkshareSource()
         board_df = ds.fetch_industry_spot()
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "rows": 0, "error": f"板块行情获取失败: {exc}",
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                "updated_at": _now().strftime("%Y-%m-%d %H:%M:%S")}
 
     if board_df is None or board_df.empty or "board_name" not in board_df.columns:
         return {"success": False, "rows": 0, "error": "板块行情返回空表",
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                "updated_at": _now().strftime("%Y-%m-%d %H:%M:%S")}
 
     # 复用 market_view 既有逻辑（已有完整排序 + 领涨龙头解析降级链）
     boards = []
@@ -68,11 +69,11 @@ def refresh_sector_snapshot() -> dict:
 
     if not rows:
         return {"success": False, "rows": 0, "error": "无有效板块数据",
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                "updated_at": _now().strftime("%Y-%m-%d %H:%M:%S")}
 
     inserted = repo.upsert_sector_snapshot(rows)
     return {"success": True, "rows": inserted, "error": None,
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            "updated_at": _now().strftime("%Y-%m-%d %H:%M:%S")}
 
 
 def get_hot_sectors_with_fallback() -> dict:
@@ -86,7 +87,7 @@ def get_hot_sectors_with_fallback() -> dict:
       4. DB 无数据 + 非交易时段 → 返回空 + error
     """
     from app.datasource.market_hours import snapshot_allowed
-    today = time.strftime("%Y-%m-%d")
+    today = _now().strftime("%Y-%m-%d")
     sectors = repo.list_sector_snapshot_by_date(today, limit=5)
     updated_at = repo.get_sector_snapshot_updated_at(today) or ""
 
@@ -96,7 +97,7 @@ def get_hot_sectors_with_fallback() -> dict:
         if updated_at:
             try:
                 last_ts = datetime.strptime(updated_at[:19], "%Y-%m-%d %H:%M:%S")
-                stale = (datetime.now() - last_ts).total_seconds() > STALE_THRESHOLD_SECONDS
+                stale = (_now() - last_ts).total_seconds() > STALE_THRESHOLD_SECONDS
             except (ValueError, TypeError):
                 stale = True  # 解析失败也判 stale，让前端标注
         return {"sectors": sectors, "updated_at": updated_at,
@@ -108,7 +109,7 @@ def get_hot_sectors_with_fallback() -> dict:
         if refresh_result.get("success"):
             sectors = repo.list_sector_snapshot_by_date(today, limit=5)
             return {"sectors": sectors,
-                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "updated_at": _now().strftime("%Y-%m-%d %H:%M:%S"),
                     "stale": False, "error": None}
         return {"sectors": [], "updated_at": "", "stale": False,
                 "error": refresh_result.get("error", "板块行情暂不可用")}

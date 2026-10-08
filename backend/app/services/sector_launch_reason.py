@@ -4,12 +4,12 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from pydantic import BaseModel, Field
-from sqlalchemy import text
+from pydantic import BaseModel, Field, field_validator
 
 from app.agents.common import agent_call
 from app.db import repo
-from app.db.models import SectorLaunchReason
+from app.db.models import SectorLaunchReason, _now
+
 from app.db.session import SessionLocal
 from app.llm.structured import ModelLevel
 from agent_prompts.sector_launch_prompt import SYSTEM, build_prompt
@@ -46,6 +46,23 @@ class CausalChainItem(BaseModel):
                                            "related_signal/post_move_explanation/unusable_rumor")
 
 
+class FalsificationOutput(BaseModel):
+    """反证条件契约：条件文本 + 明确的布尔触发标记（不靠文本臆测，供 D' 布尔键统一消费）"""
+    t1_invalid_if: str = Field(default="", description="T+1 反证条件（若出现则判据失效）")
+    t3_invalid_if: str = Field(default="", description="T+3 反证条件（若出现则判据失效）")
+    t5_invalid_if: str = Field(default="", description="T+5 反证条件（若出现则判据失效）")
+    falsification_triggered: bool = Field(
+        default=False, description="是否已确认反证触发（仅接受明确布尔，禁止从条件文本臆测）")
+
+    @field_validator("t1_invalid_if", "t3_invalid_if", "t5_invalid_if", mode="before")
+    @classmethod
+    def _join_invalid_if(cls, value):
+        """prompt 契约输出列表；历史字符串同样兼容，统一存为「；」连接文本。"""
+        if isinstance(value, (list, tuple, set)):
+            return "；".join(str(item).strip() for item in value if str(item).strip())
+        return value if value is not None else ""
+
+
 class SectorLaunchOutput(BaseModel):
     """启动归因输出契约"""
     reason_tags: str = Field(description="归因标签，逗号分隔：policy/news/fund/oversold/earnings/overseas/rotation")
@@ -60,8 +77,8 @@ class SectorLaunchOutput(BaseModel):
         default_factory=dict, description="direct_core/indirect_related/emotion_proxy 三类公司映射")
     capital_behavior: dict = Field(
         default_factory=dict, description="龙头、扩散、成交、弱市防御等资金验证")
-    falsification: dict = Field(
-        default_factory=dict, description="t1_invalid_if/t3_invalid_if/t5_invalid_if")
+    falsification: FalsificationOutput = Field(
+        default_factory=FalsificationOutput, description="t1/t3/t5 反证条件与明确触发布尔")
 
 
 def _limit_up_streak(kline) -> int | None:
@@ -99,6 +116,26 @@ def _latest_field(rows, key) -> float | None:
     except (IndexError, KeyError, TypeError):
         return None
     return None if v is None else float(v)
+
+
+def _latest_field_on(rows, key: str, trade_date: str) -> float | None:
+    """取资金流中日期 <= trade_date 的最新一行字段（B 支线：避免未来数据污染归因证据）。"""
+    if rows is None or getattr(rows, "empty", False):
+        return None
+    try:
+        records = rows.to_dict("records") if hasattr(rows, "to_dict") else list(rows)
+    except (TypeError, ValueError):
+        return None
+    picked = None
+    for row in records:
+        try:
+            date_key = str(row.get("date") or "")[:10]
+            value = float(row.get(key))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if date_key and date_key <= trade_date:
+            picked = (date_key, value)
+    return picked[1] if picked is not None else None
 
 
 def _index_change_pct(rows, trade_date: str) -> float | None:
@@ -145,6 +182,35 @@ def _news_evidence(news) -> list[dict]:
     for row in records[-5:]:
         if not isinstance(row, dict):
             continue
+        item = {}
+        for key in ("title", "published_at", "source", "url"):
+            value = row.get(key)
+            if value is not None and str(value):
+                item[key] = str(value)
+        if item:
+            out.append(item)
+    return out
+
+
+def _news_evidence_on(news, trade_date: str) -> list[dict]:
+    """按发布时间过滤新闻证据：只保留发布日期 <= trade_date 的最近 5 条（B 支线：
+    避免归因读到「当日尚未发生」的未来新闻，时间口径与 trade_date 对齐）。"""
+    if news is None or getattr(news, "empty", False):
+        return []
+    try:
+        records = news.to_dict("records") if hasattr(news, "to_dict") else list(news)
+    except (TypeError, ValueError):
+        return []
+    dated = []
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("published_at")
+        pub_day = str(raw)[:10] if raw is not None else ""
+        if pub_day and pub_day <= trade_date:
+            dated.append(row)
+    out = []
+    for row in dated[-5:]:
         item = {}
         for key in ("title", "published_at", "source", "url"):
             value = row.get(key)
@@ -242,7 +308,8 @@ def _prepare_evidence(ev: dict, out: SectorLaunchOutput) -> tuple[dict, float, s
     industry_transmission = [str(item) for item in (out.industry_transmission or []) if str(item)]
     company_mapping = out.company_mapping or {}
     capital_behavior = out.capital_behavior or {}
-    falsification = out.falsification or {}
+    falsification = _model_dump(out.falsification) if out.falsification else {}
+    falsification.setdefault("falsification_triggered", False)
     evidence.update({
         "causal_chain": causal_chain,
         "industry_transmission": industry_transmission,
@@ -289,14 +356,14 @@ def collect_evidence(sector_name: str, trade_date: str) -> dict | None:
         ev["leading_limit_up_streak"] = None
     try:
         flow = src.fetch_fund_flow(code)
-        ev["main_net_inflow"] = _latest_field(flow, "main_net_inflow")
-        ev["main_net_pct"] = _latest_field(flow, "main_net_pct")
+        ev["main_net_inflow"] = _latest_field_on(flow, "main_net_inflow", trade_date)
+        ev["main_net_pct"] = _latest_field_on(flow, "main_net_pct", trade_date)
     except Exception:  # noqa: BLE001
         ev["main_net_inflow"] = ev["main_net_pct"] = None
     try:
         news = src.fetch_news(code)
         ev["news_count"] = len(news) if news is not None and not getattr(news, "empty", False) else 0
-        ev["news_evidence"] = _news_evidence(news)
+        ev["news_evidence"] = _news_evidence_on(news, trade_date)
     except Exception:  # noqa: BLE001
         ev["news_count"] = ev["news_evidence"] = None
     try:
@@ -321,23 +388,22 @@ def collect_evidence(sector_name: str, trade_date: str) -> dict | None:
 
 def _upsert_launch_reason(row: dict) -> None:
     with SessionLocal() as db:
-        db.add(SectorLaunchReason(
-            trade_date=row["trade_date"], sector_name=row["sector_name"],
-            rank_no=row["rank_no"], reason_tags=row["reason_tags"],
-            reason_text=row["reason_text"], reason_chain=row["reason_chain"],
-            evidence=row["evidence"], confidence=row["confidence"]))
+        db.execute(repo._upsert_stmt(db, SectorLaunchReason, {
+            "trade_date": row["trade_date"], "sector_name": row["sector_name"],
+            "rank_no": row["rank_no"], "reason_tags": row["reason_tags"],
+            "reason_text": row["reason_text"], "reason_chain": row["reason_chain"],
+            "evidence": row["evidence"], "confidence": row["confidence"],
+        }, ["trade_date", "sector_name"]))
         db.commit()
 
 
 def run_launch_reason(trade_date: str | None = None) -> dict:
-    """对 top10 板块各一次 LIGHT 归因，落 sector_launch_reason（同 trade_date 删后插幂等）"""
-    today = trade_date or time.strftime("%Y-%m-%d")
+    """对 top10 板块各一次 LIGHT 归因，落 sector_launch_reason（逐条原子 upsert 幂等；
+    不再先全量 DELETE，避免中途失败清空当日归因、D' 读到半状态造成 causal_missing 固化）"""
+    today = trade_date or _now().strftime("%Y-%m-%d")
     rows = repo.list_sector_daily_by_date(today)[:TOP_N]
     if not rows:
         return {"success": False, "error": f"{today} 无全板块日快照", "count": 0}
-    with SessionLocal() as db:
-        db.execute(text("DELETE FROM sector_launch_reason WHERE trade_date = :d"), {"d": today})
-        db.commit()
     done = []
     for row in rows:
         ev = collect_evidence(row["sector_name"], today)

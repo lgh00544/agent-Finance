@@ -56,7 +56,7 @@
 1. **前端只改 React `web/src/`，不动 Streamlit `streamlit/pages/`**。例外仅三种：①后端 API 变更致旧版报错阻塞 ②sir 显式点名 ③React 侧功能尚未迁移。**后端 / 数据 / Agent / 交易规则改动只动后端**，两端共同消费，不重复实现。
 2. **Agent 解耦**：新增或修改能力只动各 Agent 的 `collect` 段，**不动** `agent_call` / `push_alert_node`。
 3. **自文件落盘**：提示词 / 方案 / 执行指令 / 审核结论 / 工单 / 风险清单 → 默认写 `D:\self\{主题}_{版本}_{文档类型}.md`，**不写桌面**（桌面仅保留历史镜像）。
-4. **交易规则与研判标准表**：`auto-merge` **永不修改**；任何规则改动必须经 `review_log` 可回滚。
+4. **交易规则与研判标准表**：`auto-merge` **永不修改**；任何规则改动必须留痕在 `rule_change` 表（可回滚：`status=active → rolled_back` + `rollback_reason/rollback_time`）。⚠️ 回滚只改 `rule_change.status`，**不写** `review_log`/`audit_log` —— 规则采纳/回滚的审计口径一律以 `rule_change` 表为准（`repo.adopt_rule_suggestion` / `repo.rollback_rule_change`）；`review_log` 只记经验链的 approve/reject/auto_merge/rollback/strictness_freeze（外键指向 `experience.id`）。
 
 ---
 

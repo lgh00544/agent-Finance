@@ -7,6 +7,7 @@ MarketIntelAgent 市场研判底座 - LangGraph 节点
 不强制改变任何 agent 判级；与 market_condition（打分→候选池上限）并存，不替代。
 数据纪律：数据缺失如实标注（不编造量比/资金数字），研判置信度由 LLM 在文本中说明。
 """
+from app.core import clock
 import logging
 import time
 from datetime import datetime, timedelta
@@ -23,11 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 def _today() -> str:
-    return time.strftime("%Y-%m-%d")
+    return clock.today()
 
 
 def _days_ago(n: int) -> str:
-    return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
+    return (clock.now() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
 def collect_market_data() -> dict:

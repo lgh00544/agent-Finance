@@ -14,6 +14,8 @@ from typing import Any, Callable
 import pandas as pd
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy.dialects.mysql import insert as _mysql_insert
+from sqlalchemy.dialects.sqlite import insert as _sqlite_insert
 
 from app.cache import cache
 from app.core.config import settings
@@ -40,6 +42,29 @@ from app.db.session import SessionLocal
 from app.services import reasoning_trace, task_queue
 
 logger = logging.getLogger(__name__)
+
+
+def _upsert_stmt(db, model, values: dict, conflict_cols: list[str],
+                 set_: dict | None = None):
+    """原子 upsert：SQLite ON CONFLICT DO UPDATE / MySQL ON DUPLICATE KEY UPDATE。
+    set_ 为 None → 更新 values 全部列；否则仅更新 set_ 指定列，值为常量或
+    ("excluded", col)（表示取本次待插入值）。"""
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+        ins = _sqlite_insert(model).values(**values)
+        excl = ins.excluded
+    else:
+        ins = _mysql_insert(model).values(**values)
+        excl = ins.inserted
+    if set_ is None:
+        set_ = {k: excl[k] for k in values}
+    else:
+        # fix(b5): excl 是 ColumnCollection，只能按列名索引；("excluded", col) 元组应取 v[1]
+        set_ = {k: (excl[v[1]] if isinstance(v, tuple) and v and v[0] == "excluded" else v)
+                for k, v in set_.items()}
+    if dialect == "sqlite":
+        return ins.on_conflict_do_update(index_elements=conflict_cols, set_=set_)
+    return ins.on_duplicate_key_update(**set_)
 
 
 def _experience_scope_user(user_id: int | None = None, *, for_write: bool = False) -> int | None:
@@ -277,23 +302,24 @@ def _context_user_id(default: int | None = None) -> int | None:
 def upsert_candidate(stock_code: str, stock_name: str, trade_date: str, rank: int,
                      reasons: list, risk_notice: list, snapshot: dict,
                      detail: dict | None = None) -> None:
+    created_at = _now()
+    values = {
+        "stock_code": stock_code, "stock_name": stock_name, "trade_date": trade_date,
+        "rank": rank, "reasons": reasons, "risk_notice": risk_notice,
+        "snapshot": snapshot, "detail": detail, "created_at": created_at,
+    }
+    set_ = {k: ("excluded", k) for k in ("rank", "reasons", "risk_notice",
+                                         "snapshot", "created_at")}
+    if detail is not None:
+        set_["detail"] = ("excluded", "detail")
     with SessionLocal() as db:
-        row = db.execute(
-            select(StockCandidate).where(
-                StockCandidate.stock_code == stock_code, StockCandidate.trade_date == trade_date)
-        ).scalar_one_or_none()
-        if row is None:
-            row = StockCandidate(stock_code=stock_code, stock_name=stock_name, trade_date=trade_date)
-            db.add(row)
-        row.rank, row.reasons, row.risk_notice, row.snapshot = rank, reasons, risk_notice, snapshot
-        if detail is not None:
-            row.detail = detail
-        row.created_at = _now()  # 覆盖更新：同日同股以最新执行时间为准（前端去重取最大）
+        db.execute(_upsert_stmt(db, StockCandidate, values,
+                                ["stock_code", "trade_date"], set_=set_))
         task_queue.guarded_commit(db)
         _invalidate("candidate")
         # 推理留痕（异步批量写，零阻塞）：discover 结论=候选理由+风险初判+detail 结构字段
         reasoning_trace.trace_candidate(stock_code, stock_name, trade_date, reasons,
-                                        risk_notice, snapshot, detail or {}, row.created_at)
+                                        risk_notice, snapshot, detail or {}, created_at)
 
 
 def get_candidate_detail(stock_code: str, trade_date: str) -> dict:
@@ -645,6 +671,51 @@ def list_sector_daily_dates(limit: int = 60) -> list[str]:
         return list(result)
 
 
+def list_sector_daily_snapshot_on_or_before(trade_date: str) -> list[dict]:
+    """取 ≤ trade_date 的最近一个交易日全板块日快照（S-9/F-2 因子 IC 历史板块底座）。
+
+    板块因子（f22-f25）回测时必须使用「快照日当时」的板块行情，绝不能用当日全市场
+    快照注入历史月份（前视）。历史板块快照只含 change_pct/rank_no 等客观字段，
+    无 sector_fund/rotation_pos/crowd/5d 等实时扩展字段 —— 调用方自然 data_missing，
+    宁可缺数不用前视数据。返回行带 board_name（=sector_name）键，与
+    DataAdapter.sector() 的 board_name/sector_name 兼容匹配。无历史返回 []。
+    """
+    with SessionLocal() as db:
+        latest_date = db.execute(
+            select(SectorDailySnapshot.trade_date)
+            .where(SectorDailySnapshot.trade_date <= trade_date)
+            .order_by(SectorDailySnapshot.trade_date.desc())
+            .limit(1)
+        ).scalar()
+        if not latest_date:
+            return []
+        rows = db.execute(
+            select(SectorDailySnapshot)
+            .where(SectorDailySnapshot.trade_date == latest_date)
+            .order_by(SectorDailySnapshot.rank_no.asc())
+        ).scalars().all()
+        total = max(1, len(rows))
+        return [
+            {
+                "board_name": r.sector_name,
+                "sector_name": r.sector_name,
+                "trade_date": r.trade_date,
+                "change_pct": r.change_pct,
+                "rank_no": r.rank_no,
+                # S-9/F-2：rotation_pos 由当日板块涨跌幅排名反推（rank 1=涨最多→pos≈100），
+                # 与线上 fetch_industry_spot 的 change_pct.rank(pct=True)*100 同语义且无前视。
+                "rotation_pos": round((total - (r.rank_no or total) + 1) / total * 100, 2),
+                "volume_ratio": r.volume_ratio,
+                "turnover_rate": r.turnover_rate,
+                "leading_stock_name": r.leading_stock_name,
+                "leading_stock_code": r.leading_stock_code,
+                "leading_chg": r.leading_chg,
+                "source": r.source,
+            }
+            for r in rows
+        ]
+
+
 # ==================== 板块轮动·轮动指标快照（sector_daily_rank_log） ====================
 
 def upsert_sector_rank_log(row: dict) -> int:
@@ -709,25 +780,21 @@ def list_sector_launch_by_date(trade_date: str) -> list[dict]:
 
 
 def upsert_sector_regime_forecast(row: dict) -> int:
-    """行情结构预测删后插（trade_date 唯一，当日最后一次覆盖）。"""
+    """行情结构预测原子 upsert（trade_date 唯一，当日最后一次覆盖）。"""
     if not row or not row.get("trade_date"):
         return 0
     with SessionLocal() as db:
-        db.execute(
-            text("DELETE FROM sector_regime_forecast WHERE trade_date = :d"),
-            {"d": row["trade_date"]},
-        )
-        db.add(SectorRegimeForecast(
-            trade_date=row["trade_date"],
-            current_regime=row.get("current_regime", "chaos"),
-            regime_stage=row.get("regime_stage", "unknown"),
-            regime_confidence=row.get("regime_confidence"),
-            forward_bias_t1=row.get("forward_bias_t1", "uncertain"),
-            forward_bias_t3=row.get("forward_bias_t3", "uncertain"),
-            forward_bias_t5=row.get("forward_bias_t5", "uncertain"),
-            evidence=row.get("evidence") or {},
-            notes=row.get("notes", ""),
-        ))
+        db.execute(_upsert_stmt(db, SectorRegimeForecast, {
+            "trade_date": row["trade_date"],
+            "current_regime": row.get("current_regime", "chaos"),
+            "regime_stage": row.get("regime_stage", "unknown"),
+            "regime_confidence": row.get("regime_confidence"),
+            "forward_bias_t1": row.get("forward_bias_t1", "uncertain"),
+            "forward_bias_t3": row.get("forward_bias_t3", "uncertain"),
+            "forward_bias_t5": row.get("forward_bias_t5", "uncertain"),
+            "evidence": row.get("evidence") or {},
+            "notes": row.get("notes", ""),
+        }, ["trade_date"]))
         db.commit()
     return 1
 
@@ -755,7 +822,7 @@ def get_sector_regime_forecast(trade_date: str) -> dict | None:
 
 
 def upsert_sector_forward_forecast(rows: list[dict]) -> int:
-    """板块前瞻删后插（trade_date 全量覆盖，板块+窗口唯一）。"""
+    """板块前瞻全量覆盖（trade_date 先删后插，板块+窗口唯一；并发冲突由原子 upsert 兜底）。"""
     if not rows or not rows[0].get("trade_date"):
         return 0
     trade_date = rows[0]["trade_date"]
@@ -763,21 +830,21 @@ def upsert_sector_forward_forecast(rows: list[dict]) -> int:
         db.execute(text("DELETE FROM sector_forward_forecast WHERE trade_date = :d"),
                    {"d": trade_date})
         for row in rows:
-            db.add(SectorForwardForecast(
-                trade_date=trade_date,
-                sector_name=row["sector_name"],
-                rank_no=row["rank_no"],
-                stage=row.get("stage", "unknown"),
-                continuation_prob=row.get("continuation_prob"),
-                exhaustion_risk=row.get("exhaustion_risk"),
-                chase_risk=row.get("chase_risk"),
-                switch_candidate=bool(row.get("switch_candidate", False)),
-                regime=row.get("regime", "unknown"),
-                forward_bias=row.get("forward_bias", "uncertain"),
-                forecast_horizon=row.get("forecast_horizon", "t1"),
-                sector_tag=row.get("sector_tag", "none"),
-                evidence=row.get("evidence") or {},
-            ))
+            db.execute(_upsert_stmt(db, SectorForwardForecast, {
+                "trade_date": trade_date,
+                "sector_name": row["sector_name"],
+                "rank_no": row["rank_no"],
+                "stage": row.get("stage", "unknown"),
+                "continuation_prob": row.get("continuation_prob"),
+                "exhaustion_risk": row.get("exhaustion_risk"),
+                "chase_risk": row.get("chase_risk"),
+                "switch_candidate": bool(row.get("switch_candidate", False)),
+                "regime": row.get("regime", "unknown"),
+                "forward_bias": row.get("forward_bias", "uncertain"),
+                "forecast_horizon": row.get("forecast_horizon", "t1"),
+                "sector_tag": row.get("sector_tag", "none"),
+                "evidence": row.get("evidence") or {},
+            }, ["trade_date", "sector_name", "forecast_horizon"]))
         db.commit()
     return len(rows)
 
@@ -804,7 +871,7 @@ def list_sector_forward_forecast(trade_date: str) -> list[dict]:
 
 
 def upsert_sector_next_hot(rows: list[dict], trade_date: str | None = None) -> int:
-    """下一个风口预测删后插（trade_date 全量覆盖）。"""
+    """下一个风口预测全量覆盖（trade_date 先删后插，板块唯一；并发冲突由原子 upsert 兜底）。"""
     trade_date = trade_date or (rows[0].get("trade_date") if rows else None)
     if not trade_date:
         return 0
@@ -812,15 +879,15 @@ def upsert_sector_next_hot(rows: list[dict], trade_date: str | None = None) -> i
         db.execute(text("DELETE FROM sector_next_hot WHERE trade_date = :d"),
                    {"d": trade_date})
         for row in rows:
-            db.add(SectorNextHot(
-                trade_date=trade_date,
-                sector_name=row["sector_name"],
-                rank_no=row["rank_no"],
-                hot_score=row["hot_score"],
-                expected_horizon_days=row["expected_horizon_days"],
-                confidence=row["confidence"],
-                trigger_evidence=row.get("trigger_evidence") or {},
-            ))
+            db.execute(_upsert_stmt(db, SectorNextHot, {
+                "trade_date": trade_date,
+                "sector_name": row["sector_name"],
+                "rank_no": row["rank_no"],
+                "hot_score": row["hot_score"],
+                "expected_horizon_days": row["expected_horizon_days"],
+                "confidence": row["confidence"],
+                "trigger_evidence": row.get("trigger_evidence") or {},
+            }, ["trade_date", "sector_name"]))
         db.commit()
     return len(rows)
 
@@ -846,7 +913,7 @@ def list_sector_next_hot_by_date(trade_date: str, limit: int = 5) -> list[dict]:
 
 
 def upsert_sector_forecast_verify(rows: list[dict]) -> int:
-    """前瞻验证删后插（forecast_date + horizon 唯一）。"""
+    """前瞻验证全量覆盖（forecast_date+horizon 先删后插；并发冲突由原子 upsert 兜底）。"""
     if not rows:
         return 0
     with SessionLocal() as db:
@@ -856,17 +923,17 @@ def upsert_sector_forecast_verify(rows: list[dict]) -> int:
                      "WHERE forecast_date = :d AND verify_horizon = :h"),
                 {"d": row["forecast_date"], "h": row["verify_horizon"]},
             )
-            db.add(SectorForecastVerify(
-                forecast_date=row["forecast_date"],
-                verify_horizon=row["verify_horizon"],
-                verify_date=row.get("verify_date"),
-                regime_hit=row.get("regime_hit"),
-                top5_continue_rate=row.get("top5_continue_rate"),
-                mainline_hit=row.get("mainline_hit"),
-                regime_forecast=row.get("regime_forecast"),
-                miss_reason=row.get("miss_reason", ""),
-                detail=row.get("detail") or {},
-            ))
+            db.execute(_upsert_stmt(db, SectorForecastVerify, {
+                "forecast_date": row["forecast_date"],
+                "verify_horizon": row["verify_horizon"],
+                "verify_date": row.get("verify_date"),
+                "regime_hit": row.get("regime_hit"),
+                "top5_continue_rate": row.get("top5_continue_rate"),
+                "mainline_hit": row.get("mainline_hit"),
+                "regime_forecast": row.get("regime_forecast"),
+                "miss_reason": row.get("miss_reason", ""),
+                "detail": row.get("detail") or {},
+            }, ["forecast_date", "verify_horizon"]))
         db.commit()
     return len(rows)
 
@@ -992,7 +1059,7 @@ def list_sector_news_articles(sector_code: str = "", days: int = 7,
             stmt = stmt.where(SectorNewsArticle.created_at >= day,
                               SectorNewsArticle.created_at < day + timedelta(days=1))
         else:
-            cutoff = datetime.now() - timedelta(days=max(1, min(int(days or 7), 30)))
+            cutoff = _now() - timedelta(days=max(1, min(int(days or 7), 30)))
             stmt = stmt.where(SectorNewsArticle.created_at >= cutoff)
         if status:
             stmt = stmt.where(SectorNewsArticle.status == status)
@@ -1044,7 +1111,7 @@ def add_sector_news_shadow(row: dict) -> int:
         rec = SectorNewsShadowVerify(
             interpret_id=interpret_id, sector_code=str(row.get("sector_code") or ""),
             sector_name=str(row.get("sector_name") or ""),
-            signal_date=str(row.get("signal_date") or time.strftime("%Y-%m-%d")),
+            signal_date=str(row.get("signal_date") or _now().strftime("%Y-%m-%d")),
             base_index_value=row.get("base_index_value"))
         db.add(rec)
         db.commit()
@@ -1189,7 +1256,7 @@ def _parse_ts(value) -> datetime:
             return datetime.strptime(value.strip(), "%Y-%m-%d %H:%M:%S")
         except ValueError:
             pass
-    return datetime.now()
+    return _now()
 
 
 def get_quote_snapshot(within_minutes: int = 10) -> pd.DataFrame | None:
@@ -1197,7 +1264,7 @@ def get_quote_snapshot(within_minutes: int = 10) -> pd.DataFrame | None:
 
     返回 DataFrame（code/name/price/change_pct/source）；表空或全部过期返回 None
     （调用方走下一级全市场快照兜底）。首页热路径 O(rows) 秒回，无外部请求。"""
-    cutoff = datetime.now() - timedelta(minutes=within_minutes)
+    cutoff = _now() - timedelta(minutes=within_minutes)
     with SessionLocal() as db:
         rows = db.execute(
             select(QuoteSnapshot).where(QuoteSnapshot.updated_at >= cutoff)
@@ -1215,18 +1282,32 @@ def upsert_distribution_phase(trade_date: str, symbol: str, phase: int, phase_la
                               confidence: str, six_dim: dict, missing_data: list) -> None:
     """派发期判定结果幂等落库（(trade_date, symbol) 唯一键冲突时覆盖）"""
     with SessionLocal() as db:
+        db.execute(_upsert_stmt(db, DistributionPhaseLog, {
+            "trade_date": trade_date,
+            "symbol": symbol,
+            "phase": phase,
+            "phase_label": phase_label,
+            "confidence": confidence,
+            "six_dim": _json(six_dim or {}),
+            "missing_data": _json(missing_data or []),
+            "updated_at": _now(),
+        }, ["trade_date", "symbol"]))
+        task_queue.guarded_commit(db)
+
+
+def get_distribution_phase(trade_date: str, symbol: str) -> dict | None:
+    """读取已落库的派发期判定（15:30 任务落库后供收盘后优先复用，避免盘中值污染收盘判定）"""
+    with SessionLocal() as db:
         row = db.execute(
             select(DistributionPhaseLog).where(
                 DistributionPhaseLog.trade_date == trade_date,
                 DistributionPhaseLog.symbol == symbol)
         ).scalar_one_or_none()
         if row is None:
-            row = DistributionPhaseLog(trade_date=trade_date, symbol=symbol)
-            db.add(row)
-        row.phase, row.phase_label, row.confidence = phase, phase_label, confidence
-        row.six_dim, row.missing_data = six_dim or {}, missing_data or []
-        row.updated_at = _now()
-        db.commit()
+            return None
+        return {"phase": row.phase, "phase_label": row.phase_label,
+                "confidence": row.confidence, "six_dim": row.six_dim or {},
+                "missing_data": row.missing_data or [], "trade_date": trade_date}
 
 
 # ==================== 市场研判底座（market_intel，每日收盘后 1 次 + 手动入口） ====================
@@ -1234,19 +1315,15 @@ def upsert_distribution_phase(trade_date: str, symbol: str, phase: int, phase_la
 def upsert_market_intel(trade_date: str, phase: str, core_conflict: str, risk_appetite: str,
                         volume_signal: dict, operative_meaning: dict, next_day_watch: dict,
                         summary: str, raw: dict) -> None:
-    """当日市场研判落库（code 唯一幂等覆盖；只新增，不迁移不改旧表）"""
+    """当日市场研判落库（trade_date 唯一幂等覆盖；只新增，不迁移不改旧表）"""
     with SessionLocal() as db:
-        row = db.execute(
-            select(MarketIntel).where(MarketIntel.trade_date == trade_date)
-        ).scalar_one_or_none()
-        if row is None:
-            row = MarketIntel(trade_date=trade_date)
-            db.add(row)
-        row.phase, row.core_conflict, row.risk_appetite = phase, core_conflict, risk_appetite
-        row.volume_signal, row.operative_meaning, row.next_day_watch = (
-            volume_signal, operative_meaning, next_day_watch)
-        row.summary, row.raw = summary, raw
-        db.commit()
+        db.execute(_upsert_stmt(db, MarketIntel, {
+            "trade_date": trade_date, "phase": phase, "core_conflict": core_conflict,
+            "risk_appetite": risk_appetite, "volume_signal": volume_signal,
+            "operative_meaning": operative_meaning, "next_day_watch": next_day_watch,
+            "summary": summary, "raw": raw,
+        }, ["trade_date"]))
+        task_queue.guarded_commit(db)
 
 
 def get_market_intel(trade_date: str) -> dict | None:
@@ -1299,19 +1376,14 @@ def upsert_candidate_tradeable(stock_code: str, stock_name: str, trade_date: str
                                cond_risk: int, block_reason: str, detail: dict) -> None:
     """按 code+date 幂等 upsert 当日可建仓判定（覆盖更新，口径见 services/candidate_tradeable.py）"""
     with SessionLocal() as db:
-        row = db.execute(
-            select(CandidateTradeable).where(
-                CandidateTradeable.stock_code == stock_code,
-                CandidateTradeable.trade_date == trade_date)
-        ).scalar_one_or_none()
-        if row is None:
-            row = CandidateTradeable(stock_code=stock_code, stock_name=stock_name,
-                                     trade_date=trade_date)
-            db.add(row)
-        row.tier, row.is_tradeable, row.label = tier, is_tradeable, label
-        row.plan_exists, row.price_zone, row.current_price = plan_exists, price_zone, current_price
-        row.cond_grade, row.cond_price, row.cond_risk = cond_grade, cond_price, cond_risk
-        row.block_reason, row.detail = block_reason, detail
+        db.execute(_upsert_stmt(db, CandidateTradeable, {
+            "stock_code": stock_code, "stock_name": stock_name, "trade_date": trade_date,
+            "tier": tier, "is_tradeable": is_tradeable, "label": label,
+            "plan_exists": plan_exists, "price_zone": price_zone,
+            "current_price": current_price, "cond_grade": cond_grade,
+            "cond_price": cond_price, "cond_risk": cond_risk,
+            "block_reason": block_reason, "detail": detail,
+        }, ["stock_code", "trade_date"]))
         task_queue.guarded_commit(db)
         _invalidate("tradeable")
 
@@ -1367,17 +1439,11 @@ def upsert_candidate_adjust(stock_code: str, stock_name: str, trade_date: str,
                             operator: str = "") -> None:
     """写入/更新覆盖（幂等）；回滚即删除该行恢复原判定"""
     with SessionLocal() as db:
-        row = db.execute(
-            select(CandidateAdjust).where(
-                CandidateAdjust.stock_code == stock_code,
-                CandidateAdjust.trade_date == trade_date)
-        ).scalar_one_or_none()
-        if row is None:
-            row = CandidateAdjust(stock_code=stock_code, stock_name=stock_name,
-                                  trade_date=trade_date)
-            db.add(row)
-        row.tier_override, row.label_override = tier_override, label_override
-        row.reason, row.operator = reason, operator
+        db.execute(_upsert_stmt(db, CandidateAdjust, {
+            "stock_code": stock_code, "stock_name": stock_name, "trade_date": trade_date,
+            "tier_override": tier_override, "label_override": label_override,
+            "reason": reason, "operator": operator,
+        }, ["stock_code", "trade_date"]))
         db.commit()
         _invalidate("tradeable")
 
@@ -1548,6 +1614,13 @@ def insert_alert(stock_code: str, stock_name: str, alert_type: str, severity: st
 def insert_review(stock_code: str, stock_name: str, holding_id: int, exit_date: str,
                   hold_days: int, pnl_pct: float, plan_vs_actual: dict, lesson: str,
                   feedback: dict, user_id: int | None = None) -> int:
+    # 批次18：归属口径与 insert_agent_suggestion（下方 user_id = _context_user_id(1)）对齐。
+    # 修复前生产路径 agents/review.py:307 不传 user_id，review_result.user_id 恒 NULL，
+    # 与读侧的 owner 过滤（get_review_for_user / list_reviews）互相矛盾：单用户模式下
+    # 全部真实复盘从列表消失、旧采纳入口 404。任务线程由 task_queue 还原 owner 上下文
+    # （services/task_queue.py:197-200），故此处取上下文用户，无上下文时回落默认账号。
+    if user_id is None:
+        user_id = _context_user_id(1)
     with SessionLocal() as db:
         row = ReviewResult(stock_code=stock_code, stock_name=stock_name, holding_id=holding_id,
                            exit_date=exit_date, hold_days=hold_days, pnl_pct=pnl_pct,
@@ -1723,7 +1796,7 @@ def maintenance_db() -> dict:
     from app.core.config import settings
     from app.db.session import engine
 
-    cutoff = datetime.now() - timedelta(days=settings.news_retention_days)
+    cutoff = _now() - timedelta(days=settings.news_retention_days)
     news_deleted = 0
     try:
         with SessionLocal() as db:
@@ -1791,7 +1864,7 @@ def get_recent_news(stock_code: str, days: int = 7) -> list[dict]:
     published_at 为空的历史行按入库时间 created_at 兜底参与过滤与排序。"""
     from datetime import datetime, timedelta
 
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (_now() - timedelta(days=days)).strftime("%Y-%m-%d")
     with SessionLocal() as db:
         rows = db.execute(
             select(NewsArticle).where(NewsArticle.stock_code == stock_code)
@@ -1944,7 +2017,7 @@ def get_latest_account_pnl(user_id: int | None = None, *, is_admin: bool = False
 def list_account_pnl_history(days: int = 30, user_id: int | None = None,
                              *, is_admin: bool = False) -> list[dict]:
     """近 N 天同花顺盈亏快照历史（按日降序；每行只取核心字段）"""
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (_now() - timedelta(days=days)).strftime("%Y-%m-%d")
     user_id = _context_user_id(user_id)
     with SessionLocal() as db:
         stmt = select(AccountPnlSnapshot).where(AccountPnlSnapshot.trade_date >= cutoff)
@@ -2006,22 +2079,30 @@ def get_active_holding_by_code(stock_code: str, user_id: int | None = None,
 def insert_holding(stock_code: str, stock_name: str, entry_date: str, entry_price: float,
                    shares: int, cost: float, stop_loss: float = 0.0, take_profit: float = 0.0,
                    target_pct: float = 0.0, plan_id: int | None = None, note: str = "",
-                   user_id: int | None = None) -> int:
+                   user_id: int | None = None,
+                   commission: float | None = None, slippage: float | None = None) -> int:
     with SessionLocal() as db:
         row = Holding(stock_code=stock_code, stock_name=stock_name, entry_date=entry_date,
                       entry_price=entry_price, shares=shares, cost=cost, stop_loss=stop_loss,
                       take_profit=take_profit, target_pct=target_pct, plan_id=plan_id, note=note,
-                      user_id=user_id)
+                      # E-11/A-12：high_price 建仓初始化=entry_price，移动止盈（C4）立即可用；
+                      # 后续由持仓期最高价刷新（record_holding_trade/红线扫描写回）
+                      high_price=entry_price,
+                      # S-5：cost_basis_initial = 生命周期总成本（累计买入成本，减仓/清仓不回退）；
+                      # cost = 当前持仓总成本（= entry_price × shares）
+                      cost_basis_initial=cost, user_id=user_id)
         db.add(row)
         db.commit()
         db.refresh(row)
         _invalidate("holding")
     # 建仓即补开仓 buy 流水（新建仓恒缺首笔；幂等，cost/shares 非法时跳过不抛）
-    ensure_opening_trade(row)
+    ensure_opening_trade(row, commission=commission, slippage=slippage)
     return row.id
 
 
-def ensure_opening_trade(holding_row: Holding) -> dict:
+def ensure_opening_trade(holding_row: Holding,
+                         commission: float | None = None,
+                         slippage: float | None = None) -> dict:
     """确保持仓有建仓 buy 流水：缺首笔时补录 note='建仓补录'（幂等，禁止重复插入）。
 
     补法（§二口径）：金额 = cost − Σ已有 buy；股数 = 首条 buy 的 before_shares
@@ -2064,6 +2145,9 @@ def ensure_opening_trade(holding_row: Holding) -> dict:
         db.add(TradeRecord(holding_id=holding_row.id, stock_code=holding_row.stock_code,
                            side="buy", price=price, shares=shares, amount=missing,
                            trade_date=holding_row.entry_date, note="建仓补录",
+                           commission=commission, slippage=slippage,
+                           # E-8 净额口径：buy 净额 = 含费用支出
+                           net_amount=round(missing + (commission or 0.0), 2),
                            before_shares=0, after_shares=shares))
         db.commit()
         _invalidate("holding")
@@ -2094,28 +2178,68 @@ def update_holding(holding_id: int, **fields) -> None:
         _invalidate("holding")
 
 
+# S-5 持仓成本不变量容差（元）：cost 与 entry_price × shares 允许的舍入差
+COST_INVARIANT_TOLERANCE = 0.01
+
+
+def cost_invariant_delta(entry_price, shares, cost) -> float | None:
+    """S-5 不变量偏差 = |cost − entry_price × shares|；任一字段缺失 → None（无从判定）"""
+    try:
+        if entry_price is None or shares is None or cost is None:
+            return None
+        return abs(float(cost) - float(entry_price) * float(shares))
+    except (TypeError, ValueError):
+        return None
+
+
+def _assert_cost_invariant(row) -> None:
+    """S-5 一致性断言：holding.cost 必须等于 entry_price × shares（容差 0.01 元）。
+
+    字段缺失（旧数据/异常行）无从判定 → 跳过，不误杀；一旦能判定且脱钩，
+    宁可让本次写入失败回滚，也不让「成本与股数脱钩」的脏数据再进库。
+    """
+    delta = cost_invariant_delta(row.entry_price, row.shares, row.cost)
+    if delta is not None and delta >= COST_INVARIANT_TOLERANCE:
+        raise ValueError(
+            "持仓成本不变量被破坏（S-5）：holding_id=%s cost=%s ≠ entry_price=%s × "
+            "shares=%s（偏差 %.4f ≥ %.2f）"% (
+                row.id, row.cost, row.entry_price, row.shares,
+                delta, COST_INVARIANT_TOLERANCE))
+
+
 def record_holding_trade(holding_id: int, *, side: str, price: float, shares: int,
                          trade_date: str, note: str,
                          before_shares: int | None = None,
                          after_shares: int | None = None,
                          holding_fields: dict | None = None,
-                         user_id: int | None = None) -> int:
+                         user_id: int | None = None,
+                         commission: float | None = None,
+                         slippage: float | None = None,
+                         net_amount: float | None = None) -> int:
     """事务化持仓操作写入（手动加仓/减仓/清仓/成本修正共用）：
     操作流水 + 持仓字段更新在单 session 一次 commit，失败整体回滚，保证流水与持仓
     状态一致（K223 留痕与事实一致）。仅数据存取，业务计算（加权成本/C3 等）由调用方
-    算好后经 holding_fields 传入。返回流水 id。"""
+    算好后经 holding_fields 传入。返回流水 id。
+
+    E-8/E-7 净额口径：commission/slippage 为可选费用留痕；net_amount 未传时按 side
+    推算（buy=amount+commission；sell=amount-commission），避免历史录入无费用时行为漂移。
+    """
+    if net_amount is None and commission is not None:
+        net_amount = round(price * shares + (commission if side == "buy" else -commission), 2)
     with SessionLocal() as db:
         row = db.get(Holding, holding_id)
         if row is None:
             raise ValueError("持仓不存在")
         db.add(TradeRecord(holding_id=holding_id, stock_code=row.stock_code, side=side,
                            price=price, shares=shares, amount=round(price * shares, 2),
+                           commission=commission, slippage=slippage, net_amount=net_amount,
                            trade_date=trade_date, note=note,
                            before_shares=before_shares, after_shares=after_shares,
                            user_id=user_id if user_id is not None else row.user_id))
         if holding_fields:
             for k, v in holding_fields.items():
                 setattr(row, k, v)
+        _assert_cost_invariant(row)  # S-5：成本与股数脱钩即失败回滚
         db.commit()
         _invalidate("holding")
         return row.id
@@ -2170,11 +2294,81 @@ def get_closest_score_grade(stock_code: str, trade_date: str) -> str | None:
         return None
 
 
-def get_latest_plan(code: str) -> PositionPlan | None:
+def score_trading_day_age(score_date: str, trade_date: str) -> int | None:
+    """评分日到 trade_date 之间的交易日数（同一天 = 0）。
+
+    优先用已缓存的交易日历（key=ak:trade_calendar，由数据源写入，不额外触网）；
+    日历缺失/异常时退化为自然工作日计数（跨周末按保守估计）；无法判定 → None。
+    """
+    if not score_date or not trade_date or str(score_date) > str(trade_date):
+        return None
+    try:
+        raw = cache.get("ak:trade_calendar") or ""
+        days = sorted(d for d in str(raw).split(",") if d.strip())
+        if days:
+            return len([d for d in days if str(score_date) < d <= str(trade_date)])
+    except Exception as exc:  # noqa: BLE001 日历不可用 → 退化为工作日估算
+        logger.warning("交易日历读取失败，评分新鲜度退化为工作日估算: %s", exc)
+    try:
+        start = datetime.fromisoformat(str(score_date))
+        end = datetime.fromisoformat(str(trade_date))
+    except ValueError:
+        return None
+    if end.date() < start.date():
+        return None
+    span = (end.date() - start.date()).days
+    return sum(1 for i in range(1, span + 1)
+               if (start.date() + timedelta(days=i)).weekday() < 5)
+
+
+def get_score_for_position(stock_code: str, trade_date: str,
+                           max_trading_days: int | None = None) -> tuple[StockScore | None, dict]:
+    """建仓链唯一评分读取入口（S-7）：不晚于 trade_date 的最新评分 + 交易日新鲜度。
+
+    返回 (score_row, meta)，meta = {as_of, score_date, grade, stale,
+    age_trading_days, max_trading_days, reason}：
+    - stale=True 时调用方**必须**把评级降级为「未评级」，禁止用陈旧评级生成建仓计划；
+    - 评分日期缺失（无法判定新鲜度，只可能出现在非 DB 的测试替身）不判 stale，
+      只记 warning —— 真实表 stock_score.trade_date 为 NOT NULL，缺日期属异常数据，
+      由别处的数据质量检查负责，不在本函数里凭空推断。
+    """
+    limit = (int(getattr(settings, "score_freshness_max_trading_days", 3))
+             if max_trading_days is None else int(max_trading_days))
+    row = get_latest_score(stock_code, as_of=trade_date)
+    if row is None:
+        return None, {"as_of": trade_date, "score_date": None, "grade": None,
+                      "stale": True, "age_trading_days": None,
+                      "max_trading_days": limit, "reason": "no_score"}
+    score_date = getattr(row, "trade_date", None)
+    meta = {"as_of": trade_date, "score_date": score_date,
+            "grade": getattr(row, "grade", None), "stale": False,
+            "age_trading_days": None, "max_trading_days": limit, "reason": None}
+    if not score_date:
+        logger.warning("评分缺少 trade_date，无法判定新鲜度（不降级）: %s", stock_code)
+        meta["reason"] = "unknown_score_date"
+        return row, meta
+    age = score_trading_day_age(str(score_date), str(trade_date))
+    meta["age_trading_days"] = age
+    if age is None or age > limit:
+        meta["stale"] = True
+        meta["reason"] = "stale"
+    return row, meta
+
+
+def get_latest_plan(code: str, user_id: int | None = None,
+                    statuses: tuple[str, ...] = ("proposed", "accepted")) -> PositionPlan | None:
+    """最新可建仓计划（多用户隔离 + 生命周期门禁修复）。
+
+    statuses 限定可复用状态（排除 expired/superseded 等不可用版本）；
+    user_id 传入时强制按归属过滤（fail-closed），避免跨用户读到他人建仓计划。
+    """
     with SessionLocal() as db:
-        return db.execute(
-            select(PositionPlan).where(PositionPlan.stock_code == code)
-            .order_by(PositionPlan.id.desc()).limit(1)).scalar_one_or_none()
+        stmt = select(PositionPlan).where(PositionPlan.stock_code == code)
+        if user_id is not None:
+            stmt = stmt.where(PositionPlan.user_id == user_id)
+        if statuses:
+            stmt = stmt.where(PositionPlan.status.in_(statuses))
+        return db.execute(stmt.order_by(PositionPlan.id.desc()).limit(1)).scalar_one_or_none()
 
 
 def get_plan(plan_id: int | None, user_id: int | None = None,
@@ -2394,23 +2588,22 @@ def list_candidate_dates(limit: int = 30) -> list[str]:
 def upsert_track_verify(stock_code: str, stock_name: str, select_date: str,
                         select_rating: str, base_close_price: float,
                         factor_scores: dict | None = None) -> int:
-    """初始化追踪行：同 (code, select_date) 已存在则返回既有 id（幂等，重复执行安全）"""
+    """初始化追踪行：同 (code, select_date) 已存在则返回既有 id（原子 ON CONFLICT DO NOTHING + 回读）"""
     with SessionLocal() as db:
+        db.execute(_sqlite_insert(CandidateTrackVerify).values(
+            stock_code=stock_code, stock_name=stock_name,
+            select_date=select_date, select_rating=select_rating,
+            base_close_price=base_close_price, factor_scores=factor_scores or {},
+        ).on_conflict_do_nothing(index_elements=["stock_code", "select_date"]))
         row = db.execute(
             select(CandidateTrackVerify).where(
                 CandidateTrackVerify.stock_code == stock_code,
                 CandidateTrackVerify.select_date == select_date)
-        ).scalar_one_or_none()
-        if row is None:
-            row = CandidateTrackVerify(stock_code=stock_code, stock_name=stock_name,
-                                       select_date=select_date, select_rating=select_rating,
-                                       base_close_price=base_close_price,
-                                       factor_scores=factor_scores)
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-            _invalidate("track_verify")
-        return row.id
+        ).scalar_one()
+        row_id = row.id
+        db.commit()
+        _invalidate("track_verify")
+        return row_id
 
 
 def update_track_verify(row_id: int, *, t3_pct=None, t5_pct=None, t10_pct=None,
@@ -2435,7 +2628,7 @@ def update_track_verify(row_id: int, *, t3_pct=None, t5_pct=None, t10_pct=None,
         if factor_scores is not None:
             row.factor_scores = factor_scores
         row.is_finished = is_finished
-        row.update_time = time.strftime("%Y-%m-%d %H:%M")
+        row.update_time = _now().strftime("%Y-%m-%d %H:%M")
         db.commit()
         _invalidate("track_verify")
 
@@ -2500,7 +2693,7 @@ def update_forward_view_actual(row_id: int, actual: float, bucket: str) -> None:
         if row is None:
             return
         row.t5_pct_actual = float(actual)
-        row.t5_filled_at = datetime.now()
+        row.t5_filled_at = _now()
         row.accuracy_bucket = bucket
         db.commit()
         _invalidate("forward_view")
@@ -2509,7 +2702,7 @@ def update_forward_view_actual(row_id: int, actual: float, bucket: str) -> None:
 def compute_forward_view_accuracy(lookback_days: int = 30) -> dict:
     """近 lookback_days 日前瞻准确率（校准先验用）：按 forward_view 分桶统计。
     准确率 = correct / (correct + wrong)，neutral 不计入分母；无样本返回 0（诚实标注）。"""
-    cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    cutoff = (_now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     with SessionLocal() as db:
         rows = db.execute(
             select(ForwardViewHistory)
@@ -2790,6 +2983,10 @@ def list_scores(code: str | None = None, date: str | None = None, limit: int = 1
 
 def list_plans(code: str | None = None, limit: int = 50, user_id: int | None = None,
                *, is_admin: bool = False) -> list[dict]:
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return []
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(PositionPlan).order_by(PositionPlan.id.desc())
@@ -2818,6 +3015,10 @@ def list_plans(code: str | None = None, limit: int = 50, user_id: int | None = N
 
 def list_holdings(status: str | None = None, user_id: int | None = None,
                   *, is_admin: bool = False) -> list[dict]:
+    user_id = _context_user_id(user_id)
+    if settings.multi_user_enabled and user_id is None and not is_admin:
+        return []
+
     def _load() -> list[dict]:
         with SessionLocal() as db:
             stmt = select(Holding).order_by(Holding.id.desc())
@@ -2832,12 +3033,15 @@ def list_holdings(status: str | None = None, user_id: int | None = None,
                                            "entry_price": r.entry_price, "shares": r.shares,
                                            "cost": r.cost, "stop_loss": r.stop_loss,
                                            "take_profit": r.take_profit,
+                                           "high_price": r.high_price,
+                                           "cost_basis_initial": r.cost_basis_initial,
                                            "target_pct": r.target_pct, "status": r.status,
                                            "plan_id": r.plan_id, "note": r.note,
                                            "execution_mode": "real",
                                            "source_label": "真实交易",
                                            "audit_status": "not_required",
-                                           "created_at": str(r.created_at)} for r in rows])
+                                           "created_at": str(r.created_at),
+                                           "updated_at": str(r.updated_at)} for r in rows])
 
     return _dbq("holding", {"status": status, "user_id": user_id,
                               "is_admin": is_admin}, _load)
@@ -2857,6 +3061,8 @@ def list_alerts(limit: int = 100, user_id: int | None = None,
                                            "message": r.message, "action": r.action,
                                            "signal": r.signal, "pushed": r.pushed,
                                            "source": r.source,
+                                           "push_channel": r.push_channel,
+                                           "push_result": r.push_result,
                                            "created_at": str(r.created_at)} for r in rows])
 
     return _dbq("alert", {"limit": limit, "user_id": user_id,
@@ -2870,7 +3076,9 @@ def list_reviews(code: str | None = None, limit: int = 50, user_id: int | None =
             stmt = select(ReviewResult).order_by(ReviewResult.id.desc())
             if code:
                 stmt = stmt.where(ReviewResult.stock_code == code)
-            if user_id is not None and not is_admin:
+            # 批次18：与 get_review_for_user 同一归属分支——单用户模式无归属概念，
+            # 否则 legacy（user_id=NULL）复盘不出现在 /reviews 列表，用户无从采纳。
+            if settings.multi_user_enabled and user_id is not None and not is_admin:
                 stmt = stmt.where(ReviewResult.user_id == user_id)
             rows = db.execute(stmt.limit(limit)).scalars().all()
             return _backfill_stock_names([{"id": r.id, "stock_code": r.stock_code,
@@ -3450,7 +3658,11 @@ def get_review(review_id: int) -> ReviewResult | None:
 def get_review_for_user(review_id: int, user_id: int, *, is_admin: bool = False) -> ReviewResult | None:
     with SessionLocal() as db:
         stmt = select(ReviewResult).where(ReviewResult.id == review_id)
-        if not is_admin:
+        # 批次18：单用户模式（MULTI_USER_ENABLED=false）不存在归属概念：历史 legacy 复盘的
+        # user_id 为 NULL，若仍按 owner 过滤，/reviews/{rid}/adopt|reject 会把无归属复盘判 404
+        # （tests/test_adopt_audit_gate.py::test_legacy_review_adopt_is_marked_without_audit_claim）。
+        # 多人模式保持 fail-closed：仅放行本人记录（管理员不受限）。
+        if settings.multi_user_enabled and not is_admin:
             stmt = stmt.where(ReviewResult.user_id == user_id)
         return db.execute(stmt).scalar_one_or_none()
 
@@ -3689,7 +3901,7 @@ def bump_knowledge_hits(knowledge_ids: list[int]) -> int:
         res = db.execute(
             update(PrivateKnowledge)
             .where(PrivateKnowledge.id.in_(ids))
-            .values(hit_count=PrivateKnowledge.hit_count + 1, last_used_at=datetime.now())
+            .values(hit_count=PrivateKnowledge.hit_count + 1, last_used_at=_now())
         )
         db.commit()
         return int(res.rowcount or 0)
@@ -3970,8 +4182,14 @@ def get_active_rules(user_id: int | None = None) -> list[dict]:
         user_id = _context_user_id(1 if settings.multi_user_enabled else None)
 
     def _load() -> list[dict]:
+        today = _now().strftime("%Y-%m-%d")
         with SessionLocal() as db:
             stmt = select(RuleChange).where(RuleChange.status == "active")
+            # A-22 生命周期：未到生效日 / 已过到期日的规则不注入；''=即刻生效/永久有效
+            stmt = stmt.where((RuleChange.effective_from == "") |
+                              (RuleChange.effective_from <= today))
+            stmt = stmt.where((RuleChange.expires_at == "") |
+                              (RuleChange.expires_at >= today))
             if user_id is not None:
                 stmt = stmt.where((RuleChange.user_id == user_id) | RuleChange.user_id.is_(None))
             rows = db.execute(stmt.order_by(RuleChange.id)).scalars().all()
@@ -4022,6 +4240,7 @@ def list_rule_changes(status: str | None = None, target_agent: str | None = None
                      "stock_name": r.stock_name, "target_agent": r.target_agent,
                      "rule_type": r.rule_type, "rule_name": r.rule_name,
                      "rule_text": r.rule_text, "priority": r.priority,
+                     "effective_from": r.effective_from, "expires_at": r.expires_at,
                      "status": r.status, "operator": r.operator,
                      "user_id": r.user_id,
                      "created_at": str(r.created_at),
@@ -4051,6 +4270,7 @@ def get_rule_change(rule_change_id: int, user_id: int | None = None,
                      "reason": r.reason, "evidence": r.evidence,
                      "expected_effect": r.expected_effect, "risk_note": r.risk_note,
                      "file_path": r.file_path, "insert_position": r.insert_position,
+                     "effective_from": r.effective_from, "expires_at": r.expires_at,
                       "status": r.status, "rollback_reason": r.rollback_reason,
                       "rollback_time": r.rollback_time, "operator": r.operator,
                       "user_id": r.user_id,
@@ -4059,6 +4279,57 @@ def get_rule_change(rule_change_id: int, user_id: int | None = None,
     rows = _dbq("rule_change", {"detail": rule_change_id, "user_id": user_id,
                                 "admin": is_admin}, _load)
     return rows[0] if rows else None
+
+
+def get_rule_effect(rule_change_id: int, user_id: int | None = None,
+                    *, is_admin: bool = False) -> dict | None:
+    """采纳后效果对账（A-22 闭环）：按 target_agent 映射确定性统计域，只读不写。
+
+    discover/score → 生效日后新增候选的 T+5 胜率与样本数（track_verify 客观统计）；
+    position/monitor/sell/review → 生效日后卖出复盘的 pnl_pct 均值与样本数。
+    规则不存在/无归属权限 → None；样本不足或无法统计 → 明确标注 insufficient。
+    """
+    with SessionLocal() as db:
+        r = db.get(RuleChange, rule_change_id)
+        if r is None:
+            return None
+        if user_id is not None and not is_admin and r.user_id != user_id:
+            return None
+        base_date = (r.effective_from or "").strip() or str(r.created_at.date())
+        agent = r.target_agent or ""
+        if agent in ("discover", "score"):
+            rows = db.execute(
+                select(CandidateTrackVerify).where(
+                    CandidateTrackVerify.select_date >= base_date,
+                    CandidateTrackVerify.is_finished == 1)
+            ).scalars().all()
+            samples = len(rows)
+            if samples == 0:
+                return {"rule_change_id": r.id, "target_agent": agent,
+                        "base_date": base_date, "metric": "t5_win_rate",
+                        "win_rate": None, "samples": 0, "insufficient": True}
+            wins = sum(1 for x in rows if (x.t5_pct or 0) > 0)
+            return {"rule_change_id": r.id, "target_agent": agent,
+                    "base_date": base_date, "metric": "t5_win_rate",
+                    "win_rate": round(wins / samples * 100, 2), "samples": samples,
+                    "insufficient": False}
+        if agent in ("position", "monitor", "sell", "review"):
+            rows = db.execute(
+                select(ReviewResult).where(ReviewResult.exit_date >= base_date)
+            ).scalars().all()
+            samples = len(rows)
+            if samples == 0:
+                return {"rule_change_id": r.id, "target_agent": agent,
+                        "base_date": base_date, "metric": "avg_pnl_pct",
+                        "avg_pnl": None, "samples": 0, "insufficient": True}
+            avg = sum(float(x.pnl_pct or 0.0) for x in rows) / samples
+            return {"rule_change_id": r.id, "target_agent": agent,
+                    "base_date": base_date, "metric": "avg_pnl_pct",
+                    "avg_pnl": round(avg, 2), "samples": samples,
+                    "insufficient": False}
+        return {"rule_change_id": r.id, "target_agent": agent,
+                "base_date": base_date, "metric": None,
+                "samples": 0, "insufficient": True, "unsupported_agent": True}
 
 
 def adopt_rule_suggestion(suggestion_id: int, operator: str = "") -> int:
@@ -4448,15 +4719,15 @@ def _artifacts_meta(ref, code, sig, original_ref) -> dict:
             meta = json.loads(ref)
             if isinstance(meta, dict):
                 meta.setdefault("count", 1)
-                meta.setdefault("first_at", datetime.now().isoformat(timespec="seconds"))
-                meta.setdefault("last_at", datetime.now().isoformat(timespec="seconds"))
+                meta.setdefault("first_at", _now().isoformat(timespec="seconds"))
+                meta.setdefault("last_at", _now().isoformat(timespec="seconds"))
                 meta.setdefault("stock_code", code)
                 meta.setdefault("signal_type", sig)
                 meta.setdefault("original_ref", original_ref)
                 return meta
         except (TypeError, ValueError):
             pass
-    now = datetime.now().isoformat(timespec="seconds")
+    now = _now().isoformat(timespec="seconds")
     return {"count": 1, "first_at": now, "last_at": now, "stock_code": code,
             "signal_type": sig, "original_ref": original_ref}
 
@@ -4467,7 +4738,7 @@ def merge_pending_duplicate(task_id, stage, summary, artifacts_ref, user_id=None
     code, sig = _parse_monitor_summary(summary)
     if not code:
         return None
-    hour_start = datetime.now().replace(minute=0, second=0, microsecond=0)
+    hour_start = _now().replace(minute=0, second=0, microsecond=0)
     with SessionLocal() as db:
         stmt = select(PendingExperience).where(PendingExperience.status == "pending", PendingExperience.created_at >= hour_start)
         if owner_id is not None:
@@ -4477,7 +4748,7 @@ def merge_pending_duplicate(task_id, stage, summary, artifacts_ref, user_id=None
             if r_code == code and r_sig == sig:
                 meta = _artifacts_meta(r.artifacts_ref, code, sig, str(artifacts_ref or ""))
                 meta["count"] = int(meta.get("count") or 1) + 1
-                meta["last_at"] = datetime.now().isoformat(timespec="seconds")
+                meta["last_at"] = _now().isoformat(timespec="seconds")
                 r.artifacts_ref = json.dumps(meta, ensure_ascii=False)
                 db.commit(); _invalidate("pending_experience")
                 return r.id
@@ -4535,7 +4806,7 @@ def release_pending(id, error=None, user_id=None) -> None:
 
 def watchdog_reset_stale_processing(older_than_hours=2.0, user_id=None) -> int:
     owner_id = _experience_scope_user(user_id)
-    cutoff = datetime.now() - timedelta(hours=older_than_hours)
+    cutoff = _now() - timedelta(hours=older_than_hours)
     with SessionLocal() as db:
         stmt = select(PendingExperience).where(PendingExperience.status == "processing", PendingExperience.created_at < cutoff)
         if owner_id is not None: stmt = stmt.where(PendingExperience.user_id == owner_id)
@@ -4560,7 +4831,7 @@ def _pending_row(r) -> dict:
 
 
 def insert_experience(title, body, stage, tags, impact, confidence, auto_merged=0, source_pending_id=None, status="pending_review", user_id=None) -> int:
-    owner_id = _experience_scope_user(user_id)
+    owner_id = _experience_scope_user(user_id, for_write=True)
     tags_json = json.dumps(tags, ensure_ascii=False) if isinstance(tags, (list, tuple)) else tags
     with SessionLocal() as db:
         if source_pending_id is not None and owner_id is not None:
@@ -4607,7 +4878,7 @@ def bump_experience_hits(ids: list[int], user_id=None) -> int:
     with SessionLocal() as db:
         stmt = update(Experience).where(Experience.id.in_(exp_ids))
         if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
-        res = db.execute(stmt.values(hit_count=Experience.hit_count + 1, last_used_at=datetime.now())); db.commit(); _invalidate("experience"); return int(res.rowcount or 0)
+        res = db.execute(stmt.values(hit_count=Experience.hit_count + 1, last_used_at=_now())); db.commit(); _invalidate("experience"); return int(res.rowcount or 0)
 
 
 def list_curator_candidates(status="active", stage="", older_than_days=None, max_hit_count=None, max_confidence=None, limit=100, user_id=None) -> list[dict]:
@@ -4617,7 +4888,7 @@ def list_curator_candidates(status="active", stage="", older_than_days=None, max
         if owner_id is not None: stmt = stmt.where(Experience.user_id == owner_id)
         if status: stmt = stmt.where(Experience.status == status)
         if stage: stmt = stmt.where(Experience.stage == stage)
-        if older_than_days is not None: stmt = stmt.where(Experience.created_at <= datetime.now() - timedelta(days=int(older_than_days)))
+        if older_than_days is not None: stmt = stmt.where(Experience.created_at <= _now() - timedelta(days=int(older_than_days)))
         if max_hit_count is not None: stmt = stmt.where(Experience.hit_count <= int(max_hit_count))
         if max_confidence is not None: stmt = stmt.where(Experience.confidence <= float(max_confidence))
         return [_exp_row(r) for r in db.execute(stmt.order_by(Experience.created_at, Experience.id).limit(min(max(int(limit),1),500))).scalars().all()]
@@ -4687,6 +4958,31 @@ def write_review_log(experience_id, action, reviewer, note=None, user_id=None) -
         db.add(ReviewLog(experience_id=experience_id, action=action, reviewer=reviewer, note=note, user_id=owner_id)); db.commit(); _invalidate("review_log")
 
 
+def list_review_logs(date: str | None = None, action: str | None = None,
+                     reviewer: str | None = None, limit: int = 100) -> list[dict]:
+    """审核留痕只读：按日期（YYYY-MM-DD，本地日界）/动作/审核人过滤，倒序返回。
+
+    供 GET /review-logs 使用（S-6：审核留痕可读，规则采纳/回滚可追溯）。
+    """
+    with SessionLocal() as db:
+        stmt = select(ReviewLog).order_by(ReviewLog.at.desc())
+        if date:
+            try:
+                start = datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                return []
+            stmt = stmt.where(ReviewLog.at >= start, ReviewLog.at < start + timedelta(days=1))
+        if action:
+            stmt = stmt.where(ReviewLog.action == action)
+        if reviewer:
+            stmt = stmt.where(ReviewLog.reviewer == reviewer)
+        rows = db.execute(stmt.limit(min(limit, 500))).scalars().all()
+        return [{"id": r.id, "experience_id": r.experience_id, "action": r.action,
+                 "reviewer": r.reviewer,
+                 "at": r.at.isoformat() if r.at is not None else None,
+                 "note": r.note, "user_id": r.user_id} for r in rows]
+
+
 def start_worker_run(user_id=None) -> int:
     owner_id=_experience_scope_user(user_id)
     with SessionLocal() as db:
@@ -4712,7 +5008,7 @@ def _search_experience_like(stage=None, tags=None, query=None, k=5, status="acti
     with SessionLocal() as db:
         stmt=select(Experience).where(Experience.status==status)
         if user_id is not None: stmt=stmt.where(Experience.user_id==int(user_id))
-        if status=="active": stmt=stmt.where(or_(Experience.expires_at.is_(None),Experience.expires_at>datetime.now()))
+        if status=="active": stmt=stmt.where(or_(Experience.expires_at.is_(None),Experience.expires_at>_now()))
         if stage: stmt=stmt.where(Experience.stage==stage)
         if tags: stmt=stmt.where(Experience.tags.like(f"%{tags}%"))
         if query and str(query).strip():

@@ -23,7 +23,9 @@ def f22_sector_strength(data: DataAdapter, code: str):
 
 @register
 def f23_sector_fund(data: DataAdapter, code: str):
-    value = _sector_value(data, "sector_fund", "sector_main_inflow", "main_net_inflow")
+    # S-9/F-5：移除 main_net_inflow（个股资金）回退 —— 板块资金因子只能取板块级字段，
+    # 取不到即 data_missing；用个股主力净流入冒充板块资金属跨口径污染。
+    value = _sector_value(data, "sector_fund", "sector_main_inflow")
     return factor(value, "ok" if value is not None else "data_missing:sector_fund", data.quantile("f23", value) if value is not None else None)
 
 

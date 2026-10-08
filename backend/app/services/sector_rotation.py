@@ -7,6 +7,7 @@ import logging
 from datetime import date
 
 from app.db import repo
+from app.db.models import _now
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ def judge_rotation_state(trade_date: str | None = None) -> dict:
     箱位复用 fetch_board_box_positions（top5 板块 10/60 日，失败标注缺失不阻断）。
     落 sector_daily_rank_log（同 trade_date 删后插），返回完整指标 dict。
     """
-    today = trade_date or date.today().isoformat()
+    today = trade_date or _now().strftime("%Y-%m-%d")
     today_rows = repo.list_sector_daily_by_date(today)
     today_top5 = [r["sector_name"] for r in today_rows[:TOP_N]]
     if not today_top5:

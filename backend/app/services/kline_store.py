@@ -7,6 +7,7 @@
 - 当日不复权快照与 qfq 历史在「当日」等价（核验结论 v2 §11.4 已验证）；除权日由调用方
   （`kline_ingest`）用「快照昨收 ≠ 本地前收」检出并触发该票历史段重建。
 """
+from app.core import clock
 import os
 import sqlite3
 import threading
@@ -112,7 +113,7 @@ def mark_short(code: str, bars: int, path: str | None = None) -> None:
     """记录「源可取但历史不足 MIN_BARS」的短史票（回补/扫描据此标 unsupported，不再夜夜重试）"""
     with connect(path) as conn:
         conn.execute("INSERT OR REPLACE INTO short_history (stock_code, bars, checked_at) "
-                     "VALUES (?,?,?)", (str(code), int(bars), datetime.now().isoformat(timespec="seconds")))
+                     "VALUES (?,?,?)", (str(code), int(bars), clock.now().isoformat(timespec="seconds")))
         conn.commit()
 
 
@@ -142,7 +143,7 @@ def upsert_bars(rows: list[dict], path: str | None = None) -> int:
     """幂等写入日线（每行需 stock_code/trade_date + _BAR_COLS 任一）；返回写入行数"""
     if not rows:
         return 0
-    now = datetime.now().isoformat(timespec="seconds")
+    now = clock.now().isoformat(timespec="seconds")
     payload = []
     for row in rows:
         if not row.get("stock_code") or not row.get("trade_date"):

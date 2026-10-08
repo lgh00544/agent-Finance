@@ -8,7 +8,7 @@
 import pytest
 
 from app.services.red_line_check import (
-    C2_DRAWDOWN_PCT, C3_FACTOR, K139_TRAILING_FACTOR, compute_red_line,
+    C2_INTRADAY_DRAWDOWN_PCT, C3_FACTOR, K139_TRAILING_FACTOR, compute_red_line,
 )
 
 
@@ -57,7 +57,7 @@ def test_c3_stop_loss_and_c2_drawdown():
     assert rows4[0]["c2_alert"] is False         # (7.2-10)/10 = -28% > -30%
     rows5 = compute_red_line([_holding(code, cost=cost)], {code: 7.0}, 100000.0, trade_date=date)
     assert rows5[0]["c2_alert"] is None          # 缺 low → 显式 null
-    assert C2_DRAWDOWN_PCT == 30.0               # L0 阈值未被改
+    assert C2_INTRADAY_DRAWDOWN_PCT == 30.0      # L0 阈值未被改（唯一源 core.config）
 
 
 # ③ K139 SOP：trailing_stop 计算 + stage 推进（参考权重，判断在 LLM）

@@ -8,6 +8,7 @@
 存储：缓存抽象层（dev=内存 / prod=Redis），按自然日分区，进程内锁保护，
 与 llm_stats 同模式（TTL 2 天，跨午夜保留当日与昨日）。
 """
+from app.core import clock
 import json
 import threading
 import time
@@ -28,7 +29,7 @@ def _empty() -> dict:
 
 
 def _key() -> str:
-    return f"datasource_stats:{time.strftime('%Y-%m-%d')}"
+    return f"datasource_stats:{clock.today()}"
 
 
 def _load() -> dict:
@@ -88,14 +89,14 @@ def snapshot() -> dict:
                       "degraded_use": ks.get("degraded_use", 0),
                       "recoveries": ks.get("recoveries", 0)})
     return {
-        "date": time.strftime("%Y-%m-%d"),
+        "date": clock.today(),
         "requests": requests,
         "failures": failures,
         "degraded_use": stats["degraded_use"],
         "recoveries": stats["recoveries"],
         "success_rate_pct": success_rate,
         "kinds": kinds,
-        "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "checked_at": clock.now_str(),
     }
 
 

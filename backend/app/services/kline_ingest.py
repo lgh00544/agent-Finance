@@ -5,6 +5,7 @@
 ⚠️ 快照为**当日不复权**；与 qfq 历史在「当日」等价（核验结论 v2 §11.4 已验证）。
 除权检测：快照昨收(2) 与本地前收不等（>0.5%）⇒ 该票 qfq 历史基准漂移，须重建其历史段。
 """
+from app.core import clock
 import time
 
 import requests
@@ -114,7 +115,7 @@ def ingest_today(trade_date: str | None = None, codes: list[str] | None = None,
         summary["seconds"] = round(time.time() - started, 1)
         return summary
 
-    fallback_date = trade_date or time.strftime("%Y-%m-%d")
+    fallback_date = trade_date or clock.today()
     snapshot, errors = fetch_snapshot(codes, batch=batch)
     summary["batches"] = (len(codes) + batch - 1) // batch
     summary["errors"] = errors

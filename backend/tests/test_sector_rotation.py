@@ -5,6 +5,7 @@
 2. streak≥3 且 top3 仍在 → 判 mainline
 3. churn≥0.6 且无 streak≥3 → 判 rotation
 """
+from app.core import clock
 from datetime import date, timedelta
 from unittest import mock
 
@@ -40,9 +41,9 @@ def test_calc_churn_rate_full_change():
 # ============ 2: streak≥3 且 top3 仍在 → mainline ============
 
 def test_streak3_judge_mainline():
-    today = date.today().isoformat()
-    d1 = (date.today() - timedelta(days=1)).isoformat()
-    d2 = (date.today() - timedelta(days=2)).isoformat()
+    today = clock.today_date().isoformat()
+    d1 = (clock.today_date() - timedelta(days=1)).isoformat()
+    d2 = (clock.today_date() - timedelta(days=2)).isoformat()
     top5 = ["半导体", "银行", "白酒", "券商", "军工"]
     for d in (d2, d1, today):
         repo.upsert_sector_daily_snapshot(_snapshot_rows(d, top5))
@@ -61,8 +62,8 @@ def test_streak3_judge_mainline():
 # ============ 3: churn≥0.6 且无 streak≥3 → rotation ============
 
 def test_churn06_no_streak_rotation():
-    today = date.today().isoformat()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    today = clock.today_date().isoformat()
+    yesterday = (clock.today_date() - timedelta(days=1)).isoformat()
     repo.upsert_sector_daily_snapshot(_snapshot_rows(yesterday, ["旧1", "旧2", "旧3", "旧4", "旧5"]))
     repo.upsert_sector_daily_snapshot(_snapshot_rows(today, ["新1", "新2", "新3", "新4", "新5"]))
     with mock.patch.object(AkshareSource, "fetch_board_box_positions", return_value={}):

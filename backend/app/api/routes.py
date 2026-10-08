@@ -2,6 +2,8 @@
 REST API：仅提供数据存取与手动触发任务（无任何二次判断逻辑）
 面板等前端不内置研判，全部展示 LLM 输出结论与原始数据。
 """
+from app.core import clock
+from datetime import datetime, timedelta, timezone
 import difflib
 import concurrent.futures
 import logging
@@ -9,7 +11,6 @@ import os
 import re
 import time
 import traceback
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -229,7 +230,7 @@ def _task_daily_pipeline(params: dict) -> dict:
     保证手动触发绝不命中缓存、结果与已有数据不同也必然覆盖更新。"""
     from app.cache import cache
 
-    date_key = time.strftime("%Y-%m-%d")
+    date_key = clock.today()
     for prefix in ("shortlist:v2:", "final:v2:", "market:v2:"):
         cache.delete_prefix(f"{prefix}{date_key}")
     result = graph_router.run_daily_pipeline()
@@ -321,6 +322,19 @@ def _task_sector_rotation() -> dict:
             "error": error}
 
 
+def _is_trade_date(d: str) -> bool:
+    """手动接口交易日校验：缓存日历优先；日历不可用时按放行避免阻塞手动操作。"""
+    try:
+        from app.cache import cache
+        from app.datasource.akshare_source import AkshareSource
+        cached = cache.get("ak:trade_calendar")
+        calendar = (cached.split(",") if cached
+                    else AkshareSource().fetch_trade_calendar())
+        return bool(calendar) and d in calendar
+    except Exception:  # noqa: BLE001 日历服务异常不阻塞手动接口
+        return True
+
+
 def _task_sector_forward(params: dict, progress: dict | None = None) -> dict:
     """手动触发：刷新快照 → C' 行情结构 → D' 板块前瞻，不依赖归因子 Agent。"""
     from app.services.sector_daily import refresh_sector_daily_snapshot
@@ -330,6 +344,10 @@ def _task_sector_forward(params: dict, progress: dict | None = None) -> dict:
     progress = progress if progress is not None else {}
     try:
         requested_date = str(params.get("trade_date") or "").strip() or None
+        if requested_date and not _is_trade_date(requested_date):
+            return {"success": False, "trade_date": requested_date,
+                    "refresh": None, "regime": None, "forward": None,
+                    "error": f"{requested_date} 非交易日，拒绝手动触发"}
         target_date = requested_date
         progress.update({"trade_date": target_date, "refresh_done": False,
                          "snapshot_missing": False})
@@ -341,12 +359,12 @@ def _task_sector_forward(params: dict, progress: dict | None = None) -> dict:
             refresh = refresh_sector_daily_snapshot(target_date)
         progress.update({"refresh": refresh, "refresh_done": bool(refresh.get("success"))})
         if not refresh.get("success"):
-            return {"success": False, "trade_date": target_date or time.strftime("%Y-%m-%d"),
+            return {"success": False, "trade_date": target_date or clock.today(),
                     "refresh": refresh, "regime": None, "forward": None,
                     "error": refresh.get("error")}
         if not target_date:
             dates = repo.list_sector_daily_dates(limit=1)
-            target_date = refresh.get("trade_date") or (dates[0] if dates else time.strftime("%Y-%m-%d"))
+            target_date = refresh.get("trade_date") or (dates[0] if dates else clock.today())
             progress["trade_date"] = target_date
         regime = judge_regime(target_date)
         progress["regime"] = regime
@@ -374,6 +392,9 @@ def _task_sector_forecast_verify(params: dict, progress: dict | None = None) -> 
     progress = progress if progress is not None else {}
     try:
         forecast_date = params.get("forecast_date") or params.get("trade_date")
+        if forecast_date and not _is_trade_date(str(forecast_date).strip()):
+            return {"success": False, "forecast_date": forecast_date,
+                    "verify": None, "error": f"{forecast_date} 非交易日，拒绝回填"}
         progress["forecast_date"] = forecast_date
         result = run_sector_forecast_verify(forecast_date)
         progress["verify"] = result
@@ -484,7 +505,7 @@ def _task_batch_ask(params: dict) -> dict:
     return batch_chat.ask_batch(str(params.get("scope", "all")),
                                 params.get("codes") or [],
                                 str(params.get("question", "")),
-                                str(params.get("date", "") or time.strftime("%Y-%m-%d")),
+                                str(params.get("date", "") or clock.today()),
                                 operator=str(params.get("operator", "")))
 
 
@@ -709,6 +730,86 @@ def factor_candidates_pending(limit: int = 50):
     return get_pending_for_sir(limit)
 
 
+class FactorRegistryStatusBody(BaseModel):
+    status: str = Field(..., description="active/deprecated")
+
+
+class FactorRegistryWeightBody(BaseModel):
+    weight_hint: float = Field(..., description="0~1 权重提示")
+
+
+@router.post("/factor-candidates/{candidate_id}/validate")
+def validate_factor_candidate(candidate_id: str | int):
+    """P-11：候选因子样本外回测（公式真实执行），结果写验证字段。"""
+    require_write_access()
+    from app.services.factor_candidate import validate
+    try:
+        return validate(candidate_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/factor-candidates/{candidate_id}/enable")
+def enable_factor_candidate(candidate_id: str | int):
+    """P-11：人工启用候选因子（公式须可安全执行），注册进运行期因子链。"""
+    require_write_access()
+    from app.services.factor_candidate import enable
+    try:
+        return enable(candidate_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/factor-candidates/{candidate_id}/disable")
+def disable_factor_candidate(candidate_id: str | int):
+    """P-11：人工驳回/停用候选因子，同时从运行期 registry 移除。"""
+    require_write_access()
+    from app.services.factor_candidate import disable
+    try:
+        return disable(candidate_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/factor-registry")
+def factor_registry_view():
+    """P-11：运行期因子注册表快照 + 缓存指纹（供人工拍板查看）。"""
+    from app.services import factor_registry
+    return {
+        "factors": [{"id": d.id, "name": d.name, "category": d.category,
+                     "status": d.status, "weight_hint": d.weight_hint,
+                     "direction": d.direction, "version": d.version}
+                    for d in factor_registry.list_all()],
+        "fingerprint": factor_registry.fingerprint(),
+    }
+
+
+@router.post("/factor-registry/{fid}/status")
+def factor_registry_status(fid: str, body: FactorRegistryStatusBody):
+    """P-11：人工拍板因子启停，写回后评分缓存指纹失效。"""
+    require_write_access()
+    from app.services import factor_registry
+    try:
+        row = factor_registry.set_factor_status(fid, body.status)
+        return {"id": row.id, "status": row.status, "weight_hint": row.weight_hint,
+                "direction": row.direction, "version": row.version}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/factor-registry/{fid}/weight")
+def factor_registry_weight(fid: str, body: FactorRegistryWeightBody):
+    """P-11：人工拍板因子权重提示，写回后评分缓存指纹失效。"""
+    require_write_access()
+    from app.services import factor_registry
+    try:
+        row = factor_registry.set_factor_weight(fid, body.weight_hint)
+        return {"id": row.id, "status": row.status, "weight_hint": row.weight_hint,
+                "direction": row.direction, "version": row.version}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ================= 板块轮动（sector_rotation：状态机 + 归因子 Agent + 手动触发） =================
 
 @router.post("/market/sector-rotation/run")
@@ -719,18 +820,34 @@ def run_sector_rotation_job():
 
 @router.post("/market/sector-forward/run")
 def run_sector_forward_job(body: dict | None = Body(default=None)):
-    """手动触发行情结构 + 板块前瞻（刷新快照、C'、D'；同步等待最多 30s）。"""
-    return _sync_run_with_timeout(_task_sector_forward, body or {})
+    """手动触发行情结构 + 板块前瞻（刷新快照、C'、D'；同步等待最多 30s）。
+    B-9：与 sector_forward_job 共享 cache 锁，防手动/调度并发交错落库。"""
+    from app.cache import cache
+    if not cache.acquire_lock("sector_forward", ttl_seconds=900):
+        raise HTTPException(status_code=409,
+                            detail="板块前瞻任务正在执行中（手动或调度），请稍后重试")
+    try:
+        return _sync_run_with_timeout(_task_sector_forward, body or {})
+    finally:
+        cache.release_lock("sector_forward")
 
 
 @router.post("/market/sector-forecast-verify/run")
 def run_sector_forecast_verify_job(forecast_date: str | None = None,
                                    body: dict | None = Body(default=None)):
-    """手动触发前瞻验证回填（同步等待最多 30s）。"""
+    """手动触发前瞻验证回填（同步等待最多 30s）。
+    B-9：与 sector_forecast_verify_job 共享 cache 锁，防手动/调度并发交错落库。"""
+    from app.cache import cache
+    if not cache.acquire_lock("sector_forecast_verify", ttl_seconds=900):
+        raise HTTPException(status_code=409,
+                            detail="前瞻验证任务正在执行中（手动或调度），请稍后重试")
     params = body or {}
     if forecast_date and "forecast_date" not in params:
         params = {**params, "forecast_date": forecast_date}
-    return _sync_run_with_timeout(_task_sector_forecast_verify, params)
+    try:
+        return _sync_run_with_timeout(_task_sector_forecast_verify, params)
+    finally:
+        cache.release_lock("sector_forecast_verify")
 
 
 @router.get("/market/diagnostics")
@@ -776,8 +893,9 @@ def get_sector_rotation(date: str | None = None):
 
 @router.get("/market/sector-forward")
 def get_sector_forward(date: str | None = None):
-    """读取指定交易日 top10 板块 T+1/T+3/T+5 前瞻。"""
-    d = date or time.strftime("%Y-%m-%d")
+    """读取指定交易日 top10 板块 T+1/T+3/T+5 前瞻；默认取最新快照日。"""
+    dates = repo.list_sector_daily_dates(limit=1)
+    d = date or (dates[0] if dates else clock.today())
     return {"trade_date": d, "forecasts": repo.list_sector_forward_forecast(d)}
 
 
@@ -785,7 +903,7 @@ def get_sector_forward(date: str | None = None):
 def get_sector_next_hot(date: str | None = None, limit: int = 10):
     """读取指定交易日下一个风口候选，作为旧轮动归因长跑的快速替代。"""
     dates = repo.list_sector_daily_dates(limit=30)
-    d = date or (dates[0] if dates else time.strftime("%Y-%m-%d"))
+    d = date or (dates[0] if dates else clock.today())
     return {"trade_date": d, "items": repo.list_sector_next_hot_by_date(d, limit)}
 
 
@@ -1087,7 +1205,7 @@ def market_indices_history(days: int = 90):
     from app.datasource.akshare_source import get_datasource
 
     days = max(7, min(days, 250))
-    now = datetime.now(timezone(timedelta(hours=8)))
+    now = clock.now_aware()
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d")
     end = now.strftime("%Y-%m-%d")
     items, err = [], None
@@ -1170,7 +1288,9 @@ class PaperRunBody(BaseModel):
                                              description="可选的已存在模拟仓位卖出意图")
     target_allocations: dict[str, float] = Field(
         default_factory=dict,
-        description="AI 决策层给出的每只标的目标仓位比例（0-1 小数或 0-100 百分数）")
+        description=("AI 决策层给出的每只标的目标仓位比例。接受两种单位：0-1 小数或 "
+                     "0-100 百分数；归一化阈值 value > 1 判为百分数（÷100），≤1 判为小数，"
+                     "最终收敛到 (0, 1]（见 paper_execution._normalize_target_allocation）"))
 
 
 class PaperStatusBody(BaseModel):
@@ -1210,10 +1330,7 @@ class PaperReviewBody(BaseModel):
 @router.post("/account/baseline")
 def save_account_baseline(body: AccountBaselineBody):
     """保存账户基准（仅人工确认后调用；每次插入一行保留历史，读取取最新）"""
-    from datetime import datetime, timedelta, timezone
-
-    trade_date = body.trade_date.strip() or datetime.now(
-        timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    trade_date = body.trade_date.strip() or clock.now_aware().strftime("%Y-%m-%d")
     bid = repo.insert_account_baseline(trade_date, body.total_asset, body.available_cash,
                                        body.position_pct, body.source,
                                        user_id=_request_user_id())
@@ -1297,7 +1414,7 @@ def paper_account_collect_context(account_id: int, body: PaperContextBody):
     from app.services import paper_context
     try:
         return paper_context.collect(account_id, body.stock_code,
-                                     body.trade_date.strip() or time.strftime("%Y-%m-%d"),
+                                     body.trade_date.strip() or clock.today(),
                                      mode=body.mode, web_query=body.web_query,
                                      web_urls=body.web_urls, historical_facts=body.historical_facts)
     except ValueError as exc:
@@ -1309,7 +1426,7 @@ def paper_account_monitor(account_id: int, body: PaperMonitorBody | None = None)
     _paper_account_for_request(account_id)
     from app.services import paper_monitor
     try:
-        return paper_monitor.run(account_id, (body.trade_date if body else "").strip() or time.strftime("%Y-%m-%d"))
+        return paper_monitor.run(account_id, (body.trade_date if body else "").strip() or clock.today())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1343,7 +1460,7 @@ def paper_account_executions(account_id: int, limit: int = 200):
 def paper_account_run(account_id: int, body: PaperRunBody | None = None):
     _paper_account_for_request(account_id)
     body = body or PaperRunBody()
-    trade_date = body.trade_date.strip() or time.strftime("%Y-%m-%d")
+    trade_date = body.trade_date.strip() or clock.today()
     from app.services import paper_execution
     try:
         return paper_execution.run(account_id, trade_date, facts=body.facts,
@@ -1377,7 +1494,7 @@ def paper_reviews(account_id: int | None = None, limit: int = 100):
 @router.post("/paper/accounts/{account_id}/reviews")
 def paper_review_create(account_id: int, body: PaperReviewBody):
     _paper_account_for_request(account_id)
-    review_date = body.review_date.strip() or time.strftime("%Y-%m-%d")
+    review_date = body.review_date.strip() or clock.today()
     rid = repo.create_paper_review(account_id, body.stock_code.strip(), body.stock_name.strip(),
                                    review_date, body.content, body.execution_id)
     return {"id": rid, "account_id": account_id, "execution_mode": "paper",
@@ -1477,7 +1594,7 @@ def candidates_tradeable(date: Optional[str] = None, limit: int = 200):
     {date, count(可建仓数), plan_candidate_count(可自动生成建仓计划数), total, items}"""
     from app.services import candidate_tradeable
 
-    trade_date = date or time.strftime("%Y-%m-%d")
+    trade_date = date or clock.today()
     return candidate_tradeable.tradeable_view(trade_date, limit)
 
 
@@ -1604,6 +1721,8 @@ class HoldingBody(BaseModel):
     target_pct: float = 0.0
     plan_id: Optional[int] = None
     note: str = ""
+    commission: float | None = Field(default=None, description="佣金（元）；E-8 净额口径留痕（建仓补录流水）")
+    slippage: float | None = Field(default=None, description="滑点（每股元，留痕）")
 
 
 class ExitBody(BaseModel):
@@ -1612,6 +1731,8 @@ class ExitBody(BaseModel):
     shares: int = Field(gt=0)
     trade_date: str
     note: str = ""
+    commission: float | None = Field(default=None, description="佣金（元）；E-7 净额口径留痕")
+    slippage: float | None = Field(default=None, description="滑点（每股元，留痕）")
 
 
 @router.get("/holdings")
@@ -1656,7 +1777,8 @@ def add_holding(body: HoldingBody):
     hid = repo.insert_holding(code, body.stock_name, body.entry_date,
                               body.entry_price, body.shares, body.cost or body.entry_price * body.shares,
                               body.stop_loss, body.take_profit, body.target_pct,
-                              body.plan_id, body.note, user_id=user_id)
+                              body.plan_id, body.note, user_id=user_id,
+                              commission=body.commission, slippage=body.slippage)
     return {"id": hid, "plan_id": body.plan_id}
 
 
@@ -1675,12 +1797,16 @@ def exit_holding(hid: int, body: ExitBody):
         raise HTTPException(status_code=400, detail="卖出股数超过持仓")
 
     remain = holding.shares - body.shares
-    fields = {"shares": remain}
+    # S-5 不变量：cost 只表示「当前持仓总成本」= 平均成本 × 剩余股数，减仓/清仓都要重算；
+    # 生命周期总成本留在 cost_basis_initial（复盘/账户总成本口径），绝不在这里回退。
+    fields = {"shares": remain,
+              "cost": round(float(holding.entry_price or 0) * remain, 2)}
     if remain == 0:
         fields["status"] = "exited"
     repo.record_holding_trade(hid, side="sell", price=body.price, shares=body.shares,
                               trade_date=body.trade_date, note=body.note,
                               before_shares=holding.shares, after_shares=remain,
+                              commission=body.commission, slippage=body.slippage,
                               holding_fields=fields, user_id=holding.user_id)
 
     result = {"holding_id": hid, "remain_shares": remain, "review_task_id": None}
@@ -1696,6 +1822,8 @@ class AddSharesBody(BaseModel):
     shares: int = Field(gt=0)
     trade_date: str
     note: str = ""
+    commission: float | None = Field(default=None, description="佣金（元）；E-8 净额口径留痕")
+    slippage: float | None = Field(default=None, description="滑点（每股元，留痕）")
 
 
 class CostAdjustBody(BaseModel):
@@ -1721,11 +1849,17 @@ def add_shares(hid: int, body: AddSharesBody):
     new_entry = round((holding.entry_price * old_shares + body.price * body.shares)
                       / new_shares, 4)
     new_stop = round(new_entry * 0.92, 2)
+    # S-5：生命周期总成本随买入累加（cost_basis_initial 不因减仓/清仓回退），
+    # 当前持仓成本按不变量重算
+    basis = float(getattr(holding, "cost_basis_initial", None) or holding.cost or 0.0)
     repo.record_holding_trade(hid, side="buy", price=body.price, shares=body.shares,
                               trade_date=body.trade_date, note=body.note,
                               before_shares=old_shares, after_shares=new_shares,
+                              commission=body.commission, slippage=body.slippage,
                               holding_fields={"shares": new_shares, "entry_price": new_entry,
                                               "cost": round(new_entry * new_shares, 2),
+                                              "cost_basis_initial": round(
+                                                  basis + body.price * body.shares, 2),
                                               "stop_loss": new_stop},
                               user_id=holding.user_id)
     return {"holding_id": hid, "shares": new_shares, "cost_price": new_entry,
@@ -1746,11 +1880,14 @@ def adjust_cost(hid: int, body: CostAdjustBody):
 
     new_stop = round(body.cost_price * 0.92, 2)
     repo.record_holding_trade(hid, side="adjust", price=body.cost_price,
-                              shares=holding.shares, trade_date=time.strftime("%Y-%m-%d"),
+                              shares=holding.shares, trade_date=clock.today(),
                               note=f"成本修正：{body.reason.strip()}",
                               before_shares=holding.shares, after_shares=holding.shares,
                               holding_fields={"entry_price": body.cost_price,
                                               "cost": round(body.cost_price * holding.shares, 2),
+                                              # S-5：成本修正同时重写生命周期总成本口径
+                                              "cost_basis_initial": round(
+                                                  body.cost_price * holding.shares, 2),
                                               "stop_loss": new_stop},
                               user_id=holding.user_id)
     return {"holding_id": hid, "cost_price": body.cost_price, "stop_loss": new_stop}
@@ -1768,7 +1905,8 @@ def holding_trades(hid: int):
     rows.sort(key=lambda r: (r.created_at, r.id), reverse=True)
     return [{"id": r.id, "holding_id": r.holding_id, "stock_code": r.stock_code,
              "side": r.side, "price": r.price, "shares": r.shares,
-             "amount": r.amount, "trade_date": r.trade_date, "note": r.note,
+             "amount": r.amount, "commission": r.commission, "slippage": r.slippage,
+             "net_amount": r.net_amount, "trade_date": r.trade_date, "note": r.note,
              "before_shares": r.before_shares, "after_shares": r.after_shares,
              "created_at": str(r.created_at)} for r in rows]
 
@@ -2339,6 +2477,16 @@ def get_rule_change_detail(rid: int):
     return row
 
 
+@router.get("/rule-changes/{rid}/effect")
+def get_rule_change_effect(rid: int):
+    """采纳后效果对账（A-22 闭环，只读统计）：按 target_agent 映射确定性统计域，
+    生效日后候选 T+5 胜率（discover/score）或卖出复盘 pnl_pct 均值（position/monitor/sell/review）。"""
+    effect = repo.get_rule_effect(rid, user_id=_request_user_id(), is_admin=_is_admin())
+    if effect is None:
+        raise HTTPException(status_code=404, detail="规则变更记录不存在")
+    return effect
+
+
 @router.post("/rule-changes/{rid}/rollback")
 def rollback_rule_change(rid: int, body: RollbackRuleBody):
     """一键回滚：恢复变更前状态（status → rolled_back，原因/时间留痕，全程可追溯）"""
@@ -2372,7 +2520,7 @@ def distribution_phase(stock_code: str, force: bool = False):
     缺维返回 null + missing_data 标注，不补零不补均值。"""
     from app.cache import cache
     from app.services.distribution_phase import compute_distribution_phase
-    trade_date = time.strftime("%Y-%m-%d")
+    trade_date = clock.today()
     if force:
         cache.delete(f"distribution_phase:{trade_date}:{stock_code}")
     try:
@@ -2391,7 +2539,7 @@ def capital_view(stock_code: str, force: bool = False):
     单源必标 source="sse_only"（K227 诚实）。"""
     from app.cache import cache
     from app.services.capital_view import compute_capital_view
-    trade_date = time.strftime("%Y-%m-%d")
+    trade_date = clock.today()
     if force:
         cache.delete(f"capital_view:{trade_date}:{stock_code}")
     try:
@@ -2408,8 +2556,8 @@ def _fetch_day_lows(codes: list) -> dict:
     if not codes:
         return lows
     from app.datasource.fallback import get_datasource
-    end = time.strftime("%Y-%m-%d")
-    start = time.strftime("%Y-%m-%d", time.localtime(time.time() - 45 * 86400))
+    end = clock.today()
+    start = (clock.now() - timedelta(days=45)).strftime("%Y-%m-%d")
     for code in codes:
         try:
             kl = get_datasource().fetch_daily_kline(code, start, end)
@@ -2421,20 +2569,17 @@ def _fetch_day_lows(codes: list) -> dict:
 
 
 def _red_line_holdings() -> tuple[list, dict]:
-    """红线扫描输入：build_holding_view() 行情行（100% 与持仓监控页同源）+ 每只 high_price（repo 读取）"""
-    view = holding_view.build_holding_view()
-    holdings = []
-    for r in view["rows"]:
-        high_price = None
-        if r.get("id"):
-            try:
-                h = repo.get_holding(r["id"])
-                high_price = getattr(h, "high_price", None)
-            except Exception:  # noqa: BLE001 单只 high_price 失败不阻塞（C4 缺数据 → null）
-                high_price = None
-        holdings.append({"stock_code": r["stock_code"], "entry_price": r.get("entry_price"),
-                         "cost": r.get("cost"), "shares": r.get("shares"),
-                         "high_price": high_price})
+    """红线扫描输入：build_holding_view() 行情行（100% 与持仓监控页同源）+ 透传 high_price。
+
+    A-12：repo.list_holdings 已返回 high_price，build_holding_view 用 {**r, ...} 原样透传，
+    这里不再逐只 repo.get_holding 回查（消除 E-17 的 N+1）；
+    旧数据缺列 → None → C4 显式 null，不伪造 False。
+    """
+    view = holding_view.build_holding_view(_request_user_id())
+    holdings = [{"stock_code": r["stock_code"], "stock_name": r.get("stock_name"),
+                 "entry_price": r.get("entry_price"),
+                 "cost": r.get("cost"), "shares": r.get("shares"),
+                 "high_price": r.get("high_price")} for r in view["rows"]]
     return holdings, view
 
 
@@ -2442,14 +2587,11 @@ def _red_line_holdings() -> tuple[list, dict]:
 def red_line_check():
     """全部持仓红线扫描：C1 占比 / C2 日内回撤 / C3 止损 / C4 突破 + K139 SOP / K226 派发期 / K189 对倒。
     纯计算 + 复用 D/E 缓存；缺数据字段显式 null；K139/K226 为参考权重（LLM 一票否决）。"""
-    from app.services.red_line_check import account_total_asset, compute_red_line
-    holdings, view = _red_line_holdings()
-    prices = {r["stock_code"]: r["current_price"] for r in view["rows"] if r.get("current_price") is not None}
-    lows = _fetch_day_lows(list(prices))
-    total_asset = account_total_asset()
-    result = compute_red_line(holdings, prices, total_asset, lows=lows)
-    return {"rows": result, "trade_date": time.strftime("%Y-%m-%d"),
-            "total_asset": total_asset, "quote_time": view.get("quote_time")}
+    # S-1/S-11：扫描 + 越限落库/推送统一走服务层入口（red_line_job 调用的就是它），
+    # 保证「页面看到的」与「定时任务落的」同源、同去重键（投递成功后置位）。
+    # 越限结果落 alert_log（source='red_line'），返回体新增 alerts 统计。
+    from app.services.red_line_check import scan_red_line
+    return scan_red_line()
 
 
 @router.get("/red_line_check/{stock_code}")
@@ -2614,7 +2756,7 @@ def track_verify_suggest():
 # ================= 其他 =================
 @router.get("/health")
 def health():
-    return {"status": "ok", "time": time.strftime("%Y-%m-%d %H:%M:%S"), "env": __import__("app.core.config", fromlist=["settings"]).settings.app_env}
+    return {"status": "ok", "time": clock.now_str(), "env": __import__("app.core.config", fromlist=["settings"]).settings.app_env}
 
 
 # ================= Agent 专属对话（提问答疑 / 规则调教 / 多模态学习） =================
@@ -2914,3 +3056,12 @@ def experience_rollback(eid: int):
                                   action="rollback", note="M4 人工回滚",
                                   user_id=_request_user_id())
     return {"id": eid, "status": "rolled_back"}
+
+
+@router.get("/review-logs")
+def review_logs(date: str | None = None, action: str | None = None,
+                reviewer: str | None = None, limit: int = 100):
+    """S-6 审核留痕只读：经验审核/自动合并/回滚/严格度冻结记录，按日期/动作/审核人过滤。"""
+    rows = repo.list_review_logs(date=date, action=action,
+                                 reviewer=reviewer, limit=limit)
+    return {"total": len(rows), "rows": rows}

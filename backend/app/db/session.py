@@ -2,6 +2,7 @@
 数据库会话管理：同一套 ORM 模型，默认 SQLite 单文件（data/dev.db，零外部依赖）；
 DB_BACKEND=mysql 时切换 MySQL8。业务代码一律通过 repo 网关访问，本模块只被网关使用。
 """
+from app.core import clock
 import hashlib
 import logging
 import os
@@ -242,11 +243,31 @@ def _add_columns(eng, table: str, additions: dict[str, str]) -> dict:
     return result
 
 
+def _assert_host_tz() -> None:
+    """入库侧 TZ 断言（P-12）：宿主本地时区偏移与 UTC+8 不一致时打 warning。
+
+    _now()/_today_cn() 强制使用 Asia/Shanghai，与宿主 TZ 无关；此处仅作
+    非容器/未设 TZ 部署的提醒，不抛异常（避免误伤合法场景）。
+    """
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        local_offset = _dt.now().astimezone().utcoffset() or _td()
+        cn_offset = _dt.now(_tz(_td(hours=8))).utcoffset() or _td()
+        if local_offset != cn_offset:
+            logger.warning(
+                "宿主时区偏移 %s 与 Asia/Shanghai(UTC+8) 不一致：全链时间已按 UTC+8 落库/展示，"
+                "裸 datetime.now()/time.strftime 若复用宿主 TZ 将整体偏移 %d 小时，请统一切换 clock/_now。",
+                local_offset, int((cn_offset - local_offset).total_seconds() // 3600))
+    except Exception:  # noqa: BLE001 断言失败不应阻断建库
+        logger.debug("宿主时区断言失败，忽略", exc_info=True)
+
+
 def init_db() -> dict:
     """建表（幂等）。prod 模式下容器初始化已有 DDL，此处 create_all 兜底保证结构一致。"""
     from app.db import models  # noqa: F401  确保模型注册
 
     global _LAST_INIT_DB_RESULT
+    _assert_host_tz()
     identity = _database_identity()
     try:
         Base.metadata.create_all(bind=engine)
@@ -262,8 +283,10 @@ def init_db() -> dict:
         _ensure_position_plan_history()
         _ensure_hot_money_profile_columns()
         _ensure_holding_high_price()
+        _ensure_holding_cost_basis_initial()
         _ensure_alert_log_source()
         _ensure_lhb_multi_source_verified()
+        _ensure_rule_change_lifecycle_columns()
         _ensure_forward_view_history()
         _ensure_market_condition_next_day()
         _add_factor_scores_column()
@@ -286,7 +309,7 @@ def init_db() -> dict:
         _LAST_INIT_DB_RESULT = {
             "status": "failed",
             **identity,
-            "initialized_at": datetime.now().isoformat(timespec="seconds"),
+            "initialized_at": clock.now().isoformat(timespec="seconds"),
             "error": _safe_error(exc),
         }
         logger.error(
@@ -298,7 +321,7 @@ def init_db() -> dict:
     _LAST_INIT_DB_RESULT = {
         "status": "ok",
         **identity,
-        "initialized_at": datetime.now().isoformat(timespec="seconds"),
+        "initialized_at": clock.now().isoformat(timespec="seconds"),
         "migrations": {
             "knowledge": knowledge,
             "experience": experience,
@@ -807,8 +830,21 @@ def _ensure_trade_record_columns(eng=None) -> None:
     additions = {
         "before_shares": "INTEGER",
         "after_shares": "INTEGER",
+        "commission": "FLOAT",
+        "slippage": "FLOAT",
+        "net_amount": "FLOAT",
     }
     _add_columns(eng, "trade_record", additions)
+
+
+def _ensure_rule_change_lifecycle_columns(eng=None) -> None:
+    """幂等补齐 rule_change 生命周期列（A-22：effective_from/expires_at）。
+    只增量加列，不重建表不丢数据；旧数据默认 ''=即刻生效+永久有效。"""
+    eng = eng or engine
+    _add_columns(eng, "rule_change", {
+        "effective_from": "VARCHAR(10) DEFAULT ''",
+        "expires_at": "VARCHAR(10) DEFAULT ''",
+    })
 
 
 def _ensure_position_plan_source(eng=None) -> None:
@@ -872,6 +908,31 @@ def _ensure_holding_high_price(eng=None) -> None:
     旧数据为 NULL，MonitorAgent 首次取行情时降级以当前价为基准）"""
     eng = eng or engine
     _add_columns(eng, "holding", {"high_price": "FLOAT"})
+
+
+def _ensure_holding_cost_basis_initial(eng=None) -> dict:
+    """幂等补齐 holding.cost_basis_initial 列（S-5 生命周期总成本）+ 一次性口径回填。
+
+    只增量加列，不重建表不丢数据：
+    1) 回填：cost_basis_initial = 当时的 cost —— 旧代码在减仓/清仓时从不重算 cost，
+       所以旧数据的 cost 恰好就是生命周期总成本，回填口径正确；
+    2) 归一 cost 不变量：有效持仓 cost 必须 = entry_price × shares。历史上减仓后
+       cost 未重算，会让「每股成本」与「账户总成本」被放大；此处按不变量一次性纠正
+       （exited 因 shares=0 自然归 0）。异常行（entry_price/shares 缺失）不动，
+       留给 record_holding_trade 的断言在下次写入时暴露。
+    两条 UPDATE 都幂等：重复执行结果一致。返回 _add_columns 结果（added/existing）。
+    """
+    eng = eng or engine
+    result = _add_columns(eng, "holding", {"cost_basis_initial": "FLOAT NULL"})
+    with eng.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE holding SET cost_basis_initial = cost "
+            "WHERE cost_basis_initial IS NULL AND cost IS NOT NULL")
+        conn.exec_driver_sql(
+            "UPDATE holding SET cost = ROUND(entry_price * shares, 2) "
+            "WHERE entry_price IS NOT NULL AND shares IS NOT NULL "
+            "AND (cost IS NULL OR ABS(cost - entry_price * shares) >= 0.01)")
+    return result
 
 
 def _ensure_alert_log_source(eng=None) -> None:

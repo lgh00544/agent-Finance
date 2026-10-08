@@ -13,6 +13,7 @@ Akshare 数据源实现（东财为主，新浪降级）
   - 结果按 中文列名 → 英文标准列 规范化
   - Redis/内存缓存按接口设置 TTL，避免高频请求触发限流
 """
+from app.core import clock
 import hashlib
 import inspect
 import json
@@ -57,7 +58,8 @@ _SPOT_COLS = {
     "涨跌额": "change_amount", "成交量": "volume", "成交额": "amount",
     "振幅": "amplitude", "最高": "high", "最低": "low", "今开": "open", "昨收": "pre_close",
     "量比": "volume_ratio", "换手率": "turnover_rate", "市盈率-动态": "pe_dynamic",
-    "市净率": "pb", "总市值": "total_mv", "流通市值": "circ_mv",
+    "市盈率(TTM)": "pe_ttm", "市净率": "pb", "市销率": "ps",
+    "总市值": "total_mv", "流通市值": "circ_mv",
     "60日涨跌幅": "pct_change_60d", "年初至今涨跌幅": "pct_change_ytd",
 }
 _KLINE_COLS = {
@@ -71,6 +73,7 @@ _PERSIST_SCOPES = frozenset({"fin", "fundflow", "news"})
 
 _FUND_FLOW_COLS = {
     "日期": "date",
+    "成交额": "amount",  # 直连 fflow 当日成交额补齐列（与主力净流入同源同期，单位元）
     "主力净流入-净额": "main_net_inflow", "主力净流入-净占比": "main_net_pct",
     "超大单净流入-净额": "super_large_net", "超大单净流入-净占比": "super_large_pct",
     "大单净流入-净额": "large_net", "大单净流入-净占比": "large_pct",
@@ -101,11 +104,15 @@ _NEWS_COLS_OLD = {"code": "code", "title": "title", "content": "content",
                   "public_time": "published_at", "url": "url"}
 _INDEX_COLS = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
                "最低": "low", "成交量": "volume", "成交额": "amount"}
-_BOARD_COLS = {"板块名称": "board_name", "板块": "board_name",  # 东财/新浪列名变体
-               "最新价": "price", "涨跌幅": "change_pct", "总市值": "total_mv",
-               "换手率": "turnover_rate", "量比": "volume_ratio",  # 东财板块行情量比（缺失时不编造）
-               "上涨家数": "up_count", "下跌家数": "down_count",
-               "领涨股票": "leading_stock", "领涨股": "leading_stock", "股票名称": "leading_stock"}
+_BOARD_COLS = {"板块名称": "board_name", "板块": "board_name", "行业": "board_name",  # 东财/新浪列名变体
+               "最新价": "price", "当前价": "price", "涨跌幅": "change_pct", "行业-涨跌幅": "change_pct",
+               "总市值": "total_mv", "换手率": "turnover_rate", "量比": "volume_ratio",  # 东财板块行情量比（缺失时不编造）
+               "总成交额": "amount",  # 新浪板块快照总成交额（元）
+               "上涨家数": "up_count", "下跌家数": "down_count", "公司家数": "stock_count",
+               "领涨股票": "leading_stock", "领涨股": "leading_stock", "股票名称": "leading_stock",
+               "领涨股-涨跌幅": "leading_stock_change_pct",
+               "净额": "sector_fund", "流入资金": "sector_inflow", "流出资金": "sector_outflow",
+               "行业指数": "board_index"}
 _SUSPEND_COLS = {"代码": "code", "名称": "name", "停牌时间": "suspend_time",
                  "停牌原因": "reason", "预计复牌时间": "resume_time"}
 _CONS_COLS = {"代码": "code", "名称": "name", "最新价": "price", "涨跌幅": "change_pct",
@@ -583,7 +590,7 @@ class AkshareSource(DataSource):
         if not market_hours.realtime_open():
             logger.debug("非交易时段（%s），%s 实时行情走收盘快照",
                          market_hours._now().strftime("%Y-%m-%d %H:%M"), code)
-            return self._quote_from_universe(code)
+            return self._quote_from_universe(code, attach_valuation=True)
         def parse_bid_ask(df: pd.DataFrame) -> pd.DataFrame:
             # 东财盘口 item/value 列（最新价/涨幅）；构造为标准单行；解析失败返回空表（不缓存坏数据）
             kv = {str(r["item"]): r["value"] for _, r in df.iterrows()}
@@ -617,17 +624,22 @@ class AkshareSource(DataSource):
         df = self._fetch(f"spot_quote:{code}", "spot_quote", primary, ttl_seconds=30,
                          fallback=fallback, required=False, kind="tick")
         if df is None or df.empty:
-            quote = self._quote_from_universe(code)
+            quote = self._quote_from_universe(code, attach_valuation=True)
         else:
             row = df.iloc[0]
             quote = {"code": code, "name": str(row.get("name") or ""),
                      "price": float(row["price"]),
                      "change_pct": float(row.get("change_pct") or 0.0),
                      "time": str(row.get("time") or "")}
-        return quote
+        # 估值字段（pe_dynamic/pb/pe_ttm/ps 等）：盘口/雪球源不含，东财 push2 单只补充；
+        # 数据源不可得字段置 None 不报错（如 ps 东财无市销率字段）
+        return self._attach_valuation_ulist(quote, code)
 
-    def _quote_from_universe(self, code: str) -> dict:
-        """第三级兜底：全市场快照匹配该股实时行情（快照本身东财→新浪双降级，缓存复用）"""
+    def _quote_from_universe(self, code: str, attach_valuation: bool = False) -> dict:
+        """第三级兜底：全市场快照匹配该股实时行情（快照本身东财→新浪双降级，缓存复用）
+
+        attach_valuation=True 时，快照行缺少估值字段则用东财 push2 单只接口补充
+        （非交易时段实时链路也走这里，保证估值字段可得）。"""
         try:
             df = self.fetch_spot_universe()
             if df is None or df.empty or "code" not in df.columns:
@@ -644,14 +656,82 @@ class AkshareSource(DataSource):
                 change_pct = float(r.get("change_pct"))
             except (TypeError, ValueError):
                 change_pct = None
-            return {"code": code, "name": str(r.get("name") or ""), "price": price,
-                    "change_pct": change_pct, "time": ""}
+            quote = {"code": code, "name": str(r.get("name") or ""), "price": price,
+                     "change_pct": change_pct, "time": "",
+                     "pe_dynamic": r.get("pe_dynamic"), "pb": r.get("pb"),
+                     "pe_ttm": r.get("pe_ttm"), "ps": r.get("ps"),
+                     "total_mv": r.get("total_mv"), "circ_mv": r.get("circ_mv")}
+            if attach_valuation and quote.get("pe_dynamic") in (None, "") and quote.get("pb") in (None, ""):
+                quote = self._attach_valuation_ulist(quote, code)
+            return quote
         except Exception as exc:  # noqa: BLE001 兜底失败返回空，调用方走日K收盘
             logger.warning("快照匹配实时行情失败 %s: %s", code, exc)
             return {}
 
     # ---------------- 批量实时行情（监控全持仓一次获取） ----------------
     _BATCH_QUOTE_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+    # 东财 push2 ulist 估值字段：f9 市盈率(动) f23 市净率 f114 市盈率(TTM)
+    # f115 市盈率(静) f20 总市值 f21 流通市值 f37 净资产收益率(ROE)
+    # 注意：push2 ulist 无市销率字段，ps 统一置 None（不编造）。
+    _VALUATION_ULIST_FIELDS = "f9,f23,f114,f115,f20,f21,f37"
+    _FFLOW_URL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+
+    def _attach_valuation_ulist(self, quote: dict, code: str) -> dict:
+        """东财 push2 ulist 单只补充估值字段（PE/PB/TTM/市值/ROE），失败或字段缺返回原 dict。
+
+        已在 quote 中出现有效 pe_dynamic/pb 时跳过（避免重复请求）；数据源不可得字段
+        置 None 不报错（如 ps：东财 push2 无市销率字段，如实标注缺失）。"""
+        if quote.get("pe_dynamic") not in (None, "") and quote.get("pb") not in (None, ""):
+            return quote
+        try:
+            secid = ("1." if code.startswith("6") else "0.") + code
+            resp = http_get(self._BATCH_QUOTE_URL, referer="eastmoney",
+                            params={"secids": secid,
+                                    "fields": f"f12,{self._VALUATION_ULIST_FIELDS}",
+                                    "fltt": 2, "invt": 2, "np": 1, "pn": 1, "pz": 1}, timeout=10)
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data") or {}
+            diff = (data or {}).get("diff") or []
+            if not diff:
+                return quote
+            item = diff[0]
+
+            def _fill(key: str, name: str):
+                try:
+                    v = float(item.get(key))
+                except (TypeError, ValueError):
+                    v = None
+                if v is not None:
+                    quote[name] = v
+
+            _fill("f9", "pe_dynamic")
+            _fill("f23", "pb")
+            _fill("f114", "pe_ttm")
+            _fill("f115", "pe_static")
+            _fill("f20", "total_mv")
+            _fill("f21", "circ_mv")
+            _fill("f37", "roe")
+            quote["ps"] = None  # 东财 push2 无市销率字段，如实置 None
+        except Exception as exc:  # noqa: BLE001 估值补充失败不阻塞行情主流程
+            logger.debug("单股估值字段补充失败 %s: %s", code, exc)
+        return quote
+
+    def _ulist_amount(self, code: str):
+        """东财 push2 ulist 当日成交额（f6，元）；失败返回 None。用于资金流当日行补齐成交额。"""
+        try:
+            secid = ("1." if code.startswith("6") else "0.") + code
+            resp = http_get(self._BATCH_QUOTE_URL, referer="eastmoney",
+                            params={"secids": secid, "fields": "f12,f6",
+                                    "fltt": 2, "invt": 2, "np": 1, "pn": 1, "pz": 1}, timeout=10)
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data") or {}
+            diff = (data or {}).get("diff") or []
+            if not diff:
+                return None
+            return float(diff[0].get("f6"))
+        except Exception as exc:  # noqa: BLE001 成交额补充失败不影响资金流主行
+            logger.debug("当日成交额补充失败 %s: %s", code, exc)
+            return None
 
     def fetch_spot_quotes_batch(self, codes: list[str],
                                 force_realtime: bool = False) -> dict[str, dict]:
@@ -707,7 +787,8 @@ class AkshareSource(DataSource):
         secids = ",".join(("1." if c.startswith("6") else "0.") + c for c in codes)
         try:
             resp = http_get(self._BATCH_QUOTE_URL, referer="eastmoney",
-                            params={"secids": secids, "fields": "f12,f14,f2,f3,f124",
+                            params={"secids": secids,
+                                    "fields": f"f12,f14,f2,f3,f124,{self._VALUATION_ULIST_FIELDS}",
                                     "fltt": 2, "invt": 2, "np": 1, "pn": 1, "pz": len(codes)})
             resp.raise_for_status()
             data = (resp.json() or {}).get("data")
@@ -726,9 +807,20 @@ class AkshareSource(DataSource):
                     change_pct = float(item.get("f3"))
                 except (TypeError, ValueError):
                     change_pct = None
+
+                def _num(key: str):
+                    try:
+                        return float(item.get(key))
+                    except (TypeError, ValueError):
+                        return None
+
                 out[code] = {"code": code, "name": str(item.get("f14") or ""),
                              "price": price, "change_pct": change_pct,
-                             "time": str(item.get("f124") or "")}
+                             "time": str(item.get("f124") or ""),
+                             "pe_dynamic": _num("f9"), "pb": _num("f23"),
+                             "pe_ttm": _num("f114"), "pe_static": _num("f115"),
+                             "total_mv": _num("f20"), "circ_mv": _num("f21"),
+                             "roe": _num("f37"), "ps": None}
             breaker.record_success()
             return out
         except Exception as exc:  # noqa: BLE001 数据源异常类型繁多，统一捕获
@@ -758,11 +850,14 @@ class AkshareSource(DataSource):
             except (TypeError, ValueError):
                 change_pct = None
             out[code] = {"code": code, "name": str(r.get("name") or ""),
-                         "price": price, "change_pct": change_pct, "time": ""}
+                         "price": price, "change_pct": change_pct, "time": "",
+                         "pe_dynamic": r.get("pe_dynamic"), "pb": r.get("pb"),
+                         "pe_ttm": r.get("pe_ttm"), "ps": r.get("ps"),
+                         "total_mv": r.get("total_mv"), "circ_mv": r.get("circ_mv")}
         return out
 
     def fetch_suspended(self) -> pd.DataFrame:
-        today = time.strftime("%Y%m%d")
+        today = clock.now().strftime("%Y%m%d")
         def call():
             return self._call_with_timeout(ak.stock_tfp_em, date=today)
         df = self._fetch(f"tfp_em:{today}", "tfp_em", call, ttl_seconds=600,
@@ -794,8 +889,8 @@ class AkshareSource(DataSource):
         返回列: date / volume_ratio / close，最多最近 days 行。"""
         from datetime import datetime, timedelta
 
-        today = time.strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")  # 前置窗口取 5 日均量
+        today = clock.today()
+        start = (clock.now() - timedelta(days=20)).strftime("%Y-%m-%d")  # 前置窗口取 5 日均量
         df = self.fetch_index_daily("sh000001", start, today)
         if df is None or df.empty or "volume" not in df.columns:
             return pd.DataFrame(columns=["date", "volume_ratio", "close"])
@@ -1007,8 +1102,8 @@ class AkshareSource(DataSource):
     def _fetch_index_total_history(self, key_col: str) -> list[float] | None:
         """近 90 日两市口径序列（sh000001+sz399001 按日期对齐求和，key_col: amount/volume）；
         任一指数历史缺失或不足 3 日返回 None"""
-        start = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-        today = time.strftime("%Y-%m-%d")
+        start = (clock.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        today = clock.today()
         df1 = self.fetch_index_daily("sh000001", start, today)
         df2 = self.fetch_index_daily("sz399001", start, today)
         if (df1 is None or df1.empty or df2 is None or df2.empty
@@ -1062,22 +1157,86 @@ class AkshareSource(DataSource):
 
     # ---------------- 资金流向 ----------------
     def fetch_fund_flow(self, code: str) -> pd.DataFrame:
+        """个股资金流【当日资金流】主源：东财 push2 fflow/kline 直连。
+
+        该接口返回当日（含历史）逐日资金流行，当日行必有（交易时段为实时累计值）；
+        当日成交额（amount）由 push2 ulist f6 补齐（与主力净流入同源同期，单位元），
+        保证 f13 主力净流入占比 = main_net_inflow / amount 可计算（同日同源，口径一致）。
+        失败降级 akshare stock_individual_fund_flow（历史多日序列，列经 _FUND_FLOW_COLS 归一）。
+        返回列: date/main_net_inflow/...（_FUND_FLOW_COLS）。"""
         market = _market_of(code)
-        def call():
+
+        def primary():
+            secid = ("1." if code.startswith("6") else "0.") + code
+            resp = http_get(self._FFLOW_URL, referer="eastmoney",
+                            params={"lmt": "0", "klt": "101", "secid": secid,
+                                    "fields1": "f1,f2,f3,f7",
+                                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"},
+                            timeout=10)
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data") or {}
+            klines = data.get("klines") or []
+            rows: list[dict] = []
+            for line in klines:
+                parts = str(line).split(",")
+                if len(parts) < 6:
+                    continue
+                rows.append({"日期": parts[0],
+                             "主力净流入-净额": parts[1], "小单净流入-净额": parts[2],
+                             "中单净流入-净额": parts[3], "大单净流入-净额": parts[4],
+                             "超大单净流入-净额": parts[5]})
+            if not rows:
+                raise DataSourceError("东财个股资金流直连无数据（限流或参数异常）")
+            df = pd.DataFrame(rows)
+            # 当日成交额补齐（与主力净流入同源同期，单位元）；失败不影响资金流行本身。
+            # S-9/F-4：amount 只写日期最大（当日）行 —— 当日成交额若写成常量列会覆盖
+            # 全部历史行，因子 IC 回测按 as_of 取历史资金流时会读到「当月未来」的成交额
+            # （跨期污染）。历史行 amount 保持 None，f13 占比仅在当日行可算。
+            amount = self._ulist_amount(code)
+            if amount is not None and "日期" in df.columns:
+                df.loc[df["日期"] == df["日期"].max(), "成交额"] = amount
+            return df
+
+        def fallback():
             return self._call_with_timeout(ak.stock_individual_fund_flow, stock=code, market=market)
-        df = self._fetch(f"fundflow:{code}", "fundflow", call, ttl_seconds=1800,
+
+        df = self._fetch(f"fundflow:{code}", "fundflow", primary, ttl_seconds=1800, fallback=fallback,
                          normalize=lambda d: _normalize(d, _FUND_FLOW_COLS))
         return _to_json_safe(df)
 
     # ---------------- 个股增量数据（v2.0 候选富化） ----------------
     def fetch_stock_info(self, code: str) -> dict:
-        """个股基本信息（item/value 两列 → dict，含 行业/上市时间等）；失败返回 {}"""
+        """个股基本信息（item/value 两列 → dict，含 行业/上市时间等）；失败返回 {}。
+
+        东财 stock_individual_info_em 属 CLIST 系接口（当前常不可达）：主源无结果或
+        缺少「行业」字段时，用东财 push2 ulist f100（所属行业，与板块行情同口径）补充，
+        保证 f22-f25 主线因子的 DataAdapter.sector() 能按行业匹配到板块行。"""
         def call():
             return self._call_with_timeout(ak.stock_individual_info_em, symbol=code)
         df = self._fetch(f"stockinfo:{code}", "stockinfo", call, ttl_seconds=86400, required=False)
-        if df is None or df.empty or "item" not in df.columns:
+        if df is not None and not df.empty and "item" in df.columns:
+            info = {str(k): v for k, v in zip(df["item"].astype(str), df["value"]) if k is not None}
+            if any("行业" in k for k in info):
+                return info
+            info.update(self._stock_info_push2(code))
+            return info
+        return self._stock_info_push2(code)
+
+    def _stock_info_push2(self, code: str) -> dict:
+        """东财 push2 ulist 补个股行业（f100 所属行业，与板块行情同口径）；失败返回 {}"""
+        try:
+            secid = ("1." if code.startswith("6") else "0.") + code
+            resp = http_get(self._BATCH_QUOTE_URL, referer="eastmoney",
+                            params={"secids": secid, "fields": "f12,f100",
+                                    "fltt": 2, "invt": 2, "np": 1, "pn": 1, "pz": 1}, timeout=10)
+            resp.raise_for_status()
+            diff = ((resp.json() or {}).get("data") or {}).get("diff") or []
+            if not diff:
+                return {}
+            industry = diff[0].get("f100")
+            return {"行业": industry} if industry not in (None, "", "-") else {}
+        except Exception:  # noqa: BLE001 补行业失败返回空，不阻塞主链路
             return {}
-        return {str(k): v for k, v in zip(df["item"].astype(str), df["value"]) if k is not None}
 
     def fetch_shareholder_detail(self, code: str) -> dict:
         """股东户数最新一期（户数/较上期增减比例等）；失败返回 {}"""
@@ -1136,13 +1295,34 @@ class AkshareSource(DataSource):
 
     # ---------------- 行业板块 ----------------
     def fetch_industry_spot(self) -> pd.DataFrame:
+        """行业板块快照【扩展板块字段】：主源东财板块资金流（当日全部行业，含
+        行业-涨跌幅/净额(亿)/领涨股/领涨股-涨跌幅/公司家数/行业指数，板块名与个股
+        行业字段同东财口径，便于 DataAdapter.sector 匹配）。
+
+        附加字段（均为客观统计或如实置 None，不编造）：
+        - rotation_pos：板块当日涨跌幅在全市场板块中的百分位（0~100，rank pct）
+        - sector_fund / sector_inflow / sector_outflow：板块资金净额/流入/流出（亿元）
+        - sector_5d / market_5d：东财板块指数历史接口当前不可达、新浪板块快照无 5 日
+          涨跌幅字段，如实置 None（不编造 5 日数据）。
+        失败降级新浪行业板块（基础列，经 _BOARD_COLS 兼容）。"""
         def primary():
-            return self._call_with_timeout(ak.stock_board_industry_name_em)
+            return self._call_with_timeout(ak.stock_fund_flow_industry, symbol="即时")
         def fallback():
             # 新浪行业板块（东财限流降级，列名与东财差异经 _BOARD_COLS 兼容）
             return self._call_with_timeout(ak.stock_sector_spot, indicator="新浪行业")
         df = self._fetch("industry_spot", "industry_spot", primary, ttl_seconds=600, fallback=fallback,
                          normalize=lambda d: _normalize(d, _BOARD_COLS), kind="snapshot")
+        if df is None or df.empty:
+            return df
+        # rotation_pos：板块当日涨跌幅全市场百分位（客观统计，涨跌幅缺失板块为 None；
+        # 直接用 rank(pct=True) 保留 NaN，避免 map 索引错位产生 nan）
+        if "change_pct" in df.columns:
+            pct = pd.to_numeric(df["change_pct"], errors="coerce")
+            if len(pct.dropna()) > 1:
+                df["rotation_pos"] = (pct.rank(pct=True) * 100.0).round(2)
+        # 5 日涨幅无数据源，如实置 None（不编造）
+        df["sector_5d"] = None
+        df["market_5d"] = None
         return _to_json_safe(df)
 
     def fetch_industry_cons(self, board_name: str) -> pd.DataFrame:
@@ -1172,8 +1352,8 @@ class AkshareSource(DataSource):
         「数据缺失」不中断整体；接口不可用则整体降级标注缺失（绝不编造）。
         返回 {"板块名": {"main_box_pct": xx, "box60_pct": xx, "note": ""}}。"""
         out: dict = {}
-        end = time.strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
+        end = clock.now().strftime("%Y%m%d")
+        start = (clock.now() - timedelta(days=120)).strftime("%Y%m%d")
         for name in (board_names or [])[:10]:
             key = str(name)
             try:

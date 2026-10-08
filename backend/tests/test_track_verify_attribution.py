@@ -6,9 +6,11 @@
       build_stock_cycle_attribution 用不存在的股票代码触发"无历史"路径（真实读库，init_db 建表）。
 """
 import inspect
+from datetime import timedelta
 
 import pytest
 
+from app.core import clock
 from app.services import track_verify as tv
 
 
@@ -47,10 +49,12 @@ def test_portfolio_contributors_and_drag(monkeypatch):
     ]
     monkeypatch.setattr(holding_view, "build_holding_view",
                         lambda: {"rows": fake_rows, "quote_time": ""})
+    d1 = (clock.today_date() - timedelta(days=3)).isoformat()
+    d2 = (clock.today_date() - timedelta(days=2)).isoformat()
     monkeypatch.setattr(tv, "_daily_closes", lambda codes, days: {
-        "A": {"2026-08-21": 11.0, "2026-08-24": 12.0},
-        "B": {"2026-08-21": 19.0, "2026-08-24": 18.0},
-    })
+            "A": {d1: 11.0, d2: 12.0},
+            "B": {d1: 19.0, d2: 18.0},
+        })
     attr = tv.build_portfolio_attribution(30)
     assert attr["total_cost"] == 2000.0
     contrib = {c["stock_code"]: c for c in attr["contributors"]}
@@ -60,8 +64,8 @@ def test_portfolio_contributors_and_drag(monkeypatch):
     assert attr["drag_analysis"] == "最大拖累者 B (-15.0%)"
     # 组合曲线全链路：2026-08-21 A(100)+B(-50)=50 → 2.5%；2026-08-24 A(200)+B(-100)=100 → 5.0%
     curve = {p["date"]: p["total_pnl_pct"] for p in attr["portfolio_curve"]}
-    assert curve["2026-08-21"] == 2.5
-    assert curve["2026-08-24"] == 5.0
+    assert curve[d1] == 2.5
+    assert curve[d2] == 5.0
 
 
 def _mk_trade(side, amount, tdate):

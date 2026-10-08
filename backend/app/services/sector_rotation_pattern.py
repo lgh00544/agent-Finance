@@ -133,27 +133,6 @@ def get_rotation_daily(trade_date: str | None = None) -> dict:
             "launch": repo.list_sector_launch_by_date(d)}
 
 
-def build_rotation_context(trade_date: str | None = None) -> str:
-    """Discover 终选宏观注入段：轮动状态 + churn + 主线 + top5 启动归因；无数据返回空串"""
-    try:
-        daily = get_rotation_daily(trade_date)
-    except Exception:  # noqa: BLE001 读取失败降级空串
-        return ""
-    if not daily.get("rotation_state") and not daily.get("top10"):
-        return ""
-    lines = [f"【板块轮动状态】{daily.get('rotation_state') or '（数据缺失）'}，"
-             f"churn={daily.get('churn_rate')}，主线={daily.get('mainline_sector') or '无'}"]
-    lmap = {r["sector_name"]: r for r in (daily.get("launch") or [])}
-    top5 = (daily.get("top10") or [])[:5]
-    if top5:
-        lines.append("今日 top5 板块启动归因：")
-        for r in top5:
-            lr = lmap.get(r["sector_name"]) or {}
-            lines.append(f"- {r['sector_name']}({r.get('change_pct')}%)："
-                         f"tags={lr.get('reason_tags') or '（数据缺失）'}；{lr.get('reason_text') or '（数据缺失）'}")
-    return "\n".join(lines)
-
-
 def get_regime_view(trade_date: str | None = None) -> dict:
     """行情结构主视图：C' + D' + E' 结果聚合；无 market_intel 也可独立展示。"""
     dates = repo.list_sector_daily_dates(limit=30)
@@ -164,6 +143,19 @@ def get_regime_view(trade_date: str | None = None) -> dict:
     regime = repo.get_sector_regime_forecast(d)
     forecasts = repo.list_sector_forward_forecast(d)
     verify = repo.list_sector_forecast_verify(d, d)
+    verify_forecast_date = d
+    if not verify and dates:
+        # SC-17：展示日当天常尚未回填（明细长期为空）→ 取展示日及之前最近一次有效预测日
+        window_start = min(list(dates) + [d])
+        recent = repo.list_sector_forecast_verify(window_start, d)
+        past_dates = sorted(
+            {r.get("forecast_date") for r in recent
+             if r.get("forecast_date") and r.get("forecast_date") < d
+             and r.get("miss_reason") != "data_insufficient"},
+            reverse=True)
+        if past_dates:
+            verify_forecast_date = past_dates[0]
+            verify = [r for r in recent if r.get("forecast_date") == verify_forecast_date]
     try:
         from app.services.sector_forecast_stats import summarize_forecast_accuracy
         accuracy = summarize_forecast_accuracy(d)
@@ -174,6 +166,7 @@ def get_regime_view(trade_date: str | None = None) -> dict:
         "regime": regime,
         "forecasts": forecasts,
         "verify": verify,
+        "verify_forecast_date": verify_forecast_date,
         "accuracy": accuracy,
     }
 
@@ -216,7 +209,7 @@ def build_regime_context(trade_date: str | None = None) -> str:
     first_win = acc[0] if acc else {}
     groups = first_win.get("groups") or []
     if groups:
-        lines.append("近30日前瞻准确率: " + "；".join(
+        lines.append("近30日前瞻准确率（窗口口径：交易日）: " + "；".join(
             f"{g.get('regime')} 样本={g.get('sample_count')} "
             f"结构命中={g.get('regime_hit_rate')} 主线命中={g.get('mainline_hit_rate')}"
             for g in groups

@@ -6,6 +6,7 @@ prompt_cache_miss_tokens / completion_tokens；调用层在每次成功响应后
 存储：缓存抽象层（dev=内存 / prod=Redis），按自然日分区，跨进程为近似值
 （进程内锁保护，不做分布式原子计数，统计误差可忽略）。
 """
+from app.core import clock
 import json
 import threading
 import time
@@ -25,7 +26,7 @@ def _empty() -> dict:
 
 
 def _key() -> str:
-    return f"llm_stats:{time.strftime('%Y-%m-%d')}"
+    return f"llm_stats:{clock.today()}"
 
 
 def _load() -> dict:
@@ -90,7 +91,7 @@ def snapshot() -> dict:
         for name, m in sorted(stats["models"].items(), key=lambda kv: -kv[1]["calls"])
     ]
     return {
-        "date": time.strftime("%Y-%m-%d"),
+        "date": clock.today(),
         "requests": stats["requests"],
         "hit_tokens": stats["hit_tokens"],
         "miss_tokens": stats["miss_tokens"],
@@ -98,5 +99,5 @@ def snapshot() -> dict:
         "hit_rate_pct": hit_rate,
         "cost_yuan": stats["cost_yuan"],
         "models": models,
-        "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "checked_at": clock.now_str(),
     }

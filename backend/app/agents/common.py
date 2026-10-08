@@ -13,6 +13,7 @@ Agent 公共工具：统一调教接口 + 统一 LLM 调用入口
 【刚性代码逻辑】以上全部为上下文注入，不参与任何市场判断；基线/偏好/知识版本号入缓存键，
 人工修改后 LLM 缓存自动失效、立即生效。
 """
+from app.core import clock
 import hashlib
 import logging
 from pathlib import Path
@@ -174,7 +175,7 @@ def knowledge_section(agent: str, docs: list | None = None, query: str = "",
             return "", []
     # 预取 docs 也经过轻量生命周期防线；只有 active 能进入正式 prompt。
     from datetime import datetime
-    now = datetime.now()
+    now = clock.now()
     docs = [d for d in docs
             if (d.get("status") or "active") == "active"
             and (not d.get("valid_from") or d["valid_from"] <= now)
