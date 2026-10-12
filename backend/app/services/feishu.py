@@ -10,6 +10,7 @@ import logging
 import time
 
 import httpx
+import re
 
 from app.core.config import settings
 
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 # S-11 投递可靠性：失败后的重试次数与间隔（飞书限流友好，不做无限重试）
 _PUSH_RETRY_TIMES = 2
 _PUSH_RETRY_SLEEP = 1.5
+
+# 正文美化：单行超长时按句读断行（避免揉成一团）
+_LINE_MAX_CHARS = 60
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；])|(?<=[:：])")
 
 
 def _direct_alert(text: str) -> int:
@@ -46,22 +51,112 @@ def _direct_alert(text: str) -> int:
     return sent
 
 
+def _format_message_body(message: str) -> str:
+    """消息正文分段美化（仅展示层排版，不改任何语义内容）。
+
+    - 正文已带换行（含【触发原因】/【建议操作】等小标题）→ 保留原有分段，压缩多余空行；
+    - 正文无换行且含【...】小标题 → 按小标题拆段，段间空行；
+    - 正文无换行也无小标题 → 按句读断行（每行不超过 _LINE_MAX_CHARS），行间空行。
+    避免推送消息揉成一团无法阅读。
+    """
+    msg = (message or "").strip()
+    if not msg:
+        return "（无详情）"
+
+    if "\n" in msg:
+        # 已分段：仅压缩连续空行，保证段间恰一个空行
+        out: list[str] = []
+        prev_blank = False
+        for ln in msg.split("\n"):
+            ln = ln.strip()
+            if not ln:
+                if out and not prev_blank:
+                    out.append("")
+                prev_blank = True
+                continue
+            out.append(ln)
+            prev_blank = False
+        return "\n".join(out).strip("\n")
+
+    # 无换行：优先按【小标题】切段
+    segs = [s.strip() for s in re.split(r"(?=【)", msg) if s.strip()]
+    if len(segs) > 1 and all("【" in s for s in segs):
+        paras: list[str] = []
+        for seg in segs:
+            paras.extend(_wrap_long_line(seg))
+        return "\n\n".join(paras)
+
+    # 完全无分段：按句读断行
+    return "\n\n".join(_wrap_long_line(msg))
+
+
+def _wrap_long_line(line: str) -> list[str]:
+    """按句读把单行切分为 ≤_LINE_MAX_CHARS 的多个自然行（保留原文字内容）。"""
+    if len(line) <= _LINE_MAX_CHARS:
+        return [line]
+    pieces = [p.strip() for p in _SENTENCE_SPLIT_RE.split(line) if p.strip()]
+    out: list[str] = []
+    buf = ""
+    for piece in pieces:
+        if len(buf) + len(piece) <= _LINE_MAX_CHARS:
+            buf += piece
+        else:
+            if buf:
+                out.append(buf)
+            # 单句本身超长时硬切，避免无限增长（切块去首尾空白，保持行首干净）
+            while len(piece) > _LINE_MAX_CHARS:
+                out.append(piece[:_LINE_MAX_CHARS].strip())
+                piece = piece[_LINE_MAX_CHARS:].strip()
+            buf = piece
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _format_alert_text(alert_type: str, stock_label: str, severity: str,
+                       action: str, message: str) -> str:
+    """告警文本组装：标题行 / 严重度建议行 / 分隔线 / 分段正文，保证消息清晰可读。"""
+    body = _format_message_body(message)
+    return (
+        f"【{alert_type}】{stock_label}\n"
+        f"严重度: {severity} | 建议操作: {action}\n"
+        f"————————————\n"
+        f"{body}"
+    )
+
+
+def _post_webhook(payload: dict, stock_name: str, stock_code: str) -> bool:
+    """webhook 卡片推送（含重试），返回是否成功。"""
+    for attempt in range(_PUSH_RETRY_TIMES + 1):
+        try:
+            resp = httpx.post(settings.feishu_webhook_url, json=payload, timeout=10)
+            resp.raise_for_status()
+            logger.info("飞书推送成功: %s %s", stock_name, stock_code)
+            return True
+        except Exception as exc:  # noqa: BLE001 推送失败不应影响主链路
+            logger.error("飞书推送失败（第 %s 次）: %s", attempt + 1, exc)
+            if attempt < _PUSH_RETRY_TIMES:
+                time.sleep(_PUSH_RETRY_SLEEP)
+    return False
+
+
 def push_alert(stock_name: str, stock_code: str, alert_type: str, severity: str,
                message: str, action: str) -> dict:
     """推送告警，返回 {result, channel, direct_sent, webhook_ok}；
-    result 三态 delivered / failed / not_configured（批A A4）。"""
+    result 三态 delivered / failed / not_configured（批A A4）。
+
+    单条投递原则：同一逻辑告警只产生一条飞书消息。
+    双通道（webhook 卡片 + 机器人直发）同时启用时，优先 webhook 卡片，
+    仅当 webhook 失败后才用机器人直发兜底，不再并发双发（消息轰炸根因之一）。
+    """
     # 股票标识统一格式：代码在前、名称紧随（600519 贵州茅台）
     stock_label = f"{stock_code} {stock_name}" if stock_name and stock_name != stock_code else stock_code
-    text = (
-        f"【{alert_type}】{stock_label}\n"
-        f"严重度: {severity} | 建议操作: {action}\n"
-        f"{message}"
-    )
+    text = _format_alert_text(alert_type, stock_label, severity, action, message)
     direct_on = bool(settings.feishu_bridge_alert_direct)
     direct_ids = bool(settings.feishu_admin_open_ids.strip())
-    direct_sent = _direct_alert(text) if direct_on else 0
-
     webhook_on = bool(settings.feishu_webhook_url)
+
+    direct_sent = 0
     webhook_ok = False
     if webhook_on:
         payload = {
@@ -72,17 +167,12 @@ def push_alert(stock_name: str, stock_code: str, alert_type: str, severity: str,
                 "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": text}}],
             },
         }
-        for attempt in range(_PUSH_RETRY_TIMES + 1):
-            try:
-                resp = httpx.post(settings.feishu_webhook_url, json=payload, timeout=10)
-                resp.raise_for_status()
-                webhook_ok = True
-                logger.info("飞书推送成功: %s %s", stock_name, stock_code)
-                break
-            except Exception as exc:  # noqa: BLE001 推送失败不应影响主链路
-                logger.error("飞书推送失败（第 %s 次）: %s", attempt + 1, exc)
-                if attempt < _PUSH_RETRY_TIMES:
-                    time.sleep(_PUSH_RETRY_SLEEP)
+        webhook_ok = _post_webhook(payload, stock_name, stock_code)
+        # webhook 失败且机器人直发可用时兜底，避免告警静默
+        if not webhook_ok and direct_on and direct_ids:
+            direct_sent = _direct_alert(text)
+    elif direct_on:
+        direct_sent = _direct_alert(text)
 
     channels: list[tuple[str, bool]] = []
     if direct_on and direct_ids:

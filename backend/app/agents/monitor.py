@@ -29,6 +29,33 @@ logger = logging.getLogger(__name__)
 # LLM 研判不可用时的纯规则兜底阈值（floating loss %）：最硬的一条确定性保命信号
 _RULE_FALLBACK_LOSS_PCT = -5.0
 
+# 告警类型稳定签名词根（推送层展示去重用，不影响研判）：
+# LLM 的 alert_type 是自由文本，同一逻辑告警在不同轮次措辞可能漂移
+# （如『派发初期预警（高位放量长上影）』vs『派发初期·高位放量长上影』），
+# 直接用原文做去重键会导致同日重复推送。命中任一词根即按该词根归一。
+_ALERT_SIG_KEYWORDS = [
+    "派发初期", "派发后期", "派发", "趋势破位", "破位", "硬止损", "移动止盈", "止盈",
+    "止损", "减仓", "清仓", "退潮", "回撤", "集中度", "时间止损", "放量", "长上影",
+    "预警", "风险", "异动", "突破",
+]
+
+
+def _alert_dedup_sig(alert_type: str) -> str:
+    """告警类型 → 稳定去重签名（仅推送层展示行为，不改任何研判逻辑）。
+
+    先去除标点/空白/括号等格式差异，再按词根表提取核心词（多个命中取最长）；
+    未命中词根时返回规范化原文前 20 字符。
+    """
+    import re
+
+    text = re.sub(r"[\s·•,，。;；:：()（）\[\]【】\-—/\\|·]+", "", str(alert_type or ""))
+    if not text:
+        return "unknown"
+    hits = [kw for kw in _ALERT_SIG_KEYWORDS if kw in text]
+    if hits:
+        return max(hits, key=len)
+    return text[:20]
+
 
 def collect_quote(state: StockAgentState) -> StockAgentState:
     """节点1：拉取持仓实时行情（30s 缓存，禁止用过期缓存）与最新新闻【刚性代码逻辑】
@@ -306,7 +333,10 @@ def push_alert_node(state: StockAgentState) -> StockAgentState:
     # 所有信号落库（面板可见）；推送按严重度与去重控制
     pushed, push_result, push_channel = False, "skipped", "none"
     if signal.get("action") != "hold" or signal.get("severity") in ("warning", "critical"):
-        dedup_key = f"{code}:{signal.get('alert_type', 'unknown')}:{today}"
+        # 去重键使用稳定告警签名：LLM 的 alert_type 为自由文本，措辞漂移（如
+        # 『派发初期预警（高位放量长上影）』vs『派发初期·高位放量长上影』）会导致
+        # 同日同逻辑告警去重失效、重复推送；_alert_dedup_sig 归一化后同日只推一次。
+        dedup_key = f"{code}:{_alert_dedup_sig(signal.get('alert_type', 'unknown'))}:{today}"
         if not cache.alert_deduplicated(dedup_key, ttl_seconds=86400):
             r = push_alert(name, code, signal.get("alert_type", "监控"),
                            signal.get("severity", "info"),
