@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>系统与治理 · 交互原型</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">A</div>
+        <div class="brand-text">
+          <div class="brand-name">A股决策 Agent</div>
+          <div class="brand-sub">交互原型 · 系统治理流</div>
+        </div>
+      </div>
+      <nav class="nav" id="nav"></nav>
+      <div class="sidebar-foot">
+        <span class="proto-dot"></span>
+        <span>原型 v0.1 · 不连接后端</span>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="crumb" id="crumb"></div>
+        <div class="topbar-spacer"></div>
+        <div class="top-status">
+          <span class="status-dot"></span>
+          <span>只读数据</span>
+          <span class="divider"></span>
+          <span class="mono">2026-11-16 周一</span>
+        </div>
+        <button class="btn ghost sm" data-action="open-palette" title="搜索页面（Ctrl+K）">
+          <span class="icon" data-icon="search"></span>
+          <span>搜索</span>
+          <kbd>Ctrl K</kbd>
+        </button>
+        <button class="btn ghost sm" data-action="open-drawer" data-drawer="notes">设计说明</button>
+        <button class="btn ghost sm" data-action="task-center">
+          <span class="icon" data-icon="clock"></span>
+          <span>任务 0</span>
+        </button>
+        <div class="avatar" title="当前账号">S</div>
+      </header>
+      <main class="view" id="view"></main>
+    </div>
+  </div>
+
+  <div id="drawer-root"></div>
+  <div id="toast-root" class="toast-root"></div>
+
+  <div class="palette-mask" id="palette" hidden>
+    <div class="palette" role="dialog" aria-label="页面搜索">
+      <div class="palette-head">
+        <span class="icon" data-icon="search"></span>
+        <input id="palette-input" type="text" placeholder="搜索页面或治理功能…" autocomplete="off" />
+        <kbd>Esc</kbd>
+      </div>
+      <div class="palette-list" id="palette-list"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
