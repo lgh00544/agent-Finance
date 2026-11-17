@@ -151,6 +151,73 @@ taskkill /F /PID <pid>
 2. 启动后 **30–60 秒 `head` 日志**，确认没有那行 port-busy 警告，再进入 ~6 分钟等待（否则白等）；
 3. 若被拒 → 立刻重查端口（此时多半已空）→ 立即重发启动命令，不要假定"已有实例在跑"。
 
+- **shell PATH 可能被清空，且 PortableGit 版本号会变**（2026-10-26：1.2.0 → **1.3.0**）。用错版本号的表现是
+  `C:\Users\57388\.workbuddy\binaries\PortableGit\versions\<X>\bin\bash.exe: line N: grep: command not found`
+  （`grep`/`head`/`date`/`git` 全 not found，看起来像"服务挂了"其实是 PATH 失效）。
+  取实际版本：`ls /c/Users/57388/.workbuddy/binaries/PortableGit/versions/`；注意 `versions/current` 是**文本文件**（内容就是版本号），不是目录。
+  当前可用 PATH：
+```
+export PATH="/c/Users/57388/.workbuddy/binaries/PortableGit/versions/1.3.0/cmd:/c/Users/57388/.workbuddy/binaries/PortableGit/versions/1.3.0/mingw64/bin:/c/Users/57388/.workbuddy/binaries/PortableGit/versions/1.3.0/usr/bin:/c/Windows/system32:/c/Windows:/c/Windows/System32/Wbem"
+```
+
+## 启动命令的两个坑（2026-10-12）
+
+**① `nohup` 不认环境变量前缀**：
+
+```bash
+nohup DB_BACKEND=sqlite .venv/Scripts/python.exe backend/scripts/dev_run.py   # ❌
+# nohup: failed to run command 'DB_BACKEND=sqlite': No such file or directory
+nohup env DB_BACKEND=sqlite ...            # ✅ 或先 export 再 nohup
+```
+`run_in_background` 场景直接用 `export DB_BACKEND=sqlite && .venv/Scripts/python.exe ...` 即可，不必 nohup。
+
+**② 本机没有 pnpm，前端要直接跑 vite**（`AppData\Roaming\npm` 下只有 vue 系列）：
+
+```bash
+cd /d/self/web
+CODEBUDDY_SAFE_DELETE_ENABLED=0 CODEBUDDY_SAFE_DELETE_SANDBOX=0 \
+VITE_API_PROXY=http://127.0.0.1:8000 \
+/c/Users/57388/.workbuddy/binaries/node/versions/22.22.2-6/node.exe \
+  node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173 --strictPort \
+  > /d/self/web-dev.stdout.log 2> /d/self/web-dev.stderr.log
+```
+实测 ready 约 **2.8s**，监听 `127.0.0.1:5173`。启动初期 `web-dev.stderr.log` 报 `ECONNREFUSED 127.0.0.1:8000` 属正常（后端还没起），不用管。
+
+## 🪤 `cloud_engine()` 会随 DB_BACKEND 变成本地引擎（2026-10-08）
+
+`sync_manager.cloud_engine()` 的实现是 `return db_session.engine`，而 `db_session.engine` 由 `DB_BACKEND` 决定。
+
+⇒ **`.env` 为 `DB_BACKEND=sqlite` 时，`cloud_engine()` 和 `local_engine()` 指向同一个 `data/dev.db`。**
+此时任何"云端 vs 本地"对比都是**自己比自己**，会得到"全部表行数一致、时间戳精确到微秒相同"的假象（我 10-08 就被骗了一次）。
+
+**正确姿势**：
+```bash
+cd backend && DB_BACKEND=mysql ../.venv/Scripts/python.exe -c "... sm.cloud_engine() ..."
+```
+即用 `DB_BACKEND=mysql` 起子进程，让 `db_session.engine` 真的是云端。
+
+**别自己手搓引擎**：TiDB Serverless 强制 TLS，`create_engine(url, connect_args={'ssl': {}})` 不够，会报
+`1105 Connections using insecure transport are prohibited`。用项目自带的引擎最稳。
+
+## `git pull` 连不上但对象已 fetch 到本地时（2026-09-29）
+
+SSH 直连 GitHub 会间歇性超时：
+
+```
+kex_exchange_identification: read: Connection timed out
+fatal: Could not read from remote repository.
+```
+
+若**此前 `git fetch` 已经成功**（输出了 `old..new  main -> origin/main`），对象其实已在本地，不必联网：
+
+```bash
+git merge --ff-only origin/main     # 直接快进，等价于 pull
+```
+
+（比 `git pull` 少一次网络握手；只在 fetch 成功过的前提下成立。）
+
+配套判断：本机**国际出口可能整体不通**（GitHub HTTPS/SSH 超时，而百度 200 正常）。此时 TiDB 表现为 `2003 WinError 10060` 连接超时——**别急着判定"配额耗尽"**：9-28 那批 1105 是拿到了 MySQL 错误包（真配额问题），而连接超时是网络问题，两者要区分。
+
 ## 云端 TiDB 配额耗尽 → 后端起不来，降级 `DB_BACKEND=sqlite`（2026-09-28）
 
 **症状**：重启后端时日志结尾是 `ERROR: Application startup failed. Exiting.`，端口不监听。
