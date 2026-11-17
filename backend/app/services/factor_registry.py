@@ -102,3 +102,61 @@ def fingerprint() -> str:
         row = _REGISTRY[fid]
         parts.append(f"{fid}:{row.status}:{row.weight_hint:.4f}:{row.direction}:{row.version}")
     return "|".join(parts) or "empty"
+
+
+# ---- 启停持久化：状态落 factor_status 表，重启由 sync_from_db 恢复 ----
+def _upsert_status(fid: str, status: str, reason: str, decided_by: str) -> None:
+    from app.db.models import FactorStatus
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        row = db.get(FactorStatus, fid)
+        if row is None:
+            row = FactorStatus(factor_id=fid)
+            db.add(row)
+        row.status = status
+        row.reason = (reason or "")[:255] or None
+        row.decided_by = decided_by
+        db.commit()
+
+
+def record_proposal(fid: str, reason: str) -> None:
+    """回测判出的失效候选只落提案（proposed），不生效；须人工确认后才下线。"""
+    if fid not in _REGISTRY:
+        return
+    _upsert_status(fid, "proposed", reason, "auto")
+
+
+def decide(fid: str, status: str, reason: str = "") -> FactorDef:
+    """人工拍板：落库 + 立即改内存。status=deprecated 即下线，active 即驳回恢复。"""
+    if status not in ("active", "deprecated"):
+        raise ValueError(f"status 必须为 active/deprecated，收到: {status!r}")
+    if fid not in _REGISTRY:
+        raise KeyError(f"因子不存在: {fid}")
+    _upsert_status(fid, status, reason, "manual")
+    return set_factor_status(fid, status)
+
+
+def list_status_rows() -> list[dict]:
+    """因子启停留痕全量（含 proposed 待确认项），供前端候审与审计。"""
+    from app.db.models import FactorStatus
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        rows = db.query(FactorStatus).order_by(FactorStatus.updated_at.desc()).all()
+        return [{"factor_id": r.factor_id, "status": r.status, "reason": r.reason,
+                 "decided_by": r.decided_by,
+                 "updated_at": r.updated_at.isoformat() if r.updated_at else None}
+                for r in rows]
+
+
+def sync_from_db() -> int:
+    """启动时把已拍板状态载入内存注册表；proposed 不生效（避免未经确认就下线因子）。"""
+    applied = 0
+    for item in list_status_rows():
+        row = _REGISTRY.get(item["factor_id"])
+        if row is None or item["status"] not in ("active", "deprecated"):
+            continue
+        row.status = item["status"]
+        applied += 1
+    return applied

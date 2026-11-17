@@ -296,6 +296,7 @@ def init_db() -> dict:
         _ensure_quote_snapshot_table()
         _ensure_distribution_phase_table()
         _ensure_job_run_log_table()
+        _ensure_factor_status_table()
         _ensure_capital_view_tables()
         _ensure_identity_tables()
         _ensure_user_identity_columns()
@@ -752,6 +753,12 @@ def _ensure_job_run_log_table() -> None:
     """幂等补建 job_run_log 表（批A A2 调度留痕；create_all 兜底 SQLite/MySQL 通吃）"""
     from app.db import models  # noqa: F401
     Base.metadata.create_all(bind=engine, tables=[models.JobRunLog.__table__])
+
+
+def _ensure_factor_status_table() -> None:
+    """幂等补建 factor_status 表（因子启停人工拍板持久化；create_all 兜底 SQLite/MySQL 通吃）"""
+    from app.db import models  # noqa: F401
+    Base.metadata.create_all(bind=engine, tables=[models.FactorStatus.__table__])
 
 
 def _ensure_capital_view_tables() -> None:

@@ -44,8 +44,25 @@ def test_run_backtest_missing_factor_is_explicit():
 
 
 def test_judge_status_after_three_weak_months():
-    assert judge_status([0.01, 0.0, -0.1]) == "deprecated_candidate"
+    assert judge_status([0.01, 0.0, -0.01]) == "deprecated_candidate"
     assert judge_status([0.01, 0.0, 0.02]) == "active"
+
+
+def test_judge_status_keeps_strong_negative_ic_active():
+    """IC 为负只代表方向相反，|IC| 大说明仍有预测力，不得判为失效。"""
+    assert judge_status([-0.477, -0.512, -0.246]) == "active"
+
+
+def test_cron_job_marks_zero_output_as_error(monkeypatch):
+    """零采集早退必须落 error 而非 ok（此前 4 个月断档被 ok 掩盖）。"""
+    from app.scheduler import jobs as scheduler_jobs
+
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(scheduler_jobs.cache, "set", lambda k, v, ttl: captured.update({k: v}))
+    monkeypatch.setattr(factor_ic, "run_factor_ic_backtest_job",
+                        lambda: {"rows": 0, "skipped": True, "reason": "零采集"})
+    scheduler_jobs.run_factor_ic_backtest_job()
+    assert captured["job:status_override_factor_ic_backtest"].startswith("error|")
 
 
 def test_job_flags_budget_shortfall_as_insufficient(monkeypatch):

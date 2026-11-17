@@ -23,6 +23,18 @@ from app.services.feishu_bridge import stop_bridge as stop_feishu_bridge
 logger = logging.getLogger(__name__)
 
 
+def _restore_factor_status() -> None:
+    """启动时恢复人工拍板的因子启停状态；读库失败不阻塞启动。"""
+    try:
+        from app.services import factor_registry
+
+        applied = factor_registry.sync_from_db()
+        if applied:
+            logger.info("因子启停状态已恢复 %d 条", applied)
+    except Exception:  # noqa: BLE001 状态恢复失败不阻塞启动
+        logger.warning("因子启停状态恢复失败（忽略）", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
@@ -30,6 +42,7 @@ async def lifespan(app: FastAPI):
         validate_multi_user_startup()
     init_db()
     repo.seed_default_hot_money_profiles()  # 游资档案种子（幂等，席位名仅作模糊匹配参考）
+    _restore_factor_status()
     start_scheduler()
     start_feishu_bridge()
 

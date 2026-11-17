@@ -732,6 +732,7 @@ def factor_candidates_pending(limit: int = 50):
 
 class FactorRegistryStatusBody(BaseModel):
     status: str = Field(..., description="active/deprecated")
+    reason: str = Field("", description="拍板理由（驳回时写明原因）")
 
 
 class FactorRegistryWeightBody(BaseModel):
@@ -786,15 +787,22 @@ def factor_registry_view():
 
 @router.post("/factor-registry/{fid}/status")
 def factor_registry_status(fid: str, body: FactorRegistryStatusBody):
-    """P-11：人工拍板因子启停，写回后评分缓存指纹失效。"""
+    """P-11：人工拍板因子启停（落库 + 立即生效，重启后仍保留）。"""
     require_write_access()
     from app.services import factor_registry
     try:
-        row = factor_registry.set_factor_status(fid, body.status)
+        row = factor_registry.decide(fid, body.status, body.reason)
         return {"id": row.id, "status": row.status, "weight_hint": row.weight_hint,
                 "direction": row.direction, "version": row.version}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/factor-status")
+def factor_status_view():
+    """因子启停留痕全量；status=proposed 为待人工确认的失效候选。"""
+    from app.services import factor_registry
+    return factor_registry.list_status_rows()
 
 
 @router.post("/factor-registry/{fid}/weight")

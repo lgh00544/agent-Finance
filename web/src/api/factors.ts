@@ -18,6 +18,19 @@ export interface FactorIcRow {
 export const factorIcHistory = (factorId?: string, period?: string, limit = 50): Promise<FactorIcRow[]> =>
   get('/factor-ic-history', { ...(factorId ? { factor_id: factorId } : {}), ...(period ? { period } : {}), limit })
 
+export interface FactorStatusRow {
+  factor_id: string
+  status: 'proposed' | 'active' | 'deprecated'
+  reason: string | null
+  decided_by: string
+  updated_at: string | null
+}
+
+export const getFactorStatus = (): Promise<FactorStatusRow[]> => get('/factor-status')
+
+export const decideFactorStatus = (fid: string, status: 'active' | 'deprecated', reason = ''): Promise<unknown> =>
+  post(`/factor-registry/${fid}/status`, { status, reason })
+
 export interface FactorCandidate {
   id: number
   candidate_id: string

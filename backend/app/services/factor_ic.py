@@ -32,6 +32,8 @@ from app.services import kline_store
 logger = logging.getLogger(__name__)
 
 FORWARD_DAYS, ROLLING_MONTHS, MIN_SAMPLE = 20, 3, 100
+# 失效判定阈值：以 |IC| 计。IC 为负只是方向相反（反向因子仍有预测力），不能当无效。
+IC_WEAK_THRESHOLD = 0.02
 # 全市场 5000+ 只 × 单只 20s+ 日K ≈ 11 小时，单次回测不可行：
 # 按代码等距抽样到 UNIVERSE_LIMIT 只，并设墙钟预算，超预算即停并落库已采部分。
 UNIVERSE_LIMIT = 300
@@ -43,6 +45,8 @@ COLLECT_BUDGET_SECONDS = int(COLLECT_TARGET_SAMPLES * settings.factor_ic_seconds
 # 只并行「票与票之间」，票内顺序与产物不变。源站反爬与 socket 全局超时副作用见
 # akshare_source._call_with_timeout 文档，故不取更高并发。
 COLLECT_WORKERS = 4
+# 单只采集硬超时（秒）：底层请求无超时挂住时靠它止损，否则线程永不返回、线程池退出死等
+CODE_TIMEOUT_SECONDS = 90
 # 本地日线仓库优先的覆盖容差（自然日）：首根 ≤ start+FIRST 且末根 ≥ min(end,今天)-LAST
 # 才采用本地序列；新股/停牌/回补未完成一律回退远端，宁慢不错。
 LOCAL_KLINE_FIRST_TOLERANCE_DAYS = 20
@@ -97,9 +101,13 @@ def calc_ir(months: list[dict]) -> float | None:
 
 
 def judge_status(ics: list[float | None]) -> str:
+    """连续 ROLLING_MONTHS 月 |IC| 均低于阈值判为失效候选（无预测力）。
+
+    IC 为负仅代表方向相反，|IC| 大说明仍有预测力，不计入失效。
+    """
     recent = ics[-ROLLING_MONTHS:]
     return ("deprecated_candidate" if len(recent) == ROLLING_MONTHS
-            and all(v is not None and v < 0.02 for v in recent) else "active")
+            and all(v is not None and abs(v) < IC_WEAK_THRESHOLD for v in recent) else "active")
 
 
 def run_backtest(month_records: dict[str, list[dict]], definitions=None) -> list[dict]:
@@ -364,7 +372,26 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
     end = (datetime.strptime(month_ends[-1], "%Y-%m-%d") + timedelta(days=45)).strftime("%Y-%m-%d")
     definitions = factor_registry.list_active() + list(extra_definitions or [])
     guard = threading.Lock()
-    state = {"attempted": 0, "stopped": False}
+    state = {"attempted": 0, "stopped": False, "timed_out": 0}
+    # 外挂数据熔断：某源连续失败到阈值后本次回测内整体跳过，避免每票白等超时
+    aux_skip = {"financial": False, "fund_flow": False, "news": False}
+    aux_fail = {"financial": 0, "fund_flow": 0, "news": 0}
+    AUX_FAIL_LIMIT = 8
+
+    def _aux(name: str, code: str):
+        with guard:
+            if aux_skip[name]:
+                return pd.DataFrame()
+        try:
+            value = getattr(source, f"fetch_{name}")(code)
+        except Exception:  # noqa: BLE001 数据源异常类型繁多，统一降级为空
+            with guard:
+                aux_fail[name] += 1
+                if aux_fail[name] >= AUX_FAIL_LIMIT:
+                    aux_skip[name] = True
+                    logger.warning("%s 连续失败 %d 次，本次回测内跳过该源", name, aux_fail[name])
+            return pd.DataFrame()
+        return value if value is not None else pd.DataFrame()
 
     def _one(code: str) -> None:
         # 墙钟护栏：超预算即不再开新票，保证任务必定结束并落库已采数据（不出现「跑不完 → 数据空」）
@@ -396,9 +423,9 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
             # S-9/F-2：sectors 不再整跑共用当日快照 —— 板块因子走 sector_daily_snapshot
             # 历史（快照日 ≤ 月末的最近交易日），f22/f23/f25 无历史字段时诚实 data_missing。
             aux = {"quote": {},
-                   "financial": _fetch_once(source, "fetch_financial", code),
-                   "fund_flow": _fetch_once(source, "fetch_fund_flow", code),
-                   "news": _fetch_once(source, "fetch_news", code)}
+                   "financial": _aux("financial", code),
+                   "fund_flow": _aux("fund_flow", code),
+                   "news": _aux("news", code)}
             rows: list[tuple] = []
             has_amount = "amount" in kline.columns
             for snapshot in month_ends:
@@ -451,18 +478,32 @@ def collect_month_records(source, month_ends: list[str], codes: list[str],
         except Exception:
             return
 
+    def _one_bounded(code: str) -> None:
+        """单只硬超时：底层请求无超时挂住时不得拖住整个进程（2026-11-13 曾僵死 69 小时）。"""
+        thread = threading.Thread(target=_one, args=(code,), daemon=True)
+        thread.start()
+        thread.join(CODE_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            with guard:
+                state["timed_out"] += 1
+            logger.warning("因子 IC 单只超时 %ss，跳过 %s", CODE_TIMEOUT_SECONDS, code)
+
     workers = max(1, min(int(COLLECT_WORKERS), len(codes)))
     if workers == 1:
         for code in codes:
-            _one(code)
+            _one_bounded(code)
     else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(_one, codes))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            list(pool.map(_one_bounded, codes))
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     if state["stopped"]:
         logger.warning("因子 IC 采集超墙钟预算 %.0fs：已尝试 %d/%d 只，停止并落库已采部分",
                        budget_seconds, state["attempted"], len(codes))
     if stats is not None:
         stats["attempted"] = state["attempted"]
+        stats["timed_out"] = state["timed_out"]
         stats["elapsed"] = round(time.monotonic() - started, 1)
         stats["budget_exhausted"] = bool(state["stopped"])
     return records
@@ -585,16 +626,17 @@ def run_factor_ic_backtest_job(months: int = 36) -> dict:
                     "reason": _job_reason(codes, 0, 0, stats)}
         results = run_backtest(records)
         persisted = persist_history(results)
-        # A-14/F-6 回流：连续 ROLLING_MONTHS 个月 IC<0.02 的因子写回 factor_registry（deprecated），
-        # 在线打分 list_active() 自动剔除；版本指纹变更 → 缓存键失效，无需手动干预。
+        # 失效结论只落「待确认提案」，不自动下线：判失效属研判标准，须人工拍板后生效。
+        latest = max((r["period"] for r in results), default="")
         deprecated_ids = sorted({r["factor_id"] for r in results
                                  if r.get("status") == "deprecated_candidate"})
         for fid in deprecated_ids:
             try:
-                factor_registry.set_factor_status(fid, "deprecated")
-                logger.info("因子 IC 结论回流：%s 置为 deprecated", fid)
+                factor_registry.record_proposal(
+                    fid, f"回测至{latest}：连续{ROLLING_MONTHS}月|IC|<{IC_WEAK_THRESHOLD}")
+                logger.info("因子 IC 失效提案（待人工确认）：%s", fid)
             except Exception as exc:  # noqa: BLE001 单因子写回失败不阻断批次
-                logger.warning("因子 %s 状态写回失败: %s", fid, exc)
+                logger.warning("因子 %s 失效提案落库失败: %s", fid, exc)
     except Exception as exc:  # noqa: BLE001 取数异常转结构化结果，避免 cron/脚本裸崩
         error_kind = _classify_error(exc)
         logger.warning("因子 IC 回测取数失败（%s）：%s", error_kind, exc)

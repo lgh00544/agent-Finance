@@ -237,6 +237,13 @@ def _record_job_run(event) -> None:
         from app.db.session import SessionLocal
 
         exc = getattr(event, "exception", None)
+        status, reason = ("error", str(exc)[:500]) if exc else ("ok", None)
+        override_key = f"job:status_override_{event.job_id}"
+        override = cache.get(override_key)
+        if override:
+            head, _, tail = override.partition("|")
+            status, reason = head or status, tail or reason
+            cache.delete(override_key)
         with SessionLocal() as db:
             row = db.get(JobRunLog, event.job_id)
             if row is None:
@@ -244,8 +251,8 @@ def _record_job_run(event) -> None:
                 db.add(row)
             # M6：DB 列是 naive DateTime，aware 时间会破坏契约 → 取上海墙上时间后摘掉 tzinfo
             row.last_run = _cn_now().replace(tzinfo=None)
-            row.last_status = "error" if exc else "ok"
-            row.last_reason = str(exc)[:500] if exc else None
+            row.last_status = status
+            row.last_reason = reason
             db.commit()
     except Exception as exc:  # noqa: BLE001
         logger.warning("job_run_log 写入失败: %s", exc)
@@ -334,12 +341,28 @@ def market_intel_job() -> None:
 
 
 def run_factor_ic_backtest_job() -> None:
-    """每月因子 IC 回测；失败只记日志，不阻塞其他调度任务。"""
+    """每月因子 IC 回测；失败只记日志，不阻塞其他调度任务。
+
+    服务层把「零采集早退」和「取数异常」都转成正常返回的 dict，
+    这里必须据结果覆盖 job_run_log 状态，否则零产出也会被记成 ok。
+    """
+    override_key = "job:status_override_factor_ic_backtest"
     try:
         from app.services.factor_ic import run_factor_ic_backtest_job as run_backtest
-        logger.info("因子 IC 月度回测完成: %s", run_backtest())
+
+        result = run_backtest()
     except Exception as exc:  # noqa: BLE001 回测失败不阻塞调度
+        cache.set(override_key, f"error|{str(exc)[:400]}", 3600)
         logger.error("因子 IC 月度回测失败: %s", exc)
+        return
+    reason = str(result.get("reason") or "")[:400]
+    if result.get("error_kind") or result.get("skipped") or not result.get("rows"):
+        cache.set(override_key, f"error|{reason or '零产出：未写入任何 IC 记录'}", 3600)
+        logger.error("因子 IC 月度回测无产出: %s", result)
+        return
+    if not result.get("sufficient"):
+        cache.set(override_key, f"ok|样本不足：{reason}", 3600)
+    logger.info("因子 IC 月度回测完成: %s", result)
 
 
 def pre_market_screen_job() -> None:

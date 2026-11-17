@@ -927,6 +927,20 @@ class FactorIcHistory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class FactorStatus(Base):
+    """因子启停人工拍板留痕（持久化，重启后仍生效）。
+
+    status: proposed=回测判出的待确认失效；deprecated/active=已拍板结果。
+    """
+    __tablename__ = "factor_status"
+
+    factor_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decided_by: Mapped[str] = mapped_column(String(16), default="auto")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
 class FactorCandidate(Base):
     """候选因子提议与人工启用状态。"""
     __tablename__ = "factor_candidate"
