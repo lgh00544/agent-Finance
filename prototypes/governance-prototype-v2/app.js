@@ -449,6 +449,30 @@ const state = {
   expConfirm: null,
   expRejectIn: null,
   expQuickConfirm: null,
+  holdings: null,
+  exited: null,
+  hdAccount: null,
+  hdView: 'all',
+  hdId: 2071,
+  hdTab: 'concl',
+  hdKlineOpen: false,
+  hdForm: null,
+  hdTradeDrafts: {},
+  hdArchiveId: null,
+  hdHistOpen: true,
+  hdNewPending: null,
+  hdOcrDone: false,
+  hdOcrRows: null,
+  paper: null,
+  paperSeq: null,
+  ppAcc: 901,
+  ppView: 'current',
+  ppTab: 'positions',
+  ppPos: '603501',
+  ppCtx: null,
+  ppFilter: '',
+  ppForm: null,
+  ppKline: false,
   paletteIndex: 0,
   collabResult: null
 };
@@ -621,6 +645,7 @@ const NAV = [
       { path: '#/overview', label: '工作台总览', icon: 'home' },
       { path: '#/candidates', label: '每日候选池', icon: 'chart' },
       { path: '#/holdings', label: '持仓监控', icon: 'shield' },
+      { path: '#/paper', label: 'AI 模拟操盘', icon: 'agent' },
       { path: '#/alerts', label: '告警日志', icon: 'bell' }
     ]
   },
@@ -660,10 +685,6 @@ const GOV_TABS = [
 ];
 
 const PLACEHOLDERS = {
-  '#/holdings': {
-    title: '持仓监控', desc: '下一批设计：卡片/列表 + 详情抽屉，操作入口固定在首行。',
-    scope: ['组合概览与告警优先', '详情抽屉：持仓操作、流水、止盈计划、卖出决策', '加仓/减仓/清仓就地完成，不跳页', '卖出决策结果回写到持仓时间线']
-  },
   '#/alerts': { title: '告警日志', desc: '下一批设计：按严重度分组，支持一键进入对应持仓或规则。', scope: ['严重度分组与已读状态', '告警 → 持仓 / 规则 / 复盘 的深链', '保留原始 payload 折叠查看'] },
   '#/market-intel': { title: '市场研判', desc: '下一批设计：结论先行，12 张卡片按「主线 → 验证 → 风险」重组。', scope: ['首屏只留主线结论与三个关键指标', '板块与个股验证按需展开', '历史准确率做成趋势而非孤立卡片'] },
   '#/news-sector': { title: '行业消息雷达', desc: '下一批设计：按影响面排序，消息与板块联动。', scope: ['高影响消息置顶', '消息详情抽屉 + 关联板块', '已读/已处理状态'] },
@@ -694,6 +715,41 @@ function parseRoute() {
     const d = params.get('date');
     if (d && CAND_BATCHES.some((b) => b.date === d)) { state.candBatch = d; state.candMode = 'history'; }
     if (params.get('mode') === 'today') state.candMode = 'today';
+  }
+  if (path === '#/holdings') {
+    const hp = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
+    const hid = hp.get('id');
+    if (hid && hdData().some((r) => String(r.id) === String(hid))) {
+      state.hdId = Number(hid);
+      if (hp.get('view') === 'exited') state.hdView = 'all';
+    }
+    const hvw = hp.get('view');
+    if (hvw && HD_VIEWS.some((v) => v[0] === hvw)) state.hdView = hvw;
+    const htb = hp.get('tab');
+    if (htb && ['concl', 'basis', 'ops', 'risk'].indexOf(htb) >= 0) state.hdTab = htb;
+    state.hdForm = null;
+  }
+  if (path === '#/paper') {
+    const pp = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
+    const acc = pp.get('acc');
+    if (acc && ppData().some((a) => String(a.id) === String(acc))) {
+      state.ppAcc = Number(acc);
+      state.ppView = ppData().filter((a) => String(a.id) === String(acc))[0].status === 'archived' ? 'archived' : 'current';
+    }
+    const pvw = pp.get('view');
+    if (pvw && ['current', 'archived'].indexOf(pvw) >= 0) state.ppView = pvw;
+    const ptb = pp.get('tab');
+    if (ptb && PP_TABS.some((t) => t[0] === ptb)) state.ppTab = ptb;
+    const pos = pp.get('pos');
+    if (pos && ppAcc().universe[pos]) state.ppPos = pos;
+    const pfl = pp.get('filter');
+    if (pfl && PP_FILTERS.some((f) => f[0] === pfl)) state.ppFilter = pfl;
+    const ctx = pp.get('ctx');
+    if (ctx && ppAcc().contexts.some((c) => String(c.id) === String(ctx))) {
+      state.ppCtx = Number(ctx);
+      state.ppTab = 'contexts';
+    }
+    state.ppForm = null;
   }
   if (path === '#/reviews') {
     const params = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
@@ -1519,18 +1575,64 @@ const WO_CANDIDATES = [
 const WO_CANDIDATE_TOTAL = 8;
 const WO_CANDIDATE_PASS = 3;
 
-const WO_HOLDINGS = [
-  { code: '600519', name: '贵州茅台', price: '1412.00', today: -1.02, note: '回撤 7.2% 已过止损线 7%', state: '红线预警' },
-  { code: '300750', name: '宁德时代', price: '268.40', today: 1.35, note: '浮盈 +18.4%，接近止盈线 20%', state: '接近止盈' },
-  { code: '002415', name: '海康威视', price: '31.26', today: -2.30, note: '今日放量下跌，量能未收敛', state: '关注' }
-];
-const WO_HOLD_SUMMARY = { total: '486,200', todayPnl: 3420, todayPct: 0.71, count: 6, redline: 1 };
+/* 持仓块不再单独维护一份数据：全部从 #/holdings 的实时状态算出来，两边永远一致 */
+const HD_SEVERITY = { exit: 0, reduce: 1, watch: 2, info: 3, hold: 4 };
+const HD_STATE_LABEL = { exit: '红线预警', reduce: '该减', watch: '关注', info: '待补行情', hold: '继续拿' };
 
-const WO_TP_PLANS = [
-  { code: '300750', name: '宁德时代', body: '分两档 20% / 25%，第一档进入观察区。' },
-  { code: '600519', name: '贵州茅台', body: '维持 7% 止损，未上移。' },
-  { code: '601012', name: '隆基绿能', body: '止盈上移至 +15%，锁定利润。' }
-];
+function hdPnlPct(r) { return r.price == null ? null : (r.price / r.cost - 1) * 100; }
+function woTodayPrefix(h) { return h.today == null ? '还没有行情' : (h.today >= 0 ? '+' : '') + h.today.toFixed(2) + '% 今日'; }
+function woTodayCell(h) { return h.today == null
+  ? '<span class="mono dim">无行情</span>'
+  : '<span class="mono ' + (h.today >= 0 ? 'wo-up' : 'wo-down') + '">' + (h.today >= 0 ? '+' : '') + h.today.toFixed(2) + '%</span>'; }
+
+function woHoldNote(r, v) {
+  if (v === 'info') return '这只还没有行情：成本 ' + r.cost.toFixed(2) + '，止损 ' + r.stop.toFixed(2) + '，补上现价才能算红线';
+  const pnl = hdPnlPct(r);
+  if (v === 'exit') return '现价 ' + r.price.toFixed(2) + ' 已跌破止损红线 ' + r.stop.toFixed(2) + '（成本 ' + r.cost.toFixed(2) + '×0.92）';
+  if (r.trail && r.trail.hit) return '浮盈 ' + hdPct(pnl, 1) + '，移动止盈' + r.trail.stage + '，按档减仓';
+  if (v === 'reduce') return '浮盈 ' + hdPct(pnl, 1) + '，但单票占总资产 ' + (r.shares * r.price / state.hdAccount.total * 100).toFixed(1) + '%，超过 ' + r.targetPct + '% 上限';
+  if (v === 'watch') return pnl < 0
+    ? '跌破成本，距止损 ' + r.stop.toFixed(2) + ' 只差 ' + ((r.price - r.stop) / r.price * 100).toFixed(1) + '%，到价就走'
+    : '浮盈 ' + hdPct(pnl, 1) + '，红线都没踩，破 ' + r.stop.toFixed(2) + ' 才动';
+  return '浮盈 ' + hdPct(pnl, 1) + '，四条红线都没踩，按计划拿着';
+}
+
+function woPlanBody(r) {
+  const v = hdVerdict(r);
+  const t = r.trail;
+  if (v === 'info') return '先补齐行情才能算止盈止损；当前成本 ' + r.cost.toFixed(2) + '，止损 ' + r.stop.toFixed(2) + '。';
+  if (v === 'exit') return '止损 ' + r.stop.toFixed(2) + ' = 成本 ' + r.cost.toFixed(2) + '×0.92，永久红线，已跌破，不上移。';
+  if (t && t.hit) return '移动止盈' + t.stage + '，按档先减一部分；下一档 ' + r.tp.toFixed(2) + '，止损已上移至 ' + r.stop.toFixed(2) + '。';
+  if (v === 'reduce') return '先减一档把单票占比压回 ' + r.targetPct + '% 以内；' + (t ? t.next + '。' : '止损 ' + r.stop.toFixed(2) + '。');
+  if (v === 'watch') return '未破 ' + r.stop.toFixed(2) + ' 之前不动；反弹到 ' + r.tp.toFixed(2) + ' 再谈止盈。';
+  return (t ? t.next + '；' : '') + '止盈 ' + r.tp.toFixed(2) + '，止损 ' + r.stop.toFixed(2) + '。';
+}
+
+function woHoldings() {
+  const rows = hdData().slice().sort((a, b) => {
+    const d = HD_SEVERITY[hdVerdict(a)] - HD_SEVERITY[hdVerdict(b)];
+    return d !== 0 ? d : (b.shares * (b.price || 0)) - (a.shares * (a.price || 0));
+  });
+  const pnl = hdTodayPnl();
+  const total = state.hdAccount.total;
+  return {
+    rows: rows.slice(0, 4).map((r) => ({
+      id: r.id, code: r.code, name: r.name, today: r.today,
+      state: HD_STATE_LABEL[hdVerdict(r)], note: woHoldNote(r, hdVerdict(r))
+    })),
+    plans: rows.slice(0, 4).map((r) => ({ id: r.id, code: r.code, name: r.name, body: woPlanBody(r) })),
+    summary: {
+      mv: hdMoney(hdTotalMv()),
+      total: (total / 10000).toFixed(1) + ' 万',
+      share: hdTotalShare().toFixed(1) + '%',
+      todayPnl: Math.round(pnl),
+      todayPct: pnl / total * 100,
+      count: rows.length,
+      redline: rows.filter((r) => hdVerdict(r) === 'exit').length,
+      todo: hdTodo().length
+    }
+  };
+}
 
 const WO_TASKS = [
   { title: '单条 AI 审核 · 追高容忍度', sub: '第 2 轮审核 · 完成后自动进入「等你决定」', status: 'run', progress: 65 },
@@ -1570,6 +1672,7 @@ function renderWorkspaceOverview() {
     nav: '#/system/factors',
     icon: 'chart'
   })));
+  const hold = woHoldings();
 
   const cards =
     '<div class="wo-actions">' +
@@ -1587,11 +1690,11 @@ function renderWorkspaceOverview() {
         '<div class="wo-foot"><button class="btn link sm" data-nav="#/candidates">进入候选池 ' + icon('arrow', 'sm') + '</button></div>' +
       '</div>' +
       '<div class="wo-card err">' +
-        '<div class="wo-head">' + icon('alert') + '<span class="wo-title">持仓风控</span><span class="wo-count">' + WO_HOLD_SUMMARY.redline + ' 条红线 · 2 项关注</span></div>' +
-        '<div class="wo-entries">' + WO_HOLDINGS.map((h) => woEntry({
+        '<div class="wo-head">' + icon('alert') + '<span class="wo-title">持仓风控</span><span class="wo-count">' + hold.summary.todo + ' 只要处理 · ' + hold.summary.redline + ' 条踩红线</span></div>' +
+        '<div class="wo-entries">' + hold.rows.map((h) => woEntry({
           name: h.name + ' ' + h.code,
-          desc: (h.today >= 0 ? '+' : '') + h.today.toFixed(2) + '% 今日 · ' + h.note
-        }, h.state === '红线预警' ? '#/alerts' : '#/holdings', h.state === '红线预警' ? 'bell' : 'shield')).join('') + '</div>' +
+          desc: woTodayPrefix(h) + ' · ' + h.note
+        }, '#/holdings?id=' + h.id, h.state === '红线预警' ? 'bell' : 'shield')).join('') + '</div>' +
         '<div class="wo-foot"><button class="btn link sm" data-nav="#/holdings">进入持仓监控 ' + icon('arrow', 'sm') + '</button></div>' +
       '</div>' +
       '<div class="wo-card ok">' +
@@ -1626,17 +1729,17 @@ function renderWorkspaceOverview() {
     '<div class="card">' +
       '<div class="card-title"><h3>持仓摘要</h3><button class="btn link sm" data-nav="#/holdings">查看全部 ' + icon('arrow', 'sm') + '</button></div>' +
       '<div class="metric-strip">' +
-        '<div class="metric"><div class="metric-label">总市值</div><div class="metric-value">' + esc(WO_HOLD_SUMMARY.total) + '</div><div class="metric-sub">模拟账户</div></div>' +
-        '<div class="metric"><div class="metric-label">今日盈亏（推算）</div><div class="metric-value ' + (WO_HOLD_SUMMARY.todayPnl >= 0 ? 'up' : 'down') + '">+' + WO_HOLD_SUMMARY.todayPnl.toLocaleString() + '</div><div class="metric-sub">+' + WO_HOLD_SUMMARY.todayPct.toFixed(2) + '%</div></div>' +
-        '<div class="metric"><div class="metric-label">持仓标的</div><div class="metric-value">' + WO_HOLD_SUMMARY.count + '</div><div class="metric-sub">有效持仓</div></div>' +
-        '<div class="metric"><div class="metric-label">红线预警</div><div class="metric-value err">' + WO_HOLD_SUMMARY.redline + '</div><div class="metric-sub">需人工确认</div></div>' +
+        '<div class="metric"><div class="metric-label">持仓市值</div><div class="metric-value">' + esc(hold.summary.mv) + '</div><div class="metric-sub">总资产 ' + esc(hold.summary.total) + ' · 仓位 ' + esc(hold.summary.share) + '</div></div>' +
+        '<div class="metric"><div class="metric-label">今日盈亏</div><div class="metric-value ' + (hold.summary.todayPnl >= 0 ? 'up' : 'down') + '">' + (hold.summary.todayPnl >= 0 ? '+' : '-') + Math.abs(hold.summary.todayPnl).toLocaleString() + '</div><div class="metric-sub">' + (hold.summary.todayPct >= 0 ? '+' : '') + hold.summary.todayPct.toFixed(2) + '%</div></div>' +
+        '<div class="metric"><div class="metric-label">持仓标的</div><div class="metric-value">' + hold.summary.count + '</div><div class="metric-sub">有效持仓</div></div>' +
+        '<div class="metric"><div class="metric-label">等你处理</div><div class="metric-value warn">' + hold.summary.todo + '</div><div class="metric-sub">其中 ' + hold.summary.redline + ' 条踩红线</div></div>' +
       '</div>' +
-      '<div class="wo-entries" style="margin-top:6px">' + WO_HOLDINGS.map((h) =>
-        '<div class="wo-entry" data-nav="' + (h.state === '红线预警' ? '#/alerts' : '#/holdings') + '">' +
-          '<span class="hold-dot ' + (h.state === '红线预警' ? 'err' : h.state === '接近止盈' ? 'warn' : 'info') + '"></span>' +
+      '<div class="wo-entries" style="margin-top:6px">' + hold.rows.map((h) =>
+        '<div class="wo-entry" data-nav="#/holdings?id=' + h.id + '">' +
+          '<span class="hold-dot ' + (h.state === '红线预警' ? 'err' : h.state === '该减' ? 'warn' : 'info') + '"></span>' +
           '<div class="wo-e-main"><div class="wo-e-name">' + esc(h.name) + ' <span class="mono dim">' + esc(h.code) + '</span></div>' +
           '<div class="wo-e-desc">' + esc(h.note) + '</div></div>' +
-          '<span class="mono ' + (h.today >= 0 ? 'wo-up' : 'wo-down') + '">' + (h.today >= 0 ? '+' : '') + h.today.toFixed(2) + '%</span>' +
+          woTodayCell(h) +
         '</div>'
       ).join('') + '</div>' +
     '</div>';
@@ -1644,7 +1747,7 @@ function renderWorkspaceOverview() {
   const tpCard =
     '<div class="card">' +
       '<div class="card-title"><h3>移动止盈计划</h3><span class="hint">只读摘要</span></div>' +
-      '<div class="stack">' + WO_TP_PLANS.map((p) =>
+      '<div class="stack">' + hold.plans.map((p) =>
         '<div class="wo-tp"><b>' + esc(p.name) + '</b><span class="mono dim">' + esc(p.code) + '</span><p>' + esc(p.body) + '</p></div>'
       ).join('') + '</div>' +
     '</div>';
@@ -1678,7 +1781,7 @@ function renderWorkspaceOverview() {
       '<div class="spacer"></div>' + tag('已收盘', 'outline') +
     '</div>' +
     '<div class="cap-note warn" style="margin-bottom:16px">' + icon('clock') +
-      '<div><b>今天有 ' + (decisions.length + WO_HOLD_SUMMARY.redline) + ' 件事需要你处理</b>：治理决策 ' + decisions.length + ' 件 · 持仓红线 ' + WO_HOLD_SUMMARY.redline + ' 条。其余均为只读摘要，不会动线上策略。</div>' +
+      '<div><b>今天有 ' + (decisions.length + hold.summary.todo) + ' 件事需要你处理</b>：治理决策 ' + decisions.length + ' 件 · 持仓要处理 ' + hold.summary.todo + ' 只（其中 ' + hold.summary.redline + ' 只已踩止损红线）。其余均为只读摘要，不会动线上策略。</div>' +
     '</div>' +
     cards +
     market +
@@ -2232,13 +2335,13 @@ function quoteUrls(code) {
 function mockBars(c) {
   const base = (c.trend && c.trend.length ? c.trend : [c.last || 100]);
   const seed = code5(c.stock_code);
-  const n = 30;
+  const n = 121;
   const bars = [];
-  for (let i = 0; i < n; i++) {
-    const t = (i / (n - 1)) * (base.length - 1);
+  for (let i = -159; i < n; i++) {
+    const t = (Math.max(0, i) / (n - 1)) * (base.length - 1);
     const k = Math.floor(t), f = t - k;
     const a = base[k], b = base[Math.min(k + 1, base.length - 1)];
-    const close = a + (b - a) * f;
+    const close = i < 0 ? base[0] * (1 + i * 0.00015 + Math.sin(i * 0.07) * 0.03) : a + (b - a) * f;
     const wob = Math.sin(i * 2.7 + seed) * 0.009;
     const open = close * (1 + wob);
     const hi = Math.max(open, close) * (1 + 0.005 + Math.abs(wob) * 0.5);
@@ -2249,18 +2352,22 @@ function mockBars(c) {
 }
 function code5(code) { let s = 0; for (const ch of String(code)) s += ch.charCodeAt(0); return s % 7; }
 
-function candKlineHtml(c, anchorLabel) {
+function candKlineHtml(c, anchorLabel, compact) {
   const anch = anchorLabel || '选中日';
-  const bars = mockBars(c);
-  const w = 640, ph = 168, vh = 40, padL = 44, padR = 10;
-  const lo = Math.min(...bars.map((b) => b.low));
-  const hi = Math.max(...bars.map((b) => b.high));
+  const history = mockBars(c);
+  const bars = history.slice(159);
+  const averages = [5, 10, 40, 160].map((period) => ({ period,
+    values: bars.map((_, i) => history.slice(i + 160 - period, i + 160).reduce((sum, b) => sum + b.close, 0) / period)
+  }));
+  const w = 640, ph = 208, vh = 40, padL = 44, padR = 10;
+  const maValues = averages.flatMap((a) => a.values);
+  const lo = Math.min(...bars.map((b) => b.low), ...maValues);
+  const hi = Math.max(...bars.map((b) => b.high), ...maValues);
   const span = hi - lo || 1;
   const bw = (w - padL - padR) / bars.length;
   const y = (v) => 12 + (1 - (v - lo) / span) * (ph - 24);
-  const anchorIdx = bars.length - 7;
+  const anchorIdx = 60;
   const anchorX = padL + anchorIdx * bw + bw / 2;
-  const ma = (p) => bars.map((_, i) => i + 1 < p ? null : bars.slice(i - p + 1, i + 1).reduce((s, b) => s + b.close, 0) / p);
   const maPath = (vals) => vals.map((v, i) => v == null ? '' : (i === 0 || vals[i - 1] == null ? 'M' : 'L') + (padL + i * bw + bw / 2) + ' ' + y(v)).join(' ');
   const candles = bars.map((b, i) => {
     const up = b.close >= b.open;
@@ -2280,17 +2387,14 @@ function candKlineHtml(c, anchorLabel) {
       [0, 0.25, 0.5, 0.75, 1].map((f) => '<line class="wk-grid" x1="' + padL + '" y1="' + (12 + f * (ph - 24)) + '" x2="' + (w - padR) + '" y2="' + (12 + f * (ph - 24)) + '"/>' +
         '<text class="wk-axis" x="' + (padL - 6) + '" y="' + (16 + f * (ph - 24)) + '">' + (hi - f * span).toFixed(2) + '</text>').join('') +
       candles +
-      '<path class="wk-ma ma5" d="' + maPath(ma(5)) + '"/>' +
-      '<path class="wk-ma ma20" d="' + maPath(ma(20)) + '"/>' +
+      averages.map((a) => '<path class="wk-ma ma' + a.period + '" d="' + maPath(a.values) + '"><title>MA' + a.period + ' · ' + a.period + ' 日均线</title></path>').join('') +
       '<line class="wk-anchor-line" x1="' + anchorX + '" y1="8" x2="' + anchorX + '" y2="' + (ph + vh) + '"/>' +
       '<text class="wk-anchor-text" x="' + (anchorX + 4) + '" y="18">' + esc(anch) + '</text>' +
     '</svg>' +
-    '<div class="wk-legend"><span><i class="bull"></i>阳线（涨）</span><span><i class="bear"></i>阴线（跌）</span>' +
-      '<span><i class="l ma5"></i>MA5</span><span><i class="l ma20"></i>MA20</span><span>下方为成交量</span></div>' +
-    '<div class="cap-note" style="margin-top:12px">' + icon('info') + '<div>正式页面直接复用现有组件 <code>KlineChart</code>（ECharts 蜡烛图 + MA + 锚点虚线），数据走 <code>GET /api/kline/{code}</code>，本地日线库已有回填任务，不需要新写图表。这里的图是示意数据。</div></div>' +
-    '<div class="wk-links"><span class="hint">需要看分时/资金/研报原文时直接跳行情页：</span>' +
-      quoteUrls(c.stock_code).map((q) => '<a class="btn sm" href="' + q.url + '" target="_blank" rel="noopener noreferrer">' + esc(q.name) + ' ' + icon('external', 'sm') + '</a>').join('') +
-    '</div>' +
+    '<div class="wk-legend wk-averages">' + averages.map((a) => '<span class="ma' + a.period + '" title="' + a.period + ' 个交易日收盘价的简单平均"><i class="l ma' + a.period + '"></i>MA' + a.period + ' <b class="mono">' + a.values[a.values.length - 1].toFixed(2) + '</b></span>').join('') + '</div>' +
+    '<div class="wk-legend"><span><i class="bull"></i>阳线（涨）</span><span><i class="bear"></i>阴线（跌）</span><span>下方为成交量 · 原型示意，非真实行情</span></div>' +
+    (compact ? '' : '<div class="wk-links"><span class="hint">真实行情：</span>' +
+      quoteUrls(c.stock_code).map((q) => '<a class="btn sm" href="' + q.url + '" target="_blank" rel="noopener noreferrer">' + esc(q.name) + ' ' + icon('external', 'sm') + '</a>').join('') + '</div>') +
   '</div>';
 }
 
@@ -4134,11 +4238,3236 @@ function rollbackExperience(id) {
 }
 
 /* ---------- 渲染 ---------- */
+/* ============================================================
+   持仓监控（#/holdings）
+   口径来自生产接口，正式页面全部走真接口，这里是示意数据：
+     GET  /api/holdings/quotes              持仓 + 实时行情 + 参考风控位（约 60s 缓存）
+     GET  /api/red_line_check               四条红线扫描（约 300s 缓存）
+     GET  /api/holdings/{id}/trades         操作流水
+     GET  /api/holdings/{id}/sell-decisions 卖出决策历史
+     GET  /api/holdings/take-profit-plan    止盈与仓位计划
+     POST /api/holdings/{id}/add|exit|cost  加仓 / 减仓清仓 / 修正成本（只记录人工成交，不下单）
+     POST 后台任务 monitor_all / portfolio_sentinel / sell_decision
+   ============================================================ */
+const HD_CAP = { total: 60, gradeA: 30, c3: 0.92, drawdown: 30, indexBar: 4000, softCap: 20 };
+
+const HD_ACCOUNT = { total: 486200, cash: 66115, quoteTime: '2026-11-16 14:56:12', index: 3962.18 };
+
+/* 每只持仓：verdict 由红线自动推导，concls 只写可能到达的结论 */
+const HD_ROWS = [
+  {
+    id: 2071, code: '603501', name: '韦尔股份', source: '真实交易', entry: '2026-10-21',
+    shares: 1250, cost: 118.60, price: 126.30, today: 1.2, dd: -4.6,
+    stop: 109.11, tp: 142.32, targetPct: 30, suggestPct: 20,
+    trail: { stage: '第二档（+15%）未到', hit: false, next: '涨到 136.39 上移止盈' },
+    plan: { id: 812, batch: '2026-10-20' }, alerts: 1,
+    rules: [{ id: 'RC-1050', name: '单股最大仓位上限' }, { id: 'RC-1042', name: '移动止盈回撤阈值' }],
+    concls: {
+      reduce: '盈利不错，但单票已经占总资产 32.5%，超过 A 级 30% 上限。先减一档把集中度压回上限内，不等回调。',
+      hold: '单票占比回到上限内，止损未破，继续拿。',
+      exit: '跌破止损红线，全部离场，不再讨论基本面。'
+    },
+    scenes: [
+      { k: 'up', c: '站上 136.39（+8.0%）', a: '移动止盈上移，按新止盈位持有；再涨到 142.32 减第二档 400 股' },
+      { k: 'flat', c: '120.00 - 136.39 之间', a: '在 126 附近减 400 股，把单票占比压回 25% 以内，剩下的按 109.11 止损' },
+      { k: 'dn', c: '跌破 109.11（成本 ×0.92）', a: '剩余全部离场，跌破红线不补仓、不摊薄' }
+    ],
+    decision: {
+      action: 'partial', conf: 'high', ratio: 0.33, at: '2026-11-16 09:31',
+      final: '先减三分之一把集中度压回上限内，不等回调；剩余仓位交给移动止盈。',
+      dims: [
+        { dim: '趋势', score: 74, verdict: '支持', advice: '日线仍在 20 日均线上方，未破位' },
+        { dim: '量能', score: 58, verdict: '支持', advice: '今日缩量上涨，追高动能一般' },
+        { dim: '板块', score: 66, verdict: '支持', advice: '半导体主线未切换，但资金开始分散' },
+        { dim: '盈亏', score: 41, verdict: '风险', advice: '浮盈 +6.5%，未到第三档移动止盈' },
+        { dim: '风险', score: 30, verdict: '风险', advice: '单票占比 32.5%，超过 A 级 30% 上限' }
+      ],
+      reasons: [
+        '单票市值 157,875 元，占总资产 32.5%，触发 C1 集中度预警。',
+        '现价高于买入区上沿，属于「已涨上来」的持仓，继续加仓的赔率变差。',
+        '止损 109.11 未破，趋势维度没有要求清仓，因此是减仓而不是离场。'
+      ],
+      zone: '126.00 - 128.50 分两笔',
+      risk: '半导体今日冲高回落，若明日低开可把执行价下移一档，但不要为了等价格而不减仓位。',
+      checks: [
+        { label: '未跌破 C3 止损线（109.11）', ok: true },
+        { label: '单票占比未超 A 级上限（30%）', ok: false },
+        { label: '总仓位未超防御期软上限（20%）', ok: false },
+        { label: '当日未重复减仓', ok: true },
+        { label: '无未执行的清仓红线告警', ok: true }
+      ]
+    },
+    decisions: [
+      { at: '2026-11-16 09:31', action: 'partial', conf: 'high', one: '减三分之一压集中度' },
+      { at: '2026-11-12 09:35', action: 'hold', conf: 'medium', one: '趋势完好，继续持有' }
+    ],
+    trades: [
+      { side: 'buy', shares: 450, price: 112.40, date: '2026-10-21', note: '首仓，候选池 10-20 批次评分 88' },
+      { side: 'buy', shares: 800, price: 122.10, date: '2026-11-04', note: '突破回踩加仓' },
+      { side: 'sys', shares: 0, price: 0, date: '2026-11-04', note: '加仓后成本重算 118.60，止损上移至 109.11' }
+    ],
+    records: [
+      { date: '2026-10-21', price: 112.40, shares: 450, created: '2026-10-21 09:41', status: '历史买入' },
+      { date: '2026-11-04', price: 122.10, shares: 800, created: '2026-11-04 10:02', status: '当前有效' }
+    ]
+  },
+  {
+    id: 2064, code: '600519', name: '贵州茅台', source: '真实交易', entry: '2026-09-28',
+    shares: 100, cost: 1520.00, price: 1392.00, today: -1.02, dd: -8.4,
+    stop: 1398.40, tp: 1824.00, targetPct: 20, suggestPct: 0,
+    trail: null, plan: { id: 774, batch: '2026-09-25' }, alerts: 3,
+    rules: [{ name: 'C3 止损红线：成本 ×0.92，永久红线' }],
+    concls: {
+      exit: '现价 1392.00 已跌破止损红线 1398.40（成本 1520 × 0.92）。这是系统唯一不给你商量的动作：今天必须清仓。',
+      hold: '未跌破止损，继续持有观察。'
+    },
+    scenes: [
+      { k: 'up', c: '收复 1398.40 之上', a: '仍然按红线执行：反弹只影响卖出价，不改变「要离场」这个结论' },
+      { k: 'flat', c: '1380 - 1400 之间', a: '在 1395 附近一次清仓 100 股，不留「再看看」' },
+      { k: 'dn', c: '继续跌破 1380', a: '直接市价清仓，跌破红线后每多等一天都是额外风险' }
+    ],
+    decision: {
+      action: 'exit', conf: 'high', ratio: null, at: '2026-11-16 09:30',
+      final: '跌破止损红线，全部清仓。这笔的亏损是规则成本，不是判断错误。',
+      dims: [
+        { dim: '趋势', score: 22, verdict: '风险', advice: '跌破 20 日与 60 日均线，日线破位' },
+        { dim: '量能', score: 35, verdict: '风险', advice: '下跌放量，承接不足' },
+        { dim: '板块', score: 40, verdict: '风险', advice: '白酒板块资金持续净流出' },
+        { dim: '盈亏', score: 12, verdict: '风险', advice: '浮亏 -8.4%，已过止损位' },
+        { dim: '风险', score: 18, verdict: '风险', advice: '防御期单票 28.6% 占比偏高' }
+      ],
+      reasons: [
+        '现价 1392.00 低于 C3 止损位 1398.40，触发永久红线。',
+        '五个维度全部偏风险，没有任何一个维度支持继续持有。',
+        '防御期（沪指 3962 < 4000）本就该降仓位，两个理由方向一致。'
+      ],
+      zone: '1385 - 1400 一次出清',
+      risk: '白酒若明日跳空低开会有滑点；不要为了等一个价而挂单不成交。',
+      checks: [
+        { label: '未跌破 C3 止损线（1398.40）', ok: false },
+        { label: '无更高优先级的停牌/涨跌停限制', ok: true },
+        { label: '清仓股数等于持仓股数', ok: true },
+        { label: '离场后会自动生成复盘', ok: true }
+      ]
+    },
+    decisions: [
+      { at: '2026-11-16 09:30', action: 'exit', conf: 'high', one: '跌破止损，清仓' },
+      { at: '2026-11-17 09:32', action: 'reduce', conf: 'medium', one: '减半仓，接近止损' },
+      { at: '2026-11-10 09:30', action: 'hold', conf: 'medium', one: '未到止损' }
+    ],
+    trades: [
+      { side: 'buy', shares: 100, price: 1520.00, date: '2026-09-28', note: '建仓计划 #774' },
+      { side: 'sys', shares: 0, price: 0, date: '2026-11-16', note: '监控扫描：跌破 C3 止损，生成红线告警' }
+    ],
+    records: [
+      { date: '2026-09-28', price: 1520.00, shares: 100, created: '2026-09-28 10:15', status: '当前有效' }
+    ]
+  },
+  {
+    id: 2075, code: '300750', name: '宁德时代', source: '真实交易', entry: '2026-10-30',
+    shares: 200, cost: 214.50, price: 268.40, today: 1.35, dd: -5.2,
+    stop: 245.00, tp: 285.60, targetPct: 15, suggestPct: 10,
+    trail: { stage: '第三档（+25%）已触发', hit: true, next: '止盈位已上移至 245.00' },
+    plan: { id: 803, batch: '2026-10-29' }, alerts: 1,
+    rules: [{ id: 'RC-1042', name: '移动止盈回撤阈值' }],
+    concls: {
+      reduce: '浮盈 +25.1% 已到 K139 第三档，规则要求减 1/4 落袋；移动止盈位已上移到 245.00。',
+      hold: '未到下一档，按移动止盈位持有。'
+    },
+    scenes: [
+      { k: 'up', c: '涨到 285.60（+6.4%）', a: '减第二笔 50 股，止盈位再上移一档' },
+      { k: 'flat', c: '245.00 - 285.60 之间', a: '先按第三档减 50 股，剩下的拿到止盈位被跌破为止' },
+      { k: 'dn', c: '跌破 245.00（上移后的止盈位）', a: '剩余全部离场，这一笔已经赚到了，不要把利润坐回去' }
+    ],
+    decision: {
+      action: 'partial', conf: 'high', ratio: 0.25, at: '2026-11-16 09:32',
+      final: '到档就减，不要因为「还在涨」跳过这一档。',
+      dims: [
+        { dim: '趋势', score: 78, verdict: '支持', advice: '沿 10 日均线上行，趋势最强的一只' },
+        { dim: '量能', score: 69, verdict: '支持', advice: '放量新高，量能未背离' },
+        { dim: '板块', score: 62, verdict: '支持', advice: '锂电中游补库，板块资金回流' },
+        { dim: '盈亏', score: 88, verdict: '风险', advice: '浮盈 +25.1%，已到第三档减仓线' },
+        { dim: '风险', score: 71, verdict: '支持', advice: '单票占比 11.0%，在上限内' }
+      ],
+      reasons: [
+        '浮盈 +25.1% 触发 K139 第三档，规则要求减仓 1/4。',
+        '趋势与量能仍支持，因此只减一档，不清仓。',
+        '移动止盈位上移至 245.00，跌破即全部离场。'
+      ],
+      zone: '266.00 - 270.00 减 50 股',
+      risk: '若减完后继续拉升，剩余仓位仍能吃到主升，不要为了多赚而不减。',
+      checks: [
+        { label: '未到 C3 止损线（245.00）', ok: true },
+        { label: '已到 K139 减仓档', ok: true },
+        { label: '单票占比未超上限（11.0% / 30%）', ok: true },
+        { label: '当日未重复减仓', ok: true }
+      ]
+    },
+    decisions: [
+      { at: '2026-11-16 09:32', action: 'partial', conf: 'high', one: '第三档到，减 1/4' },
+      { at: '2026-11-06 09:31', action: 'partial', conf: 'medium', one: '第二档到，减 100 股（已执行）' }
+    ],
+    trades: [
+      { side: 'buy', shares: 300, price: 214.50, date: '2026-10-30', note: '建仓计划 #803' },
+      { side: 'sell', shares: 100, price: 241.00, date: '2026-11-06', note: 'K139 第二档减仓' },
+      { side: 'sys', shares: 0, price: 0, date: '2026-11-16', note: '止盈位上移至 245.00，第三档触发' }
+    ],
+    records: [
+      { date: '2026-10-30', price: 214.50, shares: 300, created: '2026-10-30 09:52', status: '历史买入' },
+      { date: '2026-11-06', price: 241.00, shares: -100, created: '2026-11-06 14:20', status: '当前有效' }
+    ]
+  },
+  {
+    id: 2078, code: '002415', name: '海康威视', source: '真实交易', entry: '2026-11-11',
+    shares: 1000, cost: 32.00, price: 31.26, today: -2.3, dd: -6.1,
+    stop: 29.44, tp: 38.40, targetPct: 10, suggestPct: 10,
+    trail: null, plan: { id: 821, batch: '2026-11-10' }, alerts: 1,
+    rules: [{ name: 'C3 止损红线：成本 ×0.92，永久红线' }],
+    concls: {
+      watch: '今天放量跌 2.3%，距止损只剩 6.2%。这一只不用现在动手，但要知道「跌破 29.44 就走」。',
+      exit: '跌破止损红线，按规则清仓。',
+      hold: '量能收敛，未破位，继续持有。'
+    },
+    scenes: [
+      { k: 'up', c: '收复 32.00 成本线', a: '回到成本之上，撤销「到价提醒」，继续按 29.44 止损' },
+      { k: 'flat', c: '30.50 - 32.00 之间', a: '不动，也不加仓——防御期不摊薄亏损仓位' },
+      { k: 'dn', c: '跌破 29.44（成本 ×0.92）', a: '全部清仓 1000 股，系统会同时把这笔送进复盘' }
+    ],
+    decision: {
+      action: 'hold', conf: 'medium', ratio: null, at: '2026-11-16 09:33',
+      final: '还没到止损，不提前砍；但今天已经放量下跌，跌破 29.44 不要再等确认。',
+      dims: [
+        { dim: '趋势', score: 44, verdict: '风险', advice: '跌破 20 日均线，尚未破 60 日' },
+        { dim: '量能', score: 38, verdict: '风险', advice: '下跌放量，抛压未收敛' },
+        { dim: '板块', score: 52, verdict: '中性', advice: '安防/AI 视觉无明确主线催化' },
+        { dim: '盈亏', score: 61, verdict: '支持', advice: '浮亏 -2.3%，距止损还有 6.2%' },
+        { dim: '风险', score: 74, verdict: '支持', advice: '单票占比 6.4%，可承受' }
+      ],
+      reasons: [
+        '未触发 C3 止损，也没有到减仓档，规则层面不要求动手。',
+        '量能与趋势偏风险，因此把这笔标成「到价了要盯」，而不是正常持有。'
+      ],
+      zone: '不设卖出价；跌破 29.44 直接执行',
+      risk: '如果明日继续放量下杀，可能一步跌破止损，届时按开盘价执行不要挂单等反弹。',
+      checks: [
+        { label: '未到 C3 止损线（29.44）', ok: true },
+        { label: '单票占比未超上限', ok: true },
+        { label: '无未了结红线告警', ok: false }
+      ]
+    },
+    decisions: [{ at: '2026-11-16 09:33', action: 'hold', conf: 'medium', one: '未到止损，盯 29.44' }],
+    trades: [
+      { side: 'buy', shares: 1000, price: 32.00, date: '2026-11-11', note: '建仓计划 #821，第二档买入' }
+    ],
+    records: [
+      { date: '2026-11-11', price: 32.00, shares: 1000, created: '2026-11-11 13:06', status: '当前有效' }
+    ]
+  },
+  {
+    id: 2069, code: '601012', name: '隆基绿能', source: '真实交易', entry: '2026-10-14',
+    shares: 900, cost: 24.80, price: 27.10, today: 0.6, dd: -3.4,
+    stop: 22.82, tp: 28.52, targetPct: 10, suggestPct: 8,
+    trail: { stage: '第一档（+15%）未到', hit: false, next: '涨到 28.52 上移止盈' },
+    plan: { id: 791, batch: '2026-10-13' }, alerts: 0,
+    rules: [{ id: 'RC-1042', name: '移动止盈回撤阈值' }],
+    concls: {
+      hold: '浮盈 +9.3%，距第一档止盈还有 5.2%，趋势没坏。这一只今天什么都不用做。'
+    },
+    scenes: [
+      { k: 'up', c: '涨到 28.52（+5.2%）', a: '止盈上移并减 300 股，锁定第一档利润' },
+      { k: 'flat', c: '25.50 - 28.52 之间', a: '不动' },
+      { k: 'dn', c: '跌破 24.80 成本线', a: '减仓一半，不等到止损；跌破 22.82 全部离场' }
+    ],
+    decision: null,
+    decisions: [{ at: '2026-11-13 09:34', action: 'hold', conf: 'medium', one: '未到档，继续持有' }],
+    trades: [
+      { side: 'buy', shares: 900, price: 24.80, date: '2026-10-14', note: '建仓计划 #791' }
+    ],
+    records: [
+      { date: '2026-10-14', price: 24.80, shares: 900, created: '2026-10-14 10:11', status: '当前有效' }
+    ]
+  },
+  {
+    id: 2081, code: '002138', name: '顺络电子', source: '真实交易', entry: '2026-11-18',
+    shares: 400, cost: 34.20, price: null, today: null, dd: null,
+    stop: 31.46, tp: 41.04, targetPct: 5, suggestPct: 5,
+    trail: null, plan: null, alerts: 0, rules: [],
+    concls: {
+      info: '今天没取到行情（可能是新股/停牌/盘后延迟），所以不给你结论。先核对成本与股数，行情回来后自动补判断。'
+    },
+    scenes: null,
+    decision: null, decisions: [],
+    trades: [
+      { side: 'buy', shares: 200, price: 34.20, date: '2026-11-18', note: '人工录入' },
+      { side: 'buy', shares: 200, price: 34.20, date: '2026-11-18', note: '同一天重复录入，已被自动忽略' }
+    ],
+    records: [
+      { date: '2026-11-18', price: 34.20, shares: 200, created: '2026-11-18 14:31', status: '重复录入（已自动忽略）' },
+      { date: '2026-11-18', price: 34.20, shares: 200, created: '2026-11-18 14:33', status: '当前有效' }
+    ]
+  }
+];
+
+const HD_EXITED = [
+  { code: '600893', name: '航发动力', entry: '2026-10-09', exit: '2026-11-06', shares: 600, cost: 42.30, out: 46.10, pnl: 9.0, note: '止盈第二档全部离场', reviewId: 1039 },
+  { code: '601869', name: '长飞光纤', entry: '2026-09-22', exit: '2026-10-30', shares: 300, cost: 31.80, out: 29.10, pnl: -8.5, note: '跌破止损清仓', reviewId: 1031 }
+];
+
+/* 组合级风控：全部由持仓实时算出来，记录一笔之后这里会跟着变 */
+function hdSentinelItems() {
+  const out = [];
+  const share = hdTotalShare();
+  const defensive = state.hdAccount.index < HD_CAP.indexBar;
+  const breached = hdData().map((r) => ({ r: r, red: hdReds(r) })).filter((x) => x.red[2].st === 'bad');
+  const over = hdData().map((r) => ({ r: r, red: hdReds(r) })).filter((x) => x.red[0].st === 'bad' || x.red[0].st === 'todo');
+  if (breached.length) {
+    out.push({ id: 'PS-BREACH', level: 'bad', at: '2026-11-16 09:31', nav: '#/holdings?id=' + breached[0].r.id, navLabel: '查看止损详情',
+      title: '优先关注止损：' + breached.map((x) => x.r.name + '已跌破设定的止损价').join('；'),
+      body: '按当前止损规则，这类持仓需要优先处理。请到详情核对价位与处理要求；实际成交后记下买卖结果，账户仓位会随之更新。' });
+  }
+  if (share > HD_CAP.total || (defensive && share > HD_CAP.softCap)) {
+    out.push({ id: 'PS-TOTAL', level: share > HD_CAP.total ? 'bad' : 'todo', at: '2026-11-16 15:02', nav: '#/alerts', navLabel: '查看仓位提醒',
+      title: '账户仓位偏高：股票占总资产 ' + share.toFixed(1) + '%，高于' + (share > HD_CAP.total ? '设定上限 ' + HD_CAP.total + '%' : '当前建议上限 ' + HD_CAP.softCap + '%'),
+      body: '总资产 ' + hdMoney(state.hdAccount.total) + ' 元，其中股票市值 ' + hdMoney(hdTotalMv()) + ' 元，可用现金 ' + hdMoney(hdCash()) + ' 元。仓位越高，账户越容易受到股价波动影响。' +
+        (defensive ? '当前沪指 ' + state.hdAccount.index.toFixed(0) + '，低于设定的 ' + HD_CAP.indexBar + ' 点；按现有规则，建议将总仓位控制在 ' + HD_CAP.softCap + '% 以内。' : '可结合上面的持仓详情，核对哪些需要减仓。') });
+  }
+  if (over.length) {
+    out.push({ id: 'PS-C1', level: 'todo', at: '2026-11-16 15:02', nav: '#/holdings?id=' + over[0].r.id, navLabel: '查看持仓占比',
+      title: '留意持仓集中：' + over.map((x) => x.r.name + '占总资产 ' + hdShare(x.r).toFixed(1) + '%').join('；') + '，高于单只股票上限 ' + HD_CAP.gradeA + '%',
+      body: '单只股票占比过高时，它的涨跌会更明显地影响整个账户。查看这只股票的减仓建议，记录成交后再检查占比是否回到上限内。' });
+  }
+  if (!out.length) {
+    out.push({ id: 'PS-OK', level: 'done', at: '2026-11-16 15:02', nav: '#/alerts', navLabel: '查看过往提醒',
+      title: '暂未发现超限提醒', body: '按当前已录入的数据和可用行情，总仓位 ' + share.toFixed(1) + '%，未发现止损或持仓占比超限。可继续按原计划关注；没有提醒不代表没有投资风险。' });
+  }
+  return out;
+}
+
+/* ---------- 计算 ---------- */
+function hdData() {
+  if (!state.holdings) {
+    state.holdings = clone(HD_ROWS);
+    state.exited = clone(HD_EXITED).map((x, i) => Object.assign(x, { id: -i - 1 }));
+    state.hdAccount = Object.assign({}, HD_ACCOUNT);
+  }
+  return state.holdings;
+}
+function hdById(id) { return hdData().find((r) => String(r.id) === String(id)) || null; }
+function hdPrice(r) { return r.price == null ? r.cost : r.price; }
+function hdMv(r) { return Math.round(hdPrice(r) * Number(r.shares || 0)); }
+function hdShare(r) { const t = (state.hdAccount && state.hdAccount.total) || HD_CAP.total; return hdMv(r) / t * 100; }
+function hdPnl(r) { return r.price == null ? null : Math.round((r.price - r.cost) * r.shares); }
+function hdPnlPct(r) { return r.price == null || !r.cost ? null : (r.price / r.cost - 1) * 100; }
+function hdStopDist(r) { return r.price == null || !r.stop ? null : (r.price / r.stop - 1) * 100; }
+function hdMoney(v) { return v == null ? '—' : Number(v).toLocaleString('zh-CN'); }
+function hdPct(v, digits) {
+  if (v == null) return '—';
+  const d = digits == null ? 2 : digits;
+  return (v > 0 ? '+' : '') + v.toFixed(d) + '%';
+}
+function hdPnlCls(v) { return v == null ? 'dim' : v > 0 ? 'wo-up' : v < 0 ? 'wo-down' : 'dim'; }
+function hdTotalMv() { return hdData().reduce((s, r) => s + hdMv(r), 0); }
+function hdCash() { const a = state.hdAccount || {}; return a.cash == null ? Math.max(0, (a.total || 0) - hdTotalMv()) : a.cash; }
+function hdTotalShare() { return hdTotalMv() / ((state.hdAccount && state.hdAccount.total) || 1) * 100; }
+function hdTodayPnl() {
+  return hdData().reduce((s, r) => (r.today == null ? s : s + hdMv(r) * r.today / (100 + r.today)), 0);
+}
+
+/* 四条红线：内部代号只出现在括号里，主文案说人话 */
+function hdReds(r) {
+  const share = hdShare(r);
+  const off = r.price == null;
+  const dist = hdStopDist(r);
+  const c1 = off ? 'off' : share > HD_CAP.total ? 'bad' : share > HD_CAP.gradeA ? 'todo' : 'done';
+  const c2 = off || r.dd == null ? 'off' : r.dd <= -HD_CAP.drawdown ? 'bad' : r.dd <= -HD_CAP.drawdown * 0.3 ? 'todo' : 'done';
+  const c3 = off ? 'off' : r.price < r.stop ? 'bad' : dist != null && dist < 3 ? 'todo' : 'done';
+  const k = off || !r.trail ? 'off' : r.trail.hit ? 'todo' : 'done';
+  return [
+    { name: '单票仓位', code: 'C1', st: c1, cur: share.toFixed(1) + '%', limit: '上限 ' + HD_CAP.gradeA + '%（硬顶 ' + HD_CAP.total + '%）', plain: c1 === 'bad' ? '单票超过硬顶，必须先减' : c1 === 'todo' ? '单票超过 A 级上限，建议减一档' : c1 === 'done' ? '单票占比在上限内' : '无行情，未计算' },
+    { name: '最大回撤', code: 'C2', st: c2, cur: r.dd == null ? '—' : r.dd.toFixed(1) + '%', limit: '触发线 -' + HD_CAP.drawdown + '%', plain: c2 === 'bad' ? '回撤已到触发线' : c2 === 'todo' ? '回撤偏大，注意收敛' : c2 === 'done' ? '回撤在可承受范围' : '无行情，未计算' },
+    { name: '止损线', code: 'C3', st: c3, cur: r.price == null ? '—' : r.price.toFixed(2) + ' / ' + r.stop.toFixed(2), limit: '成本 ×0.92', plain: c3 === 'bad' ? '已跌破止损，今天必须清仓' : c3 === 'todo' ? '接近止损，跌破就走' : c3 === 'done' ? '未触及止损' : '无行情，未计算' },
+    { name: '移动止盈', code: 'K139', st: k, cur: r.trail ? r.trail.stage : '未设置', limit: '分档上移止盈', plain: k === 'todo' ? '已到减仓档，按档减' : k === 'done' ? '未到减仓档' : '无移动止盈档位' }
+  ];
+}
+function hdVerdict(r) {
+  if (r.price == null) return 'info';
+  const reds = hdReds(r);
+  if (reds[2].st === 'bad') return 'exit';
+  if (r.trail && r.trail.hit) return 'reduce';
+  if (reds[0].st !== 'done') return 'reduce';
+  if (reds[2].st === 'todo' || r.dd != null && r.dd <= -5) return 'watch';
+  return 'hold';
+}
+const HD_VERDICT = {
+  exit: { label: '该走', tone: 'bad', order: 0 },
+  reduce: { label: '该减', tone: 'todo', order: 1 },
+  watch: { label: '到价了', tone: 'todo', order: 2 },
+  hold: { label: '继续拿', tone: 'done', order: 3 },
+  info: { label: '待核对', tone: 'off', order: 4 }
+};
+function hdVerdictPill(v) {
+  const m = HD_VERDICT[v] || HD_VERDICT.info;
+  return '<span class="state ' + m.tone + '">' + m.label + '</span>';
+}
+function hdConcl(r) {
+  const v = hdVerdict(r);
+  if (r.historyEdited) return '成交记录已更新：现持 ' + r.shares + ' 股，均价 ' + r.cost.toFixed(2) + '。仓位与红线已按当前数字检查；原 AI 判断和买卖计划仍需核对。';
+  const authored = r.concls && (r.concls[v] || r.concls.info);
+  if (authored) return authored;
+  /* 人工录入 / OCR 新建的一笔没有预写结论，这里用红线实况拼一句，不留空白 */
+  const hot = hdReds(r).filter((x) => x.st === 'bad' || x.st === 'todo');
+  if (hot.length) return hot.map((x) => x.plain).join('；') + '。价位和动作在下面三行。';
+  return '刚记的一笔：成本 ' + r.cost.toFixed(2) + '，止损 ' + r.stop.toFixed(2) + '，第一档止盈 ' + r.tp.toFixed(2) + '，四条红线都没踩，先按计划拿着。';
+}
+function hdRedDot(r) {
+  const worst = hdReds(r).reduce((acc, x) => (['bad', 'todo', 'off', 'done'].indexOf(x.st) < acc ? acc : ['bad', 'todo', 'off', 'done'].indexOf(x.st)), 9);
+  return worst === 0 ? 'err' : worst === 1 ? 'warn' : worst === 2 ? 'info' : 'ok';
+}
+function hdTodo() { return hdData().filter((r) => ['exit', 'reduce'].indexOf(hdVerdict(r)) >= 0); }
+function hdVisible() {
+  const rows = hdData().filter((r) => {
+    const v = hdVerdict(r);
+    if (state.hdView === 'todo') return v === 'exit' || v === 'reduce';
+    if (state.hdView === 'check') return v === 'info';
+    return true;
+  });
+  return rows.sort((a, b) => {
+    const d = HD_VERDICT[hdVerdict(a)].order - HD_VERDICT[hdVerdict(b)].order;
+    return d !== 0 ? d : hdShare(b) - hdShare(a);
+  });
+}
+
+/* ---------- 行内表单（就地记录人工成交） ---------- */
+const HD_OPS = {
+  add: { title: '记录加仓', verb: '加仓', kind: 'add' },
+  reduce: { title: '记录减仓', verb: '减仓', kind: 'reduce' },
+  exit: { title: '记录清仓', verb: '清仓', kind: 'exit' },
+  cost: { title: '修正成本', verb: '修正成本', kind: 'cost' }
+};
+function hdFormOpen(id, kind) { return state.hdForm && String(state.hdForm.id) === String(id) && state.hdForm.kind === kind; }
+function hdSharesAfter(r, kind, v) {
+  if (kind === 'add') return r.shares + v;
+  if (kind === 'exit') return 0;
+  if (kind === 'reduce') return r.shares - v;
+  return r.shares;
+}
+function hdCostAfter(r, kind, v, price) {
+  if (kind === 'add') return (r.cost * r.shares + price * v) / (r.shares + v);
+  if (kind === 'cost') return v;
+  return r.cost;
+}
+/* 对齐生产 positionWarnings：A 级单票 / C1 集中度 / C2 总仓位 / E2 防御期软上限 */
+function hdWarns(r, kind, sharesAfter, price) {
+  const total = state.hdAccount.total;
+  if (!total || !sharesAfter) return [];
+  const out = [];
+  const share = (sharesAfter * price) / total * 100;
+  const rest = (hdTotalMv() - hdMv(r) + sharesAfter * price) / total * 100;
+  if (share > HD_CAP.gradeA) out.push('这一笔单票仓位将达 ' + share.toFixed(1) + '%，超过 A 级上限 ' + HD_CAP.gradeA + '%');
+  if (share > HD_CAP.total) out.push('这一笔单票仓位将达 ' + share.toFixed(1) + '%，超过 C1 硬顶 ' + HD_CAP.total + '%');
+  if (rest > HD_CAP.total) out.push('做完之后总仓位将达 ' + rest.toFixed(1) + '%，超过 C2 上限 ' + HD_CAP.total + '%');
+  if (state.hdAccount.index < HD_CAP.indexBar && rest > HD_CAP.softCap) {
+    out.push('现在是防御期（沪指 ' + state.hdAccount.index.toFixed(0) + ' < ' + HD_CAP.indexBar + '），总仓位软上限只有 ' + HD_CAP.softCap + '%，做完之后是 ' + rest.toFixed(1) + '%');
+  }
+  if (kind === 'add' && r.cost) {
+    const newCost = hdCostAfter(r, 'add', sharesAfter - r.shares, price);
+    if (price < newCost * HD_CAP.c3) out.push('成交价 ' + price + ' 低于 C3 止损位（成本 ' + newCost.toFixed(2) + ' × 0.92 = ' + (newCost * HD_CAP.c3).toFixed(2) + '），属于跌破止损线加仓');
+  }
+  return out;
+}
+function hdFieldsText(r, kind, v) {
+  if (kind === 'cost') return '修正后成本 ' + v.cost_price + ' 元（原 ' + r.cost.toFixed(2) + '）\n原因 ' + v.reason;
+  const shares = kind === 'exit' ? r.shares : v.shares;
+  const remain = hdSharesAfter(r, kind, Number(shares || 0));
+  return (kind === 'add' ? '成交价 ' : '卖出价 ') + v.price + ' × ' + shares + ' 股' +
+    (kind === 'reduce' || kind === 'exit' ? '\n做完之后剩余 ' + remain + ' 股（' + Math.floor(remain / 100) + ' 手）' : '') +
+    '\n日期 ' + v.trade_date + '\n备注 ' + (v.note || '（无）');
+}
+function hdFormHtml(r, kind) {
+  const op = HD_OPS[kind];
+  const dr = (state.hdForm && String(state.hdForm.id) === String(r.id) && state.hdForm.draft) || {};
+  const f = {
+    price: dr.price != null ? dr.price : (r.price == null ? '' : r.price.toFixed(2)),
+    shares: dr.shares != null ? dr.shares : (kind === 'exit' ? r.shares : ''),
+    date: dr.date || '2026-11-16',
+    note: dr.note || '',
+    cost: dr.cost || '',
+    reason: dr.reason || ''
+  };
+  if (kind === 'cost') {
+    return '<div class="hd-form">' +
+      '<div class="hd-form-title">' + op.title + ' <span class="hint">只改成本，不产生成交</span></div>' +
+      '<label class="hd-field"><span>修正后成本 *</span><input class="input" id="hd-f-cost" type="number" step="0.01" value="' + esc(String(f.cost)) + '" placeholder="' + r.cost.toFixed(2) + '"></label>' +
+      '<label class="hd-field wide"><span>修正原因 *（必填，会写进流水）</span><input class="input" id="hd-f-reason" value="' + esc(f.reason) + '" placeholder="例如：交割单录入时把 34.20 打成 33.20"></label>' +
+      hdFormActions(r, kind) + '</div>';
+  }
+  return '<div class="hd-form">' +
+    '<div class="hd-form-title">' + op.title + ' <span class="hint">' + esc(r.name) + ' · 现持 ' + r.shares + ' 股 · 成本 ' + r.cost.toFixed(2) + '</span></div>' +
+    '<label class="hd-field"><span>' + (kind === 'add' ? '成交价 *' : '卖出价 *') + '</span><input class="input" id="hd-f-price" type="number" step="0.01" value="' + esc(String(f.price)) + '"></label>' +
+    (kind === 'exit'
+      ? '<label class="hd-field"><span>清仓股数（自动取全部）</span><input class="input" id="hd-f-shares" type="number" value="' + f.shares + '" readonly></label>'
+      : '<label class="hd-field"><span>' + (kind === 'add' ? '加仓股数 *（100 整数倍）' : '减仓股数 *（≤ ' + r.shares + '）') + '</span><input class="input" id="hd-f-shares" type="number" step="100" min="100" value="' + esc(String(f.shares)) + '" placeholder="' + (kind === 'add' ? '300' : '400') + '"></label>') +
+    '<label class="hd-field"><span>成交日期 *</span><input class="input" id="hd-f-date" type="date" value="' + esc(String(f.date)) + '"></label>' +
+    '<label class="hd-field wide"><span>备注</span><input class="input" id="hd-f-note" value="' + esc(f.note) + '" placeholder="' + (kind === 'exit' ? '清仓原因，会带进复盘' : '可不填') + '"></label>' +
+    hdFormActions(r, kind) + '</div>';
+}
+function hdFormActions(r, kind) {
+  const confirming = state.hdForm && state.hdForm.confirm;
+  return '<div class="hd-form-acts"><button class="btn sm" data-action="hd-op-cancel" data-hd="' + r.id + '">取消</button>' +
+    (confirming ? '<span class="hint">上面已列出风险，核对后确认</span>' : '<span class="hint">提交前会再让你核对一次</span>') +
+    '<button class="btn ' + (kind === 'exit' ? 'danger' : 'primary') + ' sm" data-action="hd-op-ok" data-hd="' + r.id + '" data-kind="' + kind + '">提交</button></div>';
+}
+function hdConfirmHtml(r, kind, v) {
+  const warns = v.warns || [];
+  const shares = kind === 'cost' ? r.shares : (kind === 'exit' ? r.shares : Number(v.shares));
+  const remain = kind === 'cost' ? r.shares : hdSharesAfter(r, kind, shares);
+  return '<div class="inline-confirm' + (kind === 'exit' ? ' danger' : '') + '">' +
+    '<div class="ic-title">确认' + HD_OPS[kind].title.replace('记录', '') + '？</div>' +
+    (warns.length ? '<div class="hd-warns">' + warns.map((w) => '<div class="hd-warn">' + icon('alert', 'sm') + esc(w) + '</div>').join('') + '</div>' : '') +
+    '<div class="ic-desc">' + esc(v.fields).replace(/\n/g, ' ') + '</div>' +
+    '<div class="hd-confirm-rule">' + icon('shield', 'sm') + '<div>这一步只记录你人工成交的结果，系统不会下单。确认后 C3 止损 / 移动止盈 / +5% / +10% 档位按知识库规则自动重算，并重算单票与总仓位占比（留痕可在流水里查）。</div></div>' +
+    '<div class="ic-actions"><button class="btn sm" data-action="hd-op-cancel" data-hd="' + r.id + '">返回改数字</button>' +
+      '<button class="btn ' + (kind === 'exit' ? 'danger' : 'primary') + ' sm" data-action="hd-op-confirm" data-hd="' + r.id + '" data-kind="' + kind + '">确认记录</button></div>' +
+    (remain === 0 ? '<div class="hint" style="margin-top:8px">清仓后这笔会自动进入复盘队列，' + esc(r.name) + ' 的持仓记录改为已离场。</div>' : '') +
+  '</div>';
+}
+/* 读表单 + 校验，返回 null 表示被拦下（与生产 rules 一致） */
+function hdReadForm(r, kind) {
+  const num = (id) => { const el = $('#' + id); return el ? el.value : ''; };
+  if (kind === 'cost') {
+    const cost = parseFloat(num('hd-f-cost'));
+    const reason = (num('hd-f-reason') || '').trim();
+    if (!Number.isFinite(cost) || !(cost > 0)) { toast('成本价要填正数', '修正成本只改成本，不产生成交。', 'warn'); return null; }
+    if (!reason) { $('#' + 'hd-f-reason').focus(); toast('必须填写修正原因', '不写原因，后面没人知道这笔成本为什么变了。', 'warn'); return null; }
+    return { cost_price: cost, reason: reason, shares: r.shares, warns: [], fields: hdFieldsText(r, kind, { cost_price: cost.toFixed(2), reason: reason }) };
+  }
+  const price = parseFloat(num('hd-f-price'));
+  const shares = kind === 'exit' ? r.shares : parseInt(num('hd-f-shares'), 10);
+  const date = num('hd-f-date') || '2026-11-16';
+  const note = (num('hd-f-note') || '').trim();
+  if (!(price > 0)) { toast('成交价要填正数', '价格取当前现价也可以，但不能空着。', 'warn'); return null; }
+  if (kind !== 'exit') {
+    if (!(shares > 0)) { toast('股数要填', '减仓股数不能超过持仓。', 'warn'); return null; }
+    if (shares % 100 !== 0) { toast('股数必须是 100 的整数倍', 'A 股一手 100 股，你填的是 ' + shares + '。', 'warn'); return null; }
+  }
+  if (kind === 'reduce' && shares >= r.shares) { toast('减仓不能减完', '要全部走请用「清仓」，只有清仓会把这笔转成已离场并触发复盘。', 'warn'); return null; }
+  if (kind !== 'add' && shares > r.shares) { toast('卖出股数超过持仓', '当前持仓 ' + r.shares + ' 股。', 'warn'); return null; }
+  const after = hdSharesAfter(r, kind, shares);
+  return {
+    price: price, shares: shares, trade_date: date, note: note,
+    warns: hdWarns(r, kind, after, price),
+    fields: hdFieldsText(r, kind, { price: price.toFixed(2), shares: shares, trade_date: date, note: note })
+  };
+}
+function hdApplyOp(r, kind, v) {
+  const ledger = hdTradeLedger(r), old = r.cost;
+  const adjustment = { id: r.id + '-t' + ledger.nextId++, date: ledger.entries.map(t => t.date).concat('2026-11-16').sort().pop(), order: Math.max(...ledger.entries.map(t => t.order)) + 1, side: 'adjust', amount: hdTradeRound((Number(v.cost_price) - old) * r.shares), status: 'active', note: '成本由 ' + old.toFixed(2) + ' 修正为 ' + Number(v.cost_price).toFixed(2) + '：' + v.reason };
+  ledger.entries.push(adjustment); ledger.version++;
+  ledger.audit.unshift({ at: new Date().toLocaleString('zh-CN'), reason: v.reason, changes: [{ before: null, after: clone(adjustment) }] });
+  r.cost = Number(v.cost_price); r.stop = Math.round(r.cost * HD_CAP.c3 * 100) / 100; r.historyEdited = true;
+  r.trades.unshift({ side: 'sys', shares: 0, price: 0, date: adjustment.date, note: '成本由 ' + old.toFixed(2) + ' 修正为 ' + r.cost.toFixed(2) + '：' + v.reason });
+  return '成本已修正为 ' + r.cost.toFixed(2) + '，止损位跟着重算到 ' + r.stop.toFixed(2);
+}
+
+/* ---------- 详情 Tab ---------- */
+function hdConclTab(r) {
+  const v = hdVerdict(r);
+  const dist = hdStopDist(r);
+  const reds = hdReds(r);
+  const triggered = reds.filter((x) => x.st === 'bad' || x.st === 'todo');
+  return '<div class="hd-concl ' + (v === 'exit' ? 'bad' : v === 'info' ? 'off' : 'warn') + '">' +
+      '<div class="hd-concl-tag">' + hdVerdictPill(v) + '<b>' + esc(r.name) + '</b><span class="hint">' + esc(v === 'exit' ? '今天要动手' : v === 'reduce' ? '今天要动手' : v === 'watch' ? '到价再说' : v === 'hold' ? '今天不动' : '先补数据') + '</span></div>' +
+      '<div class="hd-concl-txt">' + esc(hdConcl(r)) + '</div>' +
+      (triggered.length ? '<div class="hd-concl-reds">' + triggered.map((x) =>
+        '<button class="hd-red" data-action="hd-tab" data-tab="risk"><span class="state ' + x.st + '"></span>' + esc(x.name) + '：' + esc(x.plain) + '</button>').join('') + '</div>' : '') +
+    '</div>' +
+    '<dl class="kv">' +
+      '<dt>现价 / 加权成本</dt><dd class="mono">' + (r.price == null ? '<span class="dim">未取到行情</span>' : r.price.toFixed(2) + ' / ' + r.cost.toFixed(2)) + '</dd>' +
+      '<dt>持股 / 市值</dt><dd class="mono">' + r.shares + ' 股 · ' + hdMoney(hdMv(r)) + ' 元（占总资产 ' + hdShare(r).toFixed(1) + '%）</dd>' +
+      '<dt>浮动盈亏</dt><dd><span class="mono ' + hdPnlCls(hdPnl(r)) + '">' + hdMoney(hdPnl(r)) + ' 元（' + hdPct(hdPnlPct(r)) + '）</span>' + (r.today == null ? '' : ' <span class="hint">今日 ' + hdPct(r.today) + '</span>') + '</dd>' +
+      '<dt>止损 / 距止损</dt><dd class="mono">' + r.stop.toFixed(2) + ' <span class="' + (dist != null && dist < 3 ? 'wo-down' : 'hint') + '">' + (dist == null ? '' : '距 ' + dist.toFixed(1) + '%') + '</span></dd>' +
+      '<dt>止盈 / 目标仓位</dt><dd class="mono">' + r.tp.toFixed(2) + ' · ' + r.targetPct + '%' + (r.suggestPct === 0 ? ' <span class="wo-down">建议降到 0（该走）</span>' : ' <span class="hint">防御期建议 ' + r.suggestPct + '%</span>') + '</dd>' +
+      '<dt>来源</dt><dd>' + (r.plan ? '建仓计划 #' + r.plan.id + ' · <button class="btn link xs" data-nav="#/candidates?date=' + r.plan.batch + '">' + esc(r.plan.batch) + ' 候选池 ' + icon('arrow', 'sm') + '</button>' : '<span class="dim">人工录入，未绑定建仓计划</span>') + '</dd>' +
+    '</dl>' +
+    (r.scenes ? '<div class="cp-scene"><div class="cp-scene-head"><span class="cp-scene-title">怎么做</span><span class="hint">按现价 ' + (r.price == null ? '—' : r.price.toFixed(2)) + ' 算的三个走法</span></div>' +
+      r.scenes.map((s) => '<div class="cp-sc ' + s.k + '"><div class="cp-sc-tag">' + icon(s.k === 'up' ? 'caretUp' : s.k === 'dn' ? 'caretDown' : 'minus', 'sm') +
+        (s.k === 'up' ? '如果继续涨' : s.k === 'dn' ? '如果下跌' : '如果横盘') + '</div>' +
+        '<div class="cp-sc-cond">' + esc(s.c) + '</div><div class="cp-sc-act">' + esc(s.a) + '</div></div>').join('') + '</div>'
+      : '<div class="cp-scene"><div class="cp-scene-empty">没有行情就没有价位计算，也就不给结论。点上面的「刷新行情」重取，或在「买卖记录」里核对成本与股数。</div></div>') +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') + '<div>这一页只回答「手上的票现在怎么办」。要买的新票在每日候选池；这里不重复给买入建议。</div></div>';
+}
+
+function hdDecisionCard(r, d, showActs) {
+  if (!d) {
+    if (r.price == null) return '<div class="cp-scene-empty">没有行情，卖出决策不计算。刷新行情后会自动补。</div>';
+    return '<div class="cp-scene-empty">这笔还没有卖出决策。后台跑一次（sell_decision）就有结论，会告诉你：要不要走、按什么减仓、各维度的归因、执行价位区间和动手前自检。</div>' +
+      (showActs ? '<div class="hd-decide-acts"><button class="btn primary sm" data-action="hd-decision" data-hd="' + r.id + '">' + icon('chart', 'sm') + '生成卖出决策</button>' +
+        '<span class="hint">决策只是参考，卖出必须由你人工执行；执行完了回到「买卖记录」把成交记下来。</span></div>' : '');
+  }
+  const actMap = { hold: '继续持有', reduce: '减仓', partial: '部分减仓', exit: '清仓', sell: '卖出清仓' };
+  const confMap = { high: '高', medium: '中', low: '低' };
+  const isPartial = d.action === 'partial' && d.ratio;
+  const sellShares = isPartial ? Math.min(r.shares, Math.max(100, Math.ceil((r.shares * d.ratio) / 100) * 100)) : 0;
+  return '<div class="hd-sug">' +
+    '<div class="hd-sug-head"><b>卖出决策：' + esc(actMap[d.action] || d.action) + '</b>' +
+      (d.running ? '<span class="state run"></span><span class="hd-running">后台计算中（sell_decision）</span>' : tag('置信度 ' + (confMap[d.conf] || d.conf), d.conf === 'high' ? 'red' : 'outline')) +
+      '<span class="spacer"></span><span class="hint">' + esc(d.at) + ' 生成</span></div>' +
+    (d.running ? '<div class="cp-scene-empty">这一版先把「跑完会看到什么」画出来：结论、置信度、按什么减仓、各维度归因、风险提示和卖出前检查清单。完成后刷新即替换，不会覆盖成空白。</div>' : '') +
+    (d.running ? '' : (isPartial ? '<div class="hd-sug-cut">' + icon('minus', 'sm') + '建议减 ' + Math.round(d.ratio * 100) + '%　<span class="mono">' + r.shares + ' 股 → 卖 ' + sellShares + ' 股（' + Math.floor(sellShares / 100) + ' 手）→ 剩 ' + (r.shares - sellShares) + ' 股</span></div>' : '')) +
+    (d.final ? '<div class="hd-sug-final">' + esc(d.final) + '</div>' : '') +
+    '</div>' +
+    (d.dims ? '<div class="hd-dims">' + d.dims.map((dm) => {
+      const color = dm.verdict === '支持' ? 'var(--up)' : dm.verdict === '风险' ? 'var(--warn)' : 'var(--text-3)';
+      return '<div class="hd-dim"><span class="hd-dim-name">' + esc(dm.dim) + '</span>' +
+        '<span class="hd-dim-bar"><i style="width:' + Math.max(4, Math.min(100, dm.score)) + '%;background:' + color + '"></i></span>' +
+        '<span class="hd-dim-score mono">' + dm.score + '</span>' + tag(dm.verdict, dm.verdict === '支持' ? 'red' : dm.verdict === '风险' ? 'gold' : 'mute') +
+        (dm.advice ? '<span class="hd-dim-advice">' + esc(dm.advice) + '</span>' : '') + '</div>';
+    }).join('') + '</div>' : '') +
+    (d.reasons ? '<div class="cp-list-title" style="margin-top:14px">为什么这么判</div><ol class="hd-reasons">' + d.reasons.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ol>' : '') +
+    (d.zone || d.risk ? '<dl class="kv" style="margin-top:10px">' +
+      (d.zone ? '<dt>执行价位区间</dt><dd class="mono">' + esc(d.zone) + '</dd>' : '') +
+      (d.risk ? '<dt>风险提示</dt><dd class="hd-risk">' + esc(d.risk) + '</dd>' : '') + '</dl>' : '') +
+    (d.checks ? '<div class="cp-list-title" style="margin-top:14px">动手前自检</div><ul class="hd-checks">' + d.checks.map((c) =>
+      '<li class="' + (c.ok ? 'ok' : 'no') + '">' + icon(c.ok ? 'check' : 'alert', 'sm') + esc(c.label) + '</li>').join('') + '</ul>' : '') +
+    (showActs ? '<div class="hd-decide-acts">' +
+      (d.running ? '<span class="hd-task"><span class="state run"></span>任务 sell_decision 已提交，跑完刷新这一页就有结论</span>' :
+        r.decision ? '<button class="btn sm" data-action="hd-decision" data-hd="' + r.id + '">' + icon('rotate', 'sm') + '重新生成</button>' :
+        '<button class="btn primary sm" data-action="hd-decision" data-hd="' + r.id + '">' + icon('chart', 'sm') + '生成卖出决策</button>') +
+      '<span class="hint">决策只是参考，卖出必须由你人工执行；执行完了回到「买卖记录」把成交记下来。</span></div>' : '');
+}
+
+function hdBasisTab(r) {
+  const hist = r.decisions || [];
+  return hdDecisionCard(r, r.decision, true) +
+    '<div class="cp-list-title" style="margin-top:16px">历史决策（' + hist.length + '）</div>' +
+    (hist.length ? '<div class="hd-hist">' + hist.map((h, i) => {
+      const actMap = { hold: '继续持有', reduce: '减仓', partial: '部分减仓', exit: '清仓' };
+      const open = i === 0 && state.hdHistOpen;
+      return '<div class="hd-hist-item' + (open ? ' open' : '') + '">' +
+        '<button class="hd-hist-head" data-action="hd-hist-toggle"><span class="mono dim">' + esc(h.at) + '</span>' +
+          '<b>' + esc(actMap[h.action] || h.action) + '</b>' + tag('置信 ' + ({ high: '高', medium: '中', low: '低' }[h.conf] || h.conf), h.conf === 'high' ? 'red' : 'outline') +
+          '<span class="spacer"></span><span class="dim">' + esc(h.one) + '</span>' + icon('chevron', 'sm') + '</button>' +
+        (open ? '<div class="hd-hist-body">' + esc(h.one) + '（正式页面这一层展开的是完整决策体，与上方同一套渲染）</div>' : '') +
+        '</div>';
+    }).join('') + '</div>' : '<div class="wo-empty" style="padding:12px 0">还没有历史决策。</div>') +
+    '<div class="cap-note" style="margin-top:14px">' + icon('info') + '<div>生成卖出决策走后台任务 <code>sell_decision</code>，跑完自动回到这一层，不用守着页面。它读的维度与打分口径和候选池评分同源。</div></div>';
+}
+
+function hdTradeRound(n) { return Math.round((n + Number.EPSILON) * 100000000) / 100000000; }
+function hdTradeDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) && Number.isFinite(Date.parse(s)) && new Date(s).toISOString().slice(0, 10) === s;
+}
+function hdTradeReplay(entries) {
+  let shares = 0, basis = 0, realized = 0, cashFlow = 0, buyAmount = 0;
+  const steps = [], errors = [];
+  const active = entries.filter(t => t.status !== 'void').slice().sort((a, b) => a.date.localeCompare(b.date) || a.order - b.order);
+  active.forEach(t => {
+    if (!hdTradeDate(t.date)) { errors.push('记录 ' + t.order + ' 的日期无效。'); return; }
+    if (t.side === 'adjust') {
+      if (shares) basis = hdTradeRound(basis + t.amount);
+      else realized = hdTradeRound(realized - t.amount);
+      if (basis < 0) errors.push(t.date + ' 的成本调整会使成本小于零，请先核对历史。');
+    } else {
+      const amount = hdTradeRound(t.price * t.shares), cost = shares ? basis / shares : 0;
+      if (t.side === 'buy') { basis = hdTradeRound(basis + amount); shares += t.shares; cashFlow -= amount; buyAmount += amount; }
+      else if (t.shares > shares) { errors.push(t.date + ' · 顺序 ' + t.order + ' 卖出 ' + t.shares + ' 股，但当时只有 ' + shares + ' 股；请补齐买入或调整同日顺序。'); return; }
+      else { realized = hdTradeRound(realized + amount - cost * t.shares); shares -= t.shares; basis = shares ? hdTradeRound(basis - cost * t.shares) : 0; cashFlow += amount; }
+      steps.push({ id: t.id, date: t.date, order: t.order, shares: shares, cost: shares ? basis / shares : 0, realized: realized, saleCost: cost });
+    }
+  });
+  return { shares: shares, cost: shares ? basis / shares : 0, realized: realized, cashFlow: hdTradeRound(cashFlow), buyAmount: buyAmount, steps: steps, errors: errors };
+}
+function hdTradeLedger(r) {
+  if (r.ledger) return r.ledger;
+  const entries = r.trades.filter(t => t.side === 'buy' || t.side === 'sell').map((t, i) => Object.assign({}, t, { id: r.id + '-t' + (i + 1), order: i + 1, status: 'active' }));
+  const replay = hdTradeReplay(entries);
+  const difference = hdTradeRound(r.cost * r.shares - replay.cost * replay.shares);
+  if (Math.abs(difference) >= 0.005) entries.push({ id: r.id + '-baseline', order: entries.length + 1, date: entries.map(t => t.date).sort().pop() || r.entry, side: 'adjust', amount: difference, status: 'active', note: '原有成本与成交明细的差额，保留为历史成本调整；不视为买卖，不改变现金。' });
+  r.ledger = { entries: entries, version: 0, nextId: entries.length + 1, audit: [] };
+  return r.ledger;
+}
+function hdTradeStock(id) {
+  const held = hdById(id);
+  if (held) return held;
+  const archive = state.exited.find(x => String(x.row ? x.row.id : x.id) === String(id));
+  if (!archive) return null;
+  if (!archive.row) {
+    archive.row = { id: archive.id, code: archive.code, name: archive.name, entry: archive.entry, source: '历史归档', shares: 0, cost: archive.cost, price: archive.out, today: null, dd: null, stop: archive.cost * HD_CAP.c3, tp: archive.cost * 1.15, targetPct: 10, suggestPct: 10, trail: null, plan: null, alerts: 0, rules: [], concls: {}, scenes: null, decision: null, decisions: [], records: [], archiveSummary: true, trades: [
+      { side: 'buy', shares: archive.shares, price: archive.cost, date: archive.entry, note: '根据旧归档摘要还原，请按券商明细核对' },
+      { side: 'sell', shares: archive.shares, price: archive.out, date: archive.exit, note: archive.note }
+    ] };
+  }
+  return archive.row;
+}
+function hdTradeDraft(r) {
+  if (!state.hdTradeDrafts[r.id]) {
+    const ledger = hdTradeLedger(r);
+    state.hdTradeDrafts[r.id] = { entries: clone(ledger.entries), version: ledger.version, nextId: ledger.nextId, editing: [], reason: '', paste: '', errors: [], preview: null, duplicatesOk: false };
+  }
+  return state.hdTradeDrafts[r.id];
+}
+function hdTradeAdd(r, kind) {
+  const d = hdTradeDraft(r), seq = d.nextId++;
+  const t = { id: r.id + '-t' + seq, date: d.entries.map(t => t.date).filter(hdTradeDate).concat('2026-11-16').sort().pop(), order: Math.max(0, ...d.entries.map(t => Number(t.order) || 0)) + 1, side: kind === 'reduce' || kind === 'exit' ? 'sell' : 'buy', price: '', shares: '', note: '', status: 'active' };
+  if (kind) { t.price = hdPrice(r); t.shares = kind === 'exit' ? r.shares : kind === 'reduce' ? Math.min(100, r.shares) : 100; }
+  d.entries.push(t); d.editing.push(t.id); d.preview = null; d.errors = []; d.duplicatesOk = false;
+  return t;
+}
+function hdTradeChanges(r, entries) {
+  const old = hdTradeLedger(r).entries;
+  return entries.filter(t => !old.some(o => o.id === t.id && JSON.stringify(o) === JSON.stringify(t))).map(t => ({ before: old.find(o => o.id === t.id) || null, after: t }));
+}
+function hdTradePreview(r, d) {
+  const errors = [], entries = clone(d.entries), ledger = hdTradeLedger(r);
+  if (d.version !== ledger.version) errors.push('记录已经更新，请放弃旧草稿后重新修改。');
+  entries.forEach((t, i) => {
+    if (t.side === 'adjust' || t.status === 'void') return;
+    t.price = Number(t.price); t.shares = Number(t.shares); t.order = Number(t.order); t.note = t.note.trim();
+    if (!hdTradeDate(t.date)) errors.push('第 ' + (i + 1) + ' 行：请填写有效日期。');
+    if (!['buy', 'sell'].includes(t.side)) errors.push('第 ' + (i + 1) + ' 行：方向只能是买入或卖出。');
+    if (!Number.isFinite(t.price) || !(t.price > 0) || !Number.isFinite(t.price * t.shares) || t.price * t.shares > Number.MAX_SAFE_INTEGER) errors.push('第 ' + (i + 1) + ' 行：成交价或成交金额无效。');
+    if (!Number.isSafeInteger(t.shares) || t.shares <= 0) errors.push('第 ' + (i + 1) + ' 行：股数必须是正整数，不能填小数。');
+    if (!Number.isSafeInteger(t.order) || t.order <= 0) errors.push('第 ' + (i + 1) + ' 行：同日顺序必须是正整数。');
+  });
+  const active = entries.filter(t => t.status !== 'void');
+  const orderKeys = new Set();
+  active.forEach(t => { const key = t.date + '/' + t.order; if (orderKeys.has(key)) errors.push(t.date + ' 的同日顺序 ' + t.order + ' 重复，请为先发生的一笔填更小的数字。'); orderKeys.add(key); });
+  const changes = hdTradeChanges(r, entries);
+  if (!changes.length) errors.push('还没有待保存的变更，可以新增一行或修改历史成交。');
+  if (changes.some(c => c.before) && !d.reason.trim()) errors.push('修改或作废历史成交时，必须填写本次调整原因。');
+  const after = errors.length ? null : hdTradeReplay(entries);
+  if (after) {
+    errors.push(...after.errors);
+    if (after.shares && hdData().some(x => x.id !== r.id && x.code === r.code)) errors.push('此股票已有另一条在持仓记录，不能从归档恢复为重复持仓；请先核对并合并实际成交。');
+  }
+  d.errors = [...new Set(errors)]; d.preview = null;
+  if (errors.length) return;
+  const before = hdTradeReplay(ledger.entries);
+  const duplicates = changes.filter(c => c.after.side !== 'adjust' && c.after.status !== 'void' && active.some(o => o.id !== c.after.id && o.side === c.after.side && o.date === c.after.date && o.price === c.after.price && o.shares === c.after.shares));
+  const cash = hdTradeRound(hdCash() + after.cashFlow - before.cashFlow);
+  const total = hdTradeRound(state.hdAccount.total + cash - hdCash() + (after.shares - r.shares) * hdPrice(r));
+  d.preview = { entries: entries, before: before, after: after, changes: changes, cash: cash, total: total, duplicates: duplicates.length, account: JSON.stringify(state.hdAccount) };
+}
+function hdTradeCommit(r, d) {
+  const p = d.preview, ledger = hdTradeLedger(r);
+  if (!p || ledger.version !== d.version || p.account !== JSON.stringify(state.hdAccount)) { d.preview = null; d.errors = ['账户或成交记录已变化，请重新预览后确认。']; return false; }
+  if (p.duplicates && !d.duplicatesOk) { d.errors = ['请先确认相同日期、价格和股数的记录确实是不同成交；不会自动忽略任何一笔。']; return false; }
+  ledger.audit.unshift({ at: new Date().toLocaleString('zh-CN'), reason: d.reason.trim() || '补录实际成交', changes: clone(p.changes) });
+  ledger.entries = clone(p.entries); ledger.version++; ledger.nextId = d.nextId;
+  r.shares = p.after.shares; r.cost = p.after.cost; r.realized = p.after.realized; r.historyEdited = true;
+  r.trades = ledger.entries.filter(t => t.status !== 'void' && t.side !== 'adjust').map(t => clone(t)).concat(r.trades.filter(t => t.side === 'sys'));
+  r.records = ledger.entries.filter(t => t.status !== 'void' && t.side !== 'adjust').map(t => ({ date: t.date, price: t.price, shares: t.side === 'buy' ? t.shares : -t.shares, created: '人工维护', status: '当前有效' }));
+  r.entry = ledger.entries.filter(t => t.side === 'buy' && t.status !== 'void').map(t => t.date).sort()[0] || r.entry;
+  state.hdAccount.cash = p.cash; state.hdAccount.total = p.total;
+  const oldArchive = state.exited.find(x => x.row === r);
+  state.exited = state.exited.filter(x => x.row !== r);
+  if (!r.shares) {
+    const sales = ledger.entries.filter(t => t.side === 'sell' && t.status !== 'void').sort((a, b) => a.date.localeCompare(b.date) || a.order - b.order);
+    const last = sales[sales.length - 1];
+    const step = last && p.after.steps.find(s => s.id === last.id);
+    state.holdings = state.holdings.filter(x => x.id !== r.id);
+    state.exited.unshift({ id: r.id, row: r, code: r.code, name: r.name, entry: r.entry, exit: last ? last.date : '无有效成交', shares: last ? last.shares : 0, cost: step ? step.saleCost : 0, out: last ? last.price : 0, pnl: p.after.buyAmount ? p.after.realized / p.after.buyAmount * 100 : 0, realized: p.after.realized, note: last ? '已按有效成交重算' : '记录已全部作废', reviewId: oldArchive ? oldArchive.reviewId : null });
+    state.hdView = 'exited'; state.hdArchiveId = r.id;
+  } else {
+    if (!state.holdings.some(x => x.id === r.id)) state.holdings.push(r);
+    state.hdView = 'all'; state.hdId = r.id; state.hdTab = 'ops';
+  }
+  delete state.hdTradeDrafts[r.id];
+  return true;
+}
+function hdTradeDescribe(t) {
+  if (!t) return '未录入';
+  return t.date + ' · 顺序 ' + t.order + ' · ' + (t.side === 'adjust' ? '成本调整 ' + t.amount.toFixed(2) + ' 元' : (t.side === 'buy' ? '买入 ' : '卖出 ') + t.shares + ' 股 × ' + Number(t.price).toFixed(2) + ' 元') + (t.status === 'void' ? ' · 已作废' : '') + (t.note ? ' · ' + t.note : '');
+}
+function hdTradePreviewHtml(r, d) {
+  const p = d.preview, num = n => n == null ? '无行情' : hdMoney(Number(n.toFixed(2)));
+  const b = p.before, a = p.after;
+  const floating = v => v.shares === 0 ? 0 : r.price == null ? null : (r.price - v.cost) * v.shares;
+  return '<section class="hd-trade-preview" aria-label="保存前影响预览"><h4>保存前，再核对一下 · ' + esc(r.name) + '</h4><p class="hint">' + p.changes.length + ' 笔变更，后续每笔成交已按日期和同日顺序重新计算。尚未保存。</p>' +
+    '<div class="hd-trade-impact">' + [['持股（股）', b.shares, a.shares], ['持仓均价（元）', b.cost, a.cost], ['累计已实现盈亏（元）', b.realized, a.realized], ['当前浮动盈亏（元）', floating(b), floating(a)], ['账户现金（元）', hdCash(), p.cash], ['账户总资产（元）', state.hdAccount.total, p.total]].map(x => '<div><span>' + x[0] + '</span><b class="mono">' + num(x[1]) + ' → ' + num(x[2]) + '</b></div>').join('') + '</div>' +
+    (a.shares === 0 ? '<p class="hd-warns">保存后不再持有，将移至「已离场」；仍可修改或作废历史记录。</p>' : !hdById(r.id) ? '<p class="hd-warns">保存后恢复 ' + a.shares + ' 股，重新进入持仓监控；原归档报价不是实时行情。</p>' : '') +
+    (p.cash < 0 ? '<p class="hd-warns">按录入成交计算，现金将为负数。请核对券商资金及账户基线；不会把差额自动抹成零。</p>' : '') +
+    '<details open><summary>本次变更（修改前 / 修改后）</summary><div class="hd-trade-changes">' + p.changes.map(c => '<div><span>原：' + esc(hdTradeDescribe(c.before)) + '</span><b>新：' + esc(hdTradeDescribe(c.after)) + '</b></div>').join('') + '</div></details>' +
+    '<details><summary>重算后的每笔持股、均价和累计已实现盈亏</summary><div class="hd-trade-changes">' + a.steps.map(s => '<div>' + esc(s.date) + ' · 顺序 ' + s.order + ' · ' + s.shares + ' 股 · 均价 ' + num(s.cost) + ' · 已实现 ' + num(s.realized) + ' 元</div>').join('') + '</div></details>' +
+    (p.duplicates ? '<label class="hd-trade-duplicate"><input type="checkbox" data-trade-duplicates data-hd="' + r.id + '"' + (d.duplicatesOk ? ' checked' : '') + '>存在相同日期、方向、价格和股数的记录，我已核对它们是不同的真实成交（全部保留）</label>' : '') +
+    '<p class="hint">持仓采用移动加权均价；已实现盈亏按每笔卖出时的成本计算，暂不计佣金和税费。止损、止盈计划保留不动，原 AI 判断需重新核对。原型只在本次页面会话中保存，刷新会恢复示例数据；不会下单。</p>' +
+    '<div class="hd-ops-bar"><button class="btn primary sm" data-action="hd-ledger-save" data-hd="' + r.id + '">确认保存全部变更</button><button class="btn sm" data-action="hd-ledger-back" data-hd="' + r.id + '">返回继续修改</button></div></section>';
+}
+function hdTradeTableHtml(r) {
+  const ledger = hdTradeLedger(r), d = state.hdTradeDrafts[r.id], entries = d ? d.entries : ledger.entries;
+  const button = (action, label, id, extra) => '<button class="btn ' + (extra || 'link xs') + '" data-action="hd-ledger-' + action + '" data-hd="' + r.id + '"' + (id ? ' data-trade="' + esc(id) + '"' : '') + '>' + label + '</button>';
+  const errors = d && d.errors.length ? '<div class="hd-warns" role="alert">' + d.errors.map(e => '<div>' + esc(e) + '</div>').join('') + '</div>' : '';
+  if (d && d.preview) return errors + hdTradePreviewHtml(r, d);
+  const field = (t, key, label, type) => key === 'note' ? '<textarea class="input" rows="2" aria-label="' + label + '" data-trade="' + esc(t.id) + '" data-field="note" data-hd="' + r.id + '">' + esc(t.note) + '</textarea>' : '<input class="input" aria-label="' + label + '" type="' + type + '" data-trade="' + esc(t.id) + '" data-field="' + key + '" data-hd="' + r.id + '" value="' + esc(t[key]) + '"' + (type === 'number' ? ' min="0" step="' + (key === 'price' ? '0.01' : '1') + '"' : '') + '>';
+  return '<section class="hd-trade-section"><div class="hd-ops-bar"><b>买卖明细 · ' + esc(r.name) + '</b>' + button('add', '＋ 新增一笔 / 补录', null, 'primary sm') + button('paste-open', '从 Excel 粘贴多笔', null, 'sm') + '</div>' +
+    '<p class="hint">当前已保存：' + r.shares + ' 股 · 持仓均价 ' + (r.shares ? r.cost.toFixed(2) : '—') + ' 元 · 累计已实现盈亏 ' + hdMoney(Number(hdTradeReplay(ledger.entries).realized.toFixed(2))) + ' 元。<br>可连续加行，备注格按 Tab 可加下一行，最后一次保存。日期较早的先计算；同一天按「顺序」从小到大，可调整数字。这里只记实际成交，不要求整手，不会自动下单。</p>' +
+    (r.archiveSummary ? '<p class="hd-warns">旧归档只有汇总数字，以下买卖为摘要还原，请先按券商明细核对；不代表完整历史。</p>' : '') +
+    (entries.some(t => t.side === 'adjust') ? '<p class="hd-warns">此持仓包含历史成本调整，下表单独列出并参与重算，不会伪装成成交或影响现金。</p>' : '') +
+    (entries.some(t => /忽略|重复/.test(t.note)) ? '<p class="hd-warns">旧备注含「重复 / 忽略」，但原持股计入了两笔。当前保留原有股数；请核对后作废真正多记的记录，不会仅凭同一天就自动去重。</p>' : '') + errors +
+    (d && d.pasteOpen ? '<div class="hd-trade-paste"><label class="hd-field">粘贴 Excel 单元格（按日期、方向、价格、股数、备注五列；可带表头）<textarea class="input" rows="5" data-trade-paste data-hd="' + r.id + '" placeholder="2026-11-12&#9;买入&#9;26.50&#9;100&#9;补录">' + esc(d.paste) + '</textarea></label>' + button('paste', '填入表格（尚未保存）', null, 'sm') + '<span class="hint">日期支持 2026-11-12 或 2026/11/12。也可直接在新行日期格粘贴这五列。</span></div>' : '') +
+    '<div class="hd-trade-scroll" tabindex="0" aria-label="买卖明细，可横向滚动"><table class="hd-trade-table"><thead><tr><th>日期</th><th>同日顺序</th><th>方向</th><th>价格 / 元</th><th>股数</th><th>备注</th><th>操作</th></tr></thead><tbody>' + entries.map(t => {
+      if (t.side === 'adjust') return '<tr><td>' + esc(t.date) + '</td><td>' + t.order + '</td><td colspan="3">成本调整 ' + t.amount.toFixed(2) + ' 元</td><td colspan="2">' + esc(t.note) + '</td></tr>';
+      const original = ledger.entries.find(o => o.id === t.id), editing = d && d.editing.includes(t.id), voided = t.status === 'void';
+      const read = !editing || voided;
+      return '<tr class="' + (voided ? 'is-void' : editing ? 'is-editing' : '') + '"><td>' + (read ? esc(t.date) : field(t, 'date', '成交日期', 'text')) + '</td><td>' + (read ? t.order : field(t, 'order', '同日顺序', 'number')) + '</td><td>' + (read ? (t.side === 'buy' ? '买入' : '卖出') : '<select class="input" aria-label="买卖方向" data-trade="' + esc(t.id) + '" data-field="side" data-hd="' + r.id + '">' + (!['buy', 'sell'].includes(t.side) ? '<option value="' + esc(t.side) + '" selected>待核对方向</option>' : '') + '<option value="buy"' + (t.side === 'buy' ? ' selected' : '') + '>买入</option><option value="sell"' + (t.side === 'sell' ? ' selected' : '') + '>卖出</option></select>') + '</td><td>' + (read ? Number(t.price).toFixed(2) : field(t, 'price', '成交价格', 'number')) + '</td><td>' + (read ? t.shares : field(t, 'shares', '成交股数', 'number')) + '</td><td>' + (read ? esc(t.note || '—') : field(t, 'note', '成交备注', 'text')) + '</td><td>' +
+        (voided ? '已作废' + (original && original.status !== 'void' ? button('undo', '撤销作废', t.id) : '') : (!original ? tag('待新增', 'gold') + button('remove', '移除', t.id) : (editing ? tag('待修改', 'gold') + button('undo', '撤销修改', t.id) : button('edit', '修改', t.id)) + button('void', '作废', t.id))) + '</td></tr>';
+    }).join('') + '</tbody></table></div>' +
+    (d ? '<label class="hd-field hd-trade-reason">本次调整原因（修改 / 作废历史必填，新增可选）<input class="input" data-trade-reason data-hd="' + r.id + '" value="' + esc(d.reason) + '" placeholder="例如：按券商交割单修正成交价，或之前重复记了一笔"></label><div class="hd-ops-bar">' + button('preview', '预览全部变更', null, 'primary sm') + button('discard', d.discardAsk ? '确认放弃草稿' : '放弃本次草稿', null, 'sm') + (d.discardAsk ? button('keep', '继续编辑', null, 'sm') : '<span class="hint">未保存 · 切换股票或标签仍保留草稿</span>') + '</div>' : '') +
+    '<p class="hint">原型演示：数据仅保留至刷新页面；成交金额与盈亏暂不含佣金、税费。</p>' +
+    '<details class="hd-trade-audit"><summary>修改留痕（' + ledger.audit.length + ' 次，保留修改前记录）</summary>' + (ledger.audit.length ? ledger.audit.map(a => '<div><b>' + esc(a.at) + ' · ' + esc(a.reason) + '</b>' + a.changes.map(c => '<p>原：' + esc(hdTradeDescribe(c.before)) + '<br>新：' + esc(hdTradeDescribe(c.after)) + '</p>').join('') + '</div>').join('') : '<p class="hint">还没有人工修改记录。</p>') + '</details></section>';
+}
+function hdTradePaste(r, text, targetId) {
+  const d = hdTradeDraft(r), cells = []; let row = [], cell = '', quoted = false;
+  const input = text.replace(/\r\n?/g, '\n');
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === '"' && (!cell || quoted)) { if (quoted && input[i + 1] === '"') { cell += '"'; i++; } else quoted = !quoted; }
+    else if ((ch === '\t' || ch === '\n') && !quoted) { row.push(cell); cell = ''; if (ch === '\n') { cells.push(row); row = []; } }
+    else cell += ch;
+  }
+  row.push(cell); cells.push(row);
+  const rows = cells.filter(c => c.some(x => x.trim()));
+  if (rows.length && /日期|date/i.test(rows[0][0])) rows.shift();
+  if (quoted || !rows.length || rows.length > 500 || rows.some(c => c.length < 4 || c.length > 5)) { d.errors = ['粘贴内容需为 4～5 列：日期、买卖方向、价格、股数、备注；每次最多 500 行，请检查是否复制了完整区域。']; return; }
+  const parsed = rows.map(c => {
+    const date = c[0].trim().replace(/[/.]/g, '-').replace(/^(\d{4})-(\d{1,2})-(\d{1,2})$/, (_, y, m, day) => y + '-' + m.padStart(2, '0') + '-' + day.padStart(2, '0'));
+    const sideText = c[1].trim().toLowerCase();
+    return { date: date, side: ['买入', '买', 'buy', '证券买入'].includes(sideText) ? 'buy' : ['卖出', '卖', 'sell', '证券卖出'].includes(sideText) ? 'sell' : sideText, price: c[2].trim().replace(/[,，]/g, ''), shares: c[3].trim().replace(/[,，]/g, ''), note: (c[4] || '').trim() };
+  });
+  const target = d.entries.find(t => t.id === targetId);
+  if (target && !hdTradeLedger(r).entries.some(t => t.id === target.id)) d.entries = d.entries.filter(t => t.id !== target.id);
+  parsed.forEach(values => Object.assign(hdTradeAdd(r), values));
+  d.paste = ''; d.pasteOpen = false; d.preview = null; d.errors = [];
+}
+function handleHdLedgerAction(action, el) {
+  const r = hdTradeStock(el.dataset.hd);
+  if (!r) return;
+  if (action === 'hd-ledger-archive') { state.hdArchiveId = r.id; renderView(); return; }
+  if (state.hdForm) { toast('请先完成当前成本修正', '保存或取消成本修正后，再维护成交明细。', 'warn'); return; }
+  const d = hdTradeDraft(r), id = el.dataset.trade;
+  const t = d.entries.find(t => t.id === id);
+  if (action === 'hd-ledger-add') hdTradeAdd(r);
+  else if (action === 'hd-ledger-edit' && t) { if (!d.editing.includes(id)) d.editing.push(id); }
+  else if (action === 'hd-ledger-void' && t) { t.status = 'void'; d.preview = null; }
+  else if (action === 'hd-ledger-undo' && t) { d.entries[d.entries.indexOf(t)] = clone(hdTradeLedger(r).entries.find(o => o.id === id)); d.editing = d.editing.filter(x => x !== id); }
+  else if (action === 'hd-ledger-remove') d.entries = d.entries.filter(t => t.id !== id);
+  else if (action === 'hd-ledger-paste-open') d.pasteOpen = !d.pasteOpen;
+  else if (action === 'hd-ledger-paste') hdTradePaste(r, d.paste);
+  else if (action === 'hd-ledger-preview') hdTradePreview(r, d);
+  else if (action === 'hd-ledger-back') { d.preview = null; d.errors = []; d.duplicatesOk = false; }
+  else if (action === 'hd-ledger-discard') { if (d.discardAsk) delete state.hdTradeDrafts[r.id]; else d.discardAsk = true; }
+  else if (action === 'hd-ledger-keep') d.discardAsk = false;
+  else if (action === 'hd-ledger-save' && hdTradeCommit(r, d)) {
+    if (d.quick) { state.hdView = hdData().length ? d.quickView : 'exited'; hdQuickDone(r, '全部成交已保存，修改前记录已保留', r.shares ? 'reduce' : 'exit'); return; }
+    toast('已保存全部变更', '持股、均价、盈亏及账户数字已重算，修改前的记录保留在「修改留痕」。', 'ok');
+  }
+  renderView(); syncHdHash();
+  if (action === 'hd-ledger-add' || action === 'hd-ledger-edit') {
+    const inputs = document.querySelectorAll('.hd-trade-table [data-field="date"]');
+    if (inputs.length) inputs[inputs.length - 1].focus({ preventScroll: true });
+  }
+}
+
+function hdOpsTab(r) {
+  const open = state.hdForm && String(state.hdForm.id) === String(r.id);
+  const preview = state.hdTradeDrafts[r.id] && state.hdTradeDrafts[r.id].preview;
+  return '<div class="hd-ops-bar">' +
+    [['add', '记买入 / 加仓'], ['reduce', '记卖出 / 减仓'], ['exit', '记全部卖出'], ['cost', '修正成本']].map(([kind, label]) => '<button class="btn sm" data-action="hd-op" data-hd="' + r.id + '" data-kind="' + kind + '"' + (open || preview ? ' disabled' : '') + '>' + label + '</button>').join('') +
+    '<span class="hint">快捷填入下方明细表；可继续追加多笔，一次确认。</span></div>' +
+    (open ? (state.hdForm.confirm && state.hdForm.values ? hdConfirmHtml(r, state.hdForm.kind, state.hdForm.values) : hdFormHtml(r, state.hdForm.kind)) : hdTradeTableHtml(r)) +
+    '<details class="hd-trade-audit"><summary>历史系统提醒（不作为成交参与重算）</summary><div class="timeline">' + r.trades.filter(t => t.side === 'sys').map(t => '<div class="tl-item"><div class="tl-head">' + esc(t.date) + '</div><div class="tl-body">' + esc(t.note) + '</div></div>').join('') + '</div></details>';
+}
+
+function hdRiskTab(r) {
+  const reds = hdReds(r);
+  return '<div class="hd-risk-table"><div class="hd-risk-head"><span>红线</span><span>现在</span><span>阈值</span><span>说人话</span></div>' +
+    reds.map((x) => '<div class="hd-risk-row"><span class="hd-risk-name"><span class="state ' + x.st + '"></span>' + esc(x.name) + '<em>' + esc(x.code) + '</em></span>' +
+      '<span class="mono">' + esc(x.cur) + '</span><span class="dim">' + esc(x.limit) + '</span><span>' + esc(x.plain) + '</span></div>').join('') + '</div>' +
+    '<dl class="kv" style="margin-top:14px">' +
+      '<dt>止盈与仓位计划</dt><dd>止损 ' + r.stop.toFixed(2) + ' · 止盈 ' + r.tp.toFixed(2) + ' · 目标仓位 ' + r.targetPct + '% · 防御期建议 ' + r.suggestPct + '%</dd>' +
+      '<dt>移动止盈档位</dt><dd>' + (r.trail ? esc(r.trail.stage) + ' <span class="hint">' + esc(r.trail.next) + '</span>' : '<span class="dim">这笔没有设移动止盈（短线持有）</span>') + '</dd>' +
+      '<dt>组合口径</dt><dd>当前总仓位 ' + hdTotalShare().toFixed(1) + '% · C2 上限 ' + HD_CAP.total + '% · 防御期软上限 ' + HD_CAP.softCap + '%（沪指 ' + state.hdAccount.index.toFixed(0) + '）</dd>' +
+      '<dt>最近告警</dt><dd>' + (r.alerts ? r.alerts + ' 条 · <button class="btn link xs" data-nav="#/alerts?code=' + r.code + '">去告警日志 ' + icon('arrow', 'sm') + '</button>' : '<span class="dim">暂无告警</span>') + '</dd>' +
+      (r.rules.length ? '<dt>依据的规则</dt><dd>' + r.rules.map((x) => x.id
+        ? '<button class="btn link xs" data-nav="#/system/rules?bucket=all&id=' + x.id + '">' + esc(x.name) + ' ' + esc(x.id) + ' ' + icon('arrow', 'sm') + '</button>'
+        : '<span class="dim">' + esc(x.name) + '（这条是后端口径，没有单独编号）</span>').join(' · ') + '</dd>' : '') +
+    '</dl>' +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') + '<div>四条红线的唯一裁决在后端（<code>GET /api/red_line_check</code>），页面上的颜色只是提前告诉你哪条快碰线了。左侧代号 C1 / C2 / C3 / K139 是系统内部编号，日常不用记。</div></div>';
+}
+
+function hdKlineHtml(r) {
+  return '<section class="hd-kline-panel" id="hd-kline-panel" aria-label="K线与关键价位">' +
+    '<div class="hd-kline-head"><b>K线对照</b><span class="hint">切换标的时同步更新</span></div>' +
+    (r.price == null ? '<div class="cp-scene-empty">暂未取到行情，不绘制K线和均线。请刷新行情，或通过上方链接查看真实盘面。</div>' :
+      candKlineHtml({ stock_code: r.code, stock_name: r.name, trade_date: r.entry, trend: hdTrend(r) }, '建仓日', true)) +
+    '<dl class="hd-kline-prices">' + [['现价', r.price], ['成本', r.cost], ['止损', r.stop], ['止盈', r.tp]].map(([label, value]) =>
+      '<div><dt>' + label + '</dt><dd class="mono">' + (value == null ? '无行情' : value.toFixed(2)) + '</dd></div>').join('') + '</dl>' +
+    '<div class="hd-kline-verdict">' + hdVerdictPill(hdVerdict(r)) + '<p>' + esc(hdConcl(r)) + '</p></div>' +
+  '</section>';
+}
+
+function hdDetailHtml(r) {
+  const tabs = [['concl', '现在怎么办'], ['basis', '判断依据'], ['ops', '买卖记录'], ['risk', '风控与计划']];
+  const body = state.hdTab === 'basis' ? hdBasisTab(r)
+    : state.hdTab === 'ops' ? hdOpsTab(r)
+    : state.hdTab === 'risk' ? hdRiskTab(r) : hdConclTab(r);
+  return '<div class="card">' +
+    '<div class="detail-head">' +
+      '<div style="min-width:0">' +
+        '<div class="detail-title">' + esc(r.name) + ' <span class="mono dim">' + r.code + '</span> ' + tag(r.source, 'outline') + '</div>' +
+        '<div class="detail-sub">持仓 #' + r.id + ' · 建仓 ' + esc(r.entry) + ' · ' + r.shares + ' 股 · 成本 ' + r.cost.toFixed(2) + '</div>' +
+        '<div class="detail-tags">' + hdVerdictPill(hdVerdict(r)) + ' ' +
+          (hdPnl(r) == null ? tag('无行情', 'mute') : tag(hdMoney(hdPnl(r)) + ' 元', hdPnl(r) >= 0 ? 'red' : 'green')) +
+          (hdRedDot(r) === 'err' ? tag('踩线', 'red') : hdRedDot(r) === 'warn' ? tag('预警', 'gold') : '') + '</div>' +
+      '</div>' +
+      '<div class="spacer"></div>' +
+      '<div class="cp-acts">' +
+        '<button class="btn primary sm" data-action="hd-manual" data-hd="' + r.id + '">' + icon('plus', 'sm') + '手动记买卖</button>' +
+        '<button class="btn sm" data-action="hd-kline" data-hd="' + r.id + '" aria-expanded="' + state.hdKlineOpen + '"' + (state.hdKlineOpen ? ' aria-controls="hd-kline-panel"' : '') + '>' + icon('chart', 'sm') + (state.hdKlineOpen ? '收起K线' : '看K线 · 同屏对照') + '</button>' +
+        '<div class="cp-ext">' + quoteUrls(r.code).map((q) => '<a class="btn link xs" href="' + q.url + '" target="_blank" rel="noopener noreferrer">' + esc(q.name) + ' ' + icon('external', 'sm') + '</a>').join('') + '</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="hd-detail-content' + (state.hdKlineOpen ? ' with-kline' : '') + '">' +
+    (state.hdKlineOpen ? hdKlineHtml(r) : '') + '<div class="hd-context">' +
+    '<div class="detail-tabs">' + tabs.map((t) =>
+      '<button class="detail-tab ' + (state.hdTab === t[0] ? 'active' : '') + '" data-action="hd-tab" data-tab="' + t[0] + '">' + t[1] +
+      (t[0] === 'ops' ? ' ' + tag(String(r.trades.length), 'mute') : '') + '</button>').join('') + '</div>' +
+    '<div class="cp-tab-body">' + (r.historyEdited ? '<div class="hd-warns">成交已更新，以下原 AI 判断与价位计划未自动改写；请核对后重新研判。</div>' : '') + body + '</div></div></div>' +
+  '</div>';
+}
+
+function hdRowHtml(r) {
+  const v = hdVerdict(r);
+  const active = String(state.hdId) === String(r.id);
+  const quick = v === 'exit' ? 'exit' : v === 'reduce' ? 'reduce' : null;
+  const openForm = state.hdForm && String(state.hdForm.id) === String(r.id);
+  const acts = quick && !openForm
+    ? '<span class="rq-acts">' + rqBtn('hd-row-op', 'hd', r.id, v === 'exit' ? '记清仓' : '记减仓', true) + '</span>'
+    : '';
+  const reds = hdReds(r).filter((x) => x.st === 'bad' || x.st === 'todo');
+  return '<div class="cp-row hd-row' + (active ? ' active' : '') + '" role="button" tabindex="0" data-action="hd-select" data-hd="' + r.id + '">' +
+    '<div class="cp-row-top">' +
+      '<span class="hold-dot ' + hdRedDot(r) + '"></span>' +
+      '<span class="cp-name">' + esc(r.name) + ' <span class="mono dim">' + r.code + '</span></span>' +
+      '<span class="spacer"></span>' +
+      '<span class="mono ' + hdPnlCls(hdPnl(r)) + '">' + (hdPnlPct(r) == null ? '—' : hdPct(hdPnlPct(r))) + '</span>' +
+    '</div>' +
+    '<div class="cp-row-reason">' + esc(hdConcl(r)) + '</div>' +
+    '<div class="hd-row-nums">' +
+      '<span>现价 <b class="mono">' + (r.price == null ? '—' : r.price.toFixed(2)) + '</b></span>' +
+      '<span>成本 <b class="mono">' + r.cost.toFixed(2) + '</b></span>' +
+      '<span>止损 <b class="mono ' + (hdStopDist(r) != null && hdStopDist(r) < 3 ? 'wo-down' : '') + '">' + r.stop.toFixed(2) + (hdStopDist(r) == null ? '' : '（距 ' + hdStopDist(r).toFixed(1) + '%）') + '</b></span>' +
+      '<span>占比 <b class="mono">' + hdShare(r).toFixed(1) + '%</b></span>' +
+    '</div>' +
+    (reds.length ? '<div class="hd-row-reds">' + reds.map((x) => tag(x.name + ' · ' + (x.st === 'bad' ? '已踩线' : '预警'), x.st === 'bad' ? 'red' : 'gold')).join(' ') + '</div>' : '') +
+    '<div class="cp-row-foot">' +
+      '<span class="mono dim">' + r.shares + ' 股</span>' +
+      '<span class="dim">' + hdMoney(hdMv(r)) + ' 元</span>' +
+      (r.alerts ? tag(r.alerts + ' 条告警', 'outline') : '') +
+      '<span class="spacer"></span>' + hdVerdictPill(v) + acts +
+    '</div>' +
+  '</div>';
+}
+
+/* ---------- 页面 ---------- */
+const HD_VIEWS = [['todo', '要我处理'], ['all', '全部持仓'], ['exited', '已离场'], ['check', '数据待核对']];
+
+function hdStats() {
+  const todo = hdTodo();
+  const watch = hdData().filter((r) => hdVerdict(r) === 'watch').length;
+  const share = hdTotalShare();
+  const today = hdTodayPnl();
+  return [
+    { label: '总资产', value: (state.hdAccount.total / 10000).toFixed(1) + ' 万', sub: '现金 ' + (hdCash() / 10000).toFixed(1) + ' 万 · 市值 ' + (hdTotalMv() / 10000).toFixed(1) + ' 万', tone: '' },
+    { label: '总仓位', value: share.toFixed(1) + '%', sub: 'C2 上限 60% · 防御期软上限 20%', tone: share > HD_CAP.total ? 'err' : share > HD_CAP.softCap ? 'warn' : 'ok' },
+    { label: '今日盈亏', value: (today >= 0 ? '+' : '-') + hdMoney(Math.abs(Math.round(today))), sub: '浮盈合计 ' + hdMoney(hdData().reduce((s, r) => s + (hdPnl(r) || 0), 0)) + ' 元', tone: today > 0 ? 'up' : today < 0 ? 'down' : '' },
+    { label: '等你处理', value: todo.length + ' 只', sub: watch ? '另有 ' + watch + ' 只到价待确认' : '都是「继续拿」', tone: todo.length ? 'warn' : 'ok' }
+  ];
+}
+
+/* 持仓的计数条：措辞跟着队列语义走，不复用「裁决/采纳/驳回」那套 */
+function hdRqBar(n) {
+  return '<div class="rq-bar">' + (n
+    ? '<b>等你处理 ' + n + ' 只</b><span class="dim">行上直接点「记清仓 / 记减仓」，记完自动跳到下一只，不用进详情；上下键换行</span>'
+    : '<span class="dim">现在没有要你动手的持仓，剩下的是「继续拿」和「到价了」</span>') + '</div>';
+}
+
+function hdSentinelHtml() {
+  return '<div class="hd-sentinel">' +
+    '<div class="hd-sentinel-head">' + icon('shield', 'sm') + '<b>账户风险提醒</b>' +
+      '<span class="hint">帮你看看：股票买得是否太满，资金是否太集中</span>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn xs" data-action="hd-sentinel">' + icon('rotate', 'sm') + '重新检查</button>' +
+      '<button class="btn link xs" data-nav="#/alerts">查看提醒记录 ' + icon('arrow', 'sm') + '</button></div>' +
+    '<div class="hd-sentinel-intro">上面看单只股票，这里汇总整个账户需要注意的地方。建议先看止损提醒，再看总仓位和单只股票占比；只做提醒，不会替你买卖。缺少行情的持仓，请先核对数据。</div>' +
+    hdSentinelItems().map((s) => '<div class="hd-sentinel-item"><span class="state ' + s.level + '"></span>' +
+      '<div><b>' + esc(s.title) + '</b><div class="hd-sentinel-body">' + esc(s.body) + '</div>' +
+      '<span class="hint dim">提醒时间 ' + esc(s.at) + '</span></div>' +
+      '<span class="spacer"></span><button class="btn xs" data-nav="' + s.nav + '">' + esc(s.navLabel) + ' ' + icon('arrow', 'sm') + '</button></div>').join('') +
+  '</div>';
+}
+
+function hdExitedHtml() {
+  const selected = state.hdArchiveId != null ? hdTradeStock(state.hdArchiveId) : null;
+  return '<div class="card">' +
+    '<div class="card-title"><h3>已离场（' + state.exited.length + '）</h3><span class="hint">记录成交后自动归档到这里；盈亏是已实现口径</span></div>' +
+    '<div class="hd-exited">' + state.exited.map((x) =>
+      '<div class="hd-exited-row"><span class="cp-name">' + esc(x.name) + ' <span class="mono dim">' + esc(x.code) + '</span></span>' +
+      '<span class="mono dim">' + esc(x.entry) + ' → ' + esc(x.exit) + '</span>' +
+      '<span class="mono">' + x.shares + ' 股 @ ' + x.out.toFixed(2) + '</span>' +
+      '<span class="mono ' + hdPnlCls(x.realized == null ? x.pnl : x.realized) + '">' + (x.realized == null ? hdPct(x.pnl, 1) : '累计已实现 ' + hdMoney(Number(x.realized.toFixed(2))) + ' 元') + '</span>' +
+      '<button class="btn sm" data-action="hd-ledger-archive" data-hd="' + (x.row ? x.row.id : x.id) + '">维护买卖明细</button>' +
+      '<span class="dim">' + esc(x.note) + '</span>' +
+      '<span class="spacer"></span>' +
+      (x.reviewId ? '<button class="btn link xs" data-nav="#/reviews?id=' + x.reviewId + '">看这笔复盘 ' + icon('arrow', 'sm') + '</button>'
+        : '<button class="btn link xs" data-nav="#/reviews">复盘队列 ' + icon('arrow', 'sm') + '</button>') +
+      '</div>').join('') + '</div>' +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') + '<div>已离场也能补录、修改或作废成交。先预览持股与盈亏变化，再确认；若恢复持股，会重新进入持仓监控。原复盘保留，修改成交不会自动改写已有复盘。</div></div>' +
+    (selected && !hdById(selected.id) ? '<div class="hd-archive-editor">' + hdTradeTableHtml(selected) + '</div>' : '') +
+  '</div>';
+}
+
+/* 抽屉里的三个录入口子：对齐生产 AddHoldingModal / OcrModal / BaselineModal */
+function hdTrend(r) {
+  const n = 12, from = r.cost, to = hdPrice(r), seed = code5(r.code);
+  return Array.from({ length: n }, (_, i) =>
+    Math.round((from + (to - from) * (i / (n - 1)) + Math.sin(i * 1.7 + seed) * from * 0.014) * 100) / 100);
+}
+
+function hdNewFormHtml(v, warns) {
+  const d = Object.assign({ code: '', name: '', date: '2026-11-16', price: '', shares: '', plan: '', stop: '', tp: '', target: '', note: '' }, v || {});
+  const f = (label, id, input) => '<label class="hd-field"><span>' + label + '</span>' + input + '</label>';
+  const num = (label, id, val, attrs) => f(label, id, '<input class="input" id="' + id + '" type="number" ' + (attrs || '') + ' value="' + esc(String(val)) + '">');
+  return '<div class="hd-form in-drawer">' +
+    '<div class="hd-form-title">录入人工建仓 <span class="hint">你已经成交的结果，系统不下单</span></div>' +
+    '<div class="hd-form-grid">' +
+      f('证券代码 *', 'hd-n-code', '<input class="input mono" id="hd-n-code" maxlength="6" placeholder="603501" value="' + esc(d.code) + '">') +
+      f('名称 *', 'hd-n-name', '<input class="input" id="hd-n-name" placeholder="韦尔股份" value="' + esc(d.name) + '">') +
+      f('建仓日期 *', 'hd-n-date', '<input class="input" id="hd-n-date" type="date" value="' + esc(d.date) + '">') +
+      num('成交价 *', 'hd-n-price', d.price, 'step="0.01" placeholder="118.60"') +
+      num('股数 *（100 整数倍）', 'hd-n-shares', d.shares, 'step="100" min="100" placeholder="300"') +
+      f('关联建仓计划号', 'hd-n-plan', '<input class="input mono" id="hd-n-plan" placeholder="812，可留空" value="' + esc(d.plan) + '">') +
+      num('止损位（留空按成本 ×0.92）', 'hd-n-stop', d.stop, 'step="0.01"') +
+      num('止盈位（留空按 +15% 起档）', 'hd-n-tp', d.tp, 'step="0.01"') +
+      num('目标仓位 %', 'hd-n-target', d.target, 'step="1" placeholder="10"') +
+      f('备注', 'hd-n-note', '<input class="input" id="hd-n-note" placeholder="为什么建这一笔" value="' + esc(d.note) + '">') +
+    '</div>' +
+    (warns && warns.length ? '<div class="hd-warns">' + warns.map((w) =>
+      '<div class="hd-warn">' + icon('alert', 'sm') + esc(w) + '</div>').join('') +
+      '<div class="hint">以上是风险提示，不是拦截；确认后照样记录，但会写进留痕。</div></div>' : '') +
+    '<div class="hd-form-acts">' +
+      '<button class="btn sm" data-action="close-drawer">取消</button><span class="spacer"></span>' +
+      (warns && warns.length
+        ? '<button class="btn sm" data-action="hd-new-check">返回改数字</button><button class="btn danger sm" data-action="hd-new-force">仍然记录这一笔</button>'
+        : '<button class="btn primary sm" data-action="hd-new-save">校验并记录</button>') +
+    '</div>' +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') + '<div>记录后立刻按知识库规则算出止损位、移动止盈档位和单票占比；口径与「立即刷新监控」用的是同一套后端规则，不在前端另写一份。</div></div>' +
+  '</div>';
+}
+
+function hdOcrFormHtml() {
+  if (!state.hdOcrDone) {
+    return '<div class="hd-form in-drawer">' +
+      '<div class="hd-form-title">OCR 截图建仓 <span class="hint">入口由后端开关控制</span></div>' +
+      '<label class="hd-field wide"><span>持仓截图</span><input class="input" id="hd-o-file" type="file" accept="image/*"></label>' +
+      '<div class="hd-warns"><div class="hd-warn">' + icon('info', 'sm') + '识别服务（ocrStatus.enabled）没配好时，这个入口整块是灰的；正式端会在打开抽屉时先查一次状态。</div></div>' +
+      '<div class="hd-form-acts"><button class="btn sm" data-action="close-drawer">取消</button><span class="spacer"></span>' +
+        '<button class="btn primary sm" data-action="hd-ocr-run">模拟识别完成</button></div>' +
+      '<div class="cap-note" style="margin-top:12px">' + icon('alert', 'sm') + '<div>识别出来的数字<b>不直接写库</b>。必须在下面这一屏逐行核对，尤其是成本和股数——OCR 把 34.20 认成 31.20 是常事。</div></div>' +
+    '</div>';
+  }
+  return '<div class="hd-form in-drawer">' +
+    '<div class="hd-form-title">识别结果核对 <span class="hint">2 笔 · 逐行确认后才写入</span></div>' +
+    '<div class="hd-ocr-rows">' + state.hdOcrRows.map((o, i) =>
+      '<div class="hd-ocr-row">' +
+        '<span class="cp-name">' + esc(o.name) + ' <span class="mono dim">' + o.code + '</span></span>' +
+        '<label class="hd-field"><span>成交价</span><input class="input mono" id="hd-o-p-' + i + '" type="number" step="0.01" value="' + o.price.toFixed(2) + '"></label>' +
+        '<label class="hd-field"><span>股数</span><input class="input mono" id="hd-o-s-' + i + '" type="number" step="100" value="' + o.shares + '"></label>' +
+        '<span class="hint">' + esc(o.note) + '</span>' +
+      '</div>').join('') + '</div>' +
+    '<div class="hd-form-acts"><button class="btn sm" data-action="close-drawer">取消</button><span class="spacer"></span>' +
+      '<button class="btn sm" data-action="hd-ocr-run">重新识别</button>' +
+      '<button class="btn primary sm" data-action="hd-ocr-save">核对无误，录入 ' + state.hdOcrRows.length + ' 笔</button></div>' +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') + '<div>同一只票同一天重复录入会被自动去重，只保留一条「当前有效」，其余标成「重复录入（已自动忽略）」——在详情「买卖记录」的建仓笔次表里能看到。</div></div>' +
+  '</div>';
+}
+
+function hdBaselineFormHtml(v) {
+  const d = Object.assign({ total: state.hdAccount.total, cash: state.hdAccount.cash }, v || {});
+  return '<div class="hd-form in-drawer">' +
+    '<div class="hd-form-title">账户基线 <span class="hint">总资产和现金决定总仓位口径</span></div>' +
+    '<div class="hd-form-grid">' +
+      '<label class="hd-field"><span>总资产（元）*</span><input class="input mono" id="hd-b-total" type="number" step="100" value="' + d.total + '"></label>' +
+      '<label class="hd-field"><span>可用现金（元）*</span><input class="input mono" id="hd-b-cash" type="number" step="100" value="' + d.cash + '"></label>' +
+    '</div>' +
+    '<dl class="kv" style="margin-top:12px">' +
+      '<dt>当前持仓市值</dt><dd class="mono">' + hdMoney(hdTotalMv()) + ' 元</dd>' +
+      '<dt>当前总仓位</dt><dd class="mono">' + hdTotalShare().toFixed(1) + '%　<span class="hint">C2 上限 ' + HD_CAP.total + '%</span></dd>' +
+      '<dt>沪指</dt><dd class="mono">' + state.hdAccount.index.toFixed(2) + '　<span class="hint">' +
+        (state.hdAccount.index < HD_CAP.indexBar ? '低于 ' + HD_CAP.indexBar + '，防御期软上限 ' + HD_CAP.softCap + '%' : '高于 ' + HD_CAP.indexBar + '，非防御期') + '</span></dd>' +
+    '</dl>' +
+    '<div class="hd-form-acts"><button class="btn sm" data-action="close-drawer">取消</button><span class="spacer"></span>' +
+      '<button class="btn primary sm" data-action="hd-baseline-save">保存并重算仓位</button></div>' +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') + '<div>总资产改小，单票占比和总仓位会立刻顶上来；这一屏下面的数字保存后会全部重算，包括左侧每只票的结论。</div></div>' +
+  '</div>';
+}
+
+function hdReadNew() {
+  const g = (id) => { const el = $('#' + id); return el ? String(el.value).trim() : ''; };
+  const v = { code: g('hd-n-code'), name: g('hd-n-name'), date: g('hd-n-date'), price: g('hd-n-price'), shares: g('hd-n-shares'), plan: g('hd-n-plan'), stop: g('hd-n-stop'), tp: g('hd-n-tp'), target: g('hd-n-target'), note: g('hd-n-note') };
+  const err = (t, b, focus) => { toast(t, b, 'warn'); if (focus) { const el = $('#' + focus); if (el) el.focus(); } return null; };
+  if (!/^\d{6}$/.test(v.code)) return err('代码要 6 位数字', '例如 603501。带市场的后缀在这里不用填，前缀由系统按代码段判断。', 'hd-n-code');
+  if (!v.name) return err('名称要填', '列表和结论都用名称，光有代码看不下去。', 'hd-n-name');
+  const price = parseFloat(v.price), shares = parseInt(v.shares, 10);
+  if (!(price > 0)) return err('成交价要填正数', '按你实际成交的价格填，不是当前的市场价。', 'hd-n-price');
+  if (!(shares > 0)) return err('股数要填', '一手 100 股。', 'hd-n-shares');
+  if (shares % 100 !== 0) return err('股数必须是 100 的整数倍', '你填的是 ' + shares + ' 股。', 'hd-n-shares');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v.date)) return err('建仓日期格式不对', '要 YYYY-MM-DD。', 'hd-n-date');
+  if (state.holdings.some((r) => r.code === v.code)) {
+    return err('这只票已经在持仓里了', '同一只票再加仓位，请用详情里的「加仓」——那样才会重算加权成本。', null);
+  }
+  v.price_n = price; v.shares_n = shares;
+  v.warns = hdNewWarns(v);
+  return v;
+}
+
+function hdNewWarns(v) {
+  const total = state.hdAccount.total || 1;
+  const share = v.shares_n * v.price_n / total * 100;
+  const rest = (hdTotalMv() + v.shares_n * v.price_n) / total * 100;
+  const out = [];
+  if (share > HD_CAP.gradeA) out.push('这一笔单票仓位将达 ' + share.toFixed(1) + '%，超过 A 级上限 ' + HD_CAP.gradeA + '%（硬顶 ' + HD_CAP.total + '%）');
+  if (rest > HD_CAP.total) out.push('做完之后总仓位将达 ' + rest.toFixed(1) + '%，超过 C2 上限 ' + HD_CAP.total + '%');
+  if (state.hdAccount.index < HD_CAP.indexBar && rest > HD_CAP.softCap) {
+    out.push('现在是防御期（沪指 ' + state.hdAccount.index.toFixed(0) + ' < ' + HD_CAP.indexBar + '），总仓位软上限只有 ' + HD_CAP.softCap + '%，做完之后是 ' + rest.toFixed(1) + '%');
+  }
+  return out;
+}
+
+/* 只写数据、不动界面：人工建仓和 OCR 批量录入共用 */
+function hdBuildRow(v) {
+  const cost = v.price_n;
+  const stop = v.stop ? parseFloat(v.stop) : Math.round(cost * HD_CAP.c3 * 100) / 100;
+  const tp = v.tp ? parseFloat(v.tp) : Math.round(cost * 1.15 * 100) / 100;
+  const id = state.holdings.concat(state.exited.map(x => x.row || x)).reduce((m, r) => Math.max(m, Number(r.id) || 0), 2000) + 1;
+  const pct = v.target ? parseInt(v.target, 10) : 10;
+  state.holdings.push({
+    id: id, code: v.code, name: v.name, source: v.source || '人工录入', entry: v.date,
+    shares: v.shares_n, cost: cost, price: cost, today: 0, dd: 0,
+    stop: stop, tp: tp, targetPct: pct, suggestPct: pct,
+    trail: { stage: '第一档（+15%）未到', hit: false, next: '涨到 ' + tp.toFixed(2) + ' 上移止盈' },
+    plan: v.plan ? { id: Number(v.plan) || v.plan, batch: v.date } : null,
+    alerts: 0, rules: [{ name: 'C3 止损红线：成本 ×0.92' }],
+    concls: {}, scenes: null, decision: null, decisions: [],
+    trades: [{ side: 'buy', shares: v.shares_n, price: cost, date: v.date, note: v.note || '人工录入建仓' }],
+    records: [{ date: v.date, price: cost, shares: v.shares_n, created: '2026-11-16 人工录入', status: '当前有效' }]
+  });
+  state.hdAccount.cash = Math.max(0, hdCash() - cost * v.shares_n);
+  return { id: id, stop: stop, tp: tp };
+}
+
+function hdCommitNew(v) {
+  const made = hdBuildRow(v);
+  state.hdId = made.id;
+  state.hdView = 'all';
+  state.hdTab = 'concl';
+  state.hdNewPending = null;
+  closeDrawer();
+  renderView();
+  syncHdHash();
+  toast('已录入建仓', v.name + '（' + v.code + '）' + v.shares_n + ' 股 @ ' + v.price_n.toFixed(2) + '，止损位 ' + made.stop.toFixed(2) + '、第一档止盈 ' + made.tp.toFixed(2) + ' 已按规则算好。已留痕。', 'ok');
+}
+
+function hdOcrCommit() {
+  const rows = state.hdOcrRows.map((o, i) => {
+    const pEl = $('#hd-o-p-' + i), sEl = $('#hd-o-s-' + i);
+    return { code: o.code, name: o.name, price: pEl ? parseFloat(pEl.value) : o.price, shares: sEl ? parseInt(sEl.value, 10) : o.shares, note: o.note };
+  });
+  const bad = rows.find((r) => !(r.price > 0) || !(r.shares > 0) || r.shares % 100 !== 0);
+  if (bad) { toast('这一行数字不对', bad.name + '（' + bad.code + '）的成交价或股数没填对，股数还要是 100 的整数倍。', 'warn'); return; }
+  const dup = rows.find((r) => state.holdings.some((h) => h.code === r.code));
+  if (dup) { toast('这只已经在持仓里了', dup.name + '（' + dup.code + '）已有持仓，OCR 不重复建仓。这一行请删掉，或改用详情里的「加仓」。', 'warn'); return; }
+  const made = rows.map((r) => hdBuildRow({
+    code: r.code, name: r.name, date: '2026-11-16', price_n: r.price, shares_n: r.shares, source: 'OCR 截图',
+    plan: '', stop: '', tp: '', target: '', note: 'OCR 截图建仓：' + r.note
+  }));
+  state.hdOcrDone = false;
+  state.hdOcrRows = null;
+  state.hdId = made[0].id;
+  state.hdView = 'all';
+  closeDrawer();
+  renderView();
+  syncHdHash();
+  toast('OCR 结果已录入', rows.length + ' 笔写入：' + rows.map((r) => r.name).join('、') + '。识别原图与核对后的数字都留痕，可回查。', 'ok');
+}
+
+function renderHoldings() {
+  hdData();
+  const rows = hdVisible();
+  const sel = rows.find((r) => String(r.id) === String(state.hdId)) || rows[0] || hdData()[0];
+  if (sel) state.hdId = sel.id;
+  const views = HD_VIEWS.map((v) => {
+    const n = v[0] === 'todo' ? hdTodo().length
+      : v[0] === 'all' ? hdData().length
+      : v[0] === 'exited' ? state.exited.length
+      : hdData().filter((r) => hdVerdict(r) === 'info').length;
+    return '<button class="cp-chip ' + (state.hdView === v[0] ? 'active' : '') + '" data-action="hd-view" data-view="' + v[0] + '">' + v[1] + ' <span class="mono dim">' + n + '</span></button>';
+  }).join('');
+
+  const head = '<div class="page-head"><div>' +
+      '<div class="page-title">持仓监控</div>' +
+      '<div class="page-sub">手上的票现在该怎么办：结论、动手价位、就地记录成交。行情约 60 秒缓存，红线约 5 分钟一轮。</div>' +
+    '</div>' +
+    '<div class="page-actions">' +
+      '<button class="btn sm" data-action="hd-refresh">' + icon('rotate', 'sm') + '立即刷新监控</button>' +
+      '<button class="btn sm" data-action="hd-add">' + icon('plus', 'sm') + '录入人工建仓</button>' +
+      '<button class="btn sm" data-action="hd-ocr">' + icon('download', 'sm') + 'OCR 截图建仓</button>' +
+      '<button class="btn sm" data-action="hd-baseline">' + icon('sliders', 'sm') + '账户基线</button>' +
+    '</div></div>';
+
+  const list = state.hdView === 'exited'
+    ? hdExitedHtml()
+    : '<div class="cp-layout' + (state.hdKlineOpen ? ' hd-compare' : '') + '">' +
+        '<div class="card cp-list-card">' + hdRqBar(hdTodo().length) +
+          '<div class="cp-list" id="hd-list">' + (rows.length ? rows.map(hdRowHtml).join('') : '<div class="wo-empty" style="padding:14px">这个视图下没有持仓。</div>') + '</div>' +
+          '<div class="hd-list-foot"><span class="hint">共 ' + rows.length + ' 只 · 按「要不要动手」排序，同档按单票占比从高到低</span>' +
+            '<span class="spacer"></span><span class="hint dim">行情 ' + esc(state.hdAccount.quoteTime) + '</span>' +
+            '<button class="btn link xs" data-action="hd-refresh">刷新行情</button></div>' +
+        '</div>' +
+        '<div class="cp-detail" id="hd-detail">' + (sel ? hdDetailHtml(sel) : '<div class="card"><div class="wo-empty" style="padding:20px">没有可选持仓。</div></div>') + '</div>' +
+      '</div>' + hdSentinelHtml();
+
+  return head +
+    '<div class="cp-toolbar"><div class="cp-chips">' + views + '</div>' +
+      '<span class="hint">操作都在行上和详情里就地完成；这一页不做买卖，只记录你已经成交的结果。</span></div>' +
+    '<div class="metric-strip q4" style="margin-bottom:14px">' + hdStats().map((s) =>
+      '<div class="metric"><div class="metric-label">' + esc(s.label) + '</div><div class="metric-value ' + s.tone + '">' + esc(s.value) + '</div><div class="metric-sub">' + esc(s.sub) + '</div></div>').join('') + '</div>' +
+    list +
+    '<div class="cap-note" style="margin-top:14px">' + icon('info') + '<div>闭环：候选池建仓 → 这里盯与记 → 清仓自动进复盘 → 复盘出的建议进闭环队列 → 通过后变成经验与规则。红线口径全部来自后端，页面只负责让你先看见。</div></div>';
+}
+
+function syncHdHash() {
+  if (state.route !== '#/holdings') return;
+  let next = '#/holdings?view=' + state.hdView + '&id=' + state.hdId;
+  if (state.hdTab !== 'concl') next += '&tab=' + state.hdTab;
+  if (location.hash !== next) history.replaceState(null, '', next);
+}
+/* 就地记录之后的收尾：结论没变就留在这一只，变了才跳下一只要处理的 */
+function hdQuickDone(r, msg, kind) {
+  const rest = hdTodo();
+  const still = rest.some((x) => String(x.id) === String(r.id));
+  const next = still ? null : (rest[0] || null);
+  if (next) {
+    state.hdId = Number(next.id);
+    state.hdTab = 'concl';
+  }
+  renderView();
+  if (next) {
+    const el = document.querySelector('.hd-row[data-hd="' + next.id + '"]');
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+  const tail = still
+    ? ' · 这一只的结论还是「' + HD_VERDICT[hdVerdict(r)].label + '」，没处理完就留在这里，接着记' + (kind === 'cost' ? '减仓' : '对应的成交')
+    : next
+      ? ' · 下一只要处理：' + next.name + '（' + HD_VERDICT[hdVerdict(next)].label + '）'
+      : (kind === 'exit' ? ' · 现在没有要你动手的持仓了，剩下的是「继续拿」和「到价了」' : ' · 要处理的都做完了');
+  toast(kind === 'exit' ? '已记录清仓' : kind === 'cost' ? '成本已修正' : '已记录成交', msg + tail, 'ok');
+  syncHdHash();
+}
+
+/* ---------- 持仓监控：动作分派 ---------- */
+function hdOpenForm(id, kind, quick) {
+  const r = hdById(id);
+  if (!r) { toast('这只已离场', '请在「已离场」中维护历史成交。', 'info'); return; }
+  if (kind !== 'cost') {
+    if (state.hdForm) { toast('请先完成当前成本修正', '保存或取消后再记买卖。', 'warn'); return; }
+    const d = hdTradeDraft(r);
+    if (quick) { d.quick = true; d.quickView = state.hdView; }
+    if (!d.preview && kind === 'exit') {
+      const entries = d.entries.map(t => t.side === 'adjust' ? t : Object.assign({}, t, { price: Number(t.price), shares: Number(t.shares), order: Number(t.order) }));
+      const replay = hdTradeReplay(entries);
+      if (entries.some(t => t.status !== 'void' && t.side !== 'adjust' && (!hdTradeDate(t.date) || !['buy', 'sell'].includes(t.side) || !(t.price > 0) || !Number.isSafeInteger(t.shares) || t.shares <= 0)) || replay.errors.length || !replay.shares) { toast('请先核对已有明细', '补齐或移除未填完整的行，再按草稿剩余股数记全部卖出。', 'warn'); return; }
+      hdTradeAdd(r, kind).shares = replay.shares;
+    } else if (!d.preview) hdTradeAdd(r, kind);
+    state.hdId = r.id; state.hdTab = 'ops'; renderView(); syncHdHash();
+    return;
+  }
+  if (state.hdTradeDrafts[r.id]) { toast('请先处理成交草稿', '保存或放弃草稿后再修正成本，避免两份改动互相覆盖。', 'warn'); return; }
+  const same = state.hdForm && String(state.hdForm.id) === String(r.id) && state.hdForm.kind === kind;
+  state.hdId = Number(r.id);
+  state.hdTab = 'ops';
+  state.hdForm = same ? null : { id: Number(r.id), kind: kind, quick: !!quick, confirm: false, values: null };
+  renderView();
+  syncHdHash();
+  if (!same) {
+    const f = $('#hd-f-shares') || $('#hd-f-price') || $('#hd-f-cost');
+    if (f) f.focus();
+  }
+}
+
+/* 「记录成交」按钮按结论决定先给你哪一个口子 */
+function hdEnterKind(r) {
+  const v = hdVerdict(r);
+  if (v === 'exit') return 'exit';
+  if (v === 'reduce' || v === 'watch') return 'reduce';
+  if (v === 'info') return 'cost';
+  return 'add';
+}
+
+function handleHdAction(action, el) {
+  if (action.indexOf('hd-ledger-') === 0) { handleHdLedgerAction(action, el); return; }
+  if (action === 'hd-form-keep') return;
+  const kind = el.dataset.kind;
+  const r = el.dataset.hd ? hdById(el.dataset.hd) : null;
+
+  if (action === 'hd-view') {
+    state.hdView = el.dataset.view;
+    state.hdForm = null;
+    renderView();
+    syncHdHash();
+  } else if (action === 'hd-select') {
+    if (!r) return;
+    state.hdId = Number(r.id);
+    renderView();
+    syncHdHash();
+  } else if (action === 'hd-tab' || action === 'hd-jump-tab') {
+    const tab = el.dataset.tab;
+    if (['concl', 'basis', 'ops', 'risk'].indexOf(tab) < 0) return;
+    state.hdTab = tab;
+    renderView();
+    syncHdHash();
+    if (action === 'hd-jump-tab') {
+      const row = r || hdById(state.hdId);
+      if (row) hdOpenForm(row.id, hdEnterKind(row));
+    }
+  } else if (action === 'hd-hist-toggle') {
+    state.hdHistOpen = !state.hdHistOpen;
+    renderView();
+  } else if (action === 'hd-kline') {
+    if (!r) return;
+    state.hdKlineOpen = !state.hdKlineOpen;
+    renderView();
+    $('#hd-detail [data-action="hd-kline"]').focus({ preventScroll: true });
+    $('#hd-detail').scrollIntoView({ block: 'start' });
+  } else if (action === 'hd-manual') {
+    state.hdTab = 'ops';
+    renderView();
+    syncHdHash();
+    $('#hd-detail .hd-ops-bar').scrollIntoView({ block: 'nearest' });
+  } else if (action === 'hd-refresh') {
+    state.hdAccount.quoteTime = '2026-11-16 15:12:30';
+    renderView();
+    toast('监控已跑完一轮', 'monitor_all 已对 ' + state.holdings.length + ' 只持仓逐个取行情、重算红线。行情约 60 秒缓存，红线约 5 分钟一轮；数字没变就不写库，只更新「最后更新」时间。', 'info');
+  } else if (action === 'hd-sentinel') {
+    const items = hdSentinelItems();
+    renderView();
+    const count = items.filter((x) => x.level !== 'done').length;
+    toast('账户检查已更新', count ? '按当前页面数据，有 ' + count + ' 类情况需要留意，可查看对应的持仓详情。这里只更新提示，不会自动买卖。' : '按当前页面数据，暂未发现超限提醒。可继续按原计划关注。', items.some((x) => x.level === 'bad') ? 'err' : count ? 'warn' : 'ok');
+  } else if (action === 'hd-decision') {
+    if (!r) return;
+    if (r.price == null) { toast('没有行情，不生成决策', r.name + ' 取不到现价。决策要现价、止损位和当日回撤，缺一样就不算——先刷新行情。', 'warn'); return; }
+    r.decision = { running: true, action: 'hold', conf: null, at: '2026-11-16 15:13' };
+    state.hdId = Number(r.id);
+    state.hdTab = 'basis';
+    renderView();
+    syncHdHash();
+    toast('卖出决策任务已提交', 'sell_decision 在后台跑，完成后回到这一页替换成结论。决策只是参考，卖出一刀必须由你人工下。', 'run');
+  } else if (action === 'hd-row-op') {
+    if (r) hdOpenForm(r.id, hdVerdict(r) === 'exit' ? 'exit' : 'reduce', true);
+  } else if (action === 'hd-op') {
+    if (r && HD_OPS[kind]) hdOpenForm(r.id, kind);
+  } else if (action === 'hd-op-ok') {
+    if (!r || !HD_OPS[kind]) return;
+    const v = hdReadForm(r, kind);
+    if (!v) return;
+    state.hdForm = Object.assign({}, state.hdForm, { confirm: true, values: v });
+    renderView();
+    const box = document.querySelector('#hd-detail .inline-confirm');
+    if (box) box.scrollIntoView({ block: 'nearest' });
+  } else if (action === 'hd-op-confirm') {
+    if (!r || !state.hdForm || !state.hdForm.values) return;
+    const v = state.hdForm.values;
+    const quick = state.hdForm.quick;
+    state.hdForm = null;
+    const msg = hdApplyOp(r, kind, v);
+    if (quick || !hdById(r.id)) hdQuickDone(r, msg, kind);
+    else { renderView(); syncHdHash(); toast('已记录', msg + '，已更新下方买卖记录。', 'ok'); }
+  } else if (action === 'hd-op-cancel') {
+    if (state.hdForm && state.hdForm.confirm) {
+      state.hdForm = Object.assign({}, state.hdForm, { confirm: false, values: null });
+    } else {
+      state.hdForm = null;
+    }
+    renderView();
+  } else if (action === 'hd-add') {
+    state.hdNewPending = null;
+    openDrawer('hd-new', {});
+  } else if (action === 'hd-new-save') {
+    const v = hdReadNew();
+    if (!v) return;
+    if (v.warns.length) {
+      state.hdNewPending = { v: v, warns: v.warns };
+      openDrawer('hd-new', v);
+      toast('先看一下风险', '这几条不拦你，但会立刻影响明天的红线判定；确认后可以照样记。', 'warn');
+      return;
+    }
+    hdCommitNew(v);
+  } else if (action === 'hd-new-check') {
+    const p = state.hdNewPending;
+    state.hdNewPending = null;
+    openDrawer('hd-new', p ? p.v : {});
+  } else if (action === 'hd-new-force') {
+    const p = state.hdNewPending;
+    if (p) hdCommitNew(p.v);
+  } else if (action === 'hd-ocr') {
+    state.hdOcrDone = false;
+    state.hdOcrRows = null;
+    openDrawer('hd-ocr');
+  } else if (action === 'hd-ocr-run') {
+    state.hdOcrDone = true;
+    state.hdOcrRows = [
+      { code: '000063', name: '中兴通讯', price: 38.60, shares: 500, note: '识别置信度 0.94 · 成本列取的是持仓均价' },
+      { code: '688111', name: '金山办公', price: 285.40, shares: 100, note: '识别置信度 0.71 · 小数点容易被吃掉，重点核对这一行' }
+    ];
+    openDrawer('hd-ocr');
+  } else if (action === 'hd-ocr-save') {
+    if (state.hdOcrRows) hdOcrCommit();
+  } else if (action === 'hd-baseline') {
+    openDrawer('hd-baseline');
+  } else if (action === 'hd-baseline-save') {
+    const tEl = $('#hd-b-total'), cEl = $('#hd-b-cash');
+    const total = tEl ? parseFloat(tEl.value) : NaN;
+    const cash = cEl ? parseFloat(cEl.value) : NaN;
+    if (!(total > 0)) { toast('总资产要填正数', '总资产是单票占比与总仓位的分母，空着或 0 就没法算红线。', 'warn'); return; }
+    if (cash < 0 || cash > total) { toast('可用现金不在总资产里', '现金要在 0 ～ 总资产之间：现在总资产 ' + hdMoney(total) + ' 元。', 'warn'); return; }
+    const before = hdTotalShare();
+    const mv = hdTotalMv();
+    const gap = Math.round(total - cash - mv);
+    state.hdAccount.total = total;
+    state.hdAccount.cash = cash;
+    closeDrawer();
+    renderView();
+    const after = hdTotalShare();
+    toast('账户基线已更新', '总仓位由 ' + before.toFixed(1) + '% 重算为 ' + after.toFixed(1) + '%（C2 上限 ' + HD_CAP.total + '%）。每只票的结论、单票占比和组合哨兵都跟着重算了。' +
+      (Math.abs(gap) > total * 0.01
+        ? '另外：总资产 ' + hdMoney(total) + ' 减现金 ' + hdMoney(cash) + ' 和持仓市值 ' + hdMoney(mv) + ' 差 ' + hdMoney(gap) + ' 元，已按你填的券商数字保存，差额以「其他资产」理解，不影响红线计算。'
+        : ''),
+      after > HD_CAP.total ? 'err' : 'ok');
+  } else {
+    toast('这个按钮还没接线', action + ' 没有对应的处理逻辑：原型里点到就说明漏了，这一轮补上。', 'warn');
+  }
+}
+
+/* ---------- AI 模拟操盘：与真实持仓完全隔离的 paper 账本 ---------- */
+/* 成交约束口径取自后端 paper_execution.py，改数值等于改模拟盘行为，这里只做展示对齐 */
+const PP_RULES = {
+  lot: 100, commissionRate: 0.0003, commissionMin: 5, stampRate: 0.0005, transferRate: 0.00001,
+  slipBps: 5, lotTolerance: 0.05, freshMinutes: 10, monitorMinutes: 5,
+  addTriggerPct: 3, firstTakePct: 8, mainTakePct: 15, hardStopPct: -8, trailStopPct: 5,
+  firstReduceRatio: 0.30, firstAllocationPct: 10, addAllocationPct: 10, maxAllocationPct: 20
+};
+
+/* 键名与后端 labels / reject_reason 一致，原型不另造一套词 */
+const PP_LABELS = {
+  buy: '买入', sell: '卖出', add: '加仓', reduce: '减仓', exit: '清仓', hold: '继续持有',
+  partial: '部分减仓', filled: '已成交', rejected: '已拒绝', skipped: '本轮跳过', pending: '待处理',
+  ok: '已获取', error: '获取失败', unavailable: '行情暂缺', stale: '行情已过期',
+  partial_or_unavailable: '行情不完整', no_data: '暂无数据',
+  active: '运行中', paused: '已暂停', archived: '已归档',
+  live_paper: '实时模拟', historical_replay: '历史回放', historical_snapshot: '历史冻结快照',
+  tencent: '腾讯行情', eastmoney_batch: '东财批量行情', spot_quote: '单股行情', mixed: '多来源', none: '暂无来源',
+  info: '常规关注', warning: '风险提醒', critical: '紧急风险',
+  research: '研究取证', monitor: '监控信号 + 卖出研判', position_action: 'AI 持仓动作',
+  candidate_pool: '候选池自主加减仓', current_gate: '现有门禁链路',
+  get_quote: '实时行情', get_daily_kline: '日K线', get_news: '新闻公告', get_financial: '财务指标',
+  get_fund_flow: '资金流向', search_knowledge: '知识库检索', get_sector_regime: '板块环境',
+  get_position_risk: '持仓风险', 'paper_web.search': '联网检索',
+  limit_up: '涨停无法买入', limit_down: '跌停无法卖出', suspended: '标的停牌', price_missing: '价格缺失',
+  future_data: '资料晚于决策时点', not_tradeable: '未通过可建仓验证', already_holding: '已有模拟持仓',
+  plan_or_price_missing: '建仓计划或价格缺失', cash_or_plan_position_too_small: '资金或计划仓位不足一手',
+  t_plus_one_or_no_lot: '当日买入不可卖出，或可卖数量不足一手', no_position: '没有对应模拟持仓',
+  ai_add_blocked_cash_or_lot: '加仓换算后不足一手或现金不够', single_stock_target_reached: '单票目标仓位已用满',
+  ai_reduce_unavailable_or_invalid: '可卖不足一手，或模型未给出减仓比例',
+  ai_reduce_below_one_lot: '减仓换算后不足一手', llm_unavailable: 'AI 研判暂不可用',
+  opened: '建仓后持有', added: '已加仓', trailing_protection: '止盈保护', hard_stop_loss: '硬止损触发',
+  main_take_profit: '主止盈触发', control_hold: '按计划观察', ai_add: 'AI 判定加仓',
+  ai_reduce: 'AI 判定减仓', ai_exit: 'AI 判定清仓',
+  pending: '待AI审核', pass: 'AI审核通过', fail: 'AI审核未通过'
+};
+/* 影子验证用独立词表：active / pending 在账户与审核状态里另有含义，混用会显示成「运行中」「待AI审核」 */
+const PP_SHADOW_LABELS = { not_started: '影子验证未进入', pending: '影子验证待启动', active: '影子验证中', blocked: '影子验证被拦截' };
+function ppShadowLabel(value) { return PP_SHADOW_LABELS[String(value)] || '影子验证状态未记录'; }
+function ppLabel(value, fallback) {
+  if (value == null || value === '') return fallback || '暂未记录';
+  return PP_LABELS[String(value)] || String(value);
+}
+
+const PP_TABS = [
+  ['positions', '模拟持仓'], ['executions', '模拟流水'], ['contexts', '研究取证'],
+  ['alerts', '模拟告警'], ['reviews', '模拟复盘']
+];
+
+/* 每一格是一次可核验的行情快照；null 表示本轮没取到价，可用上一轮价回填成参考行情 */
+const PP_ACCOUNT_SEED = [
+  {
+    id: 901, name: '候选池自主加仓 · 11月', status: 'active', variant: 'candidate_pool',
+    mode: 'live_paper', quoteSource: 'tencent', initialCash: 300000, createdAt: '2026-11-05',
+    model: 'action-v1 / qwen-max', ruleVersion: 'paper-execution-v1', cursor: 2,
+    schedule: { every: 5, window: '交易日 09:30-11:30 / 13:00-15:00', next: '2026-11-17 09:33' },
+    slots: [
+      { d: '2026-11-13', t: '10:35' }, { d: '2026-11-13', t: '13:40' }, { d: '2026-11-16', t: '09:35' },
+      { d: '2026-11-16', t: '10:20' }, { d: '2026-11-16', t: '13:30' }, { d: '2026-11-16', t: '14:55' },
+      { d: '2026-11-16', t: '15:00' }
+    ],
+    universe: {
+      '603501': { name: '韦尔股份', prevClose: 119.90, series: [114.60, 116.20, 121.40, 123.00, 122.20, 124.60, 125.10] },
+      '002049': { name: '紫光国微', prevClose: 69.30, series: [{ p: 76.20, limitUp: true }, 78.90, 80.60, null, 81.90, 79.80, 80.20] },
+      '300750': { name: '宁德时代', prevClose: 213.40, series: [214.80, 216.30, 219.50, 221.20, 218.40, 216.90, 217.50] },
+      '688041': { name: '海光信息', prevClose: 57.30, limitPct: 20, series: [57.90, 58.40, 59.60, 61.20, 60.40, { p: null, ref: false }, 62.30] },
+      '601012': { name: '隆基绿能', prevClose: 18.70, series: [18.90, 18.95, 19.00, 19.05, 18.85, 19.20, 19.10] },
+      '601138': { name: '工业富联', prevClose: 23.60, series: [23.90, 24.10, 24.30, 24.60, { p: 25.96, limitUp: true }, 25.40, 25.60] },
+      '600584': { name: '长电科技', prevClose: 41.20, series: [41.40, 41.80, 42.10, 42.60, 43.10, 42.80, 43.20] },
+      '002371': { name: '北方华创', prevClose: 412.00, series: [415.20, 418.60, 421.00, 424.50, 419.80, 427.30, 430.10] }
+    },
+    seeds: [
+      { d: '2026-11-05', t: '09:41', code: '601012', side: 'buy', price: 18.60, shares: 1000, status: 'filled', planId: 805, scoreId: 5410, candidateId: 'C-1104-601012', intent: '首仓 10%', note: '候选 11-04 批次评分 76，成交额闸门通过' },
+      { d: '2026-11-09', t: '09:36', code: '603501', side: 'buy', price: 112.40, shares: 200, status: 'filled', planId: 812, scoreId: 5455, candidateId: 'C-1106-603501', intent: '首仓 10%' },
+      { d: '2026-11-09', t: '10:05', code: '002049', side: 'buy', price: 76.80, shares: 300, status: 'filled', planId: 815, scoreId: 5461, candidateId: 'C-1106-002049', intent: '首仓 10%' },
+      { d: '2026-11-10', t: '09:38', code: '300750', side: 'buy', price: 209.60, shares: 200, status: 'filled', planId: 818, scoreId: 5468, candidateId: 'C-1109-300750', intent: '首仓 10%' },
+      { d: '2026-11-12', t: '09:44', code: '688041', side: 'buy', price: 55.80, shares: 500, status: 'filled', planId: 826, scoreId: 5489, candidateId: 'C-1111-688041', intent: '首仓 10%' },
+      { d: '2026-11-13', t: '10:35', code: '002049', side: 'buy', price: 76.20, shares: 0, status: 'rejected', reason: 'limit_up', intent: '加仓 10%', contextId: 5105 },
+      { d: '2026-11-13', t: '13:44', code: '300750', side: 'sell', price: 216.30, shares: 200, status: 'filled', intent: 'AI 判定清仓', contextId: 5102, note: '模型给出 exit，代码只按可卖 200 股换算' },
+      { d: '2026-11-16', t: '09:31', code: '688041', side: 'sell', price: 59.40, shares: 100, status: 'filled', intent: 'AI 减仓 30%', contextId: 5103 },
+      { d: '2026-11-16', t: '09:34', code: '600584', side: 'buy', price: 42.10, shares: 0, status: 'rejected', reason: 'not_tradeable', intent: '首仓 10%', contextId: 5104, note: '候选成交额 3.2 亿，低于 5 亿闸门（RC-1051）' },
+      { d: '2026-11-16', t: '09:35', code: '603501', side: 'buy', price: 120.10, shares: 200, status: 'filled', intent: 'AI 加仓 10%', contextId: 5101 },
+      { d: '2026-11-16', t: '09:36', code: '600584', side: 'sell', price: 42.10, shares: 0, status: 'rejected', reason: 'no_position', intent: 'AI 减仓 30%', note: '建仓被拒后队列仍挂着卖出意图；代码不猜持仓，直接拒绝留痕' }
+    ],
+    plans: {
+      '603501': { planId: 812, phase: 'added', addCount: 1, allocatedPct: 20, theme: '半导体 CIS 主线' },
+      '002049': { planId: 815, phase: 'opened', addCount: 0, allocatedPct: 10, theme: '特种芯片国产替代' },
+      '688041': { planId: 826, phase: 'ai_reduce', addCount: 0, allocatedPct: 10, theme: '算力芯片' },
+      '601012': { planId: 805, phase: 'opened', addCount: 0, allocatedPct: 10, theme: '光伏组件' }
+    },
+    intents: [
+      { code: '601138', side: 'buy', allocationPct: 10, candidateId: 'C-1116-601138', scoreId: 5521, planId: 861, from: '候选池 11-16 批次 · 评分 86' },
+      { code: '300750', side: 'buy', allocationPct: 10, candidateId: 'C-1116-300750', scoreId: 5524, planId: 863, from: '离场后重新达标，计划已重算' },
+      { code: '002049', side: 'buy', action: 'open', allocationPct: 10, candidateId: 'C-1116-002049', scoreId: 5519, planId: 862, from: '同一标的重复建仓意图' },
+      { code: '600584', side: 'buy', allocationPct: 10, candidateId: 'C-1116-600584', scoreId: 5527, planId: null, from: '候选未通过可建仓验证' },
+      { code: '601012', side: 'buy', allocationPct: 0.2, candidateId: 'C-1116-601012', scoreId: 5530, planId: 865, from: '已持仓再加仓，但目标金额换算后不足一手' },
+      { code: '002371', side: 'buy', allocationPct: 0.3, candidateId: 'C-1116-002371', scoreId: 5531, planId: 866, from: '新候选首仓，但模型给的目标仓位过小' },
+      { code: '603501', side: 'buy', action: 'add', allocationPct: 10, candidateId: 'C-1116-603501', scoreId: 5532, planId: 812, from: '计划目标仓位已到 20% 上限，模型仍想再加一档' },
+      { code: '603501', side: 'sell', reduceRatio: null, from: '模型给了减仓动作却没给比例' }
+    ],
+    contexts: [
+      {
+        id: 5101, code: '603501', d: '2026-11-16', t: '09:35', stage: 'position_action', mode: 'live_paper',
+        factAsOf: '2026-11-16 09:35', tools: [
+          { tool: 'get_quote', status: 'ok', summary: '现价 120.10，涨 +0.17%' },
+          { tool: 'get_daily_kline', status: 'ok', summary: '60 根日K，站上 20 日均线' },
+          { tool: 'get_news', status: 'ok', summary: '3 条公告与新闻，最近一条 11-15 21:04' },
+          { tool: 'get_fund_flow', status: 'ok', summary: '主力净流入 3.1 亿' },
+          { tool: 'get_sector_regime', status: 'ok', summary: '半导体板块环境：放量但拥挤度偏高' },
+          { tool: 'search_knowledge', status: 'ok', summary: '命中 4 条：加仓触发档、集中度上限' },
+          { tool: 'paper_web.search', status: 'ok', summary: '联网检索 2 条来源' }
+        ],
+        web: [
+          { title: '半导体设备招标放量，产业链订单能见度提升', source: '财联社', url: 'https://www.cls.cn/detail/2031145', publishedAt: '2026-11-15 21:04', excerpt: '多家封测与设备厂商披露 Q4 订单环比提升。', hash: 'a17f…9c20' },
+          { title: 'CIS 传感器四季度出货指引上调', source: '上海证券报', url: 'https://paper.cnstock.com/html/2026-11/16/content_1', publishedAt: '2026-11-16 07:20', excerpt: '公司指引上调 6%，主要来自动车与安防需求。', hash: 'b48d…11ae' }
+        ],
+        decision: { action: 'add', allocationPct: 10, confidence: 'medium', reasons: [
+          '浮盈 +5.2% 超过加仓触发档 +3%，趋势维度未破位。',
+          '联网证据显示订单能见度上调，但板块拥挤度偏高，因此只按一档 10% 加。'
+        ], riskNote: '若明日低开跌破 118，本档加仓的保护价需要随移动止损上移。' }
+      },
+      {
+        id: 5102, code: '300750', d: '2026-11-13', t: '13:44', stage: 'position_action', mode: 'live_paper',
+        factAsOf: '2026-11-13 13:40', tools: [
+          { tool: 'get_quote', status: 'ok', summary: '现价 216.30，跌 -1.4%' },
+          { tool: 'get_daily_kline', status: 'ok', summary: '跌破 20 日均线，量能放大' },
+          { tool: 'get_fund_flow', status: 'ok', summary: '主力连续 3 日净流出' },
+          { tool: 'search_knowledge', status: 'ok', summary: '命中 2 条：动力电池排产下修' }
+        ],
+        web: [{ title: '动力电池排产环比下修', source: '东方财富', url: 'https://finance.eastmoney.com/a/20261113001.html', publishedAt: '2026-11-13 11:12', excerpt: '11 月排产环比 -4.2%。', hash: 'c02e…77b1' }],
+        decision: { action: 'exit', confidence: 'high', reasons: [
+          '日线跌破 20 日均线且下跌放量，趋势维度转为风险。',
+          '资金与板块两个维度同向，模型判定不再等反弹，直接清仓。'
+        ], riskNote: '清仓后若板块资金回流需要重新走候选池验证，不能直接回补。' }
+      },
+      {
+        id: 5103, code: '688041', d: '2026-11-16', t: '09:31', stage: 'position_action', mode: 'live_paper',
+        factAsOf: '2026-11-16 09:30', tools: [
+          { tool: 'get_quote', status: 'ok', summary: '现价 59.40，涨 +1.7%' },
+          { tool: 'get_daily_kline', status: 'ok', summary: '高位放量滞涨' },
+          { tool: 'get_position_risk', status: 'ok', summary: '单票占模拟总资产 11.8%' },
+          { tool: 'paper_web.search', status: 'error', summary: '', error: '联网检索超时 8s，降级为站内证据' }
+        ],
+        web: [],
+        decision: { action: 'reduce', reduceRatio: 0.30, confidence: 'medium', reasons: [
+          '浮盈 +6.4% 但滞涨放量，先落袋三成。',
+          '联网证据缺失，模型置信度降到中档，减仓比例不放大。'
+        ], riskNote: '剩余仓位按移动止损 5% 保护。' }
+      },
+      {
+        id: 5104, code: '600584', d: '2026-11-16', t: '09:34', stage: 'research', mode: 'live_paper',
+        factAsOf: '2026-11-16 09:33', tools: [
+          { tool: 'get_quote', status: 'ok', summary: '现价 42.10' },
+          { tool: 'search_knowledge', status: 'ok', summary: '命中硬规则 RC-1051：候选池最低成交额 5 亿' },
+          { tool: 'get_fund_flow', status: 'ok', summary: '成交额 3.2 亿，未达闸门' }
+        ],
+        web: [],
+        decision: { action: 'hold', confidence: 'high', reasons: ['可建仓验证未通过，本次不产生建仓意图。'], riskNote: '' }
+      },
+      {
+        id: 5105, code: '002049', d: '2026-11-13', t: '10:35', stage: 'research', mode: 'live_paper',
+        factAsOf: '2026-11-13 10:35', tools: [
+          { tool: 'get_quote', status: 'ok', summary: '现价 76.20，涨停（+9.96%）' },
+          { tool: 'get_news', status: 'error', summary: '', error: '新闻接口返回空数据' },
+          { tool: 'get_sector_regime', status: 'ok', summary: '特种芯片板块资金净流入' }
+        ],
+        web: [],
+        decision: { action: 'add', allocationPct: 10, confidence: 'low', reasons: ['涨停封板，买入意图无法成交。'], riskNote: '涨停未开板前不追。' }
+      },
+      {
+        id: 5106, code: '603501', d: '2026-11-16', t: '09:33', stage: 'monitor', mode: 'live_paper',
+        factAsOf: '2026-11-16 09:33', tools: [
+          { tool: 'get_quote', status: 'ok', summary: '现价 119.80' },
+          { tool: 'get_news', status: 'ok', summary: '取到 4 条，其中 1 条发布于 2026-11-17' }
+        ],
+        web: [{ title: '（回放隔离）一条晚于决策时点的公告', source: '站内缓存', url: '', publishedAt: '2026-11-17 08:00', excerpt: '事实时点晚于本次决策时点，已被拒绝进入证据集。', hash: 'd93a…04f2' }],
+        rejected: 'future_data',
+        decision: { action: 'hold', confidence: 'low', reasons: ['冻结事实校验未通过：1 条新闻发布于 2026-11-17，晚于决策时点。'], riskNote: '本轮不产生买卖动作，下一轮重新取证。' }
+      }
+    ],
+    alerts: [
+      { id: 7001, code: '603501', d: '2026-11-16', severity: 'info', source: 'paper_monitor', contextId: 5101, message: 'AI 判定 加仓：浮盈 +5.2% 达到加仓触发档，整手换算后买入 200 股' },
+      { id: 7002, code: '603501', d: '2026-11-16', severity: 'warning', source: 'paper_monitor', contextId: 5106, message: '模拟分析未完成：冻结事实中有 1 条新闻发布于 2026-11-17，晚于本次决策时点，已拒绝使用' },
+      { id: 7003, code: '600584', d: '2026-11-16', severity: 'warning', source: 'paper_execution', contextId: 5104, message: '模拟执行已拒绝：未通过可建仓验证，候选成交额 3.2 亿低于 5 亿闸门' },
+      { id: 7004, code: '300750', d: '2026-11-13', severity: 'critical', source: 'paper_monitor', contextId: 5102, message: 'AI 判定 清仓：跌破 20 日均线且板块资金净流出，已按 216.30 卖出全部 200 股' }
+    ],
+    reviews: [
+      {
+        id: 8801, code: '300750', d: '2026-11-13', execId: null, audit: 'pass', auditMode: 'ai', shadow: 'active',
+        candidateId: 'C-1109-300750', scoreId: 5468, planId: 818, factAsOf: '2026-11-13 13:40',
+        summary: '清仓后两个交易日反弹 +2.1%，执行本身符合计划，但触发偏晚，利润回吐约 1.4%。',
+        lesson: '加仓触发 +3% 与主止盈 +15% 之间缺少中间档，趋势破位时只能整档离场。',
+        gaps: [], auditReason: '候选、评分、建仓计划来源齐全，交易日期与事实时点一致，未发现未来数据。',
+        confidence: 82, support: '同口径 12 笔清仓案例 T+5 平均 -1.4%，方向一致。',
+        dissent: '本案例单笔成交，反弹可能来自板块 beta 而非个股。',
+        boundary: '板块资金净流入转正时，破位结论需要重新评估。',
+        shadowNote: '只作为影子案例参与验证，不代表正式规则已采纳。'
+      },
+      {
+        id: 8802, code: '688041', d: '2026-11-16', execId: null, audit: 'fail', auditMode: 'ai', shadow: 'blocked',
+        candidateId: 'C-1111-688041', scoreId: 5489, planId: null, factAsOf: '2026-11-16 09:30',
+        summary: '减仓 30% 后价格回落，落袋方向正确，但建仓计划来源缺失。',
+        lesson: '减仓比例应绑定持仓成本与移动止损，而不是只看浮盈档位。',
+        gaps: ['missing:plan_id'], auditReason: '事实闸门未通过：missing:plan_id',
+        confidence: 40, support: '', dissent: '',
+        boundary: '补齐建仓计划来源后可重新送审。', shadowNote: ''
+      },
+      {
+        id: 8803, code: '600584', d: '2026-11-16', execId: null, audit: 'pending', auditMode: 'ai', shadow: 'not_started',
+        candidateId: 'C-1116-600584', scoreId: null, planId: 866, factAsOf: '2026-11-16 09:34',
+        summary: '建仓被成交额闸门拒绝，需要判断 5 亿门槛对封测类标的是否过严。',
+        lesson: '闸门按全市场统一口径，板块差异需要另做分层验证。',
+        gaps: ['missing:score_id'], auditReason: '', confidence: null, support: '', dissent: '', boundary: '',
+        shadowNote: '收盘后的 AI 审核任务会自动处理这一条。'
+      }
+    ],
+    runs: [
+      { at: '2026-11-13 10:35', kind: 'monitor', filled: 0, rejected: 1, skipped: 0 },
+      { at: '2026-11-13 13:44', kind: 'monitor', filled: 1, rejected: 0, skipped: 0 },
+      { at: '2026-11-13 15:30', kind: 'review', filled: 0, rejected: 0, skipped: 0, note: '模拟复盘 AI 审核：2 条送审，1 条通过' },
+      { at: '2026-11-16 09:34', kind: 'run', filled: 1, rejected: 2, skipped: 0 },
+      { at: '2026-11-16 09:35', kind: 'monitor', filled: 2, rejected: 0, skipped: 0 }
+    ]
+  },
+  {
+    id: 902, name: '现有门禁 · 9月历史回放', status: 'paused', variant: 'current_gate',
+    mode: 'historical_replay', quoteSource: 'historical_snapshot', initialCash: 400000, createdAt: '2026-09-15',
+    model: 'monitor-v3 + sell-v2', ruleVersion: 'paper-execution-v1', cursor: 2,
+    schedule: { every: 5, window: '回放按已冻结的 09-15 ~ 09-16 快照逐轮重放', next: '继续运行后从 2026-09-16 11:05 接着放' },
+    replayNote: '历史回放只用当日冻结事实：不回填今天的持仓、行情和知识库。',
+    slots: [
+      { d: '2026-09-15', t: '10:35' }, { d: '2026-09-15', t: '14:20' }, { d: '2026-09-16', t: '09:40' },
+      { d: '2026-09-16', t: '11:05' }, { d: '2026-09-16', t: '14:50' }
+    ],
+    universe: {
+      '002415': { name: '海康威视', prevClose: 28.40, series: [28.60, 28.75, 29.10, 29.40, 30.20] },
+      '601012': { name: '隆基绿能', prevClose: 17.30, series: [17.40, 17.95, 18.05, 16.85, 15.95] },
+      '300750': { name: '宁德时代', prevClose: 204.00, series: [205.40, 206.10, 207.50, 204.20, 202.60] }
+    },
+    seeds: [
+      { d: '2026-09-15', t: '10:40', code: '002415', side: 'buy', price: 28.60, shares: 1200, status: 'filled', planId: 776, scoreId: 5102, candidateId: 'C-0914-002415', intent: '计划 776 首批 8%' },
+      { d: '2026-09-15', t: '14:25', code: '601012', side: 'buy', price: 17.40, shares: 3000, status: 'filled', planId: 778, scoreId: 5108, candidateId: 'C-0914-601012', intent: '计划 778 首批 10%' },
+      { d: '2026-09-16', t: '09:35', code: '601012', side: 'sell', price: 18.05, shares: 1500, status: 'filled', intent: '监控信号 → 卖出研判：部分减仓 50%', contextId: 5201 },
+      { d: '2026-09-16', t: '09:38', code: '300750', side: 'buy', price: 205.40, shares: 200, status: 'filled', planId: 780, scoreId: 5111, candidateId: 'C-0915-300750', intent: '计划 780 首批 10%' },
+      { d: '2026-09-16', t: '09:40', code: '300750', side: 'sell', price: 205.90, shares: 0, status: 'rejected', reason: 't_plus_one_or_no_lot', intent: '卖出研判：部分减仓 50%', contextId: 5202 }
+    ],
+    plans: {
+      '002415': { planId: 776, phase: 'opened', addCount: 0, allocatedPct: 8, theme: '安防与AIoT' },
+      '601012': { planId: 778, phase: 'added', addCount: 0, allocatedPct: 10, theme: '光伏组件' },
+      '300750': { planId: 780, phase: 'opened', addCount: 0, allocatedPct: 10, theme: '动力电池' }
+    },
+    intents: [],
+    contexts: [
+      {
+        id: 5201, code: '601012', d: '2026-09-16', t: '09:35', stage: 'monitor', mode: 'historical_replay',
+        factAsOf: '2026-09-16 09:35', tools: [
+          { tool: 'historical_snapshot', status: 'ok', summary: '当日冻结快照：现价 18.05，涨 +1.7%' },
+          { tool: 'get_daily_kline', status: 'ok', summary: '60 根日K，触及第二档移动止盈' },
+          { tool: 'get_news', status: 'error', summary: '', error: '回放模式不取当日新闻，避免未来数据' }
+        ],
+        web: [],
+        signal: { action: 'reduce', severity: 'warning', message: '移动止盈第二档命中，浮盈 +3.7%' },
+        decision: { action: 'partial', reduceRatio: 0.50, confidence: 'medium', reasons: [
+          '监控信号要求减仓，卖出研判按第二档比例出一半。',
+          '回放口径：只用 09-16 冻结事实，不用今天的行情回填。'
+        ], riskNote: '剩余 1500 股按第二档上移后的止盈位保护。' }
+      },
+      {
+        id: 5202, code: '300750', d: '2026-09-16', t: '09:40', stage: 'monitor', mode: 'historical_replay',
+        factAsOf: '2026-09-16 09:40', tools: [
+          { tool: 'historical_snapshot', status: 'ok', summary: '现价 205.90' },
+          { tool: 'get_position_risk', status: 'ok', summary: '可卖 0 股（当日买入未解冻）' }
+        ],
+        web: [],
+        signal: { action: 'reduce', severity: 'info', message: '冲高回落 1.2%，实验性影子信号' },
+        decision: { action: 'partial', reduceRatio: 0.50, confidence: 'low', reasons: ['影子规则实验，不代表正式链路。'], riskNote: '' }
+      }
+    ],
+    alerts: [
+      { id: 5301, code: '601012', d: '2026-09-16', severity: 'warning', source: 'paper_sell', contextId: 5201, message: '模拟卖出已成交：监控信号 + 卖出研判，减仓 50%，1500 股 @18.04' },
+      { id: 5302, code: '300750', d: '2026-09-16', severity: 'warning', source: 'paper_execution', contextId: 5202, message: '模拟卖出被拒：当日买入不可卖出，或可卖数量不足一手' }
+    ],
+    reviews: [
+      {
+        id: 8901, code: '601012', d: '2026-09-16', execId: null, audit: 'pending', auditMode: 'ai', shadow: 'not_started',
+        candidateId: 'C-0914-601012', scoreId: 5108, planId: 778, factAsOf: '2026-09-16 09:35',
+        summary: '第二档止盈减半后价格回落 6.5%，落袋有效；但同日另一笔 T+1 卖出被拒，说明解冻口径要在计划里写明。',
+        lesson: '移动止盈分档在震荡下跌段优于一次性清仓。', gaps: [], auditReason: '', confidence: null,
+        support: '', dissent: '', boundary: '', shadowNote: '恢复运行后由收盘审核任务处理。'
+      }
+    ],
+    runs: [
+      { at: '2026-09-15 10:40', kind: 'run', filled: 2, rejected: 0, skipped: 0 },
+      { at: '2026-09-16 09:40', kind: 'monitor', filled: 1, rejected: 1, skipped: 0 }
+    ]
+  },
+  {
+    id: 903, name: '10月对照盘（已归档）', status: 'archived', variant: 'candidate_pool',
+    mode: 'live_paper', quoteSource: 'tencent', initialCash: 200000, createdAt: '2026-10-20',
+    model: 'action-v1 / qwen-max', ruleVersion: 'paper-execution-v1', cursor: 2,
+    archivedAt: '2026-11-06 15:10', archiveReason: '改用候选池变体另开账户做对照，旧账户停止自动运行，历史全部保留',
+    schedule: { every: 5, window: '已停止', next: '—' },
+    slots: [
+      { d: '2026-10-20', t: '09:40' }, { d: '2026-10-23', t: '14:10' }, { d: '2026-11-06', t: '09:50' }
+    ],
+    universe: {
+      '601869': { name: '长飞光纤', prevClose: 29.60, series: [29.80, 31.20, 32.10] },
+      '600893': { name: '航发动力', prevClose: 42.10, series: [42.30, 40.90, 39.10] }
+    },
+    seeds: [
+      { d: '2026-10-20', t: '09:41', code: '601869', side: 'buy', price: 29.80, shares: 1000, status: 'filled', planId: 702, scoreId: 4980, candidateId: 'C-1019-601869', intent: '首仓 10%' },
+      { d: '2026-10-20', t: '10:12', code: '600893', side: 'buy', price: 42.30, shares: 500, status: 'filled', planId: 705, scoreId: 4986, candidateId: 'C-1019-600893', intent: '首仓 10%' },
+      { d: '2026-11-06', t: '09:48', code: '601869', side: 'sell', price: 32.10, shares: 1000, status: 'filled', intent: 'AI 判定清仓（主止盈）', contextId: 5401 },
+      { d: '2026-11-06', t: '09:49', code: '600893', side: 'sell', price: 39.10, shares: 500, status: 'filled', intent: 'AI 判定清仓（硬止损 -8%）', contextId: 5401 }
+    ],
+    plans: {},
+    intents: [],
+    contexts: [
+      {
+        id: 5401, code: '600893', d: '2026-11-06', t: '09:49', stage: 'position_action', mode: 'live_paper',
+        factAsOf: '2026-11-06 09:48', tools: [
+          { tool: 'get_quote', status: 'ok', summary: '现价 39.10，跌 -1.2%' },
+          { tool: 'get_daily_kline', status: 'ok', summary: '跌破成本 ×0.92 的硬止损位' }
+        ],
+        web: [],
+        decision: { action: 'exit', confidence: 'high', reasons: ['硬止损触发，按规则离场，不讨论基本面。'], riskNote: '' }
+      }
+    ],
+    alerts: [
+      { id: 5501, code: '600893', d: '2026-11-06', severity: 'critical', source: 'paper_monitor', contextId: 5401, message: 'AI 判定 清仓：硬止损触发，已按 39.10 卖出全部 500 股' }
+    ],
+    reviews: [
+      {
+        id: 8702, code: '600893', d: '2026-11-06', execId: null, audit: 'pass', auditMode: 'manual', shadow: 'active',
+        candidateId: 'C-1019-600893', scoreId: 4986, planId: 705, factAsOf: '2026-11-06 09:48',
+        summary: '硬止损离场后继续下跌 4.1%，规则有效；同批长飞光纤止盈清仓错过后续 6% 涨幅。',
+        lesson: '主止盈档位对趋势股偏紧，需要按板块分层再验证。',
+        gaps: [], auditReason: '人工复审：AI 首轮因样本数偏少判未通过，但两笔离场方向都被后续走势验证，同意进入影子。',
+        confidence: 74, support: '', dissent: '样本只有 2 笔，板块外推不成立。', boundary: '趋势板块与震荡板块需分开统计。',
+        shadowNote: '人工复审覆盖 AI 结论，理由已留痕；仍是影子案例，不是正式规则。'
+      }
+    ],
+    runs: [
+      { at: '2026-10-20 10:12', kind: 'run', filled: 2, rejected: 0, skipped: 0 },
+      { at: '2026-11-06 09:49', kind: 'monitor', filled: 2, rejected: 0, skipped: 0 },
+      { at: '2026-11-06 15:10', kind: 'archive', filled: 0, rejected: 0, skipped: 0, note: '账户暂停并归档，调度不再触发' }
+    ]
+  }
+];
+
+/* ---------- AI 模拟操盘：账本引擎（成交是唯一事实，余额一律回放推导） ---------- */
+function ppSigned(v, digits) {
+  if (v == null || !isFinite(Number(v))) return '—';
+  const d = digits == null ? 2 : digits;
+  const n = Number(v);
+  return (n > 0 ? '+' : n < 0 ? '-' : '') + Math.abs(n).toFixed(d);
+}
+function ppAmount(v) {
+  if (v == null || !isFinite(Number(v))) return '—';
+  return Number(v).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function ppPct(v, digits) {
+  if (v == null || !isFinite(Number(v))) return '—';
+  return ppSigned(v, digits == null ? 2 : digits) + '%';
+}
+function ppCls(v) { return v == null || !isFinite(Number(v)) ? 'dim' : Number(v) > 0 ? 'wo-up' : Number(v) < 0 ? 'wo-down' : 'dim'; }
+
+function ppFees(side, gross) {
+  const commission = Math.max(+(gross * PP_RULES.commissionRate).toFixed(2), PP_RULES.commissionMin);
+  const transfer = +(gross * PP_RULES.transferRate).toFixed(2);
+  const stamp = side === 'sell' ? +(gross * PP_RULES.stampRate).toFixed(2) : 0;
+  return +(commission + transfer + stamp).toFixed(2);
+}
+
+function ppData() {
+  if (!state.paper) {
+    let seq = 9000;
+    state.paper = clone(PP_ACCOUNT_SEED).map((acc) => {
+      acc.execs = (acc.seeds || []).map((row) => {
+        seq += 1;
+        const name = (acc.universe[row.code] || {}).name || row.code;
+        const gross = +(row.price * row.shares).toFixed(2);
+        const fee = row.status === 'filled' ? ppFees(row.side, gross) : 0;
+        return Object.assign({}, row, { id: seq, name, gross, fee });
+      });
+      delete acc.seeds;
+      acc.intents = acc.intents || [];
+      return acc;
+    });
+    state.paperSeq = { exec: seq, ctx: 6100, alert: 9100, review: 9200, acc: 910 };
+  }
+  return state.paper;
+}
+
+function ppNextId(kind) {
+  ppData();
+  state.paperSeq[kind] += 1;
+  return state.paperSeq[kind];
+}
+
+function ppAccounts(view) {
+  return ppData().filter((acc) => (view === 'archived' ? acc.status === 'archived' : acc.status !== 'archived'));
+}
+
+function ppAcc() {
+  const rows = ppAccounts(state.ppView);
+  const hit = rows.filter((acc) => acc.id === state.ppAcc)[0] || rows[0] || ppData()[0];
+  state.ppAcc = hit.id;
+  return hit;
+}
+
+function ppSlot(acc, idx) {
+  return acc.slots[Math.min(Math.max(idx, 0), acc.slots.length - 1)];
+}
+
+function ppStamp(acc, idx) {
+  const slot = ppSlot(acc, idx);
+  return slot.d + ' ' + slot.t;
+}
+
+function ppQuote(acc, code, idx) {
+  const u = acc.universe[code];
+  if (!u) return null;
+  const i = Math.min(Math.max(idx, 0), acc.slots.length - 1);
+  const slot = ppSlot(acc, i);
+  const raw = u.series[Math.min(i, u.series.length - 1)];
+  const flag = raw && typeof raw === 'object' ? raw : { p: raw };
+  const base = {
+    code: code, name: u.name, prevClose: u.prevClose, limitPct: u.limitPct || 10,
+    date: slot.d, stamp: slot.d + ' ' + slot.t, source: acc.quoteSource
+  };
+  if (flag.p != null) {
+    return Object.assign({}, base, {
+      price: flag.p,
+      chgPct: +(((flag.p - u.prevClose) / u.prevClose) * 100).toFixed(2),
+      limitUp: !!flag.limitUp, limitDown: !!flag.limitDown, suspended: !!flag.suspended,
+      status: flag.suspended ? 'suspended' : 'ok', referenceOnly: false
+    });
+  }
+  if (flag.ref !== false) {
+    for (let k = i - 1; k >= 0; k -= 1) {
+      const prev = ppQuote(acc, code, k);
+      if (prev.status === 'ok') {
+        return Object.assign({}, base, {
+          price: prev.price, chgPct: prev.chgPct, limitUp: false, limitDown: false, suspended: false,
+          status: 'stale', referenceOnly: true, date: prev.date, stamp: prev.stamp,
+          source: '上一轮有效行情（仅供参考）'
+        });
+      }
+    }
+  }
+  return Object.assign({}, base, {
+    price: null, chgPct: null, limitUp: false, limitDown: false, suspended: false,
+    status: 'unavailable', referenceOnly: false
+  });
+}
+
+function ppReplay(acc) {
+  const idx = Math.min(acc.cursor, acc.slots.length - 1);
+  const today = ppSlot(acc, idx).d;
+  const rows = acc.execs.slice().sort((a, b) => (a.d + a.t).localeCompare(b.d + b.t));
+  let cash = Number(acc.initialCash), realized = 0, filled = 0, rejected = 0;
+  const map = {};
+  rows.forEach((row) => {
+    if (row.status !== 'filled') { rejected += 1; return; }
+    filled += 1;
+    const fee = row.fee || 0;
+    if (row.side === 'buy') {
+      if (!map[row.code]) {
+        map[row.code] = { code: row.code, name: row.name, shares: 0, avg: 0, blocked: 0, realized: 0, openedAt: row.d };
+      }
+      const p = map[row.code];
+      p.avg = +(((p.avg * p.shares) + (row.price * row.shares)) / (p.shares + row.shares)).toFixed(4);
+      p.shares += row.shares;
+      if (row.d === today) p.blocked += row.shares;
+      cash -= row.gross + fee;
+    } else {
+      const p = map[row.code];
+      const gain = +(row.gross - fee - p.avg * row.shares).toFixed(2);
+      p.realized = +(p.realized + gain).toFixed(2);
+      realized += gain;
+      p.shares -= row.shares;
+      cash += row.gross - fee;
+    }
+  });
+  const positions = Object.keys(map).map((code) => {
+    const p = map[code];
+    const plan = (acc.plans || {})[code] || {};
+    const costPct = +((p.avg * p.shares / Number(acc.initialCash)) * 100).toFixed(1);
+    return Object.assign({}, p, {
+      available: p.shares - p.blocked,
+      planId: plan.planId || null, theme: plan.theme || '',
+      phase: plan.phase || '', addCount: plan.addCount || 0,
+      allocatedPct: costPct,
+      planAllocPct: plan.allocatedPct == null ? costPct : Number(plan.allocatedPct)
+    });
+  }).filter((p) => p.shares > 0).sort((a, b) => a.code.localeCompare(b.code));
+  const closed = Object.keys(map).filter((code) => map[code].shares <= 0)
+    .map((code) => map[code]).sort((a, b) => a.code.localeCompare(b.code));
+  return { idx: idx, date: today, stamp: ppStamp(acc, idx), cash: +cash.toFixed(2), realized: +realized.toFixed(2),
+    filled: filled, rejected: rejected, positions: positions, closed: closed };
+}
+
+function ppProtect(avg) {
+  const pct = (v) => +(avg * (1 + v / 100)).toFixed(2);
+  return { stop: pct(PP_RULES.hardStopPct), take1: pct(PP_RULES.firstTakePct), take2: pct(PP_RULES.mainTakePct) };
+}
+
+function ppValuation(acc) {
+  const rep = ppReplay(acc);
+  let mv = 0, known = true, referenceOnly = false;
+  const factTimes = [];
+  const rows = rep.positions.map((pos) => {
+    const q = ppQuote(acc, pos.code, rep.idx);
+    const price = q.status === 'ok' || q.referenceOnly ? q.price : null;
+    const guard = ppProtect(pos.avg);
+    if (price == null) known = false;
+    else { mv += price * pos.shares; factTimes.push(q.stamp); }
+    if (q.referenceOnly) referenceOnly = true;
+    return Object.assign({}, pos, {
+      quote: q, price: price,
+      marketValue: price == null ? null : +(price * pos.shares).toFixed(2),
+      pnl: price == null ? null : +((price - pos.avg) * pos.shares).toFixed(2),
+      pnlPct: price == null || pos.avg <= 0 ? null : +(((price - pos.avg) / pos.avg) * 100).toFixed(2),
+      distStop: price == null ? null : +(((price - guard.stop) / price) * 100).toFixed(2),
+      distTake: price == null ? null : +(((guard.take1 - price) / price) * 100).toFixed(2),
+      guard: guard
+    });
+  });
+  const equity = known ? +(rep.cash + mv).toFixed(2) : null;
+  const pnl = equity == null ? null : +(equity - Number(acc.initialCash)).toFixed(2);
+  return {
+    rep: rep, rows: rows,
+    marketValue: known ? +mv.toFixed(2) : null,
+    equity: equity, pnl: pnl,
+    pnlPct: pnl == null || Number(acc.initialCash) <= 0 ? null : +((pnl / Number(acc.initialCash)) * 100).toFixed(2),
+    unrealized: known ? +(rows.reduce((sum, r) => sum + (r.pnl || 0), 0)).toFixed(2) : null,
+    quoteStatus: !known ? 'partial_or_unavailable' : referenceOnly ? 'stale' : 'ok',
+    referenceOnly: referenceOnly,
+    notice: referenceOnly ? '行情已过期，仅供参考' : !known ? '模拟估值暂不完整' : '',
+    factAsOf: factTimes.length ? factTimes.slice().sort()[0] : '—',
+    mvLabel: referenceOnly ? '估算模拟市值' : '模拟市值',
+    equityLabel: referenceOnly ? '估算模拟总资产' : '模拟总资产'
+  };
+}
+
+function ppSlip(side, price) {
+  const raw = side === 'buy' ? price * (1 + PP_RULES.slipBps / 10000) : price * (1 - PP_RULES.slipBps / 10000);
+  return +raw.toFixed(2);
+}
+
+/* 执行器只做整手、T+1、现金、费用和涨跌停换算；"何时该动"全部来自研判层 */
+function ppExecute(acc, intent, quote, pos, cash) {
+  if (!quote || quote.price == null) {
+    return { status: 'rejected', reason: 'price_missing', shares: 0, note: '本时点没有可用价格，模拟估值也不完整' };
+  }
+  if (quote.referenceOnly) {
+    return { status: 'rejected', reason: 'price_missing', shares: 0, note: '行情已过期，只能作为参考，不允许用于成交' };
+  }
+  if (quote.suspended) return { status: 'rejected', reason: 'suspended', shares: 0 };
+  const price = ppSlip(intent.side, quote.price);
+  if (intent.side === 'buy') {
+    if (quote.limitUp) return { status: 'rejected', reason: 'limit_up', shares: 0 };
+    if (pos && intent.action !== 'add') return { status: 'rejected', reason: 'already_holding', shares: 0 };
+    if (!intent.planId) return { status: 'rejected', reason: 'not_tradeable', shares: 0 };
+    const wantPct = Number(intent.allocationPct || 0);
+    const planPct = pos ? Number(pos.planAllocPct == null ? pos.allocatedPct : pos.planAllocPct) : 0;
+    const headroom = +(PP_RULES.maxAllocationPct - planPct).toFixed(1);
+    if (pos && headroom <= 0.05) {
+      return { status: 'rejected', reason: 'single_stock_target_reached', shares: 0,
+        note: '单票目标仓位上限 ' + PP_RULES.maxAllocationPct + '% 已被计划用满（' + planPct + '%），执行层不再加仓' };
+    }
+    const allocPct = pos ? +Math.min(wantPct, headroom).toFixed(1) : wantPct;
+    const target = Number(acc.initialCash) * allocPct / 100;
+    const rawLots = target / (price * PP_RULES.lot);
+    let lots = Math.floor(rawLots);
+    if (rawLots - lots >= 1 - PP_RULES.lotTolerance) lots = Math.ceil(rawLots);
+    let shares = lots * PP_RULES.lot;
+    while (shares > 0 && shares * price + ppFees('buy', shares * price) > cash) {
+      shares -= PP_RULES.lot;
+    }
+    if (shares <= 0) {
+      return { status: 'rejected', reason: intent.action === 'add' ? 'ai_add_blocked_cash_or_lot' : 'cash_or_plan_position_too_small',
+        shares: 0, note: '目标金额 ' + target.toFixed(0) + ' 元换算后不足一手，或现金不够' };
+    }
+    return { status: 'filled', shares: shares, price: price, allocPct: allocPct,
+      note: allocPct + 0.05 < wantPct
+        ? '模型要求加仓 ' + wantPct + '%，按单票上限只剩 ' + headroom + '% 压缩到 ' + allocPct + '% 执行' : '' };
+  }
+  if (!pos) return { status: 'rejected', reason: 'no_position', shares: 0 };
+  if (quote.limitDown) return { status: 'rejected', reason: 'limit_down', shares: 0 };
+  if (pos.available <= 0) return { status: 'rejected', reason: 't_plus_one_or_no_lot', shares: 0 };
+  let shares = pos.shares;
+  if (intent.action !== 'exit') {
+    const ratio = intent.reduceRatio;
+    if (ratio == null || !(ratio > 0 && ratio <= 1)) {
+      return { status: 'rejected', reason: 'ai_reduce_unavailable_or_invalid', shares: 0,
+        note: '模型未给出减仓比例，代码不代为猜测' };
+    }
+    shares = Math.floor((pos.available * ratio) / PP_RULES.lot) * PP_RULES.lot;
+    if (shares <= 0) {
+      return { status: 'rejected', reason: 'ai_reduce_below_one_lot', shares: 0,
+        note: '可卖 ' + pos.available + ' 股 × ' + Math.round(ratio * 100) + '% 不足一手' };
+    }
+  } else {
+    shares = pos.available;
+  }
+  return { status: 'filled', shares: shares, price: price };
+}
+
+function ppIntentLabel(action, payload) {
+  if (action === 'exit') return 'AI 判定清仓';
+  if (action === 'reduce') return 'AI 减仓 ' + Math.round((payload.reduceRatio || 0) * 100) + '%';
+  if (action === 'add') return 'AI 加仓 ' + (payload.allocationPct || 0) + '%';
+  if (action === 'partial') return '卖出研判：部分减仓 ' + Math.round((payload.reduceRatio || 0) * 100) + '%';
+  return 'AI 判定买入 ' + (payload.allocationPct || 0) + '%';
+}
+
+function ppDecisionTrace(acc, quote, decided, mode) {
+  const runMode = mode || acc.mode;
+  const tools = [
+    { tool: runMode === 'historical_replay' ? 'historical_snapshot' : 'get_quote',
+      status: quote.status === 'ok' ? 'ok' : 'unavailable',
+      summary: quote.status === 'ok'
+        ? (runMode === 'historical_replay' ? '冻结快照收盘价 ' : '现价 ') + quote.price + '，涨跌 ' + ppSigned(quote.chgPct) + '%'
+        : quote.price == null ? '本轮未取到可用价格' : '价格 ' + quote.price + ' 来自更早一轮，仅供参考' },
+    { tool: 'get_daily_kline', status: 'ok', summary: '60 根日K，均线与量能随本时点重算' },
+    { tool: 'get_position_risk', status: 'ok', summary: '单票目标仓位、可卖数量与现金校验' }
+  ];
+  if (runMode !== 'historical_replay') {
+    tools.push({ tool: 'paper_web.search', status: 'ok', summary: '联网检索 1 条来源，已归档证据哈希' });
+  }
+  const web = runMode === 'historical_replay' ? [] : [{
+    title: '本轮研判引用的公开报道', source: '原型内置证据', url: '',
+    publishedAt: quote.stamp, excerpt: '静态原型不联网，正文与哈希为占位；正式链路会保存来源与抓取时间。',
+    hash: 'pp' + quote.code
+  }];
+  return { tools: tools, web: web };
+}
+
+function ppCommit(acc, entry) {
+  const gross = entry.price && entry.shares ? +(entry.price * entry.shares).toFixed(2) : 0;
+  const row = {
+    id: ppNextId('exec'), d: entry.d, t: entry.t, code: entry.code,
+    name: (acc.universe[entry.code] || {}).name || entry.code,
+    side: entry.side, action: entry.action || '', price: entry.price || 0, shares: entry.shares || 0,
+    gross: gross, fee: entry.status === 'filled' ? ppFees(entry.side, gross) : 0,
+    status: entry.status, reason: entry.reason || '', intent: entry.intent || '',
+    contextId: entry.contextId || null, planId: entry.planId || null,
+    scoreId: entry.scoreId || null, candidateId: entry.candidateId || null,
+    note: entry.note || ''
+  };
+  acc.execs.push(row);
+  return row;
+}
+
+/* 一笔卖出复盘的候选/评分/计划来源，来自同一标的最早那笔已成交买入 */
+function ppOrigin(acc, code) {
+  const buys = acc.execs.filter((r) => r.code === code && r.side === 'buy' && r.status === 'filled' && r.candidateId)
+    .sort((a, b) => (a.d + a.t).localeCompare(b.d + b.t));
+  return buys[0] || null;
+}
+
+function ppAddContext(acc, ctx) {
+  const row = Object.assign({ id: ppNextId('ctx'), web: [], tools: [], rejected: '' }, ctx);
+  acc.contexts.unshift(row);
+  return row;
+}
+
+function ppAddAlert(acc, alert) {
+  const row = Object.assign({ id: ppNextId('alert'), severity: 'info', source: 'paper_execution' }, alert);
+  acc.alerts.unshift(row);
+  return row;
+}
+
+function ppAddReview(acc, review) {
+  const row = Object.assign({
+    id: ppNextId('review'), audit: 'pending', auditMode: 'ai', shadow: 'not_started',
+    gaps: [], confidence: null, support: '', dissent: '', boundary: '', shadowNote: '', auditReason: ''
+  }, review);
+  acc.reviews.unshift(row);
+  return row;
+}
+
+function ppLogRun(acc, entry) {
+  acc.runs.unshift(Object.assign({ at: ppStamp(acc, acc.cursor), kind: 'monitor', filled: 0, rejected: 0, skipped: 0 }, entry));
+}
+
+function ppApplyPlan(acc, code, action, addedPct) {
+  acc.plans = acc.plans || {};
+  if (action === 'exit') { delete acc.plans[code]; return; }
+  const plan = acc.plans[code] || { planId: null, phase: 'opened', addCount: 0, allocatedPct: 10, theme: '' };
+  if (action === 'add') {
+    plan.addCount += 1;
+    plan.phase = 'added';
+    plan.allocatedPct = +Math.min(PP_RULES.maxAllocationPct,
+      Number(plan.allocatedPct || 0) + Number(addedPct == null ? PP_RULES.addAllocationPct : addedPct)).toFixed(1);
+  }
+  if (action === 'reduce' || action === 'partial') plan.phase = 'trailing_protection';
+  acc.plans[code] = plan;
+}
+
+/* 候选池变体：阈值只用于描述当前档位，动作与幅度由研判层给出 */
+function ppDecideAI(acc, pos, quote) {
+  if (quote.price == null || quote.referenceOnly) {
+    return { action: 'hold', confidence: 'low', reasons: ['本时点没有可用价格，研判不产生买卖动作。'], riskNote: '', noQuote: true };
+  }
+  const pct = ((quote.price - pos.avg) / pos.avg) * 100;
+  const guard = ppProtect(pos.avg);
+  if (pct <= PP_RULES.hardStopPct) {
+    return { action: 'exit', confidence: 'high', reasons: [
+      '浮亏 ' + ppSigned(pct) + '% 已越过硬止损档 ' + PP_RULES.hardStopPct + '%。'],
+      riskNote: '硬止损为保护性离场，不讨论基本面。' };
+  }
+  if (pct >= PP_RULES.mainTakePct) {
+    return { action: 'exit', confidence: 'medium', reasons: [
+      '浮盈 ' + ppSigned(pct) + '% 命中主止盈档 +' + PP_RULES.mainTakePct + '%，趋势兑现离场。'],
+      riskNote: '若板块资金继续净流入需重新走候选池验证。' };
+  }
+  if (pct >= PP_RULES.firstTakePct) {
+    return { action: 'reduce', reduceRatio: PP_RULES.firstReduceRatio, confidence: 'medium', reasons: [
+      '浮盈 ' + ppSigned(pct) + '% 落在第一止盈档 +' + PP_RULES.firstTakePct + '% 与主止盈之间，先落袋三成。',
+      '剩余仓位改用移动止损 ' + PP_RULES.trailStopPct + '% 保护。' ],
+      riskNote: '移动止损位 ' + guard.take1.toFixed(2) + ' 元。' };
+  }
+  if (pct >= PP_RULES.addTriggerPct) {
+    const headroom = +(PP_RULES.maxAllocationPct - Number(pos.planAllocPct == null ? pos.allocatedPct : pos.planAllocPct)).toFixed(1);
+    if (headroom <= 0.05) {
+      return { action: 'hold', confidence: 'medium', reasons: [
+        '浮盈 ' + ppSigned(pct) + '% 达到加仓触发档 +' + PP_RULES.addTriggerPct + '%，但单票目标仓位 '
+          + PP_RULES.maxAllocationPct + '% 已被计划用满（' + pos.planAllocPct + '%），本轮不加仓。' ],
+        riskNote: '等止盈/止损档触发，或下一轮重新计算计划目标。' };
+    }
+    const addPct = +Math.min(PP_RULES.addAllocationPct, headroom).toFixed(1);
+    return { action: 'add', allocationPct: addPct, confidence: 'medium', reasons: [
+      '浮盈 ' + ppSigned(pct) + '% 达到加仓触发档 +' + PP_RULES.addTriggerPct + '%，趋势与量能未破位。',
+      '计划目标仓位 ' + pos.planAllocPct + '%，距单票上限 ' + PP_RULES.maxAllocationPct + '% 还剩 ' + headroom + '%，本轮按 '
+        + addPct + '% 加仓。' ],
+      riskNote: '加仓后成本上移，止损位需要同步重算。' };
+  }
+  return { action: 'hold', confidence: 'medium', reasons: [
+    '浮盈 ' + ppSigned(pct) + '% 未触及 +' + PP_RULES.addTriggerPct + '% 加仓档，也未触及 '
+      + PP_RULES.hardStopPct + '% 止损档。' ], riskNote: '持仓保护价：止损 ' + guard.stop.toFixed(2) + ' / 止盈 ' + guard.take1.toFixed(2) + '。' };
+}
+
+/* 现有门禁链路：先有监控信号，再由卖出研判决定比例（保留线上口径，便于和候选池对照） */
+function ppDecideGate(acc, pos, quote) {
+  if (quote.price == null || quote.referenceOnly) {
+    return { signal: { action: 'hold', severity: 'info', message: '本时点无可用价格，信号不触发' },
+      decision: { action: 'hold', reduceRatio: null, confidence: 'low', reasons: ['缺少可用行情事实。'] }, noQuote: true };
+  }
+  const pct = ((quote.price - pos.avg) / pos.avg) * 100;
+  if (pct <= PP_RULES.hardStopPct) {
+    return { signal: { action: 'exit', severity: 'critical', message: '浮亏 ' + ppSigned(pct) + '% 命中硬止损档' },
+      decision: { action: 'exit', reduceRatio: 1, confidence: 'high', reasons: ['监控信号要求离场，卖出研判确认全部可卖份额。'] } };
+  }
+  if (pct >= PP_RULES.mainTakePct) {
+    return { signal: { action: 'reduce', severity: 'warning', message: '浮盈 ' + ppSigned(pct) + '% 命中主止盈档' },
+      decision: { action: 'partial', reduceRatio: 0.50, confidence: 'medium', reasons: ['按第二档止盈出一半。'] } };
+  }
+  if (pct >= PP_RULES.firstTakePct) {
+    return { signal: { action: 'reduce', severity: 'warning', message: '浮盈 ' + ppSigned(pct) + '% 命中第一档移动止盈' },
+      decision: { action: 'partial', reduceRatio: PP_RULES.firstReduceRatio, confidence: 'medium',
+        reasons: ['监控信号触发减仓，卖出研判按第一档比例出三成。'] } };
+  }
+  return { signal: { action: 'hold', severity: 'info', message: '浮盈 ' + ppSigned(pct) + '% 未触发任何档位' },
+    decision: { action: 'hold', reduceRatio: null, confidence: 'medium', reasons: ['无信号，保持持有。'] } };
+}
+
+function ppNextSlot(acc) {
+  const next = acc.cursor + 1;
+  if (next > acc.slots.length - 1) {
+    return { idx: acc.slots.length - 1, reused: true };
+  }
+  return { idx: next, reused: false };
+}
+
+function ppRunMonitor(acc) {
+  if (acc.status === 'archived') return { blocked: '已归档账户不再执行模拟任务，历史只读。' };
+  const slot = ppNextSlot(acc);
+  const rep = ppReplay(acc);
+  const out = { stamp: ppStamp(acc, slot.idx), filled: 0, rejected: 0, skipped: 0, degraded: [], reused: slot.reused, rows: [] };
+  rep.positions.forEach((pos) => {
+    const quote = ppQuote(acc, pos.code, slot.idx);
+    if (quote.status !== 'ok') out.degraded.push({ code: pos.code, name: pos.name, status: quote.status });
+    const decided = acc.variant === 'current_gate' ? ppDecideGate(acc, pos, quote) : ppDecideAI(acc, pos, quote);
+    const action = acc.variant === 'current_gate' ? decided.decision.action : decided.action;
+    const payload = acc.variant === 'current_gate'
+      ? Object.assign({}, decided.decision, { signal: decided.signal })
+      : decided;
+    if (action === 'hold') { out.skipped += 1; return; }
+    const side = action === 'add' ? 'buy' : 'sell';
+    const origin = ppOrigin(acc, pos.code);
+    const intent = {
+      side: side, action: action, reduceRatio: payload.reduceRatio, allocationPct: payload.allocationPct,
+      planId: pos.planId, label: ppIntentLabel(action, payload)
+    };
+    const res = ppExecute(acc, intent, quote, pos, rep.cash);
+    const trace = ppDecisionTrace(acc, quote, payload);
+    const reasons = payload.reasons || (payload.decision && payload.decision.reasons) || [];
+    const ctx = ppAddContext(acc, {
+      code: pos.code, d: ppSlot(acc, slot.idx).d, t: ppSlot(acc, slot.idx).t,
+      stage: acc.variant === 'current_gate' ? 'monitor' : 'position_action',
+      mode: acc.mode, factAsOf: quote.stamp, tools: trace.tools, web: trace.web,
+      signal: payload.signal, decision: { action: action, reduceRatio: payload.reduceRatio,
+        allocationPct: payload.allocationPct, confidence: payload.confidence, reasons: reasons,
+        riskNote: payload.riskNote || '' }
+    });
+    const row = ppCommit(acc, {
+      d: ctx.d, t: ctx.t, code: pos.code, side: side, action: action,
+      price: res.status === 'filled' ? res.price : quote.price,
+      shares: res.status === 'filled' ? res.shares : 0,
+      status: res.status, reason: res.reason, intent: intent.label,
+      contextId: ctx.id, planId: pos.planId, note: res.note || ''
+    });
+    if (res.status === 'filled') {
+      out.filled += 1;
+      ppApplyPlan(acc, pos.code, action, action === 'add' ? res.allocPct : null);
+      ppAddAlert(acc, {
+        code: pos.code, d: ctx.d, severity: action === 'exit' ? 'critical' : 'warning',
+        source: acc.variant === 'current_gate' ? 'paper_sell' : 'paper_monitor', contextId: ctx.id,
+        message: ppIntentLabel(action, payload) + '：' + String(reasons[0] || '').replace(/。$/, '') + '，已按 ' + row.price + ' '
+          + (side === 'buy' ? '买入 ' : '卖出 ') + row.shares + ' 股'
+      });
+      if (side === 'sell') {
+        ppAddReview(acc, {
+          code: pos.code, d: ctx.d, execId: row.id,
+          candidateId: origin ? origin.candidateId : null, scoreId: origin ? origin.scoreId : null,
+          planId: row.planId, factAsOf: quote.stamp, gaps: [],
+          summary: action === 'exit'
+            ? pos.name + ' 本轮全额离场，成交价 ' + row.price + '，本轮已实现盈亏 ' + ppSigned(+(row.gross - row.fee - pos.avg * row.shares).toFixed(2)) + ' 元。'
+            : pos.name + ' 减仓 ' + row.shares + ' 股，剩余 ' + (pos.shares - row.shares) + ' 股改用移动止损保护。',
+          lesson: '减仓档位与可卖数量的换算需要按 T+1 校验，避免出现不足一手的拒绝。',
+          auditReason: '', confidence: null,
+          support: '', dissent: '', boundary: '',
+          shadowNote: '收盘后的 AI 审核任务会自动处理这一条。'
+        });
+      }
+    } else {
+      out.rejected += 1;
+      ppAddAlert(acc, {
+        code: pos.code, d: ctx.d, severity: 'warning', source: 'paper_execution', contextId: ctx.id,
+        message: '模拟执行已拒绝：' + ppLabel(res.reason) + (res.note ? '，' + res.note : '')
+      });
+    }
+    out.rows.push(row);
+  });
+  if (out.degraded.length) {
+    out.degraded.forEach((d) => {
+      ppAddAlert(acc, {
+        code: d.code, d: ppSlot(acc, slot.idx).d, severity: 'warning', source: 'paper_valuation', contextId: null,
+        message: '模拟估值提示：' + d.name + '（' + d.code + '）' + (d.status === 'stale'
+          ? '本时点未取到新行情，已用上一轮有效价格回填为参考行情，不用于成交。'
+          : '本时点没有任何可用价格，模拟总资产显示为「模拟估值暂不完整」。')
+      });
+    });
+  }
+  acc.cursor = slot.idx;
+  ppLogRun(acc, { at: out.stamp, kind: 'monitor', filled: out.filled, rejected: out.rejected, skipped: out.skipped });
+  return out;
+}
+
+function ppRunIntents(acc) {
+  if (acc.status === 'archived') return { blocked: '已归档账户不再执行模拟任务，历史只读。' };
+  const idx = Math.min(acc.cursor, acc.slots.length - 1);
+  const slot = ppSlot(acc, idx);
+  const out = { stamp: ppStamp(acc, idx), filled: 0, rejected: 0, rows: [], skipped: 0, reused: false, degraded: [] };
+  if (!acc.intents.length) {
+    out.empty = '当前没有待执行的模拟意图，等下一轮候选池或研判产出意图后再补跑。';
+    return out;
+  }
+  const pending = acc.intents.slice();
+  acc.intents = [];
+  pending.forEach((intent) => {
+    const quote = ppQuote(acc, intent.code, idx);
+    if (!quote) { out.skipped += 1; return; }
+    if (quote.status !== 'ok') out.degraded.push({ code: intent.code, name: quote.name, status: quote.status });
+    const rep = ppReplay(acc);
+    const pos = rep.positions.filter((p) => p.code === intent.code)[0];
+    const action = intent.action || (intent.side === 'buy' ? (pos ? 'add' : 'open') : 'reduce');
+    const payload = Object.assign({}, intent, { action: action });
+    const res = ppExecute(acc, {
+      side: intent.side, action: action,
+      allocationPct: intent.allocationPct, reduceRatio: intent.reduceRatio, planId: intent.planId
+    }, quote, pos, rep.cash);
+    const trace = ppDecisionTrace(acc, quote, payload);
+    const reasons = intent.side === 'buy'
+      ? ['候选池意图：目标仓位 ' + (intent.allocationPct == null ? '未给出' : intent.allocationPct + '%') + '，来源 ' + intent.from + '。']
+      : ['持仓动作意图：减仓比例 ' + (intent.reduceRatio == null ? '模型未给出' : Math.round(intent.reduceRatio * 100) + '%') + '。'];
+    const ctx = ppAddContext(acc, {
+      code: intent.code, d: slot.d, t: slot.t, stage: 'research', mode: acc.mode,
+      factAsOf: quote.stamp, tools: trace.tools, web: trace.web,
+      rejected: res.status === 'filled' ? '' : res.reason,
+      decision: { action: intent.side === 'buy' ? 'add' : 'reduce', allocationPct: intent.allocationPct,
+        reduceRatio: intent.reduceRatio, confidence: res.status === 'filled' ? 'medium' : 'low',
+        reasons: reasons, riskNote: res.note || '' }
+    });
+    const row = ppCommit(acc, {
+      d: slot.d, t: slot.t, code: intent.code, side: intent.side,
+      price: res.status === 'filled' ? res.price : quote.price,
+      shares: res.status === 'filled' ? res.shares : 0,
+      status: res.status, reason: res.reason,
+      intent: intent.side === 'buy' ? 'AI 判定买入' + (intent.allocationPct == null ? '（比例缺失）' : ' ' + intent.allocationPct + '%')
+        : 'AI 减仓' + (intent.reduceRatio == null ? '（比例缺失）' : ' ' + Math.round(intent.reduceRatio * 100) + '%'),
+      contextId: ctx.id, planId: intent.planId, scoreId: intent.scoreId, candidateId: intent.candidateId,
+      note: res.note || ''
+    });
+    if (res.status === 'filled') {
+      out.filled += 1;
+      ppApplyPlan(acc, intent.code, intent.side === 'buy' ? 'add' : 'reduce');
+      if (intent.side === 'sell') {
+        const origin = ppOrigin(acc, intent.code);
+        ppAddReview(acc, {
+          code: intent.code, d: slot.d, execId: row.id, planId: row.planId,
+          scoreId: origin ? origin.scoreId : row.scoreId,
+          candidateId: origin ? origin.candidateId : row.candidateId,
+          factAsOf: quote.stamp, gaps: [],
+          summary: row.name + ' 按意图减仓 ' + row.shares + ' 股。',
+          lesson: '意图与成交要逐条对账，拒绝也必须留痕。', shadowNote: '收盘后的 AI 审核任务会自动处理这一条。'
+        });
+      }
+      ppAddAlert(acc, {
+        code: intent.code, d: slot.d, severity: 'info', source: 'paper_execution', contextId: ctx.id,
+        message: '模拟' + (intent.side === 'buy' ? '买入' : '卖出') + '已成交：' + row.shares + ' 股 @' + row.price + '，' + reasons[0]
+      });
+    } else {
+      out.rejected += 1;
+      ppAddAlert(acc, {
+        code: intent.code, d: slot.d, severity: 'warning', source: 'paper_execution', contextId: ctx.id,
+        message: '模拟执行已拒绝：' + ppLabel(res.reason) + (res.note ? '，' + res.note : '')
+      });
+    }
+    out.rows.push(row);
+  });
+  ppLogRun(acc, { at: out.stamp, kind: 'run', filled: out.filled, rejected: out.rejected, skipped: out.skipped });
+  return out;
+}
+
+function ppRefreshQuotes(acc) {
+  if (acc.status === 'archived') return { blocked: '已归档账户不再拉取行情，历史只读。' };
+  const slot = ppNextSlot(acc);
+  acc.cursor = slot.idx;
+  const val = ppValuation(acc);
+  const degraded = val.rows.filter((r) => r.quote.status !== 'ok');
+  ppLogRun(acc, { at: ppStamp(acc, slot.idx), kind: 'quote', filled: 0, rejected: 0, skipped: degraded.length });
+  return { stamp: ppStamp(acc, slot.idx), degraded: degraded, valuation: val, reused: slot.reused };
+}
+
+function ppAuditReview(acc, id) {
+  const rv = acc.reviews.filter((r) => r.id === id)[0];
+  if (!rv) return null;
+  const derived = ['candidate_id', 'score_id', 'plan_id', 'trade_date', 'fact_as_of'].filter((key) => {
+    const map = { candidate_id: 'candidateId', score_id: 'scoreId', plan_id: 'planId',
+      trade_date: 'd', fact_as_of: 'factAsOf' };
+    return rv[map[key]] == null || rv[map[key]] === '';
+  }).map((key) => 'missing:' + key);
+  rv.gaps = (rv.gaps || []).concat(derived).filter((g, i, arr) => arr.indexOf(g) === i);
+  const gaps = rv.gaps;
+  if (gaps.length) {
+    rv.audit = 'fail';
+    rv.auditReason = '事实闸门未通过：' + gaps.join('; ');
+    rv.shadow = 'blocked';
+    rv.shadowNote = '';
+  } else {
+    rv.audit = 'pass';
+    rv.auditReason = rv.auditReason || '候选、评分、建仓计划来源齐全，交易日期与事实时点一致，未发现未来数据。';
+    rv.shadow = 'pending';
+    rv.shadowNote = '审核通过只允许进入影子验证，不代表正式规则已采纳。';
+  }
+  rv.auditMode = 'ai';
+  rv.confidence = rv.confidence == null ? (rv.audit === 'pass' ? 78 : 45) : rv.confidence;
+  return rv;
+}
+
+function ppManualReview(acc, id, verdict, reason) {
+  const rv = acc.reviews.filter((r) => r.id === id)[0];
+  if (!rv) return null;
+  rv.audit = verdict;
+  rv.auditMode = 'manual';
+  rv.auditReason = '人工复审：' + reason;
+  rv.shadow = verdict === 'pass' ? 'pending' : 'blocked';
+  rv.shadowNote = verdict === 'pass' ? '人工复审覆盖 AI 结论，理由已留痕；仍是影子案例，不是正式规则。' : '';
+  return rv;
+}
+
+function ppShadowStart(acc, id) {
+  const rv = acc.reviews.filter((r) => r.id === id)[0];
+  if (!rv || rv.shadow !== 'pending') return null;
+  rv.shadow = 'active';
+  rv.shadowNote = '影子验证中：只跟踪假设表现，不改动任何正式规则（rule_change 无新增）。';
+  return rv;
+}
+
+function ppCreateAccount(payload) {
+  const rows = ppData();
+  const id = ppNextId('acc');
+  const template = rows.filter((acc) => acc.id === 901)[0];
+  const codes = ['601138', '300750', '600584'];
+  const universe = {};
+  codes.forEach((code) => { universe[code] = clone(template.universe[code]); });
+  const acc = {
+    id: id, name: payload.name, status: 'active', variant: payload.variant, mode: payload.mode,
+    quoteSource: payload.mode === 'historical_replay' ? 'historical_snapshot' : 'tencent',
+    initialCash: Number(payload.initialCash), createdAt: '2026-11-16',
+    model: payload.model, ruleVersion: payload.ruleVersion, cursor: 0,
+    schedule: { every: Number(payload.every) || PP_RULES.monitorMinutes,
+      window: '交易日 09:30-11:30 / 13:00-15:00', next: '2026-11-17 09:33' },
+    replayNote: payload.mode === 'historical_replay' ? '历史回放只用当日冻结事实：不回填今天的持仓、行情和知识库。' : '',
+    slots: clone(template.slots), universe: universe,
+    execs: [], plans: {}, contexts: [], alerts: [], reviews: [], runs: [],
+    intents: codes.map((code) => ({
+      code: code, side: 'buy', allocationPct: 10, candidateId: 'C-1116-' + code,
+      scoreId: 5600 + codes.indexOf(code), planId: 880 + codes.indexOf(code),
+      from: '候选池 11-16 批次 · 手动建仓意图'
+    }))
+  };
+  rows.push(acc);
+  state.ppAcc = id;
+  state.ppView = 'current';
+  state.ppTab = 'positions';
+  state.ppPos = codes[0];
+  return acc;
+}
+
+/* ---------- AI 模拟操盘：页面渲染 ---------- */
+function ppSortedExecs(acc) {
+  return acc.execs.slice().sort((a, b) => (b.d + b.t).localeCompare(a.d + a.t));
+}
+function ppSortedContexts(acc) {
+  return acc.contexts.slice().sort((a, b) => (b.d + b.t).localeCompare(a.d + a.t));
+}
+function ppLastContext(acc, code) {
+  return ppSortedContexts(acc).filter((c) => c.code === code)[0] || null;
+}
+function ppExecContext(acc, row) {
+  return row.contextId ? acc.contexts.filter((c) => c.id === row.contextId)[0] || null : null;
+}
+function ppQuoteTag(q) {
+  if (!q) return tag('无行情事实', 'mute');
+  if (q.status === 'ok') return tag('行情正常', 'green');
+  if (q.referenceOnly) return tag('参考行情 · 不用于成交', 'gold');
+  if (q.status === 'suspended') return tag('标的停牌', 'mute');
+  return tag('行情暂缺 · 估值不完整', 'red');
+}
+function ppMoneyHtml(v, unit) {
+  if (v == null) return '<span class="dim">—</span>';
+  return '<span class="mono">' + ppAmount(v) + '</span><span class="dim"> ' + (unit || '元') + '</span>';
+}
+function ppSideTag(row) {
+  const buy = row.side === 'buy';
+  return tag(ppLabel(buy ? 'buy' : 'sell') + (row.action ? ' · ' + ppLabel(row.action) : ''), buy ? 'red' : 'green');
+}
+
+function renderPaper() {
+  ppData();
+  const accounts = ppAccounts(state.ppView);
+  const acc = ppAcc();
+  const val = ppValuation(acc);
+  const metrics = ppMetricHtml(acc, val);
+  const banner = ppBannerHtml(acc, val);
+  const chips = accounts.map((a) => {
+    const v = ppValuation(a);
+    return '<button class="cp-chip ' + (a.id === acc.id ? 'active' : '') + '" data-action="pp-account" data-acc="' + a.id + '">' +
+      esc(a.name) + ' <span class="mono dim">' + a.id + '</span> ' +
+      '<span class="mono ' + ppCls(v.pnl) + '">' + (v.pnl == null ? '估值暂不完整' : ppSigned(v.pnl, 0) + ' 元') + '</span></button>';
+  }).join('');
+  const views = [['current', '运行中/已暂停'], ['archived', '已归档']].map((v) =>
+    '<button class="seg-item ' + (state.ppView === v[0] ? 'active' : '') + '" data-action="pp-view" data-view="' + v[0] + '">' + v[1] +
+    '<span class="seg-count">' + ppAccounts(v[0]).length + '</span></button>').join('');
+  const tabs = PP_TABS.map((t) => {
+    const n = t[0] === 'positions' ? val.rows.length
+      : t[0] === 'executions' ? acc.execs.length
+      : t[0] === 'contexts' ? acc.contexts.length
+      : t[0] === 'alerts' ? acc.alerts.length : acc.reviews.length;
+    return '<button class="detail-tab ' + (state.ppTab === t[0] ? 'active' : '') + '" data-action="pp-tab" data-tab="' + t[0] + '">' +
+      t[1] + ' ' + tag(String(n), 'mute') + '</button>';
+  }).join('');
+  const body = state.ppTab === 'positions' ? ppPositionsHtml(acc, val)
+    : state.ppTab === 'executions' ? ppExecutionsHtml(acc, val)
+    : state.ppTab === 'contexts' ? ppContextsHtml(acc)
+    : state.ppTab === 'alerts' ? ppAlertsHtml(acc) : ppReviewsHtml(acc);
+
+  return '<div class="page-head"><div>' +
+      '<div class="page-title">AI 模拟操盘</div>' +
+      '<div class="page-sub">AI 自己下单的隔离账本：买了什么、为什么买、赚亏多少、有没有正常跑。只写 paper 表，与你的真实持仓和券商账户完全无关。</div>' +
+    '</div>' +
+    '<div class="page-actions">' +
+      '<button class="btn sm" data-action="pp-new">' + icon('plus', 'sm') + '新建模拟账户</button>' +
+      '<button class="btn sm" data-action="pp-toggle">' + icon(acc.status === 'active' ? 'clock' : 'rotate', 'sm') +
+        (acc.status === 'active' ? '暂停自动运行' : acc.status === 'paused' ? '继续自动运行' : '已归档 · 只读') + '</button>' +
+      '<button class="btn sm" data-action="pp-quote"' + (acc.status === 'archived' ? ' disabled' : '') + '>' + icon('rotate', 'sm') + '刷新行情</button>' +
+      '<button class="btn sm" data-action="pp-monitor"' + (acc.status === 'archived' ? ' disabled' : '') + '>' + icon('clock', 'sm') + '模拟巡检</button>' +
+      '<button class="btn primary sm" data-action="pp-run"' + (acc.status === 'archived' || !acc.intents.length ? ' disabled' : '') + '>' +
+        icon('agent', 'sm') + '立即补跑' + (acc.intents.length ? ' ' + tag(String(acc.intents.length), 'mute') : '') + '</button>' +
+      '<button class="btn sm" data-action="pp-archive"' + (acc.status === 'archived' ? ' disabled' : '') + '>' + icon('ban', 'sm') + '归档账户</button>' +
+    '</div></div>' +
+    '<div class="cp-toolbar pp-bar"><div class="cp-chips">' + views + '</div>' +
+      '<div class="cp-chips">' + chips + '</div>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn link xs" data-nav="#/holdings">我的真实持仓 ' + icon('arrow', 'sm') + '</button></div>' +
+    '<div class="cp-toolbar"><div class="detail-tabs pp-tabs">' + tabs + '</div></div>' +
+    banner + metrics + ppFactsHtml(acc, val) +
+    '<div class="pp-body">' + body + '</div>' +
+    '<div class="cap-note" style="margin-top:14px">' + icon('info') +
+      '<div>闭环：候选池 → AI 研判（研究取证留档）→ 模拟执行器（整手 / T+1 / 现金 / 费用 / 涨跌停）→ paper 账本与估值 → 模拟复盘 → AI 审核 → 影子验证。' +
+      '<b>审核通过也不会改正式规则</b>，规则改动必须走<a class="btn link xs" data-nav="#/system/rules">规则审计</a>的人工门禁并留痕在 rule_change。</div></div>';
+}
+
+function ppBannerHtml(acc, val) {
+  const lines = [];
+  if (acc.status === 'archived') {
+    lines.push({ tone: 'mute', text: '账户已归档（' + esc(acc.archivedAt || '') + '）：调度不再触发，历史成交、取证与复盘全部保留，页面只读。' });
+    if (acc.archiveReason) lines.push({ tone: 'mute', text: '归档原因：' + esc(acc.archiveReason) });
+  } else if (acc.status === 'paused') {
+    lines.push({ tone: 'warn', text: '自动运行已暂停：调度不会再触发巡检与补跑，下面「模拟巡检 / 立即补跑」仍然可以手动打一轮。' });
+  } else {
+    lines.push({ tone: 'ok', text: '自动运行中：' + esc(acc.schedule.window) + '，每 ' + acc.schedule.every + ' 分钟一轮；下一轮 ' + esc(acc.schedule.next) + '。' });
+  }
+  if (acc.mode === 'historical_replay') {
+    lines.push({ tone: 'info', text: esc(acc.replayNote || '历史回放只用当日冻结事实：不回填今天的持仓、行情和知识库。') });
+  }
+  if (val.quoteStatus === 'stale') {
+    lines.push({ tone: 'warn', text: '行情已过期，仅供参考：本时点有标的没取到新行情，估值用上一轮有效价格回填，标签已改成「估算」。参考行情一律不能用来成交。' });
+  } else if (val.quoteStatus === 'partial_or_unavailable') {
+    lines.push({ tone: 'err', text: '模拟估值暂不完整：' + val.rows.filter((r) => r.price == null).map((r) => r.name).join('、') +
+      ' 在本时点没有任何可用价格。系统不用成本价伪造市值，所以模拟市值、总资产和累计盈亏一起留空。' });
+  }
+  lines.push({ tone: 'proto', text: '静态原型说明：这一页只重算页面数据，不会真的下单，也不会连你的券商账户。行情、AI 结论和证据都来自脚本化的事实序列，点「刷新行情 / 模拟巡检 / 立即补跑」往前推一格。' });
+  return '<div class="pp-banner">' + lines.map((l) =>
+    '<div class="pp-banner-line ' + l.tone + '">' + (l.tone === 'proto' ? icon('info', 'sm') : icon('alert', 'sm')) + '<span>' + l.text + '</span></div>').join('') + '</div>';
+}
+
+function ppMetricHtml(acc, val) {
+  const items = [
+    { label: '模拟现金', value: ppAmount(val.rep.cash),
+      sub: '初始 ' + ppAmount(Number(acc.initialCash)) + ' 元', tone: '' },
+    { label: val.mvLabel, value: val.marketValue == null ? '暂不完整' : ppAmount(val.marketValue),
+      sub: val.marketValue == null ? '有标的没有可用行情' : val.rows.length + ' 只模拟持仓', tone: val.marketValue == null ? 'err' : '' },
+    { label: val.equityLabel, value: val.equity == null ? '暂不完整' : ppAmount(val.equity),
+      sub: val.equity == null ? '拒绝用成本价伪造市值' : '现金 ' + ppAmount(val.rep.cash) + ' + 市值', tone: val.equity == null ? 'err' : 'info' },
+    { label: '累计盈亏', value: val.pnl == null ? '—' : ppPct(val.pnlPct),
+      sub: val.pnl == null ? '等行情齐了再算' : ppSigned(val.pnl, 0) + ' 元 · 已实现 ' + ppSigned(val.rep.realized, 0) + ' / 浮动 ' + ppSigned(val.unrealized, 0),
+      tone: val.pnl == null ? '' : val.pnl > 0 ? 'up' : val.pnl < 0 ? 'down' : '' }
+  ];
+  return '<div class="metric-strip q4 pp-metrics">' + items.map((s) =>
+    '<div class="metric"><div class="metric-label">' + esc(s.label) + '</div>' +
+    '<div class="metric-value ' + s.tone + '">' + esc(s.value) + '</div>' +
+    '<div class="metric-sub">' + esc(s.sub) + '</div></div>').join('') + '</div>';
+}
+
+function ppFactsHtml(acc, val) {
+  const facts = [
+    ['行情事实时点', val.factAsOf + '（第 ' + (Math.min(acc.cursor, acc.slots.length - 1) + 1) + '/' + acc.slots.length + ' 格）'],
+    ['行情来源', ppLabel(acc.quoteSource) + (val.rows.some((r) => r.quote.source !== acc.quoteSource) ? ' · 本轮含回填' : '')],
+    ['策略变体', ppLabel(acc.variant) + (acc.variant === 'candidate_pool' ? '：AI 决定加/减/清与幅度' : '：监控信号 → 卖出研判')],
+    ['研判与执行版本', acc.model + ' · ' + acc.ruleVersion],
+    ['调度节奏', '每 ' + acc.schedule.every + ' 分钟 · ' + acc.schedule.window],
+    ['成交 / 拒绝', val.rep.filled + ' 笔已成交 · ' + val.rep.rejected + ' 笔被拒绝（拒绝全部留痕）']
+  ];
+  return '<div class="pp-facts">' + facts.map((f) =>
+    '<div class="pp-fact"><span class="pp-fact-k">' + esc(f[0]) + '</span><span class="pp-fact-v">' + esc(f[1]) + '</span></div>').join('') +
+    '<div class="pp-runlog">' + acc.runs.slice(0, 5).map((r) =>
+      '<span class="pp-run"><b class="mono">' + esc(r.at) + '</b> ' +
+      esc(r.kind === 'quote' ? '刷新行情' : r.kind === 'monitor' ? '模拟巡检' : r.kind === 'run' ? '立即补跑' : r.kind === 'review' ? '复盘审核' : '归档') +
+      ' ' + (r.note ? esc(r.note) : '成交 ' + r.filled + ' / 拒绝 ' + r.rejected + ' / 跳过 ' + r.skipped) + '</span>').join('') + '</div></div>';
+}
+
+function ppPositionsHtml(acc, val) {
+  const rows = val.rows;
+  const sel = rows.filter((r) => r.code === state.ppPos)[0] || rows[0] || null;
+  if (sel) state.ppPos = sel.code;
+  return '<div class="cp-layout">' +
+    '<div class="card cp-list-card">' +
+      '<div class="rq-bar">' + (rows.length
+        ? '<b>模拟持仓 ' + rows.length + ' 只</b><span class="dim">左键换标的；现价、浮动盈亏和 T+1 可卖都由成交回放算出</span>'
+        : '<span class="dim">这个账户还没有模拟持仓，点「立即补跑」执行候选池意图就会建起来</span>') + '</div>' +
+      '<div class="cp-list" id="pp-list">' +
+        (rows.length ? rows.map((r) => ppPosRowHtml(acc, r)).join('')
+          : '<div class="empty-list" style="margin:14px"><strong>没有模拟持仓</strong>新建账户后，「立即补跑」会按候选池意图下单；被拒绝的意图也会逐条留在模拟流水里。</div>') +
+      '</div>' +
+      '<div class="hd-list-foot"><span class="hint">' + esc(val.notice || '行情正常，估值口径与后端 account_view 一致') + '</span>' +
+        '<span class="spacer"></span><span class="hint dim">事实时点 ' + esc(val.factAsOf) + '</span></div>' +
+    '</div>' +
+    '<div class="cp-detail" id="pp-detail">' + (sel ? ppPosDetailHtml(acc, sel, val)
+      : '<div class="card"><div class="empty-list"><strong>选择一只模拟持仓</strong>这里看它的 AI 决策、取证证据、保护价和相关流水。</div></div>') + '</div>' +
+  '</div>';
+}
+
+function ppPosRowHtml(acc, p) {
+  const active = state.ppPos === p.code;
+  return '<div class="cp-row pp-row' + (active ? ' active' : '') + '" role="button" tabindex="0" data-action="pp-pos" data-code="' + p.code + '">' +
+    '<div class="cp-row-top">' +
+      '<span class="hold-dot ' + (p.price == null ? 'err' : p.pnl != null && p.pnl < 0 ? 'warn' : 'ok') + '"></span>' +
+      '<span class="cp-name">' + esc(p.name) + ' <span class="mono dim">' + p.code + '</span></span>' +
+      '<span class="spacer"></span>' +
+      '<span class="mono ' + ppCls(p.pnlPct) + '">' + (p.pnlPct == null ? '—' : ppPct(p.pnlPct)) + '</span>' +
+    '</div>' +
+    '<div class="cp-row-reason">' + esc(ppLastContext(acc, p.code) && ppLastContext(acc, p.code).decision
+      ? ppLabel(ppLastContext(acc, p.code).decision.action) + '：' + (ppLastContext(acc, p.code).decision.reasons[0] || '')
+      : '本时点没有 AI 动作，保持持有') + '</div>' +
+    '<div class="hd-row-nums">' +
+      '<span>现价 <b class="mono">' + (p.price == null ? '—' : p.price.toFixed(2)) + '</b></span>' +
+      '<span>成本 <b class="mono">' + p.avg.toFixed(2) + '</b></span>' +
+      '<span>持仓 <b class="mono">' + p.shares + '</b> / 可卖 <b class="mono">' + p.available + '</b></span>' +
+      '<span>占比 <b class="mono">' + p.allocatedPct.toFixed(1) + '%</b></span>' +
+    '</div>' +
+    '<div class="cp-row-foot">' +
+      '<span class="mono dim">' + (p.marketValue == null ? '市值待行情' : ppAmount(p.marketValue) + ' 元') + '</span>' +
+      ppQuoteTag(p.quote) +
+      (p.phase ? tag(ppLabel(p.phase), 'outline') : '') +
+      '<span class="spacer"></span>' +
+      '<span class="mono ' + ppCls(p.pnl) + '">' + (p.pnl == null ? '—' : ppSigned(p.pnl, 0) + ' 元') + '</span>' +
+    '</div></div>';
+}
+
+function ppPosDetailHtml(acc, p, val) {
+  const ctx = ppLastContext(acc, p.code);
+  const execs = ppSortedExecs(acc).filter((r) => r.code === p.code).slice(0, 5);
+  const alerts = acc.alerts.filter((a) => a.code === p.code).slice(0, 4);
+  const guard = p.guard;
+  const kline = candKlineHtml({ stock_code: p.code, stock_name: p.name, trade_date: val.rep.date, last: p.price || p.avg }, '本时点', true);
+  return '<div class="card pp-detail-card">' +
+    '<div class="cp-detail-head"><div>' +
+      '<div class="cp-title">' + esc(p.name) + ' <span class="mono dim">' + p.code + '</span></div>' +
+      '<div class="cp-sub">' + esc(p.theme || '未标注主线') + ' · 建仓日 ' + esc(p.openedAt) + ' · 事实时点 ' + esc(p.quote.stamp) + '</div>' +
+      '<div class="detail-tags">' + ppQuoteTag(p.quote) + ' ' +
+        (p.quote.referenceOnly ? tag('行情已过期，仅供参考', 'gold') : '') +
+        (p.phase ? tag(ppLabel(p.phase), 'outline') : '') +
+        tag('目标上限 ' + PP_RULES.maxAllocationPct + '%', 'mute') + '</div></div>' +
+      '<div class="spacer"></div>' +
+      '<div class="cp-acts">' +
+        '<button class="btn sm" data-action="pp-kline" aria-expanded="' + state.ppKline + '">' + icon('chart', 'sm') + (state.ppKline ? '收起K线' : '看K线') + '</button>' +
+        quoteUrls(p.code).map((q) => '<a class="btn link xs" href="' + q.url + '" target="_blank" rel="noopener noreferrer">' + esc(q.name) + ' ' + icon('external', 'sm') + '</a>').join('') +
+      '</div></div>' +
+    '<div class="pp-grid">' +
+      ppCell('现价', p.price == null ? '—' : p.price.toFixed(2), p.quote.chgPct == null ? '' : ppPct(p.quote.chgPct), ppCls(p.quote.chgPct)) +
+      ppCell('浮动盈亏', p.pnl == null ? '—' : ppSigned(p.pnl, 0) + ' 元', p.pnlPct == null ? '估值暂不完整' : ppPct(p.pnlPct), ppCls(p.pnlPct)) +
+      ppCell('成本 / 股数', p.avg.toFixed(2), p.shares + ' 股（可卖 ' + p.available + '）', 'dim') +
+      ppCell('持仓市值', p.marketValue == null ? '—' : ppAmount(p.marketValue) + ' 元', '占总资金 ' + p.allocatedPct.toFixed(1) + '%', 'dim') +
+    '</div>' +
+    '<div class="pp-guards">' + [
+      ['硬止损 ' + PP_RULES.hardStopPct + '%', guard.stop.toFixed(2), p.distStop == null ? '待行情' : '距现价 ' + ppSigned(p.distStop, 1) + '%'],
+      ['第一止盈 +' + PP_RULES.firstTakePct + '%', guard.take1.toFixed(2), p.distTake == null ? '待行情' : '距现价 ' + ppSigned(p.distTake, 1) + '%'],
+      ['主止盈 +' + PP_RULES.mainTakePct + '%', guard.take2.toFixed(2), '移动止损 ' + PP_RULES.trailStopPct + '%']
+    ].map((g) => '<span class="pp-guard">' + icon('shield', 'sm') + '<b>' + esc(g[0]) + '</b> ' +
+      '<span class="mono">' + esc(g[1]) + '</span> <span class="dim">' + esc(g[2]) + '</span></span>').join('') + '</div>' +
+    (state.ppKline ? '<div class="pp-kline">' + kline + '</div>' : '') +
+    '<div class="pp-section">' +
+      '<div class="pp-section-head">' + icon('agent', 'sm') + '<b>AI 决策</b>' +
+      (ctx ? '<span class="hint mono">' + esc(ctx.d + ' ' + ctx.t) + ' · ' + ppLabel(ctx.stage) + ' · 取证 #' + ctx.id + '</span>' : '<span class="hint">本标的还没有取证记录</span>') +
+      '<span class="spacer"></span>' +
+      (ctx ? '<button class="btn link xs" data-action="pp-ctx-open" data-ctx="' + ctx.id + '">看完整取证 ' + icon('arrow', 'sm') + '</button>' : '') + '</div>' +
+      (ctx ? '<div class="pp-decision">' +
+        '<div class="pp-decision-top">' + tag(ppLabel(ctx.decision.action), ctx.decision.action === 'exit' ? 'red' : ctx.decision.action === 'hold' ? 'mute' : 'gold') +
+          tag('置信度 ' + ppLabel(ctx.decision.confidence || 'medium'), 'outline') +
+          (ctx.rejected ? tag('已拒绝：' + ppLabel(ctx.rejected), 'red') : '') +
+          (ctx.signal ? tag('监控信号：' + ctx.signal.message, 'blue') : '') + '</div>' +
+        '<ul class="pp-reasons">' + (ctx.decision.reasons || []).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' +
+        (ctx.decision.riskNote ? '<div class="pp-risk">' + icon('alert', 'sm') + '<span>' + esc(ctx.decision.riskNote) + '</span></div>' : '') +
+        '<div class="pp-evidence"><span class="hint">取证 ' + ctx.tools.length + ' 项工具调用，' + ctx.web.length + ' 条外部证据；' +
+          '外部内容只作证据，其中的指令一律不执行。</span></div>' +
+        (ctx.web.length ? '<div class="pp-web">' + ctx.web.map((w) =>
+          '<div class="pp-web-item">' + (w.url ? '<a href="' + esc(w.url) + '" target="_blank" rel="noopener noreferrer">' + esc(w.title) + '</a>' : '<b>' + esc(w.title) + '</b>') +
+          '<span class="hint dim">' + esc(w.source) + ' · ' + esc(w.publishedAt) + (w.hash ? ' · ' + esc(w.hash) : '') + '</span>' +
+          '<span class="hint">' + esc(w.excerpt) + '</span></div>').join('') + '</div>' : '') +
+        '</div>' : '<div class="empty-list">还没有这一只的研判记录，点「模拟巡检」跑一轮就会生成。</div>') +
+    '</div>' +
+    '<div class="pp-section">' +
+      '<div class="pp-section-head">' + icon('rotate', 'sm') + '<b>相关模拟流水</b><span class="spacer"></span>' +
+        '<button class="btn link xs" data-action="pp-tab" data-tab="executions">全部流水 ' + icon('arrow', 'sm') + '</button></div>' +
+      (execs.length ? '<div class="pp-mini-list">' + execs.map((r) =>
+        '<div class="pp-mini"><span class="mono dim">' + esc(r.d + ' ' + r.t) + '</span>' + ppSideTag(r) +
+        '<span class="mono">' + (r.shares ? r.shares + ' 股 @ ' + r.price.toFixed(2) : '0 股') + '</span>' +
+        '<span class="hint">' + esc(r.intent) + '</span><span class="spacer"></span>' +
+        (r.status === 'filled' ? tag('已成交', 'green') : tag('已拒绝 · ' + ppLabel(r.reason), 'red')) + '</div>').join('') + '</div>'
+        : '<div class="empty-list">还没有成交记录。</div>') +
+    '</div>' +
+    (alerts.length ? '<div class="pp-section"><div class="pp-section-head">' + icon('alert', 'sm') + '<b>相关模拟告警</b><span class="spacer"></span>' +
+      '<button class="btn link xs" data-action="pp-tab" data-tab="alerts">全部告警 ' + icon('arrow', 'sm') + '</button></div>' +
+      '<div class="pp-mini-list">' + alerts.map((a) =>
+        '<div class="pp-mini"><span class="state ' + (a.severity === 'critical' ? 'bad' : a.severity === 'warning' ? 'todo' : 'done') + '"></span>' +
+        '<span class="mono dim">' + esc(a.d) + '</span><span class="hint">' + esc(a.message) + '</span></div>').join('') + '</div></div>' : '') +
+  '</div>';
+}
+
+function ppCell(label, value, sub, cls) {
+  return '<div class="pp-cell"><div class="pp-cell-k">' + esc(label) + '</div>' +
+    '<div class="pp-cell-v mono">' + esc(value) + '</div>' +
+    '<div class="pp-cell-s ' + (cls || 'dim') + '">' + esc(sub) + '</div></div>';
+}
+
+const PP_FILTERS = [['', '全部'], ['filled', '已成交'], ['rejected', '已拒绝'], ['buy', '买入方向'], ['sell', '卖出方向']];
+
+function ppExecutionsHtml(acc, val) {
+  const all = ppSortedExecs(acc);
+  const rows = all.filter((r) => !state.ppFilter
+    || (state.ppFilter === 'buy' || state.ppFilter === 'sell' ? r.side === state.ppFilter : r.status === state.ppFilter));
+  const counts = { filled: all.filter((r) => r.status === 'filled').length, rejected: all.length - all.filter((r) => r.status === 'filled').length };
+  return '<div class="card">' +
+    '<div class="card-title"><h3>模拟流水（' + all.length + '）</h3>' +
+      '<span class="hint">每一笔都被回放成现金、成本、T+1 可卖和已实现盈亏；被拒绝的意图同样留痕</span>' +
+      '<span class="spacer"></span>' +
+      '<div class="cp-chips">' + PP_FILTERS.map((f) =>
+        '<button class="cp-chip ' + (state.ppFilter === f[0] ? 'active' : '') + '" data-action="pp-filter" data-filter="' + f[0] + '">' + f[1] + '</button>').join('') + '</div></div>' +
+    (rows.length ? '<div class="table-wrap"><table class="pp-table">' +
+      '<thead><tr><th>事实时点</th><th>标的</th><th>方向</th><th>AI 意图</th><th>成交价</th><th>股数</th><th>金额</th><th>费用</th><th>结果</th><th>原因 / 说明</th><th>取证</th></tr></thead><tbody>' +
+      rows.map((r) => '<tr class="' + (r.status === 'filled' ? '' : 'pp-row-rej') + '">' +
+        '<td class="mono dim">' + esc(r.d + ' ' + r.t) + '</td>' +
+        '<td><button class="btn link xs pp-link-name" data-action="pp-pos" data-code="' + r.code + '">' + esc(r.name) + '</button> <span class="mono dim">' + r.code + '</span></td>' +
+        '<td>' + ppSideTag(r) + '</td>' +
+        '<td class="hint">' + esc(r.intent || '—') + '</td>' +
+        '<td class="mono">' + (r.price ? r.price.toFixed(2) : '—') + '</td>' +
+        '<td class="mono">' + (r.shares || 0) + '</td>' +
+        '<td class="mono">' + (r.gross ? ppAmount(r.gross) : '—') + '</td>' +
+        '<td class="mono dim">' + (r.fee ? r.fee.toFixed(2) : '—') + '</td>' +
+        '<td>' + (r.status === 'filled' ? tag('已成交', 'green') : tag('已拒绝', 'red')) + '</td>' +
+        '<td class="hint">' + (r.reason ? tag(ppLabel(r.reason), 'gold') + ' ' : '') + esc(r.note || (r.status === 'filled' ? '滑点 ±5bp 已计入成交价' : '')) + '</td>' +
+        '<td>' + (r.contextId ? '<button class="btn link xs" data-action="pp-ctx-open" data-ctx="' + r.contextId + '">#' + r.contextId + '</button>' : '<span class="dim">—</span>') + '</td>' +
+      '</tr>').join('') + '</tbody></table></div>'
+      : '<div class="empty-list" style="margin:16px">这个筛选下没有流水。</div>') +
+    '<div class="hd-list-foot"><span class="hint">成交 ' + counts.filled + ' 笔 · 拒绝 ' + counts.rejected + ' 笔 · 已实现盈亏 ' +
+      ppSigned(val.rep.realized, 2) + ' 元</span><span class="spacer"></span>' +
+      '<span class="hint dim">费用口径：佣金万 3（最低 5 元）+ 过户费万 0.1，卖出再加印花税万 5</span></div>' +
+  '</div>';
+}
+
+function ppContextsHtml(acc) {
+  const rows = ppSortedContexts(acc);
+  const openId = state.ppCtx != null ? state.ppCtx : (rows[0] ? rows[0].id : null);
+  return '<div class="card">' +
+    '<div class="card-title"><h3>研究取证（' + rows.length + '）</h3>' +
+      '<span class="hint">每个模拟动作都要留下工具调用与证据；回放模式只用当日冻结快照</span>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn sm" data-action="pp-research">' + icon('search', 'sm') + '手动研究取证</button></div>' +
+    (rows.length ? '<div class="pp-ctx-list">' + rows.map((c) => ppCtxHtml(acc, c, c.id === openId)).join('') + '</div>'
+      : '<div class="empty-list" style="margin:16px">还没有取证记录，点「模拟巡检」或「手动研究取证」生成。</div>') +
+  '</div>';
+}
+
+function ppCtxHtml(acc, c, open) {
+  const linked = acc.execs.filter((r) => r.contextId === c.id);
+  return '<div class="pp-ctx' + (open ? ' open' : '') + '" id="pp-ctx-' + c.id + '">' +
+    '<button class="pp-ctx-head" data-action="pp-ctx" data-ctx="' + c.id + '" aria-expanded="' + open + '">' +
+      '<span class="mono dim">' + esc(c.d + ' ' + c.t) + '</span>' +
+      '<span class="cp-name">' + esc((acc.universe[c.code] || {}).name || c.code) + ' <span class="mono dim">' + esc(c.code) + '</span></span>' +
+      tag(ppLabel(c.stage), 'blue') + tag(ppLabel(c.mode), 'mute') +
+      (c.rejected ? tag('闸门拒绝：' + ppLabel(c.rejected), 'red') : '') +
+      (c.decision && c.decision.action ? tag('结论：' + ppLabel(c.decision.action), 'outline') : '') +
+      '<span class="spacer"></span><span class="hint dim">#' + c.id + ' · 取证 ' + c.tools.length + ' 项' + (c.web.length ? ' · 外部证据 ' + c.web.length + ' 条' : '') + '</span>' +
+      '<span class="icon sm">' + (open ? '▴' : '▾') + '</span></button>' +
+    (open ? '<div class="pp-ctx-body">' +
+      '<dl class="kv">' +
+        '<dt>事实时点</dt><dd>' + esc(c.factAsOf || '未记录') + ' · 与决策时点一致才允许进入研判</dd>' +
+        '<dt>工具轨迹</dt><dd><div class="pp-tools">' + c.tools.map((t) =>
+          '<div class="pp-tool"><span class="state ' + (t.status === 'ok' ? 'done' : 'bad') + '"></span>' +
+          '<b>' + esc(ppLabel(t.tool)) + '</b><span class="hint">' + esc(t.status === 'ok' ? t.summary : t.error) + '</span></div>').join('') + '</div></dd>' +
+        '<dt>外部证据</dt><dd>' + (c.web.length ? c.web.map((w) =>
+          '<div class="pp-web-item">' + (w.url ? '<a href="' + esc(w.url) + '" target="_blank" rel="noopener noreferrer">' + esc(w.title) + '</a>' : '<b>' + esc(w.title) + '</b>') +
+          '<span class="hint dim">' + esc(w.source || '外部') + ' · ' + esc(w.publishedAt) + ' · 抓取哈希 ' + esc(w.hash || '—') + '</span>' +
+          '<span class="hint">' + esc(w.excerpt) + '</span></div>').join('')
+          : '<span class="dim">' + (acc.mode === 'historical_replay' ? '历史回放不联网，只用当日冻结快照。' : '本轮没有引用外部证据。') + '</span>') + '</dd>' +
+        '<dt>研判结论</dt><dd>' + (c.signal ? '<div class="hint">监控信号：' + esc(c.signal.message) + '（' + ppLabel(c.signal.severity) + '）</div>' : '') +
+          '<div class="pp-decision">' + '<div class="pp-decision-top">' +
+            tag(ppLabel(c.decision.action), c.decision.action === 'exit' ? 'red' : c.decision.action === 'hold' ? 'mute' : 'gold') +
+            tag('置信度 ' + ppLabel(c.decision.confidence || 'medium'), 'outline') +
+            (c.decision.reduceRatio != null ? tag('减仓 ' + Math.round(c.decision.reduceRatio * 100) + '%', 'blue') : '') +
+            (c.decision.allocationPct != null ? tag('目标 ' + c.decision.allocationPct + '%', 'blue') : '') + '</div>' +
+            '<ul class="pp-reasons">' + (c.decision.reasons || []).map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul>' +
+            (c.decision.riskNote ? '<div class="pp-risk">' + icon('alert', 'sm') + '<span>' + esc(c.decision.riskNote) + '</span></div>' : '') + '</div></dd>' +
+        '<dt>关联流水</dt><dd>' + (linked.length ? linked.map((r) =>
+          '<div class="pp-mini"><span class="mono dim">' + esc(r.d + ' ' + r.t) + '</span>' + ppSideTag(r) +
+          '<span class="mono">' + (r.shares ? r.shares + ' 股 @ ' + r.price.toFixed(2) : '0 股') + '</span>' +
+          (r.status === 'filled' ? tag('已成交', 'green') : tag('已拒绝 · ' + ppLabel(r.reason), 'red')) + '</div>').join('')
+          : '<span class="dim">这份取证没有产生成交（研判结论为不动，或被闸门拦下）</span>') + '</dd>' +
+      '</dl>' +
+      '<div class="cap-note" style="margin-top:12px">' + icon('info') +
+        '<div>正式端把这条记录写进 paper_context（含 context_hash、tool_trace、source_refs），复盘和审核都从同一份冻结事实出发；' +
+        '回放里任何晚于决策时点的字段都会被 future_data 闸门拒绝。</div></div>' +
+      '</div>' : '') + '</div>';
+}
+
+function ppAlertsHtml(acc) {
+  const rows = acc.alerts.slice().sort((a, b) => b.d.localeCompare(a.d));
+  return '<div class="card">' +
+    '<div class="card-title"><h3>模拟告警（' + rows.length + '）</h3>' +
+      '<span class="hint">只报模拟盘自己的事：AI 动作、闸门拒绝、行情降级；与真实持仓的告警分开</span></div>' +
+    (rows.length ? '<div class="pp-alert-list">' + rows.map((a) =>
+      '<div class="pp-alert"><span class="state ' + (a.severity === 'critical' ? 'bad' : a.severity === 'warning' ? 'todo' : 'done') + '"></span>' +
+      '<div class="pp-alert-main"><b>' + esc((acc.universe[a.code] || {}).name || a.code) + ' <span class="mono dim">' + esc(a.code) + '</span></b>' +
+      '<div class="hint">' + esc(a.message) + '</div>' +
+      '<span class="hint dim">' + esc(a.d) + ' · 来源 ' + esc(a.source) + '</span></div>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn xs" data-action="pp-pos" data-code="' + esc(a.code) + '">定位标的</button>' +
+      (a.contextId ? '<button class="btn link xs" data-action="pp-ctx-open" data-ctx="' + a.contextId + '">看取证 ' + icon('arrow', 'sm') + '</button>' : '') +
+      '</div>').join('') + '</div>'
+      : '<div class="empty-list" style="margin:16px">这个账户还没有模拟告警。</div>') +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') +
+      '<div>这一页是模拟盘告警；你自己的持仓提醒在<a class="btn link xs" data-nav="#/alerts">告警日志</a>，两套来源分开记录，不会互相覆盖。</div></div>' +
+  '</div>';
+}
+
+function ppReviewsHtml(acc) {
+  const rows = acc.reviews.slice().sort((a, b) => b.d.localeCompare(a.d));
+  return '<div class="card">' +
+    '<div class="card-title"><h3>模拟复盘（' + rows.length + '）</h3>' +
+      '<span class="hint">收盘后的审核任务逐条处理；「AI 审核通过」只是进入影子验证，不等于正式规则改动</span></div>' +
+    (rows.length ? '<div class="pp-review-list">' + rows.map((r) => ppReviewHtml(acc, r)).join('') + '</div>'
+      : '<div class="empty-list" style="margin:16px">还没有模拟复盘：模拟卖出成交后会自动排队一条待 AI 审核的复盘。</div>') +
+  '</div>';
+}
+
+function ppReviewHtml(acc, r) {
+  const stage = r.audit === 'pending' ? ['待AI审核', 'todo'] : r.audit === 'pass' ? ['AI审核通过', 'done'] : ['AI审核未通过', 'bad'];
+  if (r.auditMode === 'manual' && r.audit !== 'pending') stage[0] = r.audit === 'pass' ? '人工复核通过' : '人工复核未通过';
+  const form = state.ppForm && state.ppForm.kind === 'review' && state.ppForm.id === r.id;
+  const exec = r.execId ? acc.execs.filter((x) => x.id === r.execId)[0] : null;
+  return '<div class="pp-review' + (r.audit === 'pending' ? ' pending' : '') + '">' +
+    '<div class="pp-review-head"><b>' + esc((acc.universe[r.code] || {}).name || r.code) + ' <span class="mono dim">' + esc(r.code) + '</span></b>' +
+      '<span class="mono dim">' + esc(r.d) + '</span>' +
+      tag(stage[0], stage[1] === 'done' ? 'green' : stage[1] === 'bad' ? 'red' : stage[1] === 'todo' ? 'gold' : 'mute') +
+      (r.auditMode === 'manual' ? tag('人工覆盖 AI', 'outline') : '') +
+      tag(ppShadowLabel(r.shadow), r.shadow === 'active' ? 'blue' : r.shadow === 'pending' ? 'gold' : r.shadow === 'blocked' ? 'red' : 'mute') +
+      '<span class="spacer"></span>' +
+      (exec ? '<button class="btn link xs" data-action="pp-ctx-open" data-ctx="' + (exec.contextId || '') + '">看这笔取证</button>' : '') +
+      '</div>' +
+    '<dl class="kv">' +
+      '<dt>复盘结论</dt><dd>' + esc(r.summary) + '</dd>' +
+      '<dt>可复用经验</dt><dd>' + esc(r.lesson) + '</dd>' +
+      '<dt>事实闸门</dt><dd>' + (r.gaps && r.gaps.length
+        ? r.gaps.map((g) => tag(g, 'red')).join(' ') + '<div class="hint">缺来源的事实不允许通过，这条永远进不了影子验证。</div>'
+        : '<span class="hint">候选 / 评分 / 建仓计划 / 交易日期 / 事实时点都齐</span>') + '</dd>' +
+      (r.auditReason ? '<dt>审核意见</dt><dd>' + esc(r.auditReason) +
+        (r.confidence != null ? '<div class="hint dim">模型置信度 ' + r.confidence + '/100</div>' : '') + '</dd>' : '') +
+      (r.support ? '<dt>支持观点</dt><dd>' + esc(r.support) + '</dd>' : '') +
+      (r.dissent ? '<dt>反面观点</dt><dd>' + esc(r.dissent) + '</dd>' : '') +
+      (r.boundary ? '<dt>适用边界</dt><dd>' + esc(r.boundary) + '</dd>' : '') +
+      (r.shadowNote ? '<dt>影子验证</dt><dd>' + esc(r.shadowNote) + '</dd>' : '') +
+    '</dl>' +
+    (form ? '<div class="pp-inline-form">' +
+      '<div class="pp-inline-row"><label class="radio"><input type="radio" name="pp-rv-verdict" value="pass"' + (state.ppForm.verdict === 'pass' ? ' checked' : '') + '><span>同意进入影子验证</span></label>' +
+        '<label class="radio"><input type="radio" name="pp-rv-verdict" value="fail"' + (state.ppForm.verdict === 'fail' ? ' checked' : '') + '><span>驳回</span></label></div>' +
+      '<textarea class="input" id="pp-rv-reason" rows="3" placeholder="人工复审理由（必填，会作为留痕写进复盘记录）">' + esc(state.ppForm.reason || '') + '</textarea>' +
+      '<div class="rq-reject-acts"><button class="btn primary sm" data-action="pp-review-save" data-id="' + r.id + '">提交人工复审</button>' +
+        '<button class="btn sm" data-action="pp-review-cancel">取消</button>' +
+        '<span class="hint">人工复审可以覆盖 AI 结论，但必须写理由；覆盖后依然只进影子验证，正式规则改动要走规则审计。</span></div>' +
+      '</div>'
+      : '<div class="pp-review-acts">' +
+        (r.audit === 'pending' ? '<button class="btn primary sm" data-action="pp-review-audit" data-id="' + r.id + '">' + icon('agent', 'sm') + 'AI 审核这一条</button>' : '') +
+        '<button class="btn sm" data-action="pp-review-manual" data-id="' + r.id + '">人工复审</button>' +
+        (r.shadow === 'pending' ? '<button class="btn sm" data-action="pp-review-shadow" data-id="' + r.id + '">送入影子验证</button>' : '') +
+        '<span class="hint">模拟结论只作为参考案例与待验证假设，不自动改任何阈值。</span></div>') +
+  '</div>';
+}
+
+/* ---------- AI 模拟操盘：抽屉表单 ---------- */
+function ppReadForm(prefix) {
+  const out = {};
+  document.querySelectorAll('[id^="' + prefix + '-"]').forEach((el) => {
+    out[el.id.replace(prefix + '-', '')] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  return out;
+}
+
+function ppNewFormHtml(v, errs) {
+  const d = Object.assign({ name: '候选池自主加仓 · 12月', initialCash: '200000', variant: 'candidate_pool',
+    mode: 'live_paper', model: 'action-v1 / qwen-max', ruleVersion: 'paper-execution-v1', every: '5' }, v || {});
+  const f = (label, input) => '<label class="hd-field"><span>' + label + '</span>' + input + '</label>';
+  return '<div class="hd-form in-drawer">' +
+    '<div class="hd-form-title">新建模拟账户 <span class="hint">独立账本，不动真实持仓</span></div>' +
+    '<div class="hd-form-grid">' +
+      f('账户名称 *', '<input class="input" id="pp-n-name" value="' + esc(d.name) + '">') +
+      f('初始资金（元）*', '<input class="input mono" id="pp-n-initialCash" type="number" min="10000" step="10000" value="' + esc(d.initialCash) + '">') +
+      f('策略变体', '<select class="input" id="pp-n-variant">' +
+        '<option value="candidate_pool"' + (d.variant === 'candidate_pool' ? ' selected' : '') + '>候选池自主加减仓（AI 决定动作与幅度）</option>' +
+        '<option value="current_gate"' + (d.variant === 'current_gate' ? ' selected' : '') + '>现有门禁链路（监控信号 → 卖出研判）</option></select>') +
+      f('运行模式', '<select class="input" id="pp-n-mode">' +
+        '<option value="live_paper"' + (d.mode === 'live_paper' ? ' selected' : '') + '>实时模拟（用当前行情）</option>' +
+        '<option value="historical_replay"' + (d.mode === 'historical_replay' ? ' selected' : '') + '>历史回放（只用冻结快照）</option></select>') +
+      f('研判版本', '<input class="input mono" id="pp-n-model" value="' + esc(d.model) + '">') +
+      f('执行规则版本', '<input class="input mono" id="pp-n-ruleVersion" value="' + esc(d.ruleVersion) + '">') +
+      f('巡检间隔（分钟，≥5）', '<input class="input mono" id="pp-n-every" type="number" min="5" step="1" value="' + esc(d.every) + '">') +
+    '</div>' +
+    (errs && errs.length ? '<div class="hd-warns">' + errs.map((e) =>
+      '<div class="hd-warn">' + icon('alert', 'sm') + esc(e) + '</div>').join('') + '</div>' : '') +
+    '<div class="hd-form-acts"><button class="btn sm" data-action="close-drawer">取消</button><span class="spacer"></span>' +
+      '<button class="btn primary sm" data-action="pp-new-save">校验并创建</button></div>' +
+    '<div class="cap-note" style="margin-top:12px">' + icon('info') +
+      '<div>新账户带 3 条候选池建仓意图，创建后点「立即补跑」就能看到成交与拒绝；执行器仍然只做整手、T+1、现金、费用和涨跌停换算，' +
+      '不会碰券商接口。</div></div>' +
+  '</div>';
+}
+
+function ppResearchFormHtml(v, errs) {
+  const d = Object.assign({ code: '603501', mode: 'live_paper', snapshotDate: '', urls: 'https://www.cls.cn/detail/2031145' }, v || {});
+  const f = (label, input) => '<label class="hd-field"><span>' + label + '</span>' + input + '</label>';
+  return '<div class="hd-form in-drawer">' +
+    '<div class="hd-form-title">手动研究取证 <span class="hint">先把事实和证据留档，再决定动不动</span></div>' +
+    '<div class="hd-form-grid">' +
+      f('证券代码 *', '<input class="input mono" id="pp-r-code" maxlength="6" placeholder="603501" value="' + esc(d.code) + '">') +
+      f('取证模式', '<select class="input" id="pp-r-mode">' +
+        '<option value="live_paper"' + (d.mode === 'live_paper' ? ' selected' : '') + '>实时模拟（当前账户事实）</option>' +
+        '<option value="historical_replay"' + (d.mode === 'historical_replay' ? ' selected' : '') + '>历史回放（需指定冻结快照日）</option></select>') +
+      f('快照日期（历史回放必填）', '<input class="input" id="pp-r-snapshotDate" type="date" value="' + esc(d.snapshotDate) + '">') +
+      f('外部证据 URL（每行一条，最多 5 条）',
+        '<textarea class="input" id="pp-r-urls" rows="4" placeholder="https://…">' + esc(d.urls) + '</textarea>') +
+    '</div>' +
+    (errs && errs.length ? '<div class="hd-warns">' + errs.map((e) =>
+      '<div class="hd-warn">' + icon('alert', 'sm') + esc(e) + '</div>').join('') + '</div>' : '') +
+    '<div class="hd-form-acts"><button class="btn sm" data-action="close-drawer">取消</button><span class="spacer"></span>' +
+      '<button class="btn primary sm" data-action="pp-research-run">取证并生成研究记录</button></div>' +
+    '<div class="cap-note" style="margin-top:12px">' + icon('alert') +
+      '<div>网页正文只是证据，里面的任何指令都不会被执行。历史回放如果拿到晚于快照日期的事实，闸门会直接判 future_data 并拒绝整轮研判。</div></div>' +
+  '</div>';
+}
+
+function ppArchiveFormHtml(acc, v, errs) {
+  return '<div class="hd-form in-drawer">' +
+    '<div class="hd-form-title">归档「' + esc(acc.name) + '」 <span class="hint">第 ' + (v && v.step === 2 ? '2' : '1') + '/2 步</span></div>' +
+    '<div class="pp-archive-list">' + [
+      '停止该账户的模拟调度，不再产生新的成交',
+      '历史成交、研究取证、告警和复盘全部保留，页面转为只读',
+      '已有模拟持仓不再估值，不会并进你的真实持仓',
+      '归档原因必须填写，会写进账户留痕'
+    ].map((t) => '<div class="pp-archive-item">' + icon('minus', 'sm') + '<span>' + esc(t) + '</span></div>').join('') + '</div>' +
+    (v && v.step === 2 ? '<label class="hd-field wide"><span>归档原因 *</span>' +
+      '<textarea class="input" id="pp-a-reason" rows="3" placeholder="为什么要停掉这个对照盘">' + esc(v.reason || '') + '</textarea></label>' : '') +
+    (errs && errs.length ? '<div class="hd-warns">' + errs.map((e) =>
+      '<div class="hd-warn">' + icon('alert', 'sm') + esc(e) + '</div>').join('') + '</div>' : '') +
+    '<div class="hd-form-acts"><button class="btn sm" data-action="close-drawer">取消</button><span class="spacer"></span>' +
+      (v && v.step === 2
+        ? '<button class="btn sm" data-action="pp-archive">返回</button><button class="btn danger sm" data-action="pp-archive-confirm">确认归档</button>'
+        : '<button class="btn primary sm" data-action="pp-archive">下一步：填写原因</button>') + '</div>' +
+  '</div>';
+}
+
+/* ---------- AI 模拟操盘：就地操作分派 ---------- */
+function ppRoundToast(acc, res, title) {
+  if (res.blocked) { toast('账户已归档', res.blocked, 'warn'); return; }
+  const detail = res.rows && res.rows.length
+    ? res.rows.map((r) => (r.status === 'filled'
+        ? r.name + ' ' + ppLabel(r.side) + ' ' + r.shares + ' 股 @' + r.price.toFixed(2)
+        : r.name + ' 被拒：' + ppLabel(r.reason))).join('；')
+    : '本轮没有任何标的需要动手';
+  const degraded = (res.degraded || []).map((d) => d.name + '：' + (d.status === 'stale' ? '参考行情'
+    : d.status === 'suspended' ? '停牌' : '价格不可用')).join('、');
+  toast(title + ' · ' + res.stamp,
+    (res.reused ? '行情序列已到最后一格，沿用收盘事实。' : '') +
+    '成交 ' + res.filled + ' / 拒绝 ' + res.rejected + ' / 不动 ' + res.skipped
+    + (degraded ? ' / 行情降级 ' + degraded : '') + ' · ' + detail +
+    '。原型只重算页面数据，不会真的下单。',
+    res.rejected || degraded ? 'warn' : 'ok');
+}
+
+function handlePaperAction(action, el) {
+  const acc = ppAcc();
+
+  if (action === 'pp-view') {
+    state.ppView = el.dataset.view;
+    state.ppForm = null;
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-account') {
+    state.ppAcc = Number(el.dataset.acc);
+    state.ppForm = null;
+    state.ppCtx = null;
+    const val = ppValuation(ppAcc());
+    state.ppPos = val.rows.length ? val.rows[0].code : '';
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-tab') {
+    state.ppTab = el.dataset.tab;
+    state.ppForm = null;
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-pos') {
+    state.ppPos = el.dataset.code;
+    state.ppTab = 'positions';
+    state.ppForm = null;
+    renderView();
+    syncPaperHash();
+    const row = $('.pp-row[data-code="' + state.ppPos + '"]');
+    if (row) row.scrollIntoView({ block: 'nearest' });
+  } else if (action === 'pp-kline') {
+    state.ppKline = !state.ppKline;
+    renderView();
+  } else if (action === 'pp-filter') {
+    state.ppFilter = el.dataset.filter;
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-ctx') {
+    state.ppCtx = state.ppCtx === Number(el.dataset.ctx) ? null : Number(el.dataset.ctx);
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-ctx-open') {
+    const id = Number(el.dataset.ctx);
+    if (!id) { toast('这份记录没有取证编号', '执行器直接按意图拒绝，未生成研究记录。', 'info'); return; }
+    state.ppTab = 'contexts';
+    state.ppCtx = id;
+    renderView();
+    syncPaperHash();
+    const node = document.getElementById('pp-ctx-' + id);
+    if (node) node.scrollIntoView({ block: 'center' });
+  } else if (action === 'pp-quote') {
+    const res = ppRefreshQuotes(acc);
+    if (res.blocked) { toast('账户已归档', res.blocked, 'warn'); return; }
+    const val = ppValuation(acc);
+    toast('行情已刷新 · ' + res.stamp,
+      (res.reused ? '已是本序列最后一格（收盘快照），价格不再变化。' : '') +
+      (res.degraded.length
+        ? res.degraded.map((r) => r.name + '：' + (r.quote.referenceOnly ? '参考行情，估值用上一轮价格回填，不能用于成交' : '没有任何可用价格，总资产改显示「模拟估值暂不完整」')).join('；')
+        : '全部标的取到新鲜行情。') +
+      '当前口径：' + val.equityLabel + ' ' + (val.equity == null ? '暂不完整' : ppAmount(val.equity) + ' 元') + '。',
+      res.degraded.length ? 'warn' : 'ok');
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-monitor') {
+    const res = ppRunMonitor(acc);
+    ppRoundToast(acc, res, '模拟巡检');
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-run') {
+    const res = ppRunIntents(acc);
+    if (res.blocked) { toast('账户已归档', res.blocked, 'warn'); return; }
+    if (res.empty) { toast('没有待执行意图', res.empty, 'info'); renderView(); return; }
+    ppRoundToast(acc, res, '立即补跑');
+    renderView();
+    syncPaperHash();
+  } else if (action === 'pp-toggle') {
+    if (acc.status === 'archived') { toast('已归档', '归档账户不能再变成运行中，请新建一个模拟账户。', 'warn'); return; }
+    acc.status = acc.status === 'active' ? 'paused' : 'active';
+    ppLogRun(acc, { at: ppStamp(acc, acc.cursor), kind: acc.status === 'active' ? 'monitor' : 'monitor',
+      filled: 0, rejected: 0, skipped: 0, note: acc.status === 'active' ? '手动恢复自动运行' : '手动暂停自动运行' });
+    renderView();
+    toast(acc.status === 'active' ? '自动运行已恢复' : '自动运行已暂停',
+      acc.status === 'active'
+        ? '调度恢复：' + acc.schedule.window + '，每 ' + acc.schedule.every + ' 分钟一轮。'
+        : '调度已摘掉，历史与模拟持仓保留；页面里的「模拟巡检 / 立即补跑」仍然可以手动打一轮。',
+      acc.status === 'active' ? 'ok' : 'warn');
+  } else if (action === 'pp-new') {
+    state.ppForm = { kind: 'new' };
+    openDrawer('pp-new');
+  } else if (action === 'pp-new-save') {
+    const v = ppReadForm('pp-n');
+    const errs = [];
+    if (!String(v.name || '').trim()) errs.push('账户名称不能为空');
+    if (!(Number(v.initialCash) >= 10000)) errs.push('初始资金至少 1 万元，否则连一手都算不出来');
+    if (!(Number(v.every) >= 5)) errs.push('巡检间隔最少 5 分钟，后端拒绝更密的 cron');
+    if (!String(v.model || '').trim() || !String(v.ruleVersion || '').trim()) errs.push('研判版本与执行规则版本必须留档，不能留空');
+    if (errs.length) {
+      state.ppForm = Object.assign({ kind: 'new' }, v, { errs: errs });
+      openDrawer('pp-new');
+      toast('还没通过校验', errs[0], 'err');
+      return;
+    }
+    const created = ppCreateAccount(v);
+    state.ppForm = null;
+    closeDrawer();
+    renderView();
+    syncPaperHash();
+    toast('模拟账户已创建 · ' + created.id,
+      created.name + '：初始 ' + ppAmount(Number(created.initialCash)) + ' 元，' + ppLabel(created.variant) + '，' +
+      ppLabel(created.mode) + '。已带 3 条候选池建仓意图，点「立即补跑」就会按整手、T+1、现金和费用换算成交或拒绝。', 'ok');
+  } else if (action === 'pp-research') {
+    state.ppForm = { kind: 'research', code: state.ppPos || '603501', mode: acc.mode, snapshotDate: '', urls: '' };
+    openDrawer('pp-research');
+  } else if (action === 'pp-research-run') {
+    const v = ppReadForm('pp-r');
+    const errs = [];
+    const urls = String(v.urls || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+    if (!/^\d{6}$/.test(String(v.code || ''))) errs.push('证券代码必须是 6 位数字');
+    if (urls.length > 5) errs.push('外部证据最多 5 条，先挑最相关的');
+    if (urls.some((u) => !/^https?:\/\/.+/i.test(u))) errs.push('每条证据都要是完整 http(s) 链接');
+    if (v.mode === 'historical_replay' && !/^\d{4}-\d{2}-\d{2}$/.test(String(v.snapshotDate || ''))) {
+      errs.push('历史回放必须指定冻结快照日期，避免回填今天的行情');
+    }
+    const code = String(v.code || '');
+    if (!errs.length && !acc.universe[code]) {
+      acc.universe[code] = { name: '自定义标的 ' + code, prevClose: 20, series: [20.10, 20.40, 20.80, 20.60, 20.90, 21.20, 21.00] };
+    }
+    if (errs.length) {
+      state.ppForm = Object.assign({ kind: 'research' }, v, { errs: errs });
+      openDrawer('pp-research');
+      toast('取证条件不足', errs[0], 'err');
+      return;
+    }
+    const idx = Math.min(acc.cursor, acc.slots.length - 1);
+    const quote = ppQuote(acc, code, idx);
+    const future = v.mode === 'historical_replay' && String(v.snapshotDate) > ppSlot(acc, idx).d;
+    const trace = ppDecisionTrace(acc, quote, {}, v.mode);
+    trace.tools = trace.tools.concat(urls.map((u, i) => ({
+      tool: 'paper_web.search', status: 'ok', summary: '证据 ' + (i + 1) + '：' + u.slice(0, 46)
+    })));
+    trace.web = urls.map((u, i) => ({
+      title: '手动引入的外部证据 ' + (i + 1), source: u.replace(/^https?:\/\//, '').split('/')[0],
+      url: u, publishedAt: ppSlot(acc, idx).d + ' ' + ppSlot(acc, idx).t,
+      excerpt: '正文在正式端由抓取服务落盘并算哈希；原型只保存链接与取证时间。', hash: 'pp' + code + (i + 1)
+    }));
+    const ctx = ppAddContext(acc, {
+      code: code, d: ppSlot(acc, idx).d, t: ppSlot(acc, idx).t, stage: 'research',
+      mode: v.mode, factAsOf: quote.stamp, tools: trace.tools, web: trace.web,
+      rejected: future ? 'future_data' : '',
+      decision: { action: 'hold', confidence: future ? 'low' : 'medium', reasons: future
+        ? ['快照日期 ' + v.snapshotDate + ' 晚于本次决策时点 ' + ppSlot(acc, idx).d + '，冻结事实校验不通过，本轮研判整体拒绝。']
+        : ['取证完成：行情 ' + (quote.status === 'ok' ? quote.price : '不可用') + '，外部证据 ' + urls.length + ' 条。',
+          '这一份记录只作为证据归档；要不要动手，仍由「模拟巡检 / 立即补跑」那一轮研判决定。'],
+        riskNote: future ? '补齐快照之前的资料后重新取证。' : '' }
+    });
+    ppAddAlert(acc, {
+      code: code, d: ctx.d, severity: future ? 'warning' : 'info', source: 'paper_analysis', contextId: ctx.id,
+      message: future
+        ? '模拟分析未完成：取证模式要求只用 ' + v.snapshotDate + ' 之前的事实，检测到晚于决策时点的资料，已拒绝'
+        : '手动研究取证已留档：' + (acc.universe[code] || {}).name + '（' + code + '）取证 ' + ctx.tools.length + ' 项，外部证据 ' + urls.length + ' 条'
+    });
+    state.ppForm = null;
+    state.ppCtx = ctx.id;
+    state.ppTab = 'contexts';
+    closeDrawer();
+    renderView();
+    syncPaperHash();
+    const node = document.getElementById('pp-ctx-' + ctx.id);
+    if (node) node.scrollIntoView({ block: 'center' });
+    toast(future ? '取证被闸门拒绝' : '研究记录已生成 · #' + ctx.id,
+      future ? '快照日期晚于决策时点，判定 future_data，本轮不产生任何买卖意图。'
+        : '取证 ' + ctx.tools.length + ' 项、外部证据 ' + urls.length + ' 条已挂到 ' + code + '；证据里的指令一律不执行。',
+      future ? 'warn' : 'ok');
+  } else if (action === 'pp-archive') {
+    if (acc.status === 'archived') { toast('已经是归档状态', '归档账户只读，历史全部保留。', 'info'); return; }
+    if (!state.ppForm || state.ppForm.kind !== 'archive' || state.ppForm.step !== 1) {
+      state.ppForm = { kind: 'archive', step: 1, reason: state.ppForm && state.ppForm.reason || '' };
+    } else {
+      state.ppForm = { kind: 'archive', step: 2, reason: state.ppForm.reason };
+    }
+    openDrawer('pp-archive', acc);
+  } else if (action === 'pp-archive-confirm') {
+    const reason = String((state.ppForm && state.ppForm.reason) || (document.getElementById('pp-a-reason') || {}).value || '').trim();
+    if (!reason) {
+      state.ppForm = { kind: 'archive', step: 2, reason: '', errs: ['归档原因必填，正式端会写进账户留痕'] };
+      openDrawer('pp-archive', acc);
+      toast('还差归档原因', '不填理由不允许停掉一个对照盘。', 'err');
+      return;
+    }
+    acc.status = 'archived';
+    acc.archivedAt = '2026-11-16 17:30';
+    acc.archiveReason = reason;
+    acc.schedule = { every: acc.schedule.every, window: '已停止', next: '—' };
+    ppLogRun(acc, { at: acc.archivedAt, kind: 'archive', filled: 0, rejected: 0, skipped: 0, note: '账户暂停并归档，调度不再触发' });
+    state.ppForm = null;
+    closeDrawer();
+    state.ppView = 'archived';
+    renderView();
+    syncPaperHash();
+    toast('已归档 · ' + acc.name,
+      '原因已留痕：' + reason + '。调度不再触发，历史成交、取证、告警和复盘都还在，切到「已归档」随时回看。', 'ok');
+  } else if (action === 'pp-review-audit') {
+    const rv = ppAuditReview(acc, Number(el.dataset.id));
+    renderView();
+    syncPaperHash();
+    toast(rv.audit === 'pass' ? 'AI 审核通过 · 可进影子' : 'AI 审核未通过',
+      (rv.audit === 'pass' ? rv.auditReason : rv.auditReason) +
+      ' 审核通过只允许进入影子验证，不代表正式规则已采纳（rule_change 没有新增）。',
+      rv.audit === 'pass' ? 'ok' : 'warn');
+  } else if (action === 'pp-review-manual') {
+    state.ppForm = { kind: 'review', id: Number(el.dataset.id), verdict: 'pass', reason: '' };
+    renderView();
+    const box = document.getElementById('pp-rv-reason');
+    if (box) box.focus();
+  } else if (action === 'pp-review-cancel') {
+    state.ppForm = null;
+    renderView();
+  } else if (action === 'pp-review-save') {
+    const id = Number(el.dataset.id);
+    const form = state.ppForm || {};
+    const reason = String(form.reason || '').trim();
+    if (!reason) {
+      state.ppForm = Object.assign({}, form, { errs: ['人工复审必须写理由'] });
+      renderView();
+      toast('理由不能为空', '人工复审会覆盖 AI 结论，理由就是这条链路的留痕。', 'err');
+      return;
+    }
+    ppManualReview(acc, id, form.verdict || 'pass', reason);
+    state.ppForm = null;
+    renderView();
+    syncPaperHash();
+    toast('人工复审已提交', '结论：' + (form.verdict === 'fail' ? '人工复核未通过' : '人工复核通过') +
+      '。理由按「人工复审：…」原样留痕；即便覆盖 AI 的未通过结论，也仍然只进影子验证，不改正式规则。', 'ok');
+  } else if (action === 'pp-review-shadow') {
+    const rv = ppShadowStart(acc, Number(el.dataset.id));
+    renderView();
+    syncPaperHash();
+    toast('已进入影子验证', '只在影子链路上跟踪这条假设的表现，正式阈值一个数字都没动；要变成规则仍需走规则审计的人工门禁。', 'info');
+  } else if (action === 'pp-form-keep') {
+    return;
+  }
+}
+
+function syncPaperHash() {
+  if (state.route !== '#/paper') return;
+  let next = '#/paper?view=' + state.ppView + '&acc=' + state.ppAcc + '&tab=' + state.ppTab + '&pos=' + state.ppPos;
+  if (state.ppFilter) next += '&filter=' + state.ppFilter;
+  if (state.ppCtx != null) next += '&ctx=' + state.ppCtx;
+  if (location.hash !== next) history.replaceState(null, '', next);
+}
+
 function renderView() {
   const route = state.route;
   let html = '';
   if (route === '#/overview') html = renderWorkspaceOverview();
   else if (route === '#/candidates') html = renderCandidates();
+  else if (route === '#/holdings') html = renderHoldings();
+  else if (route === '#/paper') html = renderPaper();
   else if (route === '#/reviews') html = renderReviews();
   else if (route === '#/experience') html = renderExperience();
   else if (route.startsWith('#/system/')) {
@@ -4269,6 +7598,31 @@ function openDrawer(kind, payload) {
     title = c.stock_name + ' · 日K线';
     sub = '正式页面复用现有 KlineChart 组件，这里演示入口与版式';
     body = candKlineHtml(c);
+  } else if (kind === 'hd-new') {
+    title = '录入人工建仓';
+    sub = '系统不自动下单：这里只记录你已经成交的结果';
+    body = hdNewFormHtml(state.hdNewPending ? state.hdNewPending.v : (payload || {}), state.hdNewPending ? state.hdNewPending.warns : null);
+  } else if (kind === 'hd-ocr') {
+    title = 'OCR 截图建仓';
+    sub = '上传券商持仓截图，识别结果必须人工核对后才写入';
+    body = hdOcrFormHtml();
+  } else if (kind === 'hd-baseline') {
+    title = '账户基线';
+    sub = '总资产与可用现金决定总仓位口径；改完下面的红线判定会跟着变';
+    body = hdBaselineFormHtml();
+  } else if (kind === 'pp-new') {
+    title = '新建模拟账户';
+    sub = 'AI 自主下单只在隔离账本里发生，不碰真实资产';
+    body = ppNewFormHtml(state.ppForm && state.ppForm.kind === 'new' ? state.ppForm : (payload || {}), state.ppForm ? state.ppForm.errs : null);
+  } else if (kind === 'pp-research') {
+    title = '手动研究取证';
+    sub = '证据与工具轨迹会写进模拟账户的研究记录';
+    body = ppResearchFormHtml(state.ppForm && state.ppForm.kind === 'research' ? state.ppForm : (payload || {}), state.ppForm ? state.ppForm.errs : null);
+  } else if (kind === 'pp-archive') {
+    const acc = payload && payload.id ? payload : ppAcc();
+    title = '归档模拟账户';
+    sub = '归档后调度停止，历史保留且只读';
+    body = ppArchiveFormHtml(acc, state.ppForm, state.ppForm ? state.ppForm.errs : null);
   } else if (kind === 'tasks') {
     const running = state.rules.filter((r) => r.audit === 'auditing');
     title = '任务中心';
@@ -4616,6 +7970,8 @@ document.addEventListener('click', (e) => {
   if (action === 'sgs-audit-now') { auditSugNow(el.dataset.sgs); return; }
   if (action === 'sgs-audit-all') { auditAllSugs(); return; }
   if (action === 'sgs-rollback') { rollbackSug(el.dataset.sgs); return; }
+  if (action.indexOf('pp-') === 0) { handlePaperAction(action, el); return; }
+  if (action.indexOf('hd-') === 0) { handleHdAction(action, el); return; }
   /* 就地裁决：列表行上直接处理，处理完自动跳下一条 */
   if (action === 'rvq-adopt') { rvQuickAdopt(el.dataset.rv); return; }
   if (action === 'rvq-reject') { openInlineReject('rv', Number(el.dataset.rv)); return; }
@@ -4708,6 +8064,58 @@ document.addEventListener('click', (e) => {
   if (action === 'collab-query') { collabQuery(); return; }
 });
 
+/* 持仓就地表单：输入先落到 state.hdForm.draft，这样上下键换行、重渲染都不会吞掉已经敲进去的数字 */
+function hdTradeCapture(e) {
+  const el = e.target, d = el.dataset && state.hdTradeDrafts[el.dataset.hd];
+  if (!d) return;
+  if (el.hasAttribute('data-trade-duplicates')) { d.duplicatesOk = el.checked; return; }
+  if (d.preview) return;
+  if (el.hasAttribute('data-trade-reason')) d.reason = el.value;
+  else if (el.hasAttribute('data-trade-paste')) d.paste = el.value;
+  else if (el.dataset.field) {
+    const t = d.entries.find(t => t.id === el.dataset.trade);
+    if (t && d.editing.includes(t.id)) t[el.dataset.field] = el.value;
+  }
+  d.discardAsk = false; d.duplicatesOk = false;
+}
+document.addEventListener('input', hdTradeCapture);
+document.addEventListener('change', hdTradeCapture);
+document.addEventListener('paste', e => {
+  const el = e.target;
+  if (!el.dataset || el.dataset.field !== 'date') return;
+  const text = e.clipboardData.getData('text/plain');
+  if (!text.includes('\t')) return;
+  const r = hdTradeStock(el.dataset.hd);
+  if (!r || hdTradeLedger(r).entries.some(t => t.id === el.dataset.trade)) return;
+  e.preventDefault(); hdTradePaste(r, text, el.dataset.trade); renderView();
+});
+document.addEventListener('keydown', e => {
+  const el = e.target;
+  if (e.key !== 'Tab' || e.shiftKey || !el.dataset || el.dataset.field !== 'note') return;
+  const r = hdTradeStock(el.dataset.hd), d = r && state.hdTradeDrafts[r.id];
+  if (!d || d.entries[d.entries.length - 1].id !== el.dataset.trade) return;
+  e.preventDefault(); hdTradeAdd(r); renderView();
+  const inputs = document.querySelectorAll('.hd-trade-table [data-field="date"]');
+  inputs[inputs.length - 1].focus({ preventScroll: true });
+});
+document.addEventListener('input', (e) => {
+  const t = e.target;
+  if (!state.hdForm || !t || !t.id || t.id.indexOf('hd-f-') !== 0) return;
+  const key = t.id.replace('hd-f-', '');
+  state.hdForm.draft = state.hdForm.draft || {};
+  state.hdForm.draft[key] = t.value;
+});
+
+document.addEventListener('input', (e) => {
+  const t = e.target;
+  if (!state.ppForm || !t || !t.id) return;
+  if (t.id === 'pp-rv-reason' || t.id === 'pp-a-reason') state.ppForm.reason = t.value;
+});
+document.addEventListener('change', (e) => {
+  const t = e.target;
+  if (state.ppForm && t && t.name === 'pp-rv-verdict') state.ppForm.verdict = t.value;
+});
+
 document.addEventListener('keydown', (e) => {
   const palette = $('#palette');
   if (palette && !palette.hidden) {
@@ -4754,8 +8162,43 @@ document.addEventListener('keydown', (e) => {
     if (rowEl) rowEl.scrollIntoView({ block: 'nearest' });
     return;
   }
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('.rule-row[role="button"]')) {
+  if (state.route === '#/paper' && state.ppTab === 'positions' && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    if (e.target instanceof Element && e.target.matches('input, textarea, select')) return;
+    const list = ppValuation(ppAcc()).rows;
+    if (!list.length) return;
     e.preventDefault();
+    const idx = list.findIndex((r) => r.code === state.ppPos);
+    const step = e.key === 'ArrowDown' ? 1 : -1;
+    const next = list[Math.max(0, Math.min(list.length - 1, (idx < 0 ? 0 : idx + step)))];
+    state.ppPos = next.code;
+    renderView();
+    syncPaperHash();
+    const rowEl = $('.pp-row[data-code="' + next.code + '"]');
+    if (rowEl) rowEl.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  if (state.route === '#/holdings' && state.hdView !== 'exited' && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    if (e.target instanceof Element && e.target.matches('input, textarea, select')) return;
+    const list = hdVisible();
+    if (!list.length) return;
+    e.preventDefault();
+    const idx = list.findIndex((r) => String(r.id) === String(state.hdId));
+    const step = e.key === 'ArrowDown' ? 1 : -1;
+    const next = list[Math.max(0, Math.min(list.length - 1, (idx < 0 ? 0 : idx + step)))];
+    state.hdId = Number(next.id);
+    renderView();
+    syncHdHash();
+    const rowEl = $('.hd-row[data-hd="' + next.id + '"]');
+    if (rowEl) rowEl.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('.rule-row[role="button"], .hd-row[role="button"]')) {
+    e.preventDefault();
+    if (e.target.dataset.hd) {
+      const row = hdById(e.target.dataset.hd);
+      if (row) hdOpenForm(row.id, hdEnterKind(row));
+      return;
+    }
     selectRule(e.target.dataset.id);
   }
   if (state.route === '#/reviews' && state.rvBoard === 'sug' && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
