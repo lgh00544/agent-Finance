@@ -302,7 +302,7 @@ const HEALTH_MODULES = [
     counts: '总条目 420 · 待审 0',
     reason: '条目结构与更新时间均正常。',
     action: '保持只读，无需处理。',
-    link: '#/knowledge', linkLabel: '打开'
+    link: '', linkLabel: ''
   },
   {
     module: 'shadow', name: '影子记录 / 失败重放', status: 'attention',
@@ -473,6 +473,16 @@ const state = {
   ppFilter: '',
   ppForm: null,
   ppKline: false,
+  miDate: null,
+  miBoard: 'regime',
+  miHorizon: 't1',
+  miChainMode: 'chain',
+  miExpand: {},
+  miSector: null,
+  miDrawerPending: false,
+  miIntelBusy: null,
+  miRuns: null,
+  miLog: null,
   paletteIndex: 0,
   collabResult: null
 };
@@ -652,8 +662,6 @@ const NAV = [
   {
     group: '研究', items: [
       { path: '#/market-intel', label: '市场研判', icon: 'compass' },
-      { path: '#/news-sector', label: '行业消息雷达', icon: 'news' },
-      { path: '#/hot-money', label: '游资追踪', icon: 'fire' },
       { path: '#/scores', label: '评分报告', icon: 'star' }
     ]
   },
@@ -666,8 +674,7 @@ const NAV = [
   {
     group: '复盘', items: [
       { path: '#/reviews', label: '交易复盘', icon: 'review' },
-      { path: '#/experience', label: '经验沉淀', icon: 'layers' },
-      { path: '#/knowledge', label: '交易知识库', icon: 'book' }
+      { path: '#/experience', label: '经验沉淀', icon: 'layers' }
     ]
   },
   {
@@ -686,13 +693,9 @@ const GOV_TABS = [
 
 const PLACEHOLDERS = {
   '#/alerts': { title: '告警日志', desc: '下一批设计：按严重度分组，支持一键进入对应持仓或规则。', scope: ['严重度分组与已读状态', '告警 → 持仓 / 规则 / 复盘 的深链', '保留原始 payload 折叠查看'] },
-  '#/market-intel': { title: '市场研判', desc: '下一批设计：结论先行，12 张卡片按「主线 → 验证 → 风险」重组。', scope: ['首屏只留主线结论与三个关键指标', '板块与个股验证按需展开', '历史准确率做成趋势而非孤立卡片'] },
-  '#/news-sector': { title: '行业消息雷达', desc: '下一批设计：按影响面排序，消息与板块联动。', scope: ['高影响消息置顶', '消息详情抽屉 + 关联板块', '已读/已处理状态'] },
-  '#/hot-money': { title: '游资追踪', desc: '下一批设计：席位与个股联动，减少多表切换。', scope: ['席位列表 + 个股详情抽屉', '异常席位优先', '与市场研判互链'] },
   '#/scores': { title: '评分报告', desc: '下一批设计：评分表 + 详情抽屉，采纳状态更清晰。', scope: ['A/B/C 分级筛选', '六因子解释与风险计数', '一键去建仓计划'] },
   '#/plans': { title: '建仓计划', desc: '下一批设计：从候选池承接上下文，方案详情分区 Tab 化。', scope: ['候选来源可追溯', '分档买入、止盈止损、依据分 Tab', '采纳/放弃就地留痕'] },
-  '#/agent-chat': { title: 'Agent 对话', desc: '下一批设计：保留看板化对话，接入治理留痕。', scope: ['任务型对话与普通问答分流', '任务状态与结果卡片', '留痕与治理深链'] },
-  '#/knowledge': { title: '交易知识库', desc: '下一批设计：检索优先，条目审核轻量化。', scope: ['全局检索', '条目详情与来源', '审核状态'] }
+  '#/agent-chat': { title: 'Agent 对话', desc: '下一批设计：保留看板化对话，接入治理留痕。', scope: ['任务型对话与普通问答分流', '任务状态与结果卡片', '留痕与治理深链'] }
 };
 
 /* ---------- 路由 ---------- */
@@ -764,6 +767,17 @@ function parseRoute() {
     if (sg && SUG_ROWS.some((s) => String(s.id) === String(sg))) { state.sgsId = Number(sg); state.rvBoard = 'sug'; }
     const tk = params.get('track');
     if (tk && CAND_BATCHES.some((b) => b.date === tk)) { state.rvTrackDate = tk; state.rvBoard = 'track'; }
+  }
+  if (path === '#/market-intel') {
+    const mp = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
+    const md = mp.get('date');
+    if (md && miIdx(md) >= 0) state.miDate = md;
+    const mb = mp.get('board');
+    if (mb && MI_BOARDS.some((b) => b[0] === mb)) state.miBoard = mb;
+    const mh = mp.get('h');
+    if (mh && ['t1', 't3', 't5'].indexOf(mh) >= 0) state.miHorizon = mh;
+    const ms = mp.get('sector');
+    if (ms) { state.miSector = ms; state.miDrawerPending = true; }
   }
   if (path === '#/experience') {
     const params = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
@@ -2112,7 +2126,7 @@ function candDetailHtml(c) {
   } else if (state.candTab === 'news') {
     tabBody = (c.news || []).length
       ? '<div class="cp-news-list">' + c.news.map(candNewsItem).join('') + '</div>' +
-        '<div class="cap-note" style="margin-top:10px">' + icon('info') + '<div>这里只列与「' + esc(c.stock_name) + '」直接相关的消息；盘面类消息请到行业消息雷达看全量。</div></div>'
+        '<div class="cap-note" style="margin-top:10px">' + icon('info') + '<div>这里只列与「' + esc(c.stock_name) + '」直接相关的消息；全市场盘面消息不在这里铺开，板块层面的判断看市场研判。</div></div>'
       : '<div class="wo-empty">暂无该标的的相关消息，有新消息会自动关联到候选。</div>';
   } else {
     tabBody = '<div class="timeline">' + (c.traces || []).map((t) => {
@@ -2193,7 +2207,6 @@ function renderCandidates() {
       }).join('') : '<div class="wo-empty">当前筛选条件下没有消息。</div>') + '</div>' +
       '<div class="cp-news-foot">' +
         (newsAll.length > 3 ? '<button class="btn link sm" data-action="cand-news-expand">' + (state.candNewsOpen ? '收起，只看最近 3 条' : '展开全部 ' + newsAll.length + ' 条') + '</button>' : '<span></span>') +
-        '<button class="btn link sm" data-nav="#/news-sector">去行业消息雷达看全量 ' + icon('arrow', 'sm') + '</button>' +
       '</div>' +
     '</div>';
 
@@ -2234,6 +2247,8 @@ function renderCandidates() {
         Object.keys(CAND_TIER_META).map((k) => '<option value="' + k + '" ' + (state.candTier === k ? 'selected' : '') + '>' + k + '</option>').join('') +
       '</select>' +
       '<span class="small muted">' + list.length + ' 条</span>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn link sm" data-nav="#/market-intel">先看今天是不是主线行情 ' + icon('arrow', 'sm') + '</button>' +
     '</div>' +
     '<div class="cp-layout">' +
       '<div class="card cp-list-card"><div class="cp-list" id="cand-list">' + list.map(candRowHtml).join('') + '</div></div>' +
@@ -5439,7 +5454,8 @@ function renderHoldings() {
 
   return head +
     '<div class="cp-toolbar"><div class="cp-chips">' + views + '</div>' +
-      '<span class="hint">操作都在行上和详情里就地完成；这一页不做买卖，只记录你已经成交的结果。</span></div>' +
+      '<span class="hint">操作都在行上和详情里就地完成；这一页不做买卖，只记录你已经成交的结果。</span>' +
+      '<span class="spacer"></span><button class="btn link sm" data-nav="#/market-intel?board=volume">看今天的结构与板块量能 ' + icon('arrow', 'sm') + '</button></div>' +
     '<div class="metric-strip q4" style="margin-bottom:14px">' + hdStats().map((s) =>
       '<div class="metric"><div class="metric-label">' + esc(s.label) + '</div><div class="metric-value ' + s.tone + '">' + esc(s.value) + '</div><div class="metric-sub">' + esc(s.sub) + '</div></div>').join('') + '</div>' +
     list +
@@ -7461,6 +7477,1820 @@ function syncPaperHash() {
   if (location.hash !== next) history.replaceState(null, '', next);
 }
 
+/* ================= 市场研判（#/market-intel） ================= */
+/* 事实底座 = 全板块日快照（后端 sector_daily_snapshot，工作日 15:35 落库，rank_no 即当日板块涨幅名次）。
+   原型带 8 个交易日的 top5 名单 + 14 个交易日的 top10 明细；C'/D'/E' 三层判定按后端同一套公式在浏览器现算，
+   页面所有百分比都是这套公式 + 这张表算出来的，改表里的数字，结论会跟着变。 */
+const MI_OLD_TOP5 = [
+  ['2026-10-22', ['白酒', '煤炭开采', '光伏设备', '人形机器人', '银行']],
+  ['2026-10-23', ['军工电子', '稀土永磁', 'CPO光模块', 'AI应用', '低空经济']],
+  ['2026-10-26', ['稀土永磁', '煤炭开采', '存储芯片', '光伏设备', 'AI应用']],
+  ['2026-10-27', ['白酒', '煤炭开采', '银行', '液冷服务器', '军工电子']],
+  ['2026-10-28', ['银行', '固态电池', '白酒', 'CPO光模块', '低空经济']],
+  ['2026-10-29', ['固态电池', '光伏设备', '算力租赁', '煤炭开采', '创新药']],
+  ['2026-10-30', ['稀土永磁', '军工电子', '存储芯片', 'AI应用', '液冷服务器']],
+  ['2026-11-02', ['创新药', '固态电池', 'CPO光模块', '银行', '低空经济']]
+];
+/* [板块, 涨幅%, 量比, 板块内上涨家数]，数组顺序即 rank_no */
+const MI_DAILY = [
+  ['2026-11-03', [['液冷服务器', 3.1, 2.0, 24], ['存储芯片', 2.6, 1.9, 28], ['CPO光模块', 2.4, 1.8, 33], ['人形机器人', 1.6, 1.3, 46], ['低空经济', 1.4, 1.2, 19], ['AI应用', 1.1, 1.1, 52], ['军工电子', 0.8, 0.9, 30], ['创新药', 0.6, 0.8, 40], ['光伏设备', 0.4, 0.9, 27], ['固态电池', 0.2, 0.8, 44]]],
+  ['2026-11-04', [['存储芯片', 2.8, 1.7, 30], ['CPO光模块', 2.2, 1.6, 35], ['AI应用', 1.9, 1.5, 56], ['固态电池', 1.7, 1.4, 47], ['光伏设备', 1.2, 1.1, 29], ['液冷服务器', 0.9, 1.0, 23], ['人形机器人', 0.7, 0.9, 45], ['半导体设备', 0.5, 0.9, 38], ['低空经济', 0.3, 0.8, 18], ['军工电子', 0.1, 0.7, 29]]],
+  ['2026-11-05', [['CPO光模块', 3.3, 2.2, 37], ['存储芯片', 1.8, 1.3, 31], ['液冷服务器', 1.6, 1.2, 25], ['半导体设备', 1.4, 1.3, 41], ['人形机器人', 1.2, 1.1, 44], ['AI应用', 0.9, 1.0, 54], ['固态电池', 0.7, 0.9, 46], ['军工电子', 0.5, 0.8, 30], ['光伏设备', 0.3, 0.8, 28], ['创新药', 0.1, 0.7, 39]]],
+  ['2026-11-06', [['固态电池', 3.4, 2.1, 52], ['创新药', 2.5, 1.6, 43], ['人形机器人', 2.1, 1.5, 47], ['军工电子', 1.7, 1.2, 32], ['稀土永磁', 1.5, 1.3, 24], ['白酒', 1.2, 1.1, 15], ['煤炭开采', 1.0, 1.0, 12], ['CPO光模块', 0.6, 0.9, 36], ['低空经济', 0.4, 0.9, 19], ['光伏设备', 0.2, 0.8, 27]]],
+  ['2026-11-09', [['创新药', 2.7, 1.8, 45], ['固态电池', 2.2, 1.6, 50], ['半导体设备', 1.9, 1.5, 40], ['存储芯片', 1.6, 1.4, 29], ['白酒', 1.3, 1.1, 14], ['稀土永磁', 0.8, 0.9, 23], ['军工电子', 0.6, 0.9, 31], ['AI应用', 0.4, 0.8, 53], ['人形机器人', 0.2, 0.8, 44], ['液冷服务器', -0.5, 0.7, 22]]],
+  ['2026-11-10', [['半导体设备', 2.9, 1.9, 42], ['存储芯片', 2.4, 1.7, 31], ['创新药', 1.4, 1.2, 44], ['人形机器人', 0.9, 1.0, 45], ['液冷服务器', 0.8, 0.9, 26], ['AI应用', 0.7, 0.9, 54], ['CPO光模块', 0.5, 0.9, 35], ['固态电池', 0.2, 0.8, 48], ['低空经济', 0.1, 0.8, 18], ['煤炭开采', -0.3, 0.7, 11]]],
+  ['2026-11-11', [['半导体设备', 2.2, 1.6, 43], ['CPO光模块', 3.0, 2.3, 36], ['人形机器人', 1.4, 1.2, 46], ['固态电池', 1.1, 1.1, 49], ['存储芯片', 0.8, 1.0, 33], ['创新药', 0.5, 0.9, 43], ['液冷服务器', 0.3, 0.9, 25], ['军工电子', -0.2, 0.7, 29], ['稀土永磁', -0.3, 0.8, 22], ['光伏设备', -0.4, 0.7, 26]]],
+  ['2026-11-12', [['AI应用', 2.4, 1.8, 60], ['CPO光模块', 2.6, 2.0, 38], ['液冷服务器', 2.7, 2.1, 25], ['创新药', 1.3, 1.2, 42], ['固态电池', 0.9, 1.0, 47], ['半导体设备', 0.6, 0.9, 40], ['人形机器人', -0.2, 0.8, 44], ['稀土永磁', -0.4, 0.7, 21], ['军工电子', -0.6, 0.7, 28], ['算力租赁', -0.7, 0.9, 13]]],
+  ['2026-11-13', [['CPO光模块', 2.9, 2.1, 40], ['液冷服务器', 2.3, 1.9, 26], ['算力租赁', 2.2, 2.0, 15], ['存储芯片', 1.5, 1.6, 34], ['AI应用', 1.2, 1.5, 57], ['半导体设备', 0.5, 0.9, 39], ['创新药', 0.2, 0.8, 41], ['人形机器人', 0.1, 0.8, 43], ['低空经济', -0.3, 0.8, 20], ['固态电池', -0.4, 0.7, 46]]],
+  ['2026-11-16', [['CPO光模块', 3.4, 1.5, 43], ['液冷服务器', 2.8, 1.4, 28], ['算力租赁', 2.5, 1.6, 17], ['存储芯片', 1.4, 1.3, 36], ['AI应用', 1.1, 1.2, 55], ['半导体设备', 0.6, 0.9, 40], ['创新药', 0.3, 0.8, 41], ['人形机器人', 0.1, 0.8, 43], ['军工电子', -0.2, 0.7, 28], ['光伏设备', -0.5, 0.7, 25]]],
+  ['2026-11-17', [['CPO光模块', 4.1, 2.6, 46], ['人形机器人', 2.4, 1.9, 47], ['光伏设备', 1.8, 1.8, 31], ['军工电子', 1.5, 1.7, 32], ['固态电池', 1.2, 1.6, 49], ['液冷服务器', 0.4, 1.0, 27], ['半导体设备', 0.2, 0.9, 40], ['存储芯片', 0.1, 0.9, 34], ['AI应用', -0.3, 0.8, 54], ['低空经济', -0.6, 0.7, 19]]],
+  ['2026-11-18', [['CPO光模块', 3.6, 2.4, 44], ['液冷服务器', 3.0, 2.2, 30], ['半导体设备', 2.7, 1.9, 43], ['存储芯片', 2.1, 1.8, 36], ['AI应用', 1.6, 1.7, 56], ['算力租赁', 0.9, 1.1, 18], ['创新药', 0.4, 0.8, 42], ['人形机器人', 0.1, 0.8, 43], ['稀土永磁', -0.5, 0.7, 21], ['光伏设备', -0.9, 0.7, 26]]],
+  ['2026-11-19', [['CPO光模块', 2.7, 1.6, 42], ['液冷服务器', 2.5, 1.5, 30], ['算力租赁', 2.3, 1.7, 19], ['存储芯片', 1.9, 1.4, 35], ['AI应用', 1.7, 1.3, 55], ['半导体设备', 0.8, 0.9, 40], ['人形机器人', 0.5, 0.8, 42], ['军工电子', 0.3, 0.8, 29], ['固态电池', 0.1, 0.7, 47], ['创新药', -0.2, 0.7, 46]]],
+  ['2026-11-20', [['液冷服务器', 2.2, 1.5, 32], ['军工电子', 1.6, 1.3, 31], ['创新药', 1.1, 1.2, 46], ['白酒', 0.9, 1.1, 16], ['银行', 0.7, 1.0, 12], ['CPO光模块', -2.4, 1.4, 21], ['算力租赁', -1.8, 1.2, 11], ['存储芯片', -1.5, 1.1, 24], ['AI应用', -1.2, 1.0, 38], ['半导体设备', -0.9, 0.9, 31]]]
+];
+/* 60 日箱位（真实来自 fetch_board_box_positions）：原型按「最新值 + 全窗口线性走势」种子，
+   越靠近窗口起点越偏离最新值；只用当日 top10 的板块。 */
+const MI_BOX_LATEST = {
+  'CPO光模块': 0.92, '液冷服务器': 0.88, '算力租赁': 0.79, '存储芯片': 0.74, '半导体设备': 0.61,
+  'AI应用': 0.55, '人形机器人': 0.48, '固态电池': 0.42, '创新药': 0.51, '军工电子': 0.33,
+  '稀土永磁': 0.45, '低空经济': 0.38, '光伏设备': 0.22, '白酒': 0.28, '煤炭开采': 0.35, '银行': 0.62
+};
+const MI_BOX_SLOPE = {
+  'CPO光模块': 0.42, '液冷服务器': 0.36, '算力租赁': 0.45, '存储芯片': 0.20, '半导体设备': 0.14,
+  'AI应用': 0.05, '人形机器人': -0.04, '固态电池': -0.10, '创新药': 0.02, '军工电子': -0.08,
+  '稀土永磁': 0.12, '低空经济': -0.06, '光伏设备': -0.14, '白酒': -0.12, '煤炭开采': -0.10, '银行': 0.08
+};
+/* 箱位取数超时降级：后端线程 30s 未返回就按「缺失」处理，不阻塞主结果（sector_forward_view._fetch_boxes） */
+const MI_BOX_MISSING = { date: '2026-11-19', sectors: ['液冷服务器'], note: '东财板块箱位接口 30s 未返回，本轮按缺失处理' };
+const MI_WINDOW_LIMIT = 60;
+
+/* 板块启动归因（sector_launch_reason）：AI 只写「为什么启动」，置信度按证据链/时间匹配/产业传导/资金验证算出来。 */
+const MI_LAUNCH = {
+  '2026-11-19': [
+    {
+      sector: 'CPO光模块', tags: '订单验证,算力资本开支,持续', days: 4, confidence: 0.82,
+      text: '北美四家云厂商在 11 月财报电话会把 2027 年资本开支指引整体上修，1.6T 光模块出货指引由每季度 30 万只上调到 45 万只；' +
+        '国内两家头部模组厂在手订单已排到 2027Q1，龙头 Q3 合同负债环比 +38%，属于业绩能兑现的产业逻辑而非纯情绪。' +
+        '板块已连续 8 个交易日排在涨幅前五，量比 1.6 仍有增量资金，但 60 日箱位 0.92 已在历史高位，追高性价比下降。',
+      chain: [
+        { key: '云厂商资本开支指引', source: '公司公告', text: '四家云厂商 2027 年 capex 指引合计上修 18%，1.6T 出货指引 +50%。' },
+        { key: '龙头合同负债', source: '财报', text: '中际旭创 Q3 合同负债环比 +38%，预收款项指向 2027Q1 交付。' },
+        { key: '板块资金', source: '盘面数据', text: '连续 8 日 top5，量比 1.6，主力净流入 3 日累计 21.4 亿。' }
+      ],
+      causal: [
+        { layer: '需求端', claim: '海外云厂商资本开支上修 → 光模块出货量预期上修', level: 'L1', align: '同周', cause: 'lead' },
+        { layer: '供给端', claim: '1.6T 良率爬坡，头部厂商独占产能', level: 'L2', align: '滞后 2 周', cause: 'lead' },
+        { layer: '盘面', claim: '板块涨幅榜连续居前、量能未衰减', level: 'L3', align: '同日', cause: 'post_move_explanation' }
+      ],
+      transmission: '云厂商 capex → 光模块整机 → 光器件/光芯片 → 高速连接器 → 液冷配套（同一批资金沿着链条向后传导）',
+      capital: { main_net_in_3d: '21.4 亿', north_bound: '沪股通增持 4.2 亿', margin: '融资余额 5 日 +6.1%', turnover: '换手率 4.8%（近 60 日 92 分位）' },
+      falsify: {
+        t1: '次日板块跌出涨幅前十，或龙头缩量阴线（量比 <1）',
+        t3: '3 日内北美云厂商下调指引 / 龙头公告订单延期',
+        t5: '5 日累计涨幅转负且箱位仍 >0.9（高位滞涨=出货）',
+        triggered: false
+      },
+      cap_reason: '有 L1 产业证据 + 资金验证，箱位过高扣 0.08'
+    },
+    {
+      sector: '液冷服务器', tags: '渗透率,政策,持续', days: 3, confidence: 0.58,
+      text: '工信部新建数据中心 PUE 要求收紧到 1.15，风冷方案无法满足，液冷渗透率从 14% 提到 30% 的预期在多家卖方报告中出现；' +
+        '但落地订单集中在两家整机厂，板块内多数标的收入占比不足 10%，业绩弹性还没验证。箱位 0.88 偏高，属于「逻辑对、位置不便宜」。',
+      chain: [
+        { key: 'PUE 政策窗口', source: '政策文件', text: '新建大型数据中心 PUE ≤1.15，2027 年起执行。' },
+        { key: '卖方渗透率预测', source: '研究报告', text: '液冷渗透率 2026 14% → 2027 30%（预测值，未落订单）。' }
+      ],
+      causal: [
+        { layer: '政策端', claim: 'PUE 强制约束 → 液冷从可选变必选', level: 'L2', align: '同月', cause: 'lead' },
+        { layer: '业绩端', claim: '板块标的液冷收入占比普遍 <10%，弹性未验证', level: 'L3', align: '缺失', cause: 'unusable_rumor' }
+      ],
+      transmission: '政策约束 → 数据中心改造 → 液冷整机 → 冷板/管路 → 冷却液',
+      capital: { main_net_in_3d: '6.8 亿', north_bound: '无明显变化', margin: '融资余额 5 日 +1.2%', turnover: '换手率 3.1%' },
+      falsify: { t1: '次日跌出前十且量比 <1.2', t3: '龙头没有新增中标公示', t5: '板块 5 日累计转负', triggered: false },
+      cap_reason: '只有政策与预测证据，缺 L1 订单与资金确认，扣到中等档'
+    },
+    {
+      sector: '算力租赁', tags: '情绪,传闻,emotion_only', days: 1, confidence: 0.36,
+      text: '市场传某算力租赁商拿到新的大模型厂商长单，公司公告只写「正在洽谈」，未披露金额与期限；板块 3 日涨幅 12% 主要由游资席位推动。' +
+        '这一条只有情绪与传闻，没有可回指的硬证据，不作为主线延续的依据。',
+      chain: [
+        { key: '长单传闻', source: '媒体报道', text: '未获公司公告确认，公告仅称「正在洽谈」。' }
+      ],
+      causal: [
+        { layer: '消息端', claim: '传闻级长单 → 收入预期上修', level: 'L3', align: '缺失', cause: 'unusable_rumor' }
+      ],
+      transmission: '',
+      capital: null,
+      falsify: { t1: '公告澄清无此订单', t3: '游资席位退出龙虎榜', t5: '板块跌出前二十', triggered: true },
+      cap_reason: '传闻未证实 + 反证条件已触发，置信度封顶 0.45'
+    }
+  ],
+  '2026-11-18': [
+    {
+      sector: 'CPO光模块', tags: '订单验证,算力资本开支,持续', days: 4, confidence: 0.80,
+      text: '云厂商资本开支上修的逻辑继续发酵，龙头当日 +3.6%、量比 2.4，板块连续 7 日 top5；' +
+        '当天外围题材（稀土、低空）大量挤进涨幅榜前五，top5 换手率升到 0.8，说明增量资金开始在外围打游击，主线内部反而没有新资金接力。',
+      chain: [
+        { key: '云厂商资本开支指引', source: '公司公告', text: '2027 capex 合计上修 18%。' },
+        { key: '外围题材挤榜', source: '盘面数据', text: '当日 top5 有 3 个是一日游题材。' }
+      ],
+      causal: [
+        { layer: '需求端', claim: '海外 capex 上修 → 出货预期上修', level: 'L1', align: '同周', cause: 'lead' },
+        { layer: '资金面', claim: '外围打板资金分流，主线增量不足', level: 'L3', align: '同日', cause: 'post_move_explanation' }
+      ],
+      transmission: '云厂商 capex → 光模块整机 → 光器件 → 连接器',
+      capital: { main_net_in_3d: '14.1 亿', north_bound: '沪股通增持 1.8 亿', margin: '融资余额 5 日 +3.4%', turnover: '换手率 5.2%' },
+      falsify: { t1: '次日龙头缩量阴线', t3: 'capex 指引被下调', t5: '5 日累计涨幅转负', triggered: false },
+      cap_reason: '有 L1 证据 + 资金验证'
+    },
+    {
+      sector: '稀土永磁', tags: '情绪,传闻,emotion_only', days: 1, confidence: 0.30,
+      text: '出口管制相关消息带来单日脉冲，板块内多数标的没有业绩关联；量比 2.2 但上涨家数只有 22 家，属于资金短打。',
+      chain: [{ key: '出口管制消息', source: '媒体报道', text: '消息未涉及具体标的与收入口径。' }],
+      causal: [{ layer: '消息端', claim: '管制预期 → 涨价预期', level: 'L3', align: '同日', cause: 'unusable_rumor' }],
+      transmission: '', capital: null,
+      falsify: { t1: '次日跌出前十', t3: '无后续政策文件', t5: '5 日累计转负', triggered: false },
+      cap_reason: '只有消息，没有产业传导'
+    }
+  ],
+  '2026-11-17': [
+    {
+      sector: 'CPO光模块', tags: '订单验证,算力资本开支,持续', days: 3, confidence: 0.80,
+      text: '龙头当日 +4.1% 创 60 日新高，量比 2.6；北美 capex 上修 + 国内 1.6T 良率爬坡两条证据都还在，' +
+        '但涨幅已进入加速段，追高风险与延续概率同时抬高。',
+      chain: [
+        { key: '云厂商资本开支指引', source: '公司公告', text: '2027 capex 合计上修 18%。' },
+        { key: '1.6T 良率', source: '产业链调研', text: '头部厂商良率过 70%，产能独占。' }
+      ],
+      causal: [
+        { layer: '需求端', claim: 'capex 上修 → 出货预期上修', level: 'L1', align: '同周', cause: 'lead' },
+        { layer: '供给端', claim: '良率爬坡 → 头部独占', level: 'L2', align: '滞后 2 周', cause: 'lead' }
+      ],
+      transmission: '云厂商 capex → 光模块整机 → 光器件/光芯片',
+      capital: { main_net_in_3d: '18.9 亿', north_bound: '增持 2.6 亿', margin: '融资余额 5 日 +4.8%', turnover: '换手率 4.6%' },
+      falsify: { t1: '次日缩量阴线', t3: '指引下调', t5: '5 日累计转负', triggered: false },
+      cap_reason: '需求 + 供给双证据，资金确认完整'
+    },
+    {
+      sector: '半导体设备', tags: '国产替代,招标', days: 2, confidence: 0.50,
+      text: '两存储厂发布设备招标公告，国产化比例要求提高；金额尚未披露，按历史中标结构估算板块收入弹性 3-5%。',
+      chain: [{ key: '设备招标公告', source: '公告', text: '招标清单已挂网，金额未定。' }],
+      causal: [{ layer: '需求端', claim: '招标 → 国产设备订单', level: 'L2', align: '同月', cause: 'lead' }],
+      transmission: '存储厂扩产 → 前道设备 → 零部件', capital: { main_net_in_3d: '4.2 亿', turnover: '换手率 2.4%' },
+      falsify: { t1: '次日跌出前十', t3: '中标结果无国产厂商', t5: '5 日累计转负', triggered: false },
+      cap_reason: '有招标事实但金额未定，中等档'
+    }
+  ],
+  '2026-11-16': [
+    {
+      sector: 'CPO光模块', tags: '订单验证,持续', days: 3, confidence: 0.78,
+      text: '周末海外云厂商财报落地，2027 资本开支指引上修，板块当日 +3.4% 重回涨幅第一，连续 5 日 top5。',
+      chain: [{ key: '云厂商财报', source: '公司公告', text: 'capex 指引上修 18%。' }],
+      causal: [{ layer: '需求端', claim: 'capex 上修 → 出货预期上修', level: 'L1', align: '同周', cause: 'lead' }],
+      transmission: '云厂商 capex → 光模块整机 → 光器件', capital: { main_net_in_3d: '12.6 亿', turnover: '换手率 4.1%' },
+      falsify: { t1: '次日跌出前十', t3: '指引被下调', t5: '5 日累计转负', triggered: false },
+      cap_reason: 'L1 公告证据 + 资金净流入'
+    },
+    {
+      sector: '液冷服务器', tags: '渗透率,政策', days: 2, confidence: 0.55,
+      text: 'PUE 政策窗口叠加数据中心改造招标信息，板块 +2.8%，但收入弹性还没在报表里体现。',
+      chain: [{ key: 'PUE 政策', source: '政策文件', text: '新建数据中心 PUE ≤1.15。' }],
+      causal: [{ layer: '政策端', claim: 'PUE 约束 → 液冷必选化', level: 'L2', align: '同月', cause: 'lead' }],
+      transmission: '政策 → 数据中心改造 → 液冷整机', capital: null,
+      falsify: { t1: '次日跌出前十', t3: '无新增中标', t5: '5 日累计转负', triggered: false },
+      cap_reason: '政策证据有，资金验证缺失'
+    },
+    {
+      sector: '算力租赁', tags: '情绪', days: 1, confidence: 0.40,
+      text: '跟随主线上涨，自身没有新增订单证据，属于主线扩散。',
+      chain: [{ key: '跟随主线', source: '盘面数据', text: '板块上涨但缺少独立催化。' }],
+      causal: [{ layer: '盘面', claim: '主线扩散 → 补涨', level: 'L3', align: '同日', cause: 'post_move_explanation' }],
+      transmission: '', capital: null,
+      falsify: { t1: '次日跌出前十', t3: '主线退潮则同步退潮', t5: '5 日累计转负', triggered: false },
+      cap_reason: '只有盘面跟随，无产业证据'
+    }
+  ],
+  '2026-11-13': [
+    {
+      sector: 'CPO光模块', tags: '订单验证,持续', days: 3, confidence: 0.76,
+      text: '海外大厂下单传闻 + 卖方上调出货量预测，板块当日 +2.9% 重回第一；公告层面还没有正式合同，证据等级比 11-16 那一轮低一档。',
+      chain: [{ key: '下单传闻', source: '媒体报道', text: '卖方报告称头部厂商获追加订单。' }],
+      causal: [{ layer: '需求端', claim: '追加订单 → 出货上修', level: 'L2', align: '同周', cause: 'lead' }],
+      transmission: '云厂商 → 光模块整机 → 光器件', capital: { main_net_in_3d: '8.4 亿', turnover: '换手率 3.8%' },
+      falsify: { t1: '次日跌出前十', t3: '无公告确认', t5: '5 日累计转负', triggered: false },
+      cap_reason: '报告级证据，未见公告'
+    },
+    {
+      sector: '液冷服务器', tags: '渗透率', days: 2, confidence: 0.55,
+      text: 'PUE 政策预期驱动的补涨，量比 1.8 但上涨家数只有 26 家，集中在两只整机股。',
+      chain: [{ key: 'PUE 政策', source: '政策文件', text: 'PUE ≤1.15。' }],
+      causal: [{ layer: '政策端', claim: 'PUE → 液冷改造', level: 'L2', align: '同月', cause: 'lead' }],
+      transmission: '政策 → 改造需求 → 液冷整机', capital: null,
+      falsify: { t1: '次日跌出前十', t3: '无中标', t5: '5 日累计转负', triggered: false },
+      cap_reason: '集中度高，缺资金验证'
+    }
+  ]
+};
+/* top10 之外的「下一个风口」候选（sector_next_hot，15:50 跑）：父板块归因能否迁移过来是关键 */
+const MI_NEXT_HOT = {
+  '2026-11-20': [
+    { sector: '军工电子', rank: 11, hot: 71, days: 4, conf: 0.44, trig: { missing: false, parent: 0.61, dist: '2 跳', logic: '航发订单 → 机载电子 → 连接器与电源模块', must: '下周两型新品定型公告；板块上涨家数需 >40' } },
+    { sector: '低空经济', rank: 12, hot: 68, days: 3, conf: 0.31, trig: { missing: true, parent: null, dist: '未知', logic: '空域试点扩容，但没有可回指的产业订单证据', must: '试点城市名单落地 + 龙头公告 eVTOL 配套收入' } },
+    { sector: '光伏设备', rank: 13, hot: 55, days: 2, conf: 0.26, trig: { missing: true, parent: 0.38, dist: '3 跳', logic: '硅料限价传闻 → 组件排产回升，链条过长', must: '排产数据连续两周环比转正' } }
+  ],
+  '2026-11-19': [
+    { sector: '算力租赁', rank: 9, hot: 74, days: 3, conf: 0.36, trig: { missing: false, parent: 0.82, dist: '1 跳', logic: '光模块订单上修 → 机柜交付 → 算力租赁上架率', must: '龙头公告新增长单；否则按情绪票处理' } },
+    { sector: '创新药', rank: 14, hot: 52, days: 2, conf: 0.40, trig: { missing: false, parent: 0.51, dist: '无关', logic: '与算力主线无传导关系，独立行情', must: '海外授权首付款到账公告' } }
+  ]
+};
+/* 多窗口规律（sector_rotation_pattern.analyze_patterns 的口径） */
+const MI_PATTERNS = {
+  '3d': { days: 3, rotation_cycle: 1.8, lifecycle_avg_streak: 2.4, switch_frequency: 0.62, volume_breakout_continuation: 0.41, mainline: ['CPO光模块'], top_slopes: [{ s: 'CPO光模块', v: 3.1 }, { s: '液冷服务器', v: 2.4 }, { s: '算力租赁', v: 1.9 }] },
+  '10d': { days: 10, rotation_cycle: 3.6, lifecycle_avg_streak: 5.2, switch_frequency: 0.38, volume_breakout_continuation: 0.55, mainline: ['CPO光模块', '存储芯片'], top_slopes: [{ s: 'CPO光模块', v: 2.6 }, { s: '液冷服务器', v: 2.1 }, { s: '半导体设备', v: 1.4 }] },
+  '20d': { days: 20, rotation_cycle: 5.4, lifecycle_avg_streak: 7.8, switch_frequency: 0.27, volume_breakout_continuation: 0.48, mainline: ['CPO光模块', '液冷服务器'], top_slopes: [{ s: 'CPO光模块', v: 2.2 }, { s: '存储芯片', v: 1.3 }, { s: '创新药', v: 0.9 }] },
+  '60d': { days: 60, rotation_cycle: 9.2, lifecycle_avg_streak: 11.6, switch_frequency: 0.18, volume_breakout_continuation: 0.44, mainline: ['CPO光模块'], top_slopes: [{ s: 'CPO光模块', v: 1.7 }, { s: 'AI应用', v: 0.8 }, { s: '银行', v: 0.6 }] }
+};
+/* 模块自检（/api/market/diagnostics）：7 张表 + 5 个定时任务的最新状态 */
+const MI_DIAG = {
+  tables: {
+    sector_daily: { latest_date: '2026-11-20', row_count: 90, last_error: '' },
+    sector_rotation: { latest_date: '2026-11-19', row_count: 5, last_error: '' },
+    sector_launch_reason: { latest_date: '2026-11-19', row_count: 3, last_error: '' },
+    sector_regime_forecast: { latest_date: '2026-11-19', row_count: 1, last_error: '' },
+    sector_forward_forecast: { latest_date: '2026-11-19', row_count: 30, last_error: '' },
+    sector_forecast_verify: { latest_date: '2026-11-16', row_count: 3, last_error: '' },
+    sector_next_hot: { latest_date: '2026-11-20', row_count: 3, last_error: '' }
+  },
+  jobs: {
+    sector_daily: { last_run_at: '2026-11-20 15:35:04', last_status: 'ok', last_error: '' },
+    sector_regime: { last_run_at: '2026-11-20 15:40:37', last_status: 'failed', last_error: '数据源超时：fetch_board_box_positions 30s 未返回，C\' 结构判定中断' },
+    sector_forward: { last_run_at: '2026-11-19 15:45:02', last_status: 'ok', last_error: '' },
+    sector_forecast_verify: { last_run_at: '2026-11-20 16:05:11', last_status: 'ok', last_error: '' },
+    sector_next_hot: { last_run_at: '2026-11-20 15:50:06', last_status: 'ok', last_error: '' }
+  }
+};
+/* AI 市场研判记录（market_intel 表，工作日 16:20 跑）：只存 AI 写的文字字段，量能信号由快照现算 */
+const MI_INTEL = {
+  '2026-11-19': {
+    phase: '主线加速后转分歧：龙头还在，外围开始散', risk: '中性',
+    summary: '算力链仍是唯一抱团方向，但 11-18 起 top5 换手率升到 0.8，增量资金在外围打游击；结构没坏，位置已高，节奏比方向重要。',
+    conflict: '矛盾点一：龙头订单证据仍然成立（L1 公告 + 合同负债），但 60 日箱位 0.92 已到历史 95 分位，延续概率和追高风险同时抬高。\n' +
+      '矛盾点二：主线内部资金没有新增，涨幅靠估值扩张；外围题材（稀土、低空、固态）单日冲进 top5 又单日退出，说明打板资金在分流而不是接力。\n' +
+      '矛盾点三：液冷与算力租赁一个缺订单验证、一个只有传闻长单，却跟着主线一起涨——真主线和伪扩散目前混在同一个涨幅榜里，只有拆到个股报表层才分得开。\n' +
+      '这两个月最有效的做法是：只在主线里做已经证明业绩的环节，不碰跟随性补涨。',
+    structure: { attack: 'CPO光模块（订单证据最硬，但位置最高，只做已证明业绩的龙头环节）', relay: '半导体设备（招标公告，箱位 0.61 还在中位）', fade: '算力租赁（传闻驱动，反证条件已触发）' },
+    quality: '主线量能成色尚可但边际递减：CPO 量比从 11-17 的 2.6 降到 1.6，板块上涨家数从 46 家降到 42 家，是「缩量新高」的形态。',
+    box: {
+      'CPO光模块': '60 日箱位 92%：主升初期早已过去，现在是高位放量滞涨的风险区；但只要量比不塌到 1 以下，就不能直接判定出货。',
+      '液冷服务器': '60 日箱位 88%：位置高但资金验证缺失（融资余额几乎没动），更像存量博弈的补涨。',
+      '半导体设备': '60 日箱位 61%：唯一还在中位、且有招标公告的方向，是主线扩散的第一站。',
+      '算力租赁': '60 日箱位 79%：反证条件已触发（公告未确认订单），按一日游处理，不作为延续依据。'
+    },
+    stocks: [
+      { name: '中际旭创', code: '300308', chg: 4.2, vol: 1.9, box: 94, verdict: '加速后段' },
+      { name: '新易盛', code: '300502', chg: 3.1, vol: 1.7, box: 91, verdict: '真强' },
+      { name: '天孚通信', code: '300399', chg: 2.4, vol: 1.2, box: 96, verdict: '放量滞涨' },
+      { name: '北方华创', code: '002371', chg: 2.8, vol: 1.6, box: 63, verdict: '真强' },
+      { name: '英维克', code: '002837', chg: 1.1, vol: 0.9, box: 87, verdict: '假强' }
+    ],
+    watch: {
+      '主线龙头量能': 'CPO 量比跌破 1.2 或收阴线 → 加速转分歧确认，减配高位环节',
+      '外围一日游': '稀土/低空跌出前十 → 说明只是单日脉冲，不必跟进',
+      '半导体设备': '招标公告是否落地成中标 → 落地则作为主线接力方向',
+      '算力租赁': '是否有正式订单公告 → 没有就按情绪票处理，不参与',
+      '两市成交额': '跌破 1.6 万亿则主线容错率下降，降低仓位上限'
+    },
+    meaning: '不追高位的加速段，等一次缩量回踩；接力方向看箱位还在中位的半导体设备；跟随性补涨（算力租赁）不作为建仓理由。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 2871 / 下跌 1904，非涨停口径', sample_size: '全板块 90 个' }
+  },
+  '2026-11-18': {
+    phase: '主线高位加速，外围开始抢席位', risk: '进取',
+    summary: '龙头 +3.6% 继续新高，但当日 top5 里出现了三个一日游题材；结构仍是主线，风险在位置。',
+    conflict: '矛盾点一：主线证据仍然成立，箱位已 90%+。\n矛盾点二：top5 换手 0.8，抱团板块只剩龙头一个。\n处理方式：主线仓位不加仓，外围不参与。',
+    structure: { attack: 'CPO光模块', relay: '创新药（独立逻辑，海外授权）', fade: '稀土永磁（消息脉冲）' },
+    quality: '放量新高：龙头量比 2.4，板块上涨家数 44 家，成色比 11-17 略降。',
+    box: { 'CPO光模块': '箱位 91%：加速段特征，回踩不破 10 日线可持有。', '稀土永磁': '箱位 45%：低位脉冲，没有产业传导。' },
+    stocks: [
+      { name: '中际旭创', code: '300308', chg: 5.1, vol: 2.4, box: 92, verdict: '加速后段' },
+      { name: '新易盛', code: '300502', chg: 3.8, vol: 2.1, box: 89, verdict: '真强' },
+      { name: '天孚通信', code: '300399', chg: 1.2, vol: 1.1, box: 94, verdict: '放量滞涨' }
+    ],
+    watch: { '龙头是否缩量': '量比 <1.5 视为加速段结束', '外围题材持续性': '稀土次日跌出前十即证伪' },
+    meaning: '持有主线，不加仓；新开仓只考虑箱位中位以下的接力方向。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 3102 / 下跌 1620', sample_size: '全板块 90 个' }
+  },
+  '2026-11-17': {
+    phase: '主线确认：龙头连续在榜，榜面开始换人', risk: '进取',
+    summary: '光模块 +4.1% 创 60 日新高，需求与供给两条证据都在，结构从确认走向加速。',
+    conflict: '矛盾点一：加速段延续概率最高，但追高风险同步抬升。\n矛盾点二：半导体设备有招标公告但金额未定，接力证据不够硬。',
+    structure: { attack: 'CPO光模块', relay: '半导体设备', fade: 'AI应用（涨幅回落，量能不济）' },
+    quality: '放量新高，量比 2.6 为近 10 日最高，成色最好的一天。',
+    box: { 'CPO光模块': '箱位 90%：加速段，仓位优先给已证明业绩的环节。' },
+    stocks: [{ name: '中际旭创', code: '300308', chg: 6.2, vol: 2.6, box: 90, verdict: '加速后段' }, { name: '北方华创', code: '002371', chg: 2.2, vol: 1.7, box: 60, verdict: '真强' }],
+    watch: { '量能能否维持': '量比连续两日 >2 才算真加速', '良率数据': '1.6T 良率是否到 70%' },
+    meaning: '主线加速期：持有 > 新开仓，追高需要等回踩。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 2640 / 下跌 2100', sample_size: '全板块 90 个' }
+  },
+  '2026-11-16': {
+    phase: '主线确认：周末公告落地后一致预期形成', risk: '进取',
+    summary: '海外 capex 上修落地，算力链整体回到涨幅榜前列，持续天数达标，结构判定进入主线。',
+    conflict: '矛盾点一：证据变硬的同时位置也变高。\n矛盾点二：算力租赁只是跟随，独立证据缺失。',
+    structure: { attack: 'CPO光模块', relay: '液冷服务器', fade: '固态电池（资金撤离）' },
+    quality: '放量确认，量比 2.3，主线板块上涨家数同步扩张。',
+    box: { 'CPO光模块': '箱位 88%：突破后第二个交易日。' },
+    stocks: [{ name: '新易盛', code: '300502', chg: 4.4, vol: 2.2, box: 86, verdict: '真强' }, { name: '中际旭创', code: '300308', chg: 3.4, vol: 2.3, box: 87, verdict: '真强' }],
+    watch: { '资金是否继续加仓': '主力净流入是否连续三日为正' },
+    meaning: '主线确认期：可分批参与已证明业绩的环节。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 3320 / 下跌 1420', sample_size: '全板块 90 个' }
+  },
+  '2026-11-13': {
+    phase: '主线雏形：光模块重回第一，但只有报告级证据', risk: '中性',
+    summary: '板块回到涨幅第一，持续天数刚达标；证据是卖方报告而不是公告，判定给到主线确认但置信度打折。',
+    conflict: '矛盾点一：结构已达标，证据等级还差一档。\n矛盾点二：液冷只有两只整机股在涨，上涨家数 26 家，广度不足。',
+    structure: { attack: 'CPO光模块', relay: '算力租赁', fade: '固态电池' },
+    quality: '量比 2.1 但上涨家数集中在头部，广度偏窄。',
+    box: { 'CPO光模块': '箱位 84%：突破位附近。' },
+    stocks: [{ name: '中际旭创', code: '300308', chg: 3.9, vol: 2.1, box: 84, verdict: '真强' }],
+    watch: { '公告是否跟进': '报告级证据需要公告确认才能升档' },
+    meaning: '先按主线对待，但仓位给证据升档后的部分。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 2210 / 下跌 2480', sample_size: '全板块 90 个' }
+  },
+  '2026-11-12': {
+    phase: '混沌市：算力链回流但还没形成抱团', risk: '中性',
+    summary: '存储/半导体/AI 应用交替领先，没有一个板块连续三天在 top5，结构判不出主线。',
+    conflict: '矛盾点一：题材热度在回升，但没有持续性证据。\n矛盾点二：算力租赁第一次进榜（第 9 名），是新增还是脉冲未知。',
+    structure: { attack: 'AI应用', relay: 'CPO光模块', fade: '煤炭开采' },
+    quality: 'AI 应用量比 1.8、上涨家数 60 家，广度是这几天最好的。',
+    box: { 'AI应用': '箱位 52%：中位放量，属于可能起势的位置。' },
+    stocks: [{ name: '金山办公', code: '688111', chg: 3.2, vol: 1.8, box: 55, verdict: '真强' }],
+    watch: { '谁先做出三天 top5': '第一个连续进榜的板块就是主线候选' },
+    meaning: '混沌期不建仓，等结构定型。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 2480 / 下跌 2210', sample_size: '全板块 90 个' }
+  },
+  '2026-11-11': {
+    phase: '混沌市：存储与半导体设备轮着第一', risk: '避险',
+    summary: 'top5 内部换手不大但榜首频繁更换，缺少能带动广度的方向。',
+    conflict: '矛盾点一：算力链回到榜单但涨幅收窄。\n矛盾点二：防御板块（白酒、煤炭）没有资金撤离迹象，风险偏好没打开。',
+    structure: { attack: '存储芯片', relay: 'CPO光模块', fade: '光伏设备' },
+    quality: '存储量比 1.7，板块上涨家数 32 家，广度一般。',
+    box: { '存储芯片': '箱位 70%：反弹到压力位附近。' },
+    stocks: [{ name: '兆易创新', code: '603986', chg: 2.5, vol: 1.7, box: 70, verdict: '加速后段' }],
+    watch: { '榜首是否换手': '连续两日同一板块第一才算主线' },
+    meaning: '降仓位、等主线。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 1980 / 下跌 2710', sample_size: '全板块 90 个' }
+  },
+  '2026-11-10': {
+    phase: '混沌市：半导体设备单日脉冲', risk: '避险',
+    summary: '半导体设备 +2.9% 拿下第一，但前一日还排在第 8，属于资金单日选择。',
+    conflict: '矛盾点：榜单每天都在换人，没有持续证据，任何主线判断都会被打脸。',
+    structure: { attack: '半导体设备', relay: 'AI应用', fade: '固态电池' },
+    quality: '量比 1.9，上涨家数 42 家。',
+    box: { '半导体设备': '箱位 58%：中位起跳。' },
+    stocks: [{ name: '北方华创', code: '002371', chg: 3.1, vol: 1.9, box: 58, verdict: '真强' }],
+    watch: { '次日能否守住前三': '守住才算结构，守不住就是脉冲' },
+    meaning: '只做已经证明的，不做第一天冒出来的。',
+    raw_extra: { board_volume_ratio_available: true, breadth: '上涨家数 1720 / 下跌 2980', sample_size: '全板块 90 个' }
+  },
+  '2026-11-09': {
+    phase: '（该轮量能数据源缺板块量比）创新药与固态电池轮动', risk: '避险',
+    summary: '轮动速度快、无主线；本轮 akshare 东财接口未返回板块量比，量能信号不完整。',
+    conflict: '矛盾点：创新药有海外授权收入，固态电池只有排产传闻，两者却在同一个榜单上被同等对待。',
+    structure: { attack: '创新药', relay: '', fade: '' },
+    quality: '',
+    box: {},
+    stocks: [{ name: '恒瑞医药', code: '600276', chg: 2.7, vol: null, box: 49, verdict: '真强' }],
+    watch: { '量比数据恢复': '等 akshare 板块量比接口恢复后重跑该轮' },
+    meaning: '数据缺失时不出操作结论，只记录事实。',
+    raw_extra: { board_volume_ratio_available: false, breadth: '上涨家数 1550 / 下跌 3160', sample_size: '全板块 90 个' }
+  }
+};
+/* 历史批次已跑到的步骤（后端由各定时任务落库；11-20 的结构识别任务失败，见 MI_DIAG） */
+const MI_DONE = {
+  '2026-11-20': { regime: false, forward: false, intel: false, rotation: false, verify: false },
+  '2026-11-19': { regime: true, forward: true, intel: true, rotation: true, verify: true },
+  '2026-11-18': { regime: true, forward: true, intel: true, rotation: true, verify: true },
+  '2026-11-17': { regime: true, forward: true, intel: true, rotation: true, verify: true },
+  '2026-11-16': { regime: true, forward: true, intel: true, rotation: true, verify: true },
+  '2026-11-13': { regime: true, forward: true, intel: true, rotation: true, verify: true },
+  '2026-11-12': { regime: true, forward: true, intel: true, rotation: false, verify: true },
+  '2026-11-11': { regime: true, forward: true, intel: true, rotation: false, verify: true },
+  '2026-11-10': { regime: true, forward: true, intel: true, rotation: false, verify: true },
+  '2026-11-09': { regime: false, forward: false, intel: true, rotation: false, verify: false },
+  '2026-11-06': { regime: false, forward: false, intel: false, rotation: false, verify: false },
+  '2026-11-05': { regime: false, forward: false, intel: false, rotation: false, verify: false },
+  '2026-11-04': { regime: false, forward: false, intel: false, rotation: false, verify: false },
+  '2026-11-03': { regime: false, forward: false, intel: false, rotation: false, verify: false }
+};
+
+/* ---------- 市场研判：判定引擎（后端同一套公式的浏览器镜像） ---------- */
+const MI_DB_DAYS = 68;
+const MI_REGIME_LABEL = { mainline: '主线行情', rotation: '轮动行情', chaos: '混沌行情', unknown: '数据缺失' };
+const MI_STAGE_LABEL = { start: '启动', confirm: '确认', accelerate: '加速', diverge: '分歧', fade: '退潮', unknown: '未定档' };
+const MI_BIAS_LABEL = {
+  continue: '延续', switch: '切换', fade: '退潮', diverge: '分歧', uncertain: '不确定',
+  mainline_confirm: '主线确认', new_mainline_switch: '新主线切换', invalid_rotation: '无效轮动'
+};
+const MI_TONE_LABEL = { continue: 'green', mainline_confirm: 'green', switch: 'blue', new_mainline_switch: 'blue', fade: 'red', diverge: 'gold', uncertain: 'mute', invalid_rotation: 'red' };
+const MI_APPETITE = {
+  进取: { tone: 'red', 含义: '资金转进攻，可增配主线强势方向' },
+  中性: { tone: 'mute', 含义: '资金偏好均衡，维持中性仓位右侧确认' },
+  避险: { tone: 'gold', 含义: '资金退守防御，控制仓位等待企稳' }
+};
+/* 结构判定这块的已知毛病：对着后端代码核过，正式落地要修，页面上照实列出来 */
+const MI_REGIME_GAPS = [
+  ['没有手动补跑结构的接口', 'C′ 只在 15:40 定时任务里跑，接口层只暴露了 D′ 板块前瞻。结构记录缺失时点「刷新行情结构」会直接报「行情结构预测不存在」，页面只能显示空态。要能补历史，需要新增一个手动跑 C′ 的接口。'],
+  ['回填历史日期时置信度恒等于 20%', '取数先拉「全库最近 60 个交易日」再按当天切片，窗口长度跟着日期越靠后越短。回填一周前的数据时只剩 53 天，触发「不足 60 日」规则把置信度压到 20%，看上去像模型没信心，实际是可用样本被 60 条上限截掉了。'],
+  ['阶段档位有够不到的分支', '「启动」要求龙头连续正好 2 天，但主线判定本身要求连续 ≥3 天，两个条件互斥；「退潮」同样要求连续 <3 天。正式环境里这两个档位基本不会出现，页面按六档渲染会一直空着。'],
+  ['「加速」档天生和高换手绑在一起', '加速要同时满足连续 ≥3 天、量比扩张 >0.2、前五箱位中位数 ≥0.7。但它排在「确认」之后判断，而确认吃掉了所有榜面换手 <0.5 的日子，所以只有换手已经打到 ≥0.5 时才轮得到加速——「加速」实际含义变成了「高换手 + 放量 + 高位」，和量价扩张的本意不一样。原型 22 个交易日里只出现过 1 次，换口径后要在生产数据上复算分布。'],
+  ['箱位没取到时，页面会显示成「行情不确定」', '两边都把箱位取数做成了超时降级（拿不到就当空），但降级不等于无害：板块前瞻的延续概率要同时用量比和箱位，箱位缺失时这一项直接算不出来，三个窗口的倾向全部落到「不确定」；结构判定这边，箱位缺失会让「加速」档永远不触发。看上去是行情看不清，实际是取数没成功。落地要区分「箱位缺失」和「箱位很低」，缺失时按去掉位置项的归一公式继续算，并把降级原因写进证据字段给页面显示。'],
+  ['结构阶段直接显示英文枚举', '正式页面把 regime_stage 原样输出（forward_bias 已经过了中文映射），「accelerate」「diverge」这种字样业务看不懂，需要中文映射与配色。本页用固定六档映射，不临场造词。'],
+  ['回填历史日期时偷看了未来', '连续居前天数读的是「该板块全库最新 10 日快照」，函数不接受截止日期参数。补跑一周前的结构时，这一项用的是那一周之后的行情，主线连续天数会被未来的行情抬高或压低，连带落库的结构记录和后验准确率都不干净。回填前要给这个取数加 as-of 日期。']
+];
+const MI_BOARDS = [
+  ['regime', '行情结构'], ['basis', '市场判定依据'], ['conflict', '核心矛盾'], ['volume', '板块量能信号'],
+  ['operative', '操作含义'], ['watch', '次日盯盘点'], ['rotation', '板块轮动归因'], ['raw', '原始返回']
+];
+const MI_BOARD_NOTE = {
+  regime: '结构判定（3/10/20/60 日窗口）+ 板块三窗口前瞻 + 历史准确率，全部由日快照现算',
+  basis: '支撑本轮「阶段定性」的关键数据与证据，缺失字段照实显示（未提供）',
+  conflict: 'AI 认为这一轮最纠结的点，以及它选择怎么处理',
+  volume: '放量/缩量/极端量能来自板块快照；数据源不返回板块量比时按缺失处理，不猜',
+  operative: '箱位理解 + 主线板块内个股三维验证：涨幅、量比、60 日箱位合不合得上',
+  watch: '明天开盘要盯的具体条件，每个都给了「出现什么就改判断」',
+  rotation: 'AI 启动归因（约 5 分钟长跑）+ top10 之外的「下一个风口」快速替代 + 多窗口规律',
+  raw: '给排查用：接口原始返回与判定输入，业务判断看上面的看板'
+};
+
+function miDates() {
+  return MI_OLD_TOP5.map((d) => d[0]).concat(MI_DAILY.map((d) => d[0]));
+}
+function miIdx(date) { return miDates().indexOf(date); }
+function miDay(i) {
+  const o = MI_OLD_TOP5.length;
+  if (i < o) {
+    return {
+      date: MI_OLD_TOP5[i][0],
+      partial: true,
+      rows: MI_OLD_TOP5[i][1].map((n, k) => ({ sector: n, rank: k + 1, chg: null, vol: null, up: null }))
+    };
+  }
+  const day = MI_DAILY[i - o];
+  /* rank_no 就是当日涨幅名次：先按涨幅排序再编号，表里手写顺序不会和数字打架 */
+  return {
+    date: day[0], partial: false,
+    rows: day[1].slice().sort((a, b) => b[1] - a[1])
+      .map((r, k) => ({ sector: r[0], rank: k + 1, chg: r[1], vol: r[2], up: r[3] }))
+  };
+}
+function miTop(i, n) { return i < 0 || i >= miDates().length ? [] : miDay(i).rows.slice(0, n || 5).map((r) => r.sector); }
+function miRowOf(i, sector) {
+  if (i < 0 || i >= miDates().length) return null;
+  const hit = miDay(i).rows.filter((r) => r.sector === sector)[0];
+  return hit || null;
+}
+function miBox(sector, i) {
+  const last = miDates().length - 1;
+  if (MI_BOX_MISSING.date === miDates()[i] && MI_BOX_MISSING.sectors.indexOf(sector) >= 0) return null;
+  const base = MI_BOX_LATEST[sector];
+  if (base == null) return null;
+  const slope = MI_BOX_SLOPE[sector] || 0;
+  return Math.max(0.02, Math.min(0.99, base - slope * (last - i) / 20));
+}
+function miClamp(v) { return v == null || isNaN(v) ? null : Math.max(0, Math.min(1, v)); }
+function miMean(list) {
+  const vals = list.filter((v) => v != null && !isNaN(Number(v))).map(Number);
+  return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+}
+function miMedian(list) {
+  const vals = list.filter((v) => v != null && !isNaN(Number(v))).map(Number).sort((a, b) => a - b);
+  if (!vals.length) return null;
+  const h = Math.floor(vals.length / 2);
+  return vals.length % 2 ? vals[h] : (vals[h - 1] + vals[h]) / 2;
+}
+/* 连续进入涨幅榜前五的天数（从今天往回数，最多 10 日） */
+function miStreak(sector, i) {
+  let n = 0;
+  for (let k = i; k >= 0 && n < 10; k--) {
+    const r = miRowOf(k, sector);
+    if (!r || r.rank > 5) break;
+    n += 1;
+  }
+  return n;
+}
+function miHist(sector, i) {
+  const out = [];
+  for (let k = Math.max(0, i - 9); k <= i; k++) {
+    const r = miRowOf(k, sector);
+    if (r) out.push(Object.assign({ date: miDates()[k] }, r));
+  }
+  return out;
+}
+function miTop10Freq(sector, i) {
+  const total = Math.min(10, i + 1);
+  if (!total) return 0;
+  return miHist(sector, i).filter((r) => r.rank <= 10).length / 10;
+}
+/* top5 换手率：今天与往前三个交易日逐对比对，1 - 重合数/5，取平均 */
+function miChurn3(i) {
+  const pairs = [];
+  for (let k = 0; k < 3 && i - k - 1 >= 0; k++) {
+    const a = miTop(i - k, 5), b = miTop(i - k - 1, 5);
+    const overlap = a.filter((n) => b.indexOf(n) >= 0).length;
+    pairs.push(1 - overlap / 5);
+  }
+  return pairs.length ? miMean(pairs) : null;
+}
+/* 今日前三板块在过去 20 个交易日里「至少一个还在 top5」的天数占比 */
+function miPersist(i) {
+  const top3 = miTop(i, 3);
+  if (!top3.length) return null;
+  const from = Math.max(0, i - 19);
+  let hits = 0;
+  for (let k = from; k <= i; k++) {
+    const t5 = miTop(k, 5);
+    if (t5.some((n) => top3.indexOf(n) >= 0)) hits += 1;
+  }
+  /* 后端分母是 min(20, 截断窗口天数)，不是实际取到的快照条数 */
+  return hits / Math.min(20, miWindowDays(i));
+}
+function miWindowDays(i) {
+  const back = miDates().length - 1 - i;
+  return Math.min(MI_WINDOW_LIMIT, MI_DB_DAYS - back);
+}
+function miMetrics(i) {
+  const top5 = miDay(i).rows.slice(0, 5);
+  const streaks = top5.map((r) => ({ sector: r.sector, n: miStreak(r.sector, i) }));
+  const leader = streaks.slice().sort((a, b) => b.n - a.n)[0] || null;
+  const old = miDay(Math.max(0, i - 2));
+  const oldTop5 = old.rows.slice(0, 5);
+  const recentUp = miMean(top5.map((r) => r.up));
+  const oldUp = miMean(oldTop5.map((r) => r.up));
+  const recentVol = miMean(top5.map((r) => r.vol));
+  const oldVol = miMean(oldTop5.map((r) => r.vol));
+  const boxes = top5.map((r) => miBox(r.sector, i));
+  return {
+    leader_streak_max_10d: leader ? leader.n : 0,
+    leader_streak_sector: leader ? leader.sector : null,
+    top5_churn_3d: miChurn3(i),
+    top3_persistence_20d: miPersist(i),
+    breadth_expansion_10d: (recentUp != null && oldUp != null) ? miClamp((recentUp - oldUp) / Math.max(Math.abs(oldUp || 1), 1)) : null,
+    volume_confirm_3d: (recentVol != null && oldVol != null) ? miClamp(recentVol - oldVol) : null,
+    box_position_median_60d: miMedian(boxes) == null ? null : miMedian(boxes),
+    box_missing_count: boxes.filter((b) => b == null).length,
+    window_days: miWindowDays(i),
+    data_insufficient: miWindowDays(i) < MI_WINDOW_LIMIT
+  };
+}
+/* C' 行情结构判定（sector_regime.judge_regime） */
+function miRegime(i) {
+  const e = miMetrics(i);
+  const streak = e.leader_streak_max_10d;
+  const persist = e.top3_persistence_20d || 0;
+  const churn = e.top5_churn_3d || 0;
+  const box = e.box_position_median_60d;
+  const vol = e.volume_confirm_3d || 0;
+  let regime, stage;
+  if (streak >= 3 && persist >= 0.6) regime = 'mainline';
+  else if (churn >= 0.6 && streak < 3) regime = 'rotation';
+  else regime = 'chaos';
+  if (regime !== 'mainline') stage = 'unknown';
+  else if (streak === 2) stage = 'start';
+  else if (streak >= 3 && persist >= 0.6 && churn < 0.5) stage = 'confirm';
+  else if (streak >= 3 && vol > 0.2 && (box || 0) >= 0.7) stage = 'accelerate';
+  else if (streak >= 3 && churn >= 0.5) stage = 'diverge';
+  else if (streak < 3 && (box || 0) >= 0.7) stage = 'fade';
+  else stage = 'unknown';
+  let t1, t3, t5;
+  if (regime === 'mainline' && (stage === 'start' || stage === 'confirm')) { t1 = 'continue'; t3 = 'continue'; t5 = 'mainline_confirm'; }
+  else if (regime === 'mainline' && (stage === 'accelerate' || stage === 'diverge')) {
+    t1 = stage === 'accelerate' ? 'fade' : 'switch'; t3 = 'diverge'; t5 = 'new_mainline_switch';
+  } else if (regime === 'rotation') { t1 = 'switch'; t3 = 'switch'; t5 = 'invalid_rotation'; }
+  else { t1 = 'uncertain'; t3 = 'uncertain'; t5 = 'uncertain'; }
+  let confidence = regime === 'mainline' ? Math.min(1, 0.7 + 0.1 * Math.min(streak, 3))
+    : regime === 'rotation' ? Math.min(0.8, 0.5 + 0.1 * Math.min(churn * 10, 3)) : 0.4;
+  if (e.data_insufficient) confidence = 0.2;
+  return {
+    trade_date: miDates()[i], current_regime: regime, regime_stage: stage, regime_confidence: confidence,
+    forward_bias_t1: t1, forward_bias_t3: t3, forward_bias_t5: t5, evidence: e,
+    notes: 'window_days=' + e.window_days
+  };
+}
+/* 归因上下文（sector_forward_view._causal_context）：当日有归因就用它的置信度，没有就找历史同日并标「当日归因缺失」 */
+function miCausal(i, sector) {
+  const date = miDates()[i];
+  const cur = (MI_LAUNCH[date] || []).filter((l) => l.sector === sector)[0];
+  if (cur) {
+    const hard = (cur.causal || []).some((c) => c.level === 'L1' || c.level === 'L2');
+    return {
+      causal_missing: false, source_trade_date: date, confidence: cur.confidence, reason_tags: cur.tags,
+      falsification: { triggered: !!(cur.falsify && cur.falsify.triggered) },
+      has_hard_evidence: hard, has_transmission: !!cur.transmission, has_capital_behavior: !!cur.capital,
+      record: cur
+    };
+  }
+  const dates = miDates();
+  for (let k = i - 1; k >= 0; k--) {
+    const old = (MI_LAUNCH[dates[k]] || []).filter((l) => l.sector === sector)[0];
+    if (old) {
+      return {
+        causal_missing: true, background_available: true, source_trade_date: dates[k], confidence: null,
+        reason_tags: '', falsification: {}, has_hard_evidence: false, has_transmission: false,
+        has_capital_behavior: false, record: old
+      };
+    }
+  }
+  return {
+    causal_missing: true, background_available: false, source_trade_date: null, confidence: null,
+    reason_tags: '', falsification: {}, has_hard_evidence: false, has_transmission: false,
+    has_capital_behavior: false, record: null
+  };
+}
+/* D' 板块前瞻（sector_forward_view._score：延续/退潮/追高三个概率 + 倾向） */
+function miScore(i, row, regime) {
+  const hist = miHist(row.sector, i);
+  const previous = hist.length >= 2 ? hist[hist.length - 2] : null;
+  const causal = miCausal(i, row.sector);
+  const top10Freq = miHist(row.sector, i).filter((r) => r.rank <= 10).length / 10;
+  const streak = miStreak(row.sector, i);
+  const volumeTerm = row.vol == null ? null : miClamp(1 - Math.abs(row.vol - 1));
+  const box = miBox(row.sector, i);
+  const highBox = box != null && box >= 0.7 ? 1 : 0;
+  const historicalUp = miMean(hist.map((r) => r.up)) || 1;
+  const breadth = row.up == null ? null : miClamp((row.up / historicalUp) - 1);
+  let continuation = (volumeTerm != null && box != null)
+    ? miClamp(0.35 * top10Freq + 0.20 * volumeTerm + 0.20 * miClamp(streak / 5) + 0.15 * (breadth || 0) + 0.10 * (1 - highBox))
+    : null;
+  const streakGe5 = streak >= 5 ? 1 : 0;
+  const volumeFade = (row.vol != null && previous && previous.vol != null && previous.vol !== 0 && row.vol / previous.vol < 0.8) ? 1 : 0;
+  const rankDrop = miClamp(((row.rank || 10) - ((previous && previous.rank) || row.rank || 10)) / 10);
+  let exhaustion = miClamp(0.40 * highBox + 0.30 * streakGe5 + 0.20 * volumeFade + 0.10 * rankDrop);
+  const surge = miClamp((row.chg || 0) / 10);
+  let chase = miClamp(0.5 * surge + 0.3 * (1 - top10Freq) + 0.2 * highBox);
+  let causalAdjustment = null;
+  if (continuation != null && !causal.causal_missing && causal.confidence != null) {
+    if (causal.confidence >= 0.75) { continuation = miClamp(continuation + 0.05); causalAdjustment = 0.05; }
+    else if (causal.confidence < 0.45) { continuation = miClamp(continuation - 0.05); chase = miClamp(chase + 0.05); causalAdjustment = -0.05; }
+    else causalAdjustment = 0;
+  }
+  const falsified = !!(causal.falsification && causal.falsification.triggered);
+  if (falsified) {
+    if (continuation != null) continuation = miClamp(continuation - 0.05);
+    exhaustion = miClamp((exhaustion || 0) + 0.05);
+    chase = miClamp(chase + 0.05);
+  }
+  const mainline = regime.current_regime === 'mainline';
+  const fading = ['diverge', 'fade'].indexOf(regime.regime_stage) >= 0 &&
+    regime.evidence.leader_streak_sector !== row.sector;
+  const top10Two = hist.length >= 2 && hist.slice(-2).every((r) => r.rank <= 10);
+  const expanding = row.vol != null && previous && previous.vol != null && row.vol > previous.vol;
+  const switchCand = box != null && box < 0.7 && top10Two && !!expanding && fading;
+  const base = continuation != null && continuation >= 0.6 && (exhaustion || 0) < 0.6 ? 'continue'
+    : switchCand ? 'switch' : (exhaustion || 0) >= 0.6 ? 'fade' : 'uncertain';
+  const emotionOnly = String(causal.reason_tags || '').split(',').indexOf('emotion_only') >= 0;
+  let sectorTag = 'none';
+  if (switchCand && continuation != null && continuation >= 0.5 && streak >= 2) sectorTag = 'mainline_seed';
+  else if (exhaustion >= 0.6) sectorTag = 'fade_warn';
+  else if (regime.regime_stage === 'accelerate' && chase >= 0.5) sectorTag = 'accelerate_warn';
+  else if (exhaustion < 0.4 && continuation != null && continuation >= 0.5 && box != null && box < 0.6) sectorTag = 'low_buy';
+  else if (chase >= 0.6 && top10Freq < 0.3 && streak < 2) sectorTag = 'one_day_fly';
+  /* 情绪票不给接力资格：种子/低位可买一律降成一日游（后端同一条规则） */
+  if (emotionOnly && (sectorTag === 'mainline_seed' || sectorTag === 'low_buy')) sectorTag = 'one_day_fly';
+  const biasOf = (h) => {
+    let b = base;
+    if (h === 't3') b = (exhaustion || 0) >= 0.6 ? 'diverge' : b;
+    else if (h === 't5') {
+      b = switchCand ? 'new_mainline_switch' : (exhaustion || 0) >= 0.6 ? 'fade'
+        : base === 'continue' ? 'mainline_confirm' : regime.current_regime === 'rotation' ? 'invalid_rotation' : 'uncertain';
+    }
+    if (falsified) b = { continue: 'uncertain', mainline_confirm: 'uncertain', new_mainline_switch: 'switch' }[b] || b;
+    if (emotionOnly && ['t3', 't5'].indexOf(h) >= 0 && (b === 'continue' || b === 'mainline_confirm')) b = 'uncertain';
+    return b;
+  };
+  return {
+    sector: row.sector, rank_no: row.rank, box, streak, top10_freq: top10Freq,
+    continuation_prob: continuation, exhaustion_risk: exhaustion, chase_risk: chase,
+    sector_tag: sectorTag,
+    switch_candidate: switchCand, forward_bias_t1: biasOf('t1'), forward_bias_t3: biasOf('t3'), forward_bias_t5: biasOf('t5'),
+    causal, causal_adjustment: causalAdjustment, falsified, emotion_only: emotionOnly,
+    evidence: {
+      box_position_60d: box, streak, top10_freq_10d: top10Freq, volume_ratio: row.vol,
+      technical_continuation_prob: box != null && volumeTerm != null
+        ? miClamp(0.35 * top10Freq + 0.20 * volumeTerm + 0.20 * miClamp(streak / 5) + 0.15 * (breadth || 0) + 0.10 * (1 - highBox)) : null,
+      causal_confidence: causal.confidence, causal_missing: causal.causal_missing,
+      causal_source_trade_date: causal.source_trade_date, causal_reason_tags: causal.reason_tags,
+      falsification_triggered: falsified, data_insufficient: hist.length < 10
+    }
+  };
+}
+function miForecasts(i, regime) {
+  /* D' 依赖 C' 的结构结论：结构没跑出来就不出前瞻（后端同样直接报错） */
+  const rg = regime || (miRun(i).regime ? miRegime(i) : null);
+  if (!rg) return [];
+  return miDay(i).rows.slice(0, 10).map((r) => miScore(i, r, rg));
+}
+/* E'-1 后验：用预测日之后的真实快照回看命中（sector_forecast_verify.evaluate_forecast） */
+function miVerifyOne(i, horizon, regime, forecasts) {
+  const need = { t1: 1, t3: 3, t5: 5 }[horizon];
+  const dates = miDates();
+  const win = dates.slice(i + 1, i + 1 + need);
+  const norm = (b) => b === 'mainline_confirm' ? 'continue' : b === 'new_mainline_switch' ? 'switch' : b === 'invalid_rotation' ? 'diverge' : (b || 'uncertain');
+  const mainline = regime.evidence.leader_streak_sector || ((forecasts.filter((f) => f.rank_no === 1)[0] || {}).sector || null);
+  const sw = (forecasts.filter((f) => f.switch_candidate)[0] ||
+    forecasts.filter((f) => f.sector !== mainline && norm(f['forward_bias_' + horizon]) === 'switch')[0] ||
+    forecasts.filter((f) => f.sector !== mainline)[0] || {}).sector || null;
+  const bias = regime['forward_bias_' + horizon];
+  const prediction = norm(bias);
+  const causalReview = (hit) => {
+    const target = forecasts.filter((f) => f.sector === mainline)[0] || forecasts[0];
+    const conf = target ? target.evidence.causal_confidence : null;
+    const missing = !target || target.evidence.causal_missing || conf == null;
+    const band = missing ? 'missing' : conf >= 0.75 ? 'high' : conf >= 0.45 ? 'medium' : 'low';
+    const gaps = [];
+    if (!missing) {
+      if (!target.causal.has_hard_evidence) gaps.push('缺 L1/L2 硬证据');
+      if (!target.causal.has_transmission) gaps.push('缺产业传导链条');
+      if (!target.causal.has_capital_behavior) gaps.push('缺资金行为验证');
+    } else gaps.push('当日归因缺失');
+    return {
+      sector: target ? target.sector : null, confidence: conf, band, gaps,
+      source: target ? target.evidence.causal_source_trade_date : null,
+      status: missing ? 'causal_missing' : hit == null ? 'awaiting_market_verification' : hit ? 'market_validated' : 'market_not_validated'
+    };
+  };
+  if (win.length < need) {
+    return {
+      forecast_date: dates[i], verify_horizon: horizon, verify_date: null, regime_forecast: regime.current_regime,
+      prediction, regime_hit: null, top5_continue_rate: null, mainline_hit: null,
+      miss_reason: 'data_insufficient', missing_days: need - win.length,
+      detail: { required_days: need, actual_days: win.length, causal_review: causalReview(null) }
+    };
+  }
+  const rowsByDay = win.map((d) => miDay(dates.indexOf(d)));
+  const top5ByDay = rowsByDay.map((r) => r.rows.slice(0, 5).map((x) => x.sector));
+  const top10ByDay = rowsByDay.map((r) => r.rows.slice(0, 10).map((x) => x.sector));
+  const sumChange = (name) => {
+    let s = 0, ok = true;
+    rowsByDay.forEach((r) => {
+      const row = r.rows.filter((x) => x.sector === name)[0];
+      if (!row || row.chg == null) ok = false; else s += row.chg;
+    });
+    return ok ? s : null;
+  };
+  const first = rowsByDay[0], last = rowsByDay[rowsByDay.length - 1];
+  const firstMain = first.rows.filter((r) => r.sector === mainline)[0] || null;
+  const finalMain = last.rows.filter((r) => r.sector === mainline)[0] || null;
+  const finalSw = last.rows.filter((r) => r.sector === sw)[0] || null;
+  const mainTop5Days = top5ByDay.filter((t) => t.indexOf(mainline) >= 0).length;
+  const initialTop5 = forecasts.filter((f) => f.rank_no <= 5).map((f) => f.sector);
+  const newTop5First = top5ByDay[0].some((n) => initialTop5.indexOf(n) < 0);
+  const mainSum = sumChange(mainline), swSum = sumChange(sw);
+  const leaders = rowsByDay.map((r) => r.rows[0] && r.rows[0].sector).filter(Boolean);
+  const inter = top5ByDay.reduce((a, t) => a.filter((n) => t.indexOf(n) >= 0), top5ByDay[0] || []);
+  let posterior = 'chaos';
+  if (rowsByDay.length < 2) posterior = null;
+  else if (inter.length >= 3) posterior = 'mainline';
+  else if (new Set(leaders).size >= Math.min(3, leaders.length)) posterior = 'rotation';
+  let hit = null, reason = 'rule_miss';
+  if (prediction === 'uncertain') {
+    reason = 'uncertain';
+  } else if (prediction === 'continue') {
+    hit = horizon === 't1' ? !!(firstMain && firstMain.rank <= 5 && firstMain.chg > 0)
+      : horizon === 't3' ? mainTop5Days === 3 : (mainSum != null && mainSum > 0);
+  } else if (prediction === 'switch') {
+    hit = horizon === 't1' ? newTop5First
+      : horizon === 't3' ? !!(finalSw && finalSw.rank <= 5 && (!finalMain || finalMain.rank > 5))
+        : (swSum != null && swSum > 0);
+  } else if (prediction === 'fade') {
+    hit = horizon === 't1' ? (!firstMain || firstMain.rank > 10)
+      : horizon === 't3' ? top10ByDay.some((t) => t.indexOf(mainline) < 0)
+        : (mainSum != null && mainSum < 0);
+  } else if (prediction === 'diverge') {
+    hit = horizon === 't1' ? regime.regime_stage === 'diverge'
+      : horizon === 't3' ? new Set(leaders).size >= 2 : !!(finalSw && finalSw.rank <= 5);
+  }
+  if (hit && reason === 'rule_miss') reason = '';
+  return {
+    forecast_date: dates[i], verify_horizon: horizon, verify_date: win[win.length - 1],
+    regime_forecast: regime.current_regime, prediction,
+    regime_hit: posterior == null ? null : regime.current_regime === posterior,
+    top5_continue_rate: mainline ? mainTop5Days / need : null,
+    mainline_hit: prediction === 'uncertain' ? null : hit,
+    miss_reason: prediction === 'uncertain' ? 'uncertain' : reason,
+    uncertain: prediction === 'uncertain',
+    detail: {
+      posterior_regime: posterior, mainline_sector: mainline, switch_sector: sw,
+      mainline_change_sum: mainSum, switch_change_sum: swSum, window: win,
+      causal_review: causalReview(prediction === 'uncertain' ? null : hit)
+    }
+  };
+}
+function miVerify(i, regime, forecasts) {
+  return ['t1', 't3', 't5'].map((h) => miVerifyOne(i, h, regime, forecasts));
+}
+function miAccuracy(i) {
+  const dates = miDates();
+  const out = [];
+  [{ d: 7, label: '近 7 日' }, { d: 30, label: '近 30 日' }, { d: 90, label: '近 90 日' }].forEach((w) => {
+    const samples = [];
+    for (let k = Math.max(0, i - w.d + 1); k <= i; k++) {
+      if (!miRun(k).regime) continue;
+      const rg = miRegime(k), fc = miForecasts(k, rg);
+      miVerify(k, rg, fc).forEach((v) => samples.push({ regime: rg.current_regime, v, f: fc }));
+    }
+    const done = samples.filter((s) => s.v.miss_reason !== 'data_insufficient');
+    const groups = ['mainline', 'rotation', 'chaos'].map((rg) => {
+      const g = done.filter((s) => s.regime === rg);
+      return {
+        regime: rg, sample_count: g.length,
+        regime_hit_rate: g.length ? g.filter((s) => s.v.regime_hit).length / g.length : null,
+        top5_continue_rate: miMean(g.map((s) => s.v.top5_continue_rate)),
+        mainline_hit_rate: g.length ? (function () {
+          const h = g.filter((s) => s.v.mainline_hit != null);
+          return h.length ? h.filter((s) => s.v.mainline_hit).length / h.length : null;
+        })() : null
+      };
+    });
+    const bands = [['high', '高'], ['medium', '中'], ['low', '低'], ['missing', '缺失']].map((b) => {
+      const g = done.filter((s) => s.v.detail.causal_review.band === b[0]);
+      return {
+        band: b[0], label: b[1], sample_count: g.length,
+        regime_hit_rate: g.length ? g.filter((s) => s.v.regime_hit).length / g.length : null,
+        top5_continue_rate: miMean(g.map((s) => s.v.top5_continue_rate)),
+        mainline_hit_rate: (function () {
+          const h = g.filter((s) => s.v.mainline_hit != null);
+          return h.length ? h.filter((s) => s.v.mainline_hit).length / h.length : null;
+        })()
+      };
+    });
+    out.push({
+      window_days: w.d, label: w.label, sample_count: done.length, pending: samples.length - done.length,
+      start_date: dates[Math.max(0, i - w.d + 1)], end_date: dates[i], groups, causal_groups: bands
+    });
+  });
+  return { windows: out };
+}
+function miVolumeSignal(i, base) {
+  const rows = miDay(i).rows;
+  const date = miDates()[i];
+  const intel = base || MI_INTEL[date];
+  const avail = !(intel && intel.raw_extra && intel.raw_extra.board_volume_ratio_available === false);
+  const strong = rows.filter((r) => avail && r.vol >= 1.8).map((r) => r.sector);
+  const weak = rows.filter((r) => avail && r.vol <= 0.8).map((r) => r.sector);
+  const peak = rows.filter((r) => avail && r.vol >= 2.3).map((r) => r.sector + '（量比 ' + r.vol.toFixed(1) + '）');
+  return {
+    available: avail,
+    放量板块: strong.length ? strong.join('、') : '（无）',
+    缩量板块: weak.length ? weak.join('、') : '（无）',
+    极端量能: peak.length ? peak.join('、') : '',
+    分布: rows.slice(0, 5).map((r) => r.sector + ' ' + (r.vol == null ? '—' : r.vol.toFixed(1))).join('，'),
+    量能成色: intel ? intel.quality : '',
+    主线结构: intel ? intel.structure : null
+  };
+}
+function miOperativeMeaning(i, base) {
+  const intel = base || MI_INTEL[miDates()[i]];
+  if (!intel) return null;
+  return {
+    操作含义: intel.meaning,
+    箱位理解: intel.box,
+    个股验证: intel.stocks
+  };
+}
+function miBuildIntel(i) {
+  const date = miDates()[i];
+  if (MI_INTEL[date]) return MI_INTEL[date];
+  const rg = miRegime(i), e = rg.evidence;
+  const top = miTop(i, 3);
+  const risk = rg.current_regime === 'mainline' ? (rg.regime_stage === 'confirm' ? '进取' : '中性') : rg.current_regime === 'rotation' ? '中性' : '避险';
+  return {
+    phase: MI_REGIME_LABEL[rg.current_regime] + ' · 阶段' + MI_STAGE_LABEL[rg.regime_stage] + '：' + (top[0] || '—') + '领跑',
+    risk,
+    summary: '结构判定为' + MI_REGIME_LABEL[rg.current_regime] + '，龙头持续 ' + e.leader_streak_max_10d +
+      ' 个交易日排在涨幅前五（' + (e.leader_streak_sector || '—') + '），近三日 top5 换手 ' + (e.top5_churn_3d == null ? '—' : e.top5_churn_3d.toFixed(2)) +
+      '。这段结论文案由模板按同一批数字拼出，正式系统由 16:20 的大模型研判产出。',
+    conflict: '这一轮的矛盾点：' + (rg.current_regime === 'mainline'
+      ? '结构已经成型（前三板块 20 日留存 ' + Math.round((e.top3_persistence_20d || 0) * 100) + '%），但 60 日箱位中位数已到 ' +
+        Math.round((e.box_position_median_60d || 0) * 100) + '%，位置与证据同时到位意味着容错变小。'
+      : '榜单换手快（近三日 top5 换手 ' + (e.top5_churn_3d == null ? '—' : e.top5_churn_3d.toFixed(2)) + '），' +
+        '没有一个板块做出足够长的持续性，任何主线判断都可能第二天被打脸。'),
+    structure: { attack: top[0] || '（无）', relay: top[1] || '（无）', fade: miTop(i, 10).slice(-1)[0] || '（无）' },
+    quality: '', box: {}, stocks: [], watch: { '次日榜首': '若换人，则本轮结构判定要重新跑' },
+    meaning: '模板生成的占位操作含义，正式系统由 AI 结合当日消息面撰写。',
+    raw_extra: { board_volume_ratio_available: true, generated_by: 'prototype_template', breadth: '（原型未提供）', sample_size: '全板块 90 个' }
+  };
+}
+function miIntel(i) {
+  const date = miDates()[i];
+  const base = MI_INTEL[date] || (miRun(i).intel ? miBuildIntel(i) : null);
+  if (!base) return null;
+  const vs = miVolumeSignal(i, base);
+  return {
+    trade_date: date, phase: base.phase, risk_appetite: base.risk, core_conflict: base.conflict,
+    summary: base.summary, volume_signal: vs, operative_meaning: miOperativeMeaning(i, base),
+    next_day_watch: base.watch, raw: Object.assign({}, base.raw_extra, { generated_by: MI_INTEL[date] ? 'llm' : 'prototype_template' })
+  };
+}
+function miRun(i) {
+  const date = miDates()[i];
+  const seed = MI_DONE[date] || { regime: false, forward: false, intel: false, rotation: false, verify: false };
+  if (!state.miRuns) state.miRuns = {};
+  if (!state.miRuns[date]) state.miRuns[date] = Object.assign({}, seed);
+  return state.miRuns[date];
+}
+function miLog(i, step, text) {
+  const date = miDates()[i];
+  if (!state.miLog) state.miLog = [];
+  state.miLog.unshift({ date, step, text, at: new Date().toTimeString().slice(0, 8) });
+  if (state.miLog.length > 12) state.miLog.pop();
+}
+function miBand(conf, missing) {
+  if (missing || conf == null || isNaN(Number(conf))) return { label: '原因缺失', tone: 'mute' };
+  const v = Number(conf);
+  if (v >= 0.75) return { label: '高硬度', tone: 'green' };
+  if (v >= 0.45) return { label: '中等', tone: 'gold' };
+  return { label: '低硬度', tone: 'red' };
+}
+function miPct(v, d) {
+  if (v == null || isNaN(Number(v))) return '—';
+  return (Number(v) * 100).toFixed(d == null ? 0 : d) + '%';
+}
+function miDate() { return state.miDate && miIdx(state.miDate) >= 0 ? state.miDate : miDates()[miDates().length - 1]; }
+function miI() { return miIdx(miDate()); }
+
+/* ================= 市场研判（#/market-intel）页面渲染 ================= */
+/* ---------- 市场研判：页面渲染 ---------- */
+function miProb(v, kind) {
+  if (v == null || isNaN(Number(v))) return '<span class="dim" title="判定输入缺失，不用猜的数补上">—</span>';
+  const n = Math.round(Number(v) * 100);
+  const cls = kind === 'risk' ? (n >= 70 ? 'low' : n >= 50 ? 'mid' : 'high') : n >= 60 ? 'high' : n >= 40 ? 'mid' : 'low';
+  return '<div class="conf mi-conf"><div class="conf-bar"><div class="conf-fill ' + cls + '" style="width:' + n + '%"></div></div>' +
+    '<span class="mono mi-conf-n">' + n + '%</span></div>';
+}
+function miBias(b) {
+  return tag(MI_BIAS_LABEL[b] || b || '—', MI_TONE_LABEL[b] === 'mute' ? 'mute' : MI_TONE_LABEL[b] || 'mute');
+}
+function miRisk(v) {
+  if (v == null) return '<span class="dim">—</span>';
+  const n = Math.round(v * 100);
+  return '<span class="mono ' + (n >= 70 ? 'bad-t' : n >= 50 ? 'warn-t' : 'dim') + '">' + n + '%</span>';
+}
+function miPctCell(v, d) {
+  if (v == null || isNaN(Number(v))) return '<span class="dim">—</span>';
+  const n = Number(v);
+  return '<span class="mono ' + (n >= 0 ? 'wo-up' : 'wo-down') + '">' + (n > 0 ? '+' : '') + n.toFixed(d == null ? 1 : d) + '%</span>';
+}
+function miVerdict(v) {
+  const map = { 真强: 'green', 加速后段: 'gold', 放量滞涨: 'gold', 假强: 'red' };
+  return tag(v, map[v] || 'mute');
+}
+function miLevel(l) {
+  return tag(l === 'L1' ? 'L1 硬证据' : l === 'L2' ? 'L2 半硬' : 'L3 盘面/传闻', l === 'L1' ? 'green' : l === 'L2' ? 'blue' : 'mute');
+}
+function miCauseLabel(c) {
+  return { lead: '领先于涨', post_move_explanation: '涨后才找的解释', unusable_rumor: '不可用传闻' }[c] || c || '—';
+}
+function miStageWhy(rg) {
+  const e = rg.evidence;
+  const f = (v, d) => (v == null ? '—' : Number(v).toFixed(d == null ? 2 : d));
+  if (rg.current_regime !== 'mainline') {
+    return '龙头只排到前五连续 ' + e.leader_streak_max_10d + ' 天（要 3 天才算主线），' +
+      '近三日榜面换手 ' + f(e.top5_churn_3d) + '（≥0.6 才算轮动）→ 判成' + MI_REGIME_LABEL[rg.current_regime] + '。';
+  }
+  return '龙头（' + esc(e.leader_streak_sector || '—') + '）连续 ' + e.leader_streak_max_10d + ' 天在涨幅前五，' +
+    '前三板块 20 日留存 ' + f(e.top3_persistence_20d) + '（门槛 0.60），近三日榜面换手 ' + f(e.top5_churn_3d) +
+    '，量比确认 ' + f(e.volume_confirm_3d) + '，前五箱位中位数 ' + f(e.box_position_median_60d) + ' → 阶段判成「' +
+    MI_STAGE_LABEL[rg.regime_stage] + '」。';
+}
+function miRunBtns(i, run) {
+  const steps = [
+    ['mi-run-regime', '跑行情结构', run.regime, '先定结构，再算板块前瞻'],
+    ['mi-run-rotation', '生成轮动归因', run.rotation, 'AI 启动归因，约 5 分钟'],
+    ['mi-run-intel', '立即研判', run.intel, '16:20 那段文字结论'],
+    ['mi-run-verify', '回填验证', run.verify, '用真实行情回看，算历史准确率']
+  ];
+  return steps.map((s) => '<button class="btn sm" data-action="' + s[0] + '"' + (s[2] ? ' disabled' : '') + '>' +
+    (s[2] ? icon('check', 'sm') : icon('workflow', 'sm')) + s[1] + '</button>' +
+    '<span class="hint mi-step-state ' + (s[2] ? 'done' : '') + '">' + s[3] + '</span>').join('');
+}
+function miLogStrip() {
+  if (!state.miLog || !state.miLog.length) return '';
+  return '<div class="pp-facts mi-log"><div class="pp-fact mi-log-head"><span class="pp-fact-k">本页操作</span>' +
+    '<span class="pp-fact-v">只改页面状态，没有调用后端</span></div>' +
+    state.miLog.map((l) => '<span class="pp-run"><b class="mono">' + esc(l.at) + '</b> ' + esc(l.date) + ' ' + esc(l.text) + '</span>').join('') +
+    '<div class="pp-runlog"><button class="btn link xs" data-action="mi-clear-log">清空</button></div></div>';
+}
+function miConclusion(i, rg, intel) {
+  const lines = [];
+  if (!rg) {
+    lines.push({ tone: 'warn', text: esc(miDate()) + ' 只有板块涨幅快照，还没有结构判定：这一天的结论要等你点「跑行情结构」或等定时任务补上。' });
+  } else {
+    const e = rg.evidence;
+    lines.push({
+      tone: rg.current_regime === 'mainline' ? 'ok' : rg.current_regime === 'rotation' ? 'info' : 'warn',
+      text: '<b>' + MI_REGIME_LABEL[rg.current_regime] + ' · 阶段「' + MI_STAGE_LABEL[rg.regime_stage] + '」</b>　' +
+        '龙头 ' + esc(e.leader_streak_sector || '—') + '（连续 ' + e.leader_streak_max_10d + ' 天进前五）；' +
+        '次日倾向 ' + MI_BIAS_LABEL[rg.forward_bias_t1] + '，三日 ' + MI_BIAS_LABEL[rg.forward_bias_t3] +
+        '，五日 ' + MI_BIAS_LABEL[rg.forward_bias_t5] + '。置信度 ' + Math.round(rg.regime_confidence * 100) + '%。' +
+        (e.data_insufficient ? ' <span class="bad-t">输入不足 60 个交易日，置信度已压到 20%。</span>' : '')
+    });
+  }
+  if (intel) {
+    lines.push({
+      tone: 'info',
+      text: 'AI 研判：' + esc(intel.phase) + '　风险偏好 <b>' + esc(intel.risk_appetite) + '</b>（' +
+        esc((MI_APPETITE[intel.risk_appetite] || {}).含义 || '') + '）。'
+    });
+  } else {
+    lines.push({ tone: 'warn', text: 'AI 研判文字还没生成（16:20 的定时任务），下面「市场判定依据 / 核心矛盾 / 操作含义 / 次日盯盘点」会保持空态，不用猜的补。' });
+  }
+  if (!miRun(i).verify) {
+    lines.push({ tone: 'warn', text: '这一天的后验还没回填：结构判完之后没打「回填验证」，历史准确率里不会计入这一轮。' });
+  }
+  const job = MI_DIAG.jobs.sector_regime;
+  if (job.last_status === 'failed' && miDates()[i] >= job.last_run_at.slice(0, 10)) {
+    lines.push({ tone: 'err', text: '行情结构定时任务上次失败（' + esc(job.last_run_at) + '）：' + esc(job.last_error) + '。' +
+      '箱位取数超时按规则只影响标注，不该中断结构判定——正式代码里这一步会把整个 C′ 一起带停，属于要修的落地缺口。' });
+  }
+  lines.push({
+    tone: 'proto', text: '静态原型说明：本页所有百分比都是页面内的判定引擎按后端同一套公式现算出来的（输入是上面那张全板块日快照表），' +
+      '点「跑行情结构 / 回填验证 / 立即研判」只推进页面状态，不会调用后端、不会改数据库、不会下单。'
+  });
+  return '<div class="pp-banner">' + lines.map((l) =>
+    '<div class="pp-banner-line ' + l.tone + '">' + (l.tone === 'proto' ? icon('info', 'sm') : icon('alert', 'sm')) +
+    '<span>' + l.text + '</span></div>').join('') + '</div>';
+}
+function miReadiness(i) {
+  const facts = [
+    ['全板块日快照', MI_DIAG.tables.sector_daily.latest_date + ' · ' + MI_DIAG.tables.sector_daily.row_count + ' 个板块'],
+    ['行情结构判定', MI_DIAG.tables.sector_regime_forecast.latest_date + ' · 任务 ' + (MI_DIAG.jobs.sector_regime.last_status === 'failed' ? '上次失败' : '正常')],
+    ['板块三窗口前瞻', MI_DIAG.tables.sector_forward_forecast.latest_date + ' · ' + MI_DIAG.tables.sector_forward_forecast.row_count + ' 条'],
+    ['预测后验', MI_DIAG.tables.sector_forecast_verify.latest_date + ' · 回填到 ' + MI_DIAG.jobs.sector_forecast_verify.last_run_at.slice(0, 10)],
+    ['下一个风口', MI_DIAG.tables.sector_next_hot.latest_date + ' · ' + MI_DIAG.tables.sector_next_hot.row_count + ' 个候选'],
+    ['AI 市场研判', miRun(i).intel ? miDates()[i] + ' · 已生成' : '本日期未生成', ]
+  ];
+  const chain = ['15:35 全板块快照', '15:40 行情结构', '15:45 板块前瞻', '15:50 下一个风口', '16:05 后验回填', '16:20 AI 研判'];
+  return '<div class="pp-facts">' + facts.map((f) =>
+    '<div class="pp-fact"><span class="pp-fact-k">' + esc(f[0]) + '</span><span class="pp-fact-v">' + esc(f[1]) + '</span></div>').join('') +
+    '<div class="pp-runlog"><span class="pp-run mi-chain">' + chain.map((c, k) =>
+      (k ? '<span class="mi-chain-arrow">→</span>' : '') + '<span class="mi-chain-step">' + esc(c) + '</span>').join('') + '</span></div></div>';
+}
+
+function renderMarketIntel() {
+  const i = miI();
+  const date = miDates()[i];
+  const run = miRun(i);
+  const rg = run.regime ? miRegime(i) : null;
+  const intel = miIntel(i);
+  const dates = miDates();
+  const board = MI_BOARDS.some((b) => b[0] === state.miBoard) ? state.miBoard : 'regime';
+  state.miBoard = board;
+  const opts = dates.slice().reverse().map((d) => {
+    const r = miRun(miIdx(d));
+    return '<option value="' + d + '" ' + (d === date ? 'selected' : '') + '>' + d +
+      (r.regime ? '' : '（无结构判定）') + (r.intel ? '' : '（无AI研判）') + '</option>';
+  }).join('');
+  const chips = dates.slice().reverse().slice(0, 10).map((d) => {
+    const r = miRun(miIdx(d));
+    return '<button class="cp-chip ' + (d === date ? 'active' : '') + '" data-action="mi-date" data-date="' + d + '">' + d.slice(5) +
+      '<span class="mi-dot ' + (r.regime ? (r.intel ? 'full' : 'part') : 'none') + '"></span></button>';
+  }).join('');
+  const boards = '<div class="rv-boards"><div class="cp-chips">' + MI_BOARDS.map((b) =>
+    '<button class="cp-chip ' + (board === b[0] ? 'active' : '') + '" data-action="mi-board" data-b="' + b[0] + '">' + b[1] + '</button>').join('') +
+    '</div><span class="hint">' + esc(MI_BOARD_NOTE[board] || '') + '</span></div>';
+  const body = board === 'regime' ? miBoardRegime(i, rg, run)
+    : board === 'basis' ? miBoardBasis(i, run)
+    : board === 'conflict' ? miBoardConflict(i, rg, intel)
+    : board === 'volume' ? miBoardVolume(i, intel)
+    : board === 'operative' ? miBoardOperative(i, intel)
+    : board === 'watch' ? miBoardWatch(i, intel)
+    : board === 'rotation' ? miBoardRotation(i, rg, run)
+    : miBoardRaw(i, rg, intel, run);
+  return '<div class="page-head"><div>' +
+      '<div class="page-title">市场研判</div>' +
+      '<div class="page-sub">收盘后系统怎么判断「现在是不是主线行情、哪个板块还能延续、哪个该退」：结构判定、板块前瞻、后验回填和 AI 结论都在这一页，判定输入只有全板块日快照。</div>' +
+    '</div><div class="page-actions">' +
+      '<label class="mi-date-pick"><span class="sr-only">研判日期</span><select class="input" id="mi-date">' + opts + '</select></label>' +
+      '<button class="btn sm" data-action="mi-step" data-d="-1" ' + (i <= 0 ? 'disabled' : '') + '>' + icon('arrow', 'sm') + '前一交易日</button>' +
+      '<button class="btn sm" data-action="mi-step" data-d="1" ' + (i >= dates.length - 1 ? 'disabled' : '') + '>后一交易日' + icon('arrow', 'sm') + '</button>' +
+      '<button class="btn sm" data-action="mi-run-regime"' + (run.regime ? ' disabled' : '') + '>' + icon('workflow', 'sm') + '跑行情结构</button>' +
+      '<button class="btn sm" data-action="mi-run-verify">' + icon('check', 'sm') + '回填验证</button>' +
+      '<button class="btn primary sm" data-action="mi-run-intel"' + (run.intel ? ' disabled' : '') + '>' + icon('agent', 'sm') +
+        (state.miIntelBusy ? '研判中…' : '立即研判（后台）') + '</button>' +
+      '<button class="btn sm" data-action="mi-refresh">' + icon('rotate', 'sm') + '刷新</button>' +
+    '</div></div>' +
+    '<div class="cp-toolbar"><div class="cp-chips">' + chips + '</div>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn link xs" data-nav="#/candidates">候选池 ' + icon('arrow', 'sm') + '</button>' +
+      '<button class="btn link xs" data-nav="#/paper">AI 模拟操盘 ' + icon('arrow', 'sm') + '</button></div>' +
+    miConclusion(i, rg, intel) + miReadiness(i) + boards +
+    '<div class="mi-body">' + body + '</div>' + miLogStrip();
+}
+
+/* ----- 看板一：行情结构与三窗口前瞻 ----- */
+function miBoardRegime(i, rg, run) {
+  if (!rg) {
+    return '<div class="card"><div class="card-title"><h3>' + esc(miDate()) + ' 没有结构判定</h3>' +
+        '<span class="hint">' + esc(miDates()[i]) + ' 的全板块快照在，判定结果不在</span></div>' +
+      '<div class="empty-list"><strong>这一天 15:40 的行情结构任务没有产出记录</strong>' +
+        '常见原因：箱位接口超时把整条判定带停、当日快照晚于任务时间、或该日期是回填前的历史日。<br>可以直接在页面补跑一轮（原型内本地计算），正式系统需要后端补一个手动跑 C′ 的接口。</div>' +
+      '<div class="row mi-actions">' + miRunBtns(i, run) + '</div>' +
+      '<div class="cap-note" style="margin-top:14px">' + icon('info') + '<div><b>落地缺口：</b>页面按钮「刷新行情结构」实际调的是 D′ 板块前瞻接口，' +
+        '结构记录缺失时后端直接返回「行情结构预测不存在」。要真能补跑，需要新增 <span class="mono">POST /market/sector-regime/run</span>。</div></div></div>';
+  }
+  const e = rg.evidence;
+  const fcs = miForecasts(i, rg);
+  const h = ['t1', 't3', 't5'].indexOf(state.miHorizon) >= 0 ? state.miHorizon : 't1';
+  const metrics = [
+    ['龙头连续进前五', e.leader_streak_max_10d + ' 天', '≥3 天才算有主线', '阈值：连续 3 个交易日排在涨幅前五', e.leader_streak_max_10d >= 3],
+    ['前三板块 20 日留存', e.top3_persistence_20d == null ? '—' : Math.round(e.top3_persistence_20d * 100) + '%', '≥60% 才算抱团', '今天前三名在过去 20 个交易日里，至少一个还在前五的天数占比', (e.top3_persistence_20d || 0) >= 0.6],
+    ['近三日榜面换手', e.top5_churn_3d == null ? '—' : e.top5_churn_3d.toFixed(2), '≥0.6 判轮动', '1 − 相邻两日前五重合数 / 5，取最近三对平均', (e.top5_churn_3d || 0) >= 0.6],
+    ['广度扩张', e.breadth_expansion_10d == null ? '—' : e.breadth_expansion_10d.toFixed(2), '辅助证据', '前五板块上涨家数均值对比两日前', null],
+    ['量比确认', e.volume_confirm_3d == null ? '—' : e.volume_confirm_3d.toFixed(2), '>0.2 才算放量', '前五板块量比均值 − 两日前均值', (e.volume_confirm_3d || 0) > 0.2],
+    ['前五 60 日箱位中位数', e.box_position_median_60d == null ? '—' : Math.round(e.box_position_median_60d * 100) + '%', '≥70% 位置偏高', '辅助标注：取数超时按缺失处理，不参与结构判定', (e.box_position_median_60d || 0) >= 0.7],
+    ['判定窗口', e.window_days + ' 个交易日', '需 ≥60', '库内快照 68 个交易日，按当日可取窗口计算', !e.data_insufficient]
+  ];
+  const horizons = [['t1', 'T+1 次日'], ['t3', 'T+3 三日'], ['t5', 'T+5 五日']].map((x) =>
+    '<button class="seg-item ' + (h === x[0] ? 'active' : '') + '" data-action="mi-horizon" data-h="' + x[0] + '">' + x[1] +
+    '<span class="seg-count">' + MI_BIAS_LABEL[rg['forward_bias_' + x[0]]] + '</span></button>').join('');
+  const watch = fcs.filter((f) => f.continuation_prob != null && f.continuation_prob >= 0.6 && f.exhaustion_risk < 0.6)
+    .map((f) => f.sector);
+  const risky = fcs.filter((f) => f.chase_risk >= 0.6).map((f) => f.sector);
+  const sw = fcs.filter((f) => f.switch_candidate).map((f) => f.sector);
+  const rows = fcs.map((f) => {
+    return '<tr class="clickable" role="button" tabindex="0" data-action="mi-sector" data-s="' + esc(f.sector) + '">' +
+      '<td class="mono">' + f.rank_no + '</td>' +
+      '<td><span class="cp-name">' + esc(f.sector) + '</span>' + (f.sector === e.leader_streak_sector ? ' ' + tag('本轮龙头', 'gold') : '') + '</td>' +
+      '<td class="mono">' + miPctCell(miDay(i).rows[f.rank_no - 1] && miDay(i).rows[f.rank_no - 1].chg) + '</td>' +
+      '<td>' + miProb(f.continuation_prob) + '</td>' +
+      '<td>' + miRisk(f.exhaustion_risk) + '</td>' +
+      '<td>' + miRisk(f.chase_risk) + '</td>' +
+      '<td>' + miBias(f['forward_bias_' + h]) + '</td>' +
+      '<td>' + miSectorTag(f.sector_tag) + '</td>' +
+      '<td class="mono">' + (f.box == null ? '<span class="dim">缺失</span>' : Math.round(f.box * 100) + '%') + '</td>' +
+      '<td class="mono">' + f.streak + '</td>' +
+      '<td>' + miCausalCell(f) + '</td>' +
+      '<td>' + (f.falsified ? tag('反证已触发', 'red') : f.emotion_only ? tag('情绪票', 'gold') : '<span class="dim">—</span>') + '</td></tr>';
+  }).join('');
+  const acc = miAccuracy(i);
+  const ver = miVerify(i, rg, fcs);
+  return '<div class="grid-2 mi-top-grid">' +
+      '<div class="card mi-big"><div class="card-title"><h3>结构定性</h3><span class="hint">' + esc(miDate()) + ' · 收盘后自动判定</span></div>' +
+        '<div class="mi-verdict ' + rg.current_regime + '"><div><span class="mi-verdict-main">' + MI_REGIME_LABEL[rg.current_regime] + '</span>' +
+          '<span class="mi-verdict-stage">' + MI_STAGE_LABEL[rg.regime_stage] + '</span></div>' +
+          '<div class="mi-verdict-right"><div class="metric-label">结构置信度</div><div class="metric-value ' + (rg.regime_confidence >= 0.8 ? 'up' : rg.regime_confidence >= 0.5 ? '' : 'down') + '">' +
+            Math.round(rg.regime_confidence * 100) + '%</div></div></div>' +
+        '<p class="mi-why">' + miStageWhy(rg) + '</p>' +
+        '<div class="seg mi-hor-seg">' + horizons + '</div>' +
+        '<div class="cap-note' + (e.data_insufficient ? ' warn' : '') + '">' + icon('info') + '<div>' +
+          (e.data_insufficient ? '<b>输入不足 60 个交易日</b>：置信度按规则压到 20%，只能当方向参考。' : '') +
+          '箱位中位数只是位置标注：前五里有 ' + e.box_missing_count + ' 个板块本轮没取到箱位，缺失不会推翻结构结论，但该板块的延续概率会留空。' +
+          '</div></div></div>' +
+      '<div class="card"><div class="card-title"><h3>判定用到的六个数</h3><span class="hint">口径与阈值一起给，可对着快照核</span></div>' +
+        '<div class="table-wrap"><table class="mi-metrics"><thead><tr><th>指标</th><th>当前值</th><th>阈值</th><th>口径</th><th>达标</th></tr></thead><tbody>' +
+        metrics.map((m) => '<tr><td>' + esc(m[0]) + '</td><td class="mono"><b>' + esc(m[1]) + '</b></td><td class="dim">' + esc(m[2]) + '</td>' +
+          '<td class="small muted">' + esc(m[3]) + '</td><td>' + (m[4] == null ? '<span class="dim">辅助</span>' : m[4] ? tag('达标', 'green') : tag('未达', 'mute')) + '</td></tr>').join('') +
+        '</tbody></table></div></div>' +
+    '</div>' +
+    '<div class="card"><div class="card-title"><h3>今日榜面读数</h3><span class="hint">点任意一行看这个板块的完整链路</span></div>' +
+      '<div class="mi-picks">' +
+        '<div class="mi-pick"><span class="mi-pick-k">延续概率达标（≥60%）</span><span class="mi-pick-v">' + (watch.length ? watch.map((s) => '<button class="rule-chip" data-action="mi-sector" data-s="' + esc(s) + '">' + esc(s) + '</button>').join('') : '<span class="dim">没有</span>') + '</span></div>' +
+        '<div class="mi-pick"><span class="mi-pick-k">追高风险（≥60%）</span><span class="mi-pick-v">' + (risky.length ? risky.map((s) => '<button class="rule-chip" data-action="mi-sector" data-s="' + esc(s) + '">' + esc(s) + '</button>').join('') : '<span class="dim">没有</span>') + '</span></div>' +
+        '<div class="mi-pick"><span class="mi-pick-k">潜在切换方向</span><span class="mi-pick-v">' + (sw.length ? sw.map((s) => '<button class="rule-chip" data-action="mi-sector" data-s="' + esc(s) + '">' + esc(s) + '</button>').join('') : '<span class="dim">本轮没有给出切换候选</span>') + '</span></div>' +
+      '</div></div>' +
+    '<div class="card"><div class="card-title"><h3>板块三窗口前瞻（涨幅前十）</h3>' +
+        '<span class="hint">当前窗口 ' + MI_BIAS_LABEL[rg['forward_bias_' + h]] + ' · 延续 = 0.35 前十日留存 + 0.20 量比贴 1 + 0.20 连续天数 + 0.15 广度 + 0.10 位置</span></div>' +
+      '<div class="table-wrap"><table><thead><tr><th>名次</th><th>板块</th><th>当日涨幅</th><th>延续概率</th><th>退潮风险</th><th>追高风险</th>' +
+        '<th>' + (h === 't1' ? 'T+1' : h === 't3' ? 'T+3' : 'T+5') + ' 倾向</th><th>板块标签</th><th>60日箱位</th><th>连续前五</th><th>原因硬度</th><th>提示</th></tr></thead>' +
+        '<tbody>' + (rows || '<tr><td colspan="12" class="dim">没有前瞻记录</td></tr>') + '</tbody></table></div>' +
+      '<div class="cap-note">' + icon('info') + '<div>「原因硬度」取当日板块归因置信度：≥75% 高硬度、45–75% 中等、<45% 低硬度。<b>只有当日归因参与前瞻修正</b>（±0.05），' +
+        '旧日期的归因只作背景显示，不会拿来改今天分数——避免用上周的理由解释今天的涨幅。</div></div></div>' +
+    miVerifyCard(ver) + miAccuracyCard(acc) +
+    '<div class="card"><div class="card-title"><h3>结构判定的已知毛病</h3><span class="hint">对着后端代码核过的，正式落地要修</span></div>' +
+      '<div class="stack">' + MI_REGIME_GAPS.map((g) => '<div class="mi-gap"><b>' + esc(g[0]) + '</b><p>' + esc(g[1]) + '</p></div>').join('') + '</div></div>';
+}
+const MI_SECTOR_TAG_LABEL = {
+  mainline_seed: ['主线种子', 'green'], fade_warn: ['退潮预警', 'red'], accelerate_warn: ['加速追高', 'gold'],
+  low_buy: ['中低位可关注', 'blue'], one_day_fly: ['一日游', 'mute'], none: ['—', 'mute']
+};
+function miSectorTag(t) {
+  const m = MI_SECTOR_TAG_LABEL[t] || MI_SECTOR_TAG_LABEL.none;
+  return m[0] === '—' ? '<span class="dim">—</span>' : tag(m[0], m[1]);
+}
+/* 缺失标记在 causal 对象里，不在前瞻行顶层：读错会把每一行都显示成「原因缺失 0%」 */
+function miCausalOf(f) { return (f && f.causal) || {}; }
+function miCausalMissing(f) { const c = miCausalOf(f); return !!c.causal_missing || c.confidence == null; }
+function miCausalCell(f) {
+  const c = miCausalOf(f);
+  if (miCausalMissing(f)) {
+    return tag('当日归因缺失', 'mute') + (c.source_trade_date ? ' <span class="dim small">最近 ' + esc(c.source_trade_date) + '，只作背景</span>' : '');
+  }
+  const band = miBand(c.confidence, false);
+  return band.label + ' ' + tag(Math.round(c.confidence * 100) + '%', band.tone);
+}
+const MI_BAND_CN = { high: '高', medium: '中', low: '低', missing: '当日无归因' };
+function miVerifyCard(ver) {
+  const rows = ver.map((v) => {
+    const r = v.miss_reason === 'data_insufficient';
+    return '<tr><td>' + (v.verify_horizon === 't1' ? 'T+1 次日' : v.verify_horizon === 't3' ? 'T+3 三日' : 'T+5 五日') + '</td>' +
+      '<td>' + MI_BIAS_LABEL[v.prediction] + '</td>' +
+      '<td>' + (v.verify_date ? '<span class="mono">' + esc(v.verify_date) + '</span>' : '<span class="dim">未到期</span>') + '</td>' +
+      '<td>' + (v.regime_hit == null ? '<span class="dim">口径需 ≥2 日窗口</span>' : v.regime_hit ? tag('结构命中', 'green') : tag('结构未命中', 'red')) + '</td>' +
+      '<td>' + (v.mainline_hit == null ? '<span class="dim">未判定</span>' : v.mainline_hit ? tag('方向命中', 'green') : tag('方向错了', 'red')) + '</td>' +
+      '<td class="mono">' + (v.top5_continue_rate == null ? '—' : Math.round(v.top5_continue_rate * 100) + '%') + '</td>' +
+      '<td class="small muted">' + esc(miMissReason(v)) + '</td></tr>';
+  }).join('');
+  const cr = ver[0].detail.causal_review;
+  return '<div class="card"><div class="card-title"><h3>这一轮的后验回填</h3>' +
+      '<span class="hint">用预测日之后的真实行情回看：不猜，到期才算得出命中</span></div>' +
+      '<div class="table-wrap"><table><thead><tr><th>窗口</th><th>当时判断</th><th>验证日</th><th>结构后验</th><th>方向后验</th><th>前五留存</th><th>没命中的原因</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div>' +
+      '<div class="kv mi-causal-review"><dt>归因复盘</dt><dd>' + esc(cr.sector || '—') + ' · 当时原因硬度 ' + esc(MI_BAND_CN[cr.band] || cr.band) +
+        (cr.confidence != null ? '（' + Math.round(cr.confidence * 100) + '%）' : '') +
+        ' · 市场验证 <b>' + miCausalStatus(cr.status) + '</b>' + (cr.gaps && cr.gaps.length ? ' · 缺：' + esc(cr.gaps.join('、')) : '') + '</dd></div>' +
+      '<div class="cap-note">' + icon('info') + '<div>「结构后验」的口径很严：后验窗口内每一天都要有至少三个板块留在前五，否则后验结构就不是主线。' +
+        '所以主线判断的命中率天然偏低，看的时候连着留存率一起看，不要单看命中百分比。</div></div></div>';
+}
+function miCausalStatus(s) {
+  return { awaiting_market_verification: '等市场验证', market_validated: '已被市场验证', market_not_validated: '未被市场验证', causal_missing: '当日没有归因，不参与复盘' }[s] || s || '—';
+}
+function miMissReason(v) {
+  if (v.miss_reason === 'data_insufficient') {
+    return '后验窗口还差 ' + v.missing_days + ' 个交易日（需要 ' + v.detail.required_days + ' 日，实际 ' + v.detail.actual_days + ' 日）';
+  }
+  if (v.prediction === 'uncertain' || v.miss_reason === 'uncertain') return '当时判断就是「不确定」，不计命中也不计未命中';
+  if (!v.miss_reason) return '命中：龙头 ' + esc(v.detail.mainline_sector || '—') + ' 区间累计 ' + (v.detail.mainline_change_sum == null ? '—' : v.detail.mainline_change_sum.toFixed(1) + '%') +
+    (v.detail.switch_sector ? '，切换标的 ' + esc(v.detail.switch_sector) + ' ' + (v.detail.switch_change_sum == null ? '—' : v.detail.switch_change_sum.toFixed(1) + '%') : '');
+  return '未命中：后验结构 ' + (v.detail.posterior_regime ? MI_REGIME_LABEL[v.detail.posterior_regime] : '样本不足') +
+    '，龙头 ' + esc(v.detail.mainline_sector || '—') + ' 区间累计 ' + (v.detail.mainline_change_sum == null ? '—' : v.detail.mainline_change_sum.toFixed(1) + '%');
+}
+function miAccuracyCard(acc) {
+  const rows = acc.windows.map((w) => {
+    const g = {};
+    w.groups.forEach((x) => { g[x.regime] = x; });
+    const cell = (x) => !x || !x.sample_count ? '<span class="dim">无样本</span>' :
+      '<div class="mi-acc-cell"><span class="' + ((x.regime_hit_rate || 0) >= 0.5 ? 'ok-t' : 'bad-t') + '">' + Math.round((x.regime_hit_rate || 0) * 100) + '%</span>' +
+      '<span class="dim mono">n=' + x.sample_count + '</span>' +
+      '<span class="small muted">留存 ' + (x.top5_continue_rate == null ? '—' : Math.round(x.top5_continue_rate * 100) + '%') +
+      ' · 方向 ' + (x.mainline_hit_rate == null ? '—' : Math.round(x.mainline_hit_rate * 100) + '%') + '</span></div>';
+    return '<tr><td><b>' + esc(w.label) + '</b><div class="small muted mono">' + esc(w.start_date) + ' ~ ' + esc(w.end_date) + '</div></td>' +
+      '<td class="mono">' + w.sample_count + (w.pending ? ' <span class="dim">+' + w.pending + ' 待验证</span>' : '') + '</td>' +
+      '<td>' + cell(g.mainline) + '</td><td>' + cell(g.rotation) + '</td><td>' + cell(g.chaos) + '</td></tr>';
+  }).join('');
+  const bands = acc.windows[1].causal_groups.map((b) =>
+    '<tr><td>' + (b.band === 'missing' ? '当日无归因' : esc(b.label) + '硬度') + '</td><td class="mono">' + b.sample_count + '</td>' +
+      '<td class="mono">' + (b.regime_hit_rate == null ? '—' : Math.round(b.regime_hit_rate * 100) + '%') + '</td>' +
+      '<td class="mono">' + (b.top5_continue_rate == null ? '—' : Math.round(b.top5_continue_rate * 100) + '%') + '</td>' +
+      '<td class="mono">' + (b.mainline_hit_rate == null ? '—' : Math.round(b.mainline_hit_rate * 100) + '%') + '</td></tr>').join('');
+  const min = Math.min.apply(null, acc.windows.map((w) => w.sample_count));
+  return '<div class="grid-2">' +
+    '<div class="card"><div class="card-title"><h3>历史准确率</h3><span class="hint">按判定日统计，分母只算已到期的窗口</span></div>' +
+      '<div class="table-wrap"><table><thead><tr><th>窗口</th><th>样本</th><th>主线行情</th><th>轮动行情</th><th>混沌行情</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      (min < 10 ? '<div class="cap-note warn">' + icon('alert') + '<div><b>样本太少：</b>最少的一组只有 ' + min + ' 条已到期判定，这个百分比随时会跳。' +
+        '原型只保留了 22 个交易日的快照（正式库 68 日），「近 30 日 / 近 90 日」的窗口长度已经到边界，不要拿它当能力结论。</div></div>' : '') + '</div>' +
+    '<div class="card"><div class="card-title"><h3>按原因硬度复盘</h3><span class="hint">近 30 日：硬证据支撑的判断，命中是否真的更高</span></div>' +
+      '<div class="table-wrap"><table><thead><tr><th>归因硬度</th><th>样本</th><th>结构命中</th><th>前五留存</th><th>方向命中</th></tr></thead><tbody>' + bands + '</tbody></table></div>' +
+      '<div class="cap-note">' + icon('info') + '<div>这张表是判断「值不值得继续让归因参与修正」的依据：如果高硬度组没有明显更好，就不该给它调分权重。</div></div></div></div>';
+}
+
+/* ----- 看板二：市场判定依据（归因与因果闭环） ----- */
+function miBoardBasis(i, run) {
+  const date = miDates()[i];
+  const recs = MI_LAUNCH[date] || [];
+  const fcs = miForecasts(i);
+  if (!recs.length) {
+    return '<div class="card"><div class="card-title"><h3>板块启动归因</h3><span class="hint">每个板块的「为什么涨」：结论 + 可回指证据</span></div>' +
+      '<div class="empty-list"><strong>' + esc(date) + ' 没有板块归因</strong>' +
+        '没有归因时，前瞻只按技术面公式算，原因硬度显示「当日归因缺失」，不会拿别的日期的理由来修正今天分数。</div>' +
+      (fcs.length ? '<div class="cap-note accent">' + icon('info') + '<div>下面这几条是本轮真正参与前瞻的板块（都没有当日归因）：' +
+        fcs.slice(0, 5).map((f) => esc(f.sector)).join('、') + '。正式系统里这一步会先跑归因再跑前瞻。</div></div>' : '') + '</div>';
+  }
+  const mode = state.miChainMode === 'time' ? 'time' : 'chain';
+  return '<div class="cp-toolbar"><div class="seg">' +
+      '<button class="seg-item ' + (mode === 'chain' ? 'active' : '') + '" data-action="mi-chain-mode" data-m="chain">证据链</button>' +
+      '<button class="seg-item ' + (mode === 'time' ? 'active' : '') + '" data-action="mi-chain-mode" data-m="time">按时间</button></div>' +
+      '<span class="spacer"></span><span class="hint">' + recs.length + ' 条当日归因 · 置信度 ≥75% 才加 0.05 延续分</span></div>' +
+    '<div class="stack">' + recs.map((r) => miLaunchCard(i, r, mode, fcs)).join('') + '</div>' +
+    '<div class="card"><div class="card-title"><h3>本轮没有归因的板块</h3><span class="hint">榜单前十里剩下的那些</span></div>' +
+      '<div class="mi-picks"><div class="mi-pick"><span class="mi-pick-k">无当日归因</span><span class="mi-pick-v">' +
+      (fcs.length ? fcs.filter(miCausalMissing).map((f) => '<button class="rule-chip" data-action="mi-sector" data-s="' + esc(f.sector) + '">' + esc(f.sector) + '</button>').join('') : '<span class="dim">先跑行情结构</span>') +
+      '</span></div></div>' +
+      '<div class="cap-note">' + icon('info') + '<div>它们的前瞻分数只反映技术面；页面上会一直显示「当日归因缺失」而不是留空，避免看上去像已经解释过了。</div></div></div>';
+}
+function miLaunchCard(i, r, mode, fcs) {
+  const f = fcs.filter((x) => x.sector === r.sector)[0] || null;
+  const band = miBand(r.confidence, false);
+  const key = 'launch:' + r.sector;
+  const full = state.miExpand[key];
+  const tags = String(r.tags || '').split(',').filter(Boolean);
+  return '<div class="card mi-launch"><div class="card-title"><h3><button class="btn link" data-action="mi-sector" data-s="' + esc(r.sector) + '">' +
+      esc(r.sector) + ' ' + icon('arrow', 'sm') + '</button></h3>' +
+      '<span class="spacer"></span>' + tag('持续 ' + r.days + ' 天', 'mute') + ' ' + tag('原因硬度 ' + band.label, band.tone) +
+      ' ' + tag('置信度 ' + Math.round(r.confidence * 100) + '%', band.tone) + '</div>' +
+      '<div class="mi-tags">' + tags.map((t) => '<span class="rule-chip ' + (t === 'emotion_only' || t === '传闻' ? 'warn' : '') + '">' +
+        esc({ emotion_only: '只有情绪', 传闻: '传闻未证实', 订单验证: '有订单验证', 持续: '持续性已达标' }[t] || t) + '</span>').join('') + '</div>' +
+      '<p class="mi-text' + (full ? ' full' : '') + '">' + esc(r.text) + '</p>' +
+      '<button class="btn link xs" data-action="mi-expand" data-k="' + esc(key) + '">' + (full ? '收起' : '看完整归因') + '</button>' +
+      (r.cap_reason ? '<div class="cap-note"><div class="icon">' + icon('info') + '</div><div><b>置信度为什么是这个数：</b>' + esc(r.cap_reason) + '</div></div>' : '') +
+      '<div class="mi-cols">' +
+        '<div><div class="audit-label">证据分层</div>' +
+          '<div class="table-wrap"><table class="mi-causal"><thead><tr><th>层</th><th>主张</th><th>证据级</th><th>时间关系</th><th>因果判定</th></tr></thead><tbody>' +
+          (r.causal || []).map((c) => '<tr><td>' + esc(c.layer) + '</td><td class="small">' + esc(c.claim) + '</td><td>' + miLevel(c.level) + '</td>' +
+            '<td class="dim small">' + esc(c.align) + '</td><td class="small">' + esc(miCauseLabel(c.cause)) + '</td></tr>').join('') +
+          '</tbody></table></div></div>' +
+        '<div><div class="audit-label">' + (mode === 'time' ? '取证时间线' : '证据链') + '</div>' +
+          (mode === 'time' ? '<div class="timeline">' + (r.chain || []).map((c, k) =>
+            '<div class="tl-item"><div class="tl-dot"></div><div class="tl-body"><div class="tl-head"><b>' + esc(c.key) + '</b>' +
+            '<span class="tl-time">' + esc(c.source) + ' · 第 ' + (k + 1) + ' 步</span></div><div class="small muted">' + esc(c.text) + '</div></div></div>').join('') + '</div>'
+            : '<div class="mi-chain-list">' + (r.chain || []).map((c, k) =>
+              '<div class="mi-chain-row"><span class="mi-chain-no">' + (k + 1) + '</span><div><b>' + esc(c.key) + '</b>' +
+              '<span class="dim small"> · ' + esc(c.source) + '</span><p class="small muted">' + esc(c.text) + '</p></div></div>').join('') +
+              (r.transmission ? '<div class="mi-trans">' + esc(r.transmission) + '</div>' : '') + '</div>') +
+          '</div>' +
+      '</div>' +
+      '<div class="grid-2">' +
+        '<div class="mi-block"><div class="audit-label">产业传导链条</div><p class="small">' + esc(r.transmission || '未提供：只有情绪，没有可回指的传导路径') + '</p></div>' +
+        '<div class="mi-block"><div class="audit-label">资金行为验证</div><dl class="kv mi-kv">' +
+          Object.keys(r.capital || {}).map((k) => '<dt>' + esc({ main_net_in_3d: '主力净流入(3日)', north_bound: '北向', margin: '融资余额', turnover: '换手率' }[k] || k) +
+            '</dt><dd>' + esc(r.capital[k]) + '</dd>').join('') + '</dl></div>' +
+      '</div>' +
+      '<div class="mi-falsify"><div class="audit-label">反证条件（出现就该改判断）</div>' +
+        '<div class="table-wrap"><table class="mi-fal"><thead><tr><th>窗口</th><th>条件</th></tr></thead><tbody>' +
+        [['t1', 'T+1 次日'], ['t3', 'T+3 三日'], ['t5', 'T+5 五日']].map((x) =>
+          '<tr><td>' + x[1] + '</td><td class="small">' + esc((r.falsify || {})[x[0]] || '未提供') + '</td></tr>').join('') +
+        '</tbody></table></div>' +
+        (r.falsify && r.falsify.triggered ? '<div class="cap-note warn">' + icon('alert') +
+          '<div><b>反证条件已触发：</b>这条理由不再支撑延续判断，前瞻里的「延续 / 主线确认」标签被撤掉，改按不确定或切换处理；退潮风险与追高风险各加 0.05。' +
+          '判定只看证据里那个明确布尔标记，不从文字里猜。</div></div>' : '<div class="cap-note"><div class="icon">' + icon('check') +
+          '</div><div>反证条件未触发。触发状态由后验回填写入，不由模型自由发挥。</div></div>') +
+      '</div>' +
+      (f ? '<div class="mi-link-row"><span class="hint">这一条对前瞻的净影响：</span>' +
+        (f.causal_adjustment == null ? '<span class="dim">当日归因缺失或置信度在中段，未修正分数</span>'
+          : '<span class="' + (f.causal_adjustment > 0 ? 'ok-t' : 'bad-t') + '">' + (f.causal_adjustment > 0 ? '+' : '') + (f.causal_adjustment * 100).toFixed(0) +
+            ' 延续分</span><span class="dim">（技术面 ' + Math.round((f.evidence.technical_continuation_prob || 0) * 100) + '% → 修正后 ' +
+            Math.round((f.continuation_prob || 0) * 100) + '%）</span>') +
+        '<span class="spacer"></span><button class="btn link xs" data-action="mi-sector" data-s="' + esc(r.sector) + '">看板块链路 ' + icon('arrow', 'sm') + '</button></div>' : '') +
+    '</div>';
+}
+
+/* ----- 看板三：核心矛盾 ----- */
+function miBoardConflict(i, rg, intel) {
+  const fcs = miForecasts(i);
+  const triggered = fcs.filter((f) => f.falsified);
+  const emotional = fcs.filter((f) => f.emotion_only);
+  const missing = fcs.filter(miCausalMissing);
+  const posHigh = fcs.filter((f) => f.box != null && f.box >= 0.7);
+  const date = miDates()[i];
+  const launch = MI_LAUNCH[date] || [];
+  if (!intel) {
+    return '<div class="card"><div class="card-title"><h3>核心矛盾</h3><span class="hint">这一段本来由 16:20 的 AI 研判写</span></div>' +
+      '<div class="empty-list"><strong>' + esc(date) + ' 的 AI 研判还没生成</strong>下面只给纯代码能确定的矛盾点：位置、反证与归因缺口。</div>' +
+      miHardConflicts(rg, posHigh, triggered, emotional, missing) + '</div>';
+  }
+  const paras = String(intel.core_conflict || '').split('\n').filter(Boolean);
+  return '<div class="card"><div class="card-title"><h3>AI 认为这一轮最纠结的点</h3>' +
+      '<span class="hint">AI 原文照贴，页面不改写措辞</span></div>' +
+      '<div class="stack">' + paras.map((p, k) => '<div class="mi-conflict"><span class="mi-conflict-no">' + (k + 1) + '</span><p>' + esc(p) + '</p></div>').join('') + '</div></div>' +
+    miHardConflicts(rg, posHigh, triggered, emotional, missing) +
+    '<div class="card"><div class="card-title"><h3>反证条件是否被碰到</h3><span class="hint">代码只认证据里的明确布尔标记</span></div>' +
+      (launch.length ? '<div class="table-wrap"><table><thead><tr><th>板块</th><th>T+1 反证</th><th>T+5 反证</th><th>状态</th></tr></thead><tbody>' +
+        launch.map((r) => '<tr><td><button class="btn link" data-action="mi-sector" data-s="' + esc(r.sector) + '">' + esc(r.sector) + '</button></td>' +
+          '<td class="small">' + esc((r.falsify || {}).t1 || '未提供') + '</td><td class="small">' + esc((r.falsify || {}).t5 || '未提供') + '</td>' +
+          '<td>' + ((r.falsify || {}).triggered ? tag('已触发', 'red') : tag('未触发', 'mute')) + '</td></tr>').join('') + '</tbody></table></div>'
+        : '<div class="empty-list">本轮没有归因，反证条件为空。</div>') + '</div>';
+}
+function miHardConflicts(rg, posHigh, triggered, emotional, missing) {
+  const rows = [];
+  if (rg && rg.current_regime === 'mainline' && posHigh.length >= 3) {
+    rows.push(['位置已经上来了', '前十里有 ' + posHigh.length + ' 个板块 60 日箱位 ≥70%：' + posHigh.map((f) => f.sector).join('、') +
+      '。结构与证据还在，但容错变小——判断从「跟不跟」变成「什么价跟」。']);
+  }
+  if (triggered.length) {
+    rows.push(['有理由被自己的反证推翻了', triggered.map((f) => f.sector).join('、') + '：归因里写的反证条件已经出现，这些板块的「延续 / 主线确认」标签被撤销，改按不确定或切换处理。']);
+  }
+  if (emotional.length) {
+    rows.push(['情绪票混在主线里', emotional.map((f) => f.sector).join('、') + '：标记 emotion_only，只解释当天，不进 T+3/T+5 延续判断，板块标签降为「一日游」。']);
+  }
+  if (missing.length) {
+    rows.push(['榜单上大半没有当日理由', missing.length + '/' + (missing.length + 1) + ' 以上的板块没有当日归因，它们的分数只有技术面，页面上不会伪装成已解释。']);
+  }
+  if (rg && rg.current_regime === 'chaos') {
+    rows.push(['结构判不出来本身就是结论', '现在既没有连续三天在榜的龙头，榜面换手也没到轮动阈值，任何主线判断都可能第二天被推翻。这一轮的操作含义就是不做。']);
+  }
+  if (!rows.length) return '';
+  return '<div class="card"><div class="card-title"><h3>纯代码能确定的矛盾点</h3><span class="hint">不依赖模型措辞，直接来自判定输入</span></div>' +
+    '<div class="stack">' + rows.map((r) => '<div class="mi-conflict"><span class="mi-conflict-no">' + icon('alert', 'sm') + '</span><div><b>' + esc(r[0]) + '</b><p>' + esc(r[1]) + '</p></div></div>').join('') + '</div></div>';
+}
+
+/* ----- 看板四：板块量能信号 ----- */
+function miBoardVolume(i, intel) {
+  const vs = intel ? intel.volume_signal : miVolumeSignal(i);
+  const fcs = miForecasts(i);
+  const date = miDates()[i];
+  const rows = (miDay(i).partial
+    ? miDay(i).rows.map((r) => '<tr><td class="mono">' + r.rank + '</td><td>' + esc(r.sector) + '</td>' +
+      '<td colspan="4" class="dim">这一天只有前五名名单，涨幅/量比/上涨家数未保留（原型只留了名单）</td><td class="mono">' +
+      (miBox(r.sector, i) == null ? '—' : Math.round(miBox(r.sector, i) * 100) + '%') + '</td></tr>').join('')
+    : miDay(i).rows.map((r) => {
+      const f = fcs.filter((x) => x.sector === r.sector)[0] || null;
+      return '<tr class="' + (f ? 'clickable' : '') + '"' + (f ? ' role="button" tabindex="0" data-action="mi-sector" data-s="' + esc(r.sector) + '"' : '') + '>' +
+        '<td class="mono">' + r.rank + '</td><td><span class="cp-name">' + esc(r.sector) + '</span></td>' +
+        '<td>' + miPctCell(r.chg) + '</td>' +
+        '<td class="mono">' + (r.vol == null ? '—' : r.vol.toFixed(1)) + '</td>' +
+        '<td class="mono">' + (r.up == null ? '—' : r.up + ' 家') + '</td>' +
+        '<td class="mono">' + (f ? Math.round(f.top10_freq * 100) + '%' : '—') + '</td>' +
+        '<td class="mono">' + (f && f.box != null ? Math.round(f.box * 100) + '%' : '<span class="dim">缺失</span>') + '</td></tr>';
+    }).join(''));
+  const miss = MI_BOX_MISSING.date === date ? MI_BOX_MISSING.sectors : [];
+  return (vs.available ? '' : '<div class="pp-banner"><div class="pp-banner-line err">' + icon('alert', 'sm') +
+      '<span><b>本轮板块量比没有取到</b>（akshare 东财接口未返回）。放量 / 缩量 / 极端量能全部按缺失处理，不用上一次的数值顶上；' +
+      '这一轮的「量能成色」只能引用 AI 原文，不能作为判断依据。</span></div></div>') +
+    '<div class="grid-3">' +
+      '<div class="card mi-sig"><div class="card-title"><h3>放量板块（量比 ≥1.8）</h3></div>' +
+        '<div class="mi-sig-body">' + (vs.available ? (vs['放量板块'] === '（无）' ? '<span class="dim">本轮没有</span>' : esc(vs['放量板块'])) : '<span class="dim">数据源未返回量比</span>') + '</div></div>' +
+      '<div class="card mi-sig"><div class="card-title"><h3>缩量板块（量比 ≤0.8）</h3></div>' +
+        '<div class="mi-sig-body">' + (vs.available ? (vs['缩量板块'] === '（无）' ? '<span class="dim">本轮没有</span>' : esc(vs['缩量板块'])) : '<span class="dim">数据源未返回量比</span>') + '</div></div>' +
+      '<div class="card mi-sig"><div class="card-title"><h3>极端量能（量比 ≥2.3）</h3></div>' +
+        '<div class="mi-sig-body">' + (vs.available ? (vs['极端量能'] ? esc(vs['极端量能']) : '<span class="dim">本轮没有</span>') : '<span class="dim">数据源未返回量比</span>') + '</div></div>' +
+    '</div>' +
+    '<div class="card"><div class="card-title"><h3>前五名量价分布</h3><span class="hint">' + esc(date) + ' 快照原值，可与行情软件逐行对</span></div>' +
+      '<dl class="kv mi-kv"><dt>分布</dt><dd class="mono">' + esc(vs['分布']) + '</dd>' +
+      (intel ? '<dt>AI 量能成色</dt><dd>' + esc(vs['量能成色'] || '本轮该字段为空') + '</dd>' +
+        '<dt>主线结构</dt><dd>进攻 ' + esc(vs['主线结构'].attack || '未提供') + ' · 接力 ' + esc(vs['主线结构'].relay || '未提供') +
+        ' · 退潮 ' + esc(vs['主线结构'].fade || '未提供') + '</dd>' : '') + '</dl></div>' +
+    '<div class="card"><div class="card-title"><h3>60 日箱位与位置解读</h3>' +
+        '<span class="hint">箱位 = 当前收盘价在过去 60 个交易日最高最低价区间的百分位</span></div>' +
+      (miss.length ? '<div class="cap-note warn">' + icon('alert') + '<div><b>' + esc(miss.join('、')) + '</b>：' + esc(MI_BOX_MISSING.note) +
+        '。箱位是辅助标注，取数超时只让这一格留空，结构判定和落库都不该被它拖停——正式代码里这条降级只写在板块前瞻那一步，结构判定那一步还会因为同一个异常整体失败。</div></div>' : '') +
+      '<div class="table-wrap"><table><thead><tr><th>名次</th><th>板块</th><th>当日涨幅</th><th>量比</th><th>上涨家数</th><th>近10日在榜</th><th>60日箱位</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div>' +
+      (intel ? '<div class="stack mi-box-notes">' + Object.keys(intel.operative_meaning['箱位理解'] || {}).map((k) =>
+        '<div class="mi-box-note"><button class="btn link" data-action="mi-sector" data-s="' + esc(k) + '">' + esc(k) + ' ' + icon('arrow', 'sm') + '</button>' +
+        '<p>' + esc(intel.operative_meaning['箱位理解'][k]) + '</p></div>').join('') +
+        (Object.keys(intel.operative_meaning['箱位理解'] || {}).length ? '' : '<div class="empty-list">本轮 AI 没有给箱位理解。</div>') + '</div>' : '') +
+      '<div class="cap-note">' + icon('info') + '<div>箱位高不等于一定要退：' +
+        '箱位只进「退潮风险」的 40% 和「追高风险」的 20%，量比与持续性不塌，主线判定不会单纯因为位置高被否。</div></div></div>';
+}
+
+/* ----- 看板五：操作含义 ----- */
+function miBoardOperative(i, intel) {
+  if (!intel) {
+    return '<div class="card"><div class="card-title"><h3>操作含义</h3></div>' +
+      '<div class="empty-list"><strong>本轮没有 AI 操作含义</strong>结构判定给出的三窗口倾向仍在「行情结构」看板，这里补的是把它翻成「该做什么」的那段话。</div>' +
+      miBiasToAction(miRun(i).regime ? miRegime(i) : null) + '</div>';
+  }
+  const om = intel.operative_meaning || {};
+  return '<div class="card"><div class="card-title"><h3>操作含义</h3><span class="hint">AI 写的操作含义，页面不改写</span></div>' +
+      '<dl class="kv mi-kv">' + Object.keys(om).filter((k) => typeof om[k] !== 'object').map((k) =>
+        '<dt>' + esc(k) + '</dt><dd>' + esc(om[k] || '未提供') + '</dd>').join('') +
+        '<dt>箱位理解 / 个股验证</dt><dd>' + (Object.keys(om['箱位理解'] || {}).length || (om['个股验证'] || []).length
+          ? '见下面两张卡，这里不重复展开' : '本轮 AI 没有给这两项') + '</dd></dl>' +
+      miBiasToAction(miRun(i).regime ? miRegime(i) : null) + '</div>' +
+    '<div class="card"><div class="card-title"><h3>主线板块内个股三维验证</h3>' +
+      '<span class="hint">涨幅、量比、箱位三个维度合不合理，不看单看涨幅</span></div>' +
+      ((intel.operative_meaning['个股验证'] || []).length ? '<div class="table-wrap"><table><thead><tr><th>个股</th><th>代码</th><th>当日涨幅</th><th>量比</th><th>60日箱位</th><th>三维判定</th><th>为什么</th></tr></thead><tbody>' +
+        intel.operative_meaning['个股验证'].map((s) => '<tr><td><b>' + esc(s.name) + '</b></td><td class="mono dim">' + esc(s.code) + '</td>' +
+          '<td>' + miPctCell(s.chg) + '</td><td class="mono">' + (s.vol == null ? '<span class="dim">未取到</span>' : s.vol.toFixed(1)) + '</td>' +
+          '<td class="mono">' + (s.box == null ? '—' : s.box + '%') + '</td><td>' + miVerdict(s.verdict) + '</td>' +
+          '<td class="small muted">' + esc(miStockWhy(s)) + '</td></tr>').join('') + '</tbody></table></div>'
+        : '<div class="empty-list">本轮 AI 没有给个股验证。</div>') +
+      '<div class="cap-note">' + icon('info') + '<div>「真强」= 涨幅、量比、箱位三者同向；「加速后段 / 放量滞涨」= 位置已在 90 分位以上，涨靠估值而不是业绩；' +
+        '「假强」= 涨幅靠板块β，量比不配合。判定用词与正式页面一致，不新造标签。</div></div></div>' +
+    '<div class="card"><div class="card-title"><h3>这些结论怎么用到操作上</h3><span class="hint">只到「方向」，不下单</span></div>' +
+      '<div class="grid-3">' +
+        '<div class="mi-use"><b>接力方向进候选池</b><p>把「主线种子 / 中低位可关注」的板块带到候选池，按板块筛一遍再决定要不要看个股。</p>' +
+          '<button class="btn sm" data-nav="#/candidates">' + icon('arrow', 'sm') + '去候选池</button></div>' +
+        '<div class="mi-use"><b>已在持仓的方向对不对</b><p>如果持仓板块本轮被判「退潮预警 / 加速追高」，去持仓监控看风险条，不在这页改持仓。</p>' +
+          '<button class="btn sm" data-nav="#/holdings">' + icon('arrow', 'sm') + '去持仓监控</button></div>' +
+        '<div class="mi-use"><b>AI 有没有按判断执行</b><p>模拟盘是唯一 AI 自己下单的地方，看它在这一轮结构下买了什么、事后复盘怎么说。</p>' +
+          '<button class="btn sm" data-nav="#/paper">' + icon('arrow', 'sm') + '看模拟盘</button></div>' +
+      '</div></div>';
+}
+function miStockWhy(s) {
+  if (s.vol == null) return '量比缺失，只能看涨幅与箱位，判定保留但标注数据不足';
+  if (s.verdict === '真强') return '量比 ' + s.vol.toFixed(1) + ' 有增量资金，箱位 ' + s.box + '% 未到极值，涨幅能落到量能上';
+  if (s.verdict === '假强') return '量比 ' + s.vol.toFixed(1) + ' 没有配合，箱位 ' + s.box + '% 已在高位，涨幅来自板块β';
+  return '量比 ' + s.vol.toFixed(1) + '，箱位 ' + s.box + '% 处于历史高分位，涨得快但位置已透支';
+}
+function miBiasToAction(rg) {
+  if (!rg) return '<div class="cap-note"><div class="icon">' + icon('info') + '</div><div>没有结构判定，下面这三条倾向也无从给出。</div></div>';
+  const map = {
+    continue: '结构在延续：仓位优先给已经有硬证据的环节，跟随性补涨不作为建仓理由。',
+    mainline_confirm: '五日口径是主线确认：可以分批参与，但加仓条件写在归因里（订单、公告、招标落地）。',
+    switch: '倾向切换：不追老龙头，也不接第一天冒出来的题材，等新的连续在榜再做接力。',
+    new_mainline_switch: '五日口径是新主线切换：把注意力从本轮龙头移开，去候选池按新板块筛。',
+    fade: '倾向退潮：主线内部只做已证明业绩的部分，其余不加仓。',
+    diverge: '三日口径是分歧：分歧期不做新开仓，等榜面重新收敛。',
+    invalid_rotation: '五日口径判定这轮轮动无效：轮动行情里做切换，五日尺度大概率是错的。',
+    uncertain: '判断就是不确定：不确定就是不动作，不要用「试试看」替代判断。'
+  };
+  return '<div class="mi-bias-acts">' + [['T+1 次日', rg.forward_bias_t1], ['T+3 三日', rg.forward_bias_t3], ['T+5 五日', rg.forward_bias_t5]].map((x) =>
+    '<div class="mi-bias-act"><span class="mi-bias-k">' + x[0] + '</span>' + miBias(x[1]) + '<p>' + esc(map[x[1]] || '没有对应的动作口径') + '</p></div>').join('') + '</div>';
+}
+
+/* ----- 看板六：次日盯盘点 ----- */
+function miBoardWatch(i, intel) {
+  const date = miDates()[i];
+  const nxt = MI_NEXT_HOT[date] || MI_NEXT_HOT[miDates()[Math.min(miDates().length - 1, i + 1)]] || [];
+  const rg = miRun(i).regime ? miRegime(i) : null;
+  const fcs = miForecasts(i);
+  const seeds = fcs.filter((f) => f.sector_tag === 'mainline_seed' || f.switch_candidate);
+  return (intel ? '<div class="card"><div class="card-title"><h3>明天开盘要盯的具体条件</h3>' +
+        '<span class="hint">每条都写了「出现什么就改判断」，不是含糊的继续观察</span></div>' +
+        '<div class="table-wrap"><table><thead><tr><th>盯什么</th><th>出现什么情况就改判断</th><th>下一步</th></tr></thead><tbody>' +
+        Object.keys(intel.next_day_watch || {}).map((k) => '<tr><td><b>' + esc(k) + '</b></td><td class="small">' + esc(intel.next_day_watch[k]) + '</td>' +
+          '<td>' + miWatchAction(intel.next_day_watch[k]) + '</td></tr>').join('') + '</tbody></table></div></div>'
+      : '<div class="card"><div class="card-title"><h3>次日盯盘点</h3></div>' +
+        '<div class="empty-list"><strong>' + esc(date) + ' 没有 AI 次日盯盘清单</strong>下面两条是纯代码给出的：本轮标签和「下一个风口」候选。</div></div>') +
+    '<div class="card"><div class="card-title"><h3>下一个风口（前十之外的扩散候选）</h3>' +
+      '<span class="hint">15:50 单独跑一批，不等 AI 归因，避免主线归因 5 分钟没出来时页面空白</span></div>' +
+      (nxt.length ? '<div class="table-wrap"><table><thead><tr><th>排名</th><th>板块</th><th>热度</th><th>连续预热</th><th>可信度</th><th>与主线的传导距离</th><th>逻辑</th><th>必须出现什么</th></tr></thead><tbody>' +
+        nxt.map((n) => '<tr><td class="mono">' + n.rank + '</td><td><button class="btn link" data-action="mi-sector" data-s="' + esc(n.sector) + '">' + esc(n.sector) + '</button></td>' +
+          '<td class="mono">' + n.hot + '</td><td class="mono">' + n.days + ' 日</td>' +
+          '<td>' + miProb(n.conf) + '</td>' +
+          '<td>' + (n.trig.missing ? tag('传导关系缺失', 'gold') : esc(n.trig.dist) + ' <span class="dim mono">同源 ' + Math.round(n.trig.parent * 100) + '%</span>') + '</td>' +
+          '<td class="small">' + esc(n.trig.logic) + '</td><td class="small muted">' + esc(n.trig.must) + '</td></tr>').join('') + '</tbody></table></div>'
+        : '<div class="empty-list">这一天的「下一个风口」没有跑出来（15:50 任务未落库）。</div>') +
+      '<div class="cap-note">' + icon('info') + '<div>可信度不到 45% 的候选不给建仓建议，只当观察名单；传导距离「未知」说明它和主线之间找不到可回指的产业关系，' +
+        '这类票涨了也不该解释成主线扩散。</div></div></div>' +
+    '<div class="grid-2">' +
+      '<div class="card"><div class="card-title"><h3>本轮标签给的接力候选</h3></div>' +
+        (seeds.length ? '<div class="mi-picks"><div class="mi-pick"><span class="mi-pick-k">种子 / 切换候选</span><span class="mi-pick-v">' +
+          seeds.map((f) => '<button class="rule-chip" data-action="mi-sector" data-s="' + esc(f.sector) + '">' + esc(f.sector) + ' · ' +
+            esc(MI_SECTOR_TAG_LABEL[f.sector_tag] ? MI_SECTOR_TAG_LABEL[f.sector_tag][0] : '切换候选') + '</button>').join('') + '</span></div></div>'
+          : '<div class="empty-list">本轮没有给出主线种子或切换候选。</div>') + '</div>' +
+      '<div class="card"><div class="card-title"><h3>研判日志</h3><span class="hint">本页跑批推进记录</span></div>' +
+        ((state.miLog || []).length ? '<div class="mi-loglist">' + state.miLog.map((l) =>
+          '<div class="mi-logrow"><span class="mono dim">' + esc(l.at) + '</span><span class="mono">' + esc(l.date) + '</span><span>' + esc(l.text) + '</span></div>').join('') + '</div>'
+          : '<div class="empty-list">还没有在本页做过补跑。定时任务链路：15:35 快照 → 15:40 结构 → 15:45 前瞻 → 15:50 下一个风口 → 16:05 后验 → 16:20 AI 研判。</div>') + '</div>' +
+    '</div>' +
+    (rg ? '' : '<div class="cap-note warn">' + icon('alert') + '<div>这一天没有结构判定，「次日盯盘点」里的 T+1/T+3/T+5 倾向也是空的：先补跑行情结构，再谈明天盯什么。</div></div>');
+}
+function miWatchAction(text) {
+  if (/跌破|跌出|转负|没有|未|证伪|不参与/.test(text)) return tag('触发就减仓 / 不参与', 'red');
+  if (/落地|公告|连续|转正|为正/.test(text)) return tag('落地才继续加', 'green');
+  return tag('继续观察', 'mute');
+}
+
+/* ----- 看板七：板块轮动归因 ----- */
+function miBoardRotation(i, rg, run) {
+  const date = miDates()[i];
+  const patterns = MI_PATTERNS;
+  const fcs = miForecasts(i);
+  const churn = rg ? rg.evidence.top5_churn_3d : null;
+  const state3 = rg ? (rg.current_regime === 'mainline' ? '主线' : rg.current_regime === 'rotation' ? '轮动' : '混沌') : '未知';
+  const expl = {
+    主线: '有一个板块连续排在涨幅前五，且前三板块 20 日留存过线，资金集中在同一条产业线上。',
+    轮动: '榜面换手很快（近三日超过一半席位在换），但没有谁做出持续性：钱在板块之间搬，不在一个方向上聚。',
+    混沌: '既没有连续在榜的龙头，也没快到能叫轮动的程度：每天的榜面更像资金单日选择，第二天不认账。',
+    未知: '这一天没有结构判定，先补跑行情结构。'
+  };
+  const leaderChanges = (function () {
+    const from = Math.max(0, i - 9);
+    let n = 0;
+    for (let k = from + 1; k <= i; k++) if (miTop(k, 1)[0] !== miTop(k - 1, 1)[0]) n += 1;
+    return { n: n, days: i - from };
+  })();
+  return '<div class="grid-3">' +
+      '<div class="card"><div class="card-title"><h3>轮动状态</h3></div><div class="metric-strip">' +
+        '<div class="metric"><div class="metric-label">当前结构</div><div class="metric-value">' + esc(state3) + '</div><div class="metric-sub">' + esc(rg ? MI_STAGE_LABEL[rg.regime_stage] : '未判定') + '</div></div>' +
+        '<div class="metric"><div class="metric-label">近三日榜面换手</div><div class="metric-value">' + (churn == null ? '—' : churn.toFixed(2)) + '</div><div class="metric-sub">阈值 0.60</div></div>' +
+        '<div class="metric"><div class="metric-label">近 10 日榜首更换</div><div class="metric-value">' + leaderChanges.n + ' 次</div><div class="metric-sub">共 ' + leaderChanges.days + ' 个交易日</div></div>' +
+      '</div><p class="small muted mi-why">' + esc(expl[state3]) + '</p></div>' +
+      '<div class="card"><div class="card-title"><h3>本轮主切方向</h3><span class="hint">按快照现算</span></div>' +
+        (rg ? '<dl class="kv mi-kv"><dt>龙头板块</dt><dd>' + esc(rg.evidence.leader_streak_sector || '没有连续在榜的板块') + '</dd>' +
+          '<dt>今日前三</dt><dd>' + esc(miTop(i, 3).join('、')) + '</dd>' +
+          '<dt>两日前前五</dt><dd>' + esc(miTop(Math.max(0, i - 2), 5).join('、')) + '</dd>' +
+          '<dt>新挤进来的</dt><dd>' + esc(miTop(i, 5).filter((s) => miTop(Math.max(0, i - 2), 5).indexOf(s) < 0).join('、') || '没有') + '</dd>' +
+          '<dt>掉出前五的</dt><dd>' + esc(miTop(Math.max(0, i - 2), 5).filter((s) => miTop(i, 5).indexOf(s) < 0).join('、') || '没有') + '</dd></dl>'
+          : '<div class="empty-list">没有结构判定，主切方向算不出来。</div>') + '</div>' +
+      '<div class="card"><div class="card-title"><h3>可延续板块</h3></div>' +
+        (fcs.length ? '<div class="mi-picks"><div class="mi-pick"><span class="mi-pick-v">' +
+          fcs.filter((f) => f['forward_bias_t1'] === 'continue').map((f) => '<button class="rule-chip" data-action="mi-sector" data-s="' + esc(f.sector) + '">' +
+            esc(f.sector) + ' <span class="mono dim">' + Math.round(f.continuation_prob * 100) + '%</span></button>').join('') || '<span class="dim">本轮没有延续倾向达标的板块</span>' +
+          '</span></div></div>' : '<div class="empty-list">先跑行情结构。</div>') +
+        '<div class="cap-note"><div class="icon">' + icon('info') + '</div><div>可延续只按板块分数排，不代表可以买：追高风险与位置在「行情结构」看板的同一行里。</div></div></div>' +
+    '</div>' +
+    (run.rotation ? miRotationAi(date, i) : '<div class="card"><div class="card-title"><h3>轮动归因（AI 版）</h3>' +
+      '<span class="hint">旧的轮动归因口径，单次要跑约 5 分钟</span></div>' +
+      '<div class="empty-list"><strong>' + esc(date) + ' 的轮动归因还是空的</strong>正式页面这段一直是「等待回填」：它跑在另一条批里，没跟 16:20 研判合并，' +
+        '所以出现「AI 研判有、轮动归因没有」的半程状态。<br>本页先用「下一个风口」和板块前瞻顶上，不让页面空着。</div>' +
+      '<div class="row mi-actions">' + miRunBtns(i, run) + '</div></div>') +
+    '<div class="card"><div class="card-title"><h3>多窗口规律</h3><span class="hint">3 / 10 / 20 / 60 日各自的轮动周期与主线，口径独立于当日结构判定</span></div>' +
+      '<div class="table-wrap"><table><thead><tr><th>窗口</th><th>轮动周期(日)</th><th>生命周期均值</th><th>切换频率</th><th>放量后延续率</th><th>窗口内主线</th><th>涨幅斜率前三</th></tr></thead><tbody>' +
+      ['3d', '10d', '20d', '60d'].map((k) => {
+        const p = patterns[k];
+        return '<tr><td><b>' + p.days + ' 日</b></td><td class="mono">' + p.rotation_cycle + '</td><td class="mono">' + p.lifecycle_avg_streak + '</td>' +
+          '<td class="mono">' + p.switch_frequency.toFixed(2) + '</td><td class="mono">' + Math.round(p.volume_breakout_continuation * 100) + '%</td>' +
+          '<td class="small">' + esc(p.mainline.join('、')) + '</td>' +
+          '<td class="small">' + p.top_slopes.map((s) => esc(s.s) + ' <span class="mono dim">+' + s.v.toFixed(1) + '</span>').join('、') + '</td></tr>';
+      }).join('') + '</tbody></table></div>' +
+      '<div class="grid-3 mi-uses">' +
+        '<div class="mi-use"><b>短周期（3 日）</b><p>切换频率 0.62：三天内换两次方向是常态。用它决定「隔几天复查一次」，不决定方向。</p></div>' +
+        '<div class="mi-use"><b>中周期（10 / 20 日）</b><p>放量后延续率 55% 是四个窗口里最高的：突破当天有量，才值得拿过一周。</p></div>' +
+        '<div class="mi-use"><b>长周期（60 日）</b><p>60 日主线只有光模块一个，说明这轮不是普涨，是单线行情——分散买题材等于摊薄。</p></div>' +
+      '</div>' +
+      '<div class="cap-note"><div class="icon">' + icon('info') + '</div><div><b>📌 关注重点：</b>切换频率随窗口变长单调下降（0.62 → 0.18），' +
+        '意味着短线看到的「轮动」大多在 20 日尺度上不存在。用错窗口就会把噪音当方向。</div></div></div>';
+}
+function miRotationAi(date, i) {
+  const fcs = miForecasts(i);
+  const rows = fcs.slice(0, 6).map((f) => {
+    const rec = (MI_LAUNCH[date] || []).filter((l) => l.sector === f.sector)[0];
+    return '<tr class="clickable" role="button" tabindex="0" data-action="mi-sector" data-s="' + esc(f.sector) + '">' +
+      '<td><b>' + esc(f.sector) + '</b><div class="small muted">' + (rec ? '持续 ' + rec.days + ' 天 · ' + esc(miBand(rec.confidence, false).label) + '硬度' : '当日归因缺失') + '</div></td>' +
+      '<td class="small">' + esc(rec ? rec.text.slice(0, 80) + (rec.text.length > 80 ? '…' : '') : '没有 AI 评估，只有板块分数') + '</td>' +
+      '<td>' + (rec ? '<button class="btn link xs" data-action="mi-expand" data-k="launch:' + esc(f.sector) + '">展开</button>' : '<span class="dim">未提供</span>') + '</td>' +
+      '<td>' + miBias(f.forward_bias_t1) + '</td><td>' + miProb(f.continuation_prob) + '</td></tr>';
+  }).join('');
+  return '<div class="card"><div class="card-title"><h3>轮动归因（AI 版）</h3>' +
+      '<span class="hint">' + esc(date) + ' 已回填 · 每个板块一条启动理由</span></div>' +
+      '<div class="table-wrap"><table><thead><tr><th>板块</th><th>AI 评估</th><th>全文</th><th>T+1 倾向</th><th>延续概率</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      '<div class="cap-note"><div class="icon">' + icon('info') + '</div><div>这段文字只作解释，不进分数；真正改分数的是「当日归因置信度」（±0.05）和反证布尔标记。</div></div></div>';
+}
+
+/* ----- 看板八：原始返回 ----- */
+function miBoardRaw(i, rg, intel, run) {
+  const date = miDates()[i];
+  const fcs = miForecasts(i);
+  const dump = {
+    trade_date: date,
+    snapshot_rows: miDay(i).rows,
+    regime_forecast: rg,
+    forward_forecast_t1: fcs.map((f) => ({
+      sector: f.sector, rank_no: f.rank_no, continuation_prob: f.continuation_prob == null ? null : Number(f.continuation_prob.toFixed(4)),
+      exhaustion_risk: Number(f.exhaustion_risk.toFixed(4)), chase_risk: Number(f.chase_risk.toFixed(4)),
+      forward_bias: f.forward_bias_t1, sector_tag: f.sector_tag, switch_candidate: f.switch_candidate, evidence: f.evidence
+    })),
+    verify: run.verify && rg ? miVerify(i, rg, fcs) : '本日期未回填验证',
+    intel: intel, next_hot: MI_NEXT_HOT[date] || '本日期未跑', box_source: MI_BOX_LATEST, run_flags: run
+  };
+  return '<div class="card"><div class="card-title"><h3>接口原始返回（对账用）</h3>' +
+      '<span class="hint">正式页面一次请求拿全：快照 + 结构 + 前瞻 + 后验 + 准确率，不用分五个接口拼</span></div>' +
+      '<details class="raw" open><summary>regime-view 聚合结果（' + JSON.stringify(dump).length + ' 字节）</summary>' +
+      '<pre>' + esc(JSON.stringify(dump, null, 2)) + '</pre></details>' +
+      '<details class="raw"><summary>字段口径速查</summary><pre>' + esc([
+        'current_regime      mainline / rotation / chaos            结构三态',
+        'regime_stage        start / confirm / accelerate / diverge / fade / unknown',
+        'regime_confidence   主线 0.7+0.1*min(连续天数,3)；轮动 0.5+0.1*min(换手*10,3)；混沌 0.4；窗口<60 日强制 0.2',
+        'forward_bias_t1/t3/t5  continue / switch / fade / diverge / uncertain / mainline_confirm / new_mainline_switch / invalid_rotation',
+        'continuation_prob   0.35*近10日在榜率 + 0.20*(1-|量比-1|) + 0.20*min(连续天数/5,1) + 0.15*广度 + 0.10*(1-高位)',
+        'exhaustion_risk     0.40*高位 + 0.30*(连续≥5) + 0.20*量能衰减 + 0.10*名次回落',
+        'chase_risk          0.50*min(涨幅/10,1) + 0.30*(1-在榜率) + 0.20*高位',
+        'sector_tag          mainline_seed / fade_warn / accelerate_warn / low_buy / one_day_fly / none',
+        'miss_reason         data_insufficient（窗口未到期）/ uncertain（当时就不判断）/ rule_miss（到期但没命中）',
+        'causal_adjustment   当日归因置信度 ≥0.75 → +0.05 延续；<0.45 → -0.05 延续 +0.05 追高；缺失 → 不修正'
+      ].join('\n')) + '</pre></details></div>' +
+    '<div class="card"><div class="card-title"><h3>判定输入：全板块日快照</h3><span class="hint">改这里的数字，上面所有结论会跟着变</span></div>' +
+      '<div class="table-wrap"><table><thead><tr><th>名次</th><th>板块</th><th>涨幅</th><th>量比</th><th>上涨家数</th><th>60日箱位</th><th>连续前五</th><th>近10日在榜</th></tr></thead><tbody>' +
+      miDay(i).rows.map((r, k) => {
+        const f = fcs[k] || null;
+        return '<tr><td class="mono">' + r.rank + '</td><td>' + esc(r.sector) + '</td>' +
+          '<td>' + (r.chg == null ? '<span class="dim">未保留</span>' : miPctCell(r.chg)) + '</td>' +
+          '<td class="mono">' + (r.vol == null ? '—' : r.vol.toFixed(1)) + '</td>' +
+          '<td class="mono">' + (r.up == null ? '—' : r.up) + '</td>' +
+          '<td class="mono">' + (miBox(r.sector, i) == null ? '<span class="dim">缺失</span>' : Math.round(miBox(r.sector, i) * 100) + '%') + '</td>' +
+          '<td class="mono">' + miStreak(r.sector, i) + '</td>' +
+          '<td class="mono">' + Math.round(miTop10Freq(r.sector, i) * 100) + '%</td></tr>';
+      }).join('') + '</tbody></table></div>' +
+      (miDay(i).partial ? '<div class="cap-note warn">' + icon('alert') + '<div>原型只为 ' + esc(date) + ' 之前的日期保留了前五名单（正式库有全部 90 个板块），' +
+        '这些日期的涨幅/量比/上涨家数一律显示「未保留」，不补 0 也不补均值。</div></div>' : '') + '</div>';
+}
+
+/* ----- 板块抽屉 ----- */
+function miSectorDrawerHtml(sector) {
+  const i = miI();
+  const fcs = miForecasts(i);
+  const f = fcs.filter((x) => x.sector === sector)[0] || null;
+  const hist = miHist(sector, i);
+  const launch = (MI_LAUNCH[miDates()[i]] || []).filter((l) => l.sector === sector)[0] || null;
+  const rows = hist.map((h) => '<tr><td class="mono">' + esc(h.date) + '</td><td class="mono">' + h.rank + '</td>' +
+    '<td>' + (h.chg == null ? '<span class="dim">未保留</span>' : miPctCell(h.chg)) + '</td>' +
+    '<td class="mono">' + (h.vol == null ? '—' : h.vol.toFixed(1)) + '</td>' +
+    '<td class="mono">' + (h.up == null ? '—' : h.up + ' 家') + '</td>' +
+    '<td class="mono">' + (miBox(sector, miIdx(h.date)) == null ? '—' : Math.round(miBox(sector, miIdx(h.date)) * 100) + '%') + '</td>' +
+    '<td>' + (h.rank <= 5 ? tag('前五', 'green') : h.rank <= 10 ? tag('前十', 'mute') : '<span class="dim">出榜</span>') + '</td></tr>').join('');
+  const boxSeries = hist.map((h) => (miBox(sector, miIdx(h.date)) == null ? '—' : Math.round(miBox(sector, miIdx(h.date)) * 100) + '%')).join(' → ');
+  return '<div class="stack">' +
+      '<div class="card"><div class="card-title"><h3>当前判定</h3><span class="hint">' + esc(miDate()) + '</span></div>' +
+        (f ? '<div class="mi-drawer-score"><div><span class="metric-label">延续概率</span><div class="metric-value">' +
+            (f.continuation_prob == null ? '—' : Math.round(f.continuation_prob * 100) + '%') + '</div></div>' +
+          '<div><span class="metric-label">退潮风险</span><div class="metric-value down">' + Math.round(f.exhaustion_risk * 100) + '%</div></div>' +
+          '<div><span class="metric-label">追高风险</span><div class="metric-value down">' + Math.round(f.chase_risk * 100) + '%</div></div>' +
+          '<div><span class="metric-label">60日箱位</span><div class="metric-value">' + (f.box == null ? '缺失' : Math.round(f.box * 100) + '%') + '</div></div>' +
+          '<div><span class="metric-label">连续前五</span><div class="metric-value">' + f.streak + ' 天</div></div></div>' +
+          '<div class="mi-bias-acts mi-drawer-bias">' + [['T+1', f.forward_bias_t1], ['T+3', f.forward_bias_t3], ['T+5', f.forward_bias_t5]].map((x) =>
+            '<div class="mi-bias-act"><span class="mi-bias-k">' + x[0] + '</span>' + miBias(x[1]) + '</div>').join('') + '</div>' +
+          '<dl class="kv mi-kv"><dt>板块标签</dt><dd>' + miSectorTag(f.sector_tag) + '</dd>' +
+            '<dt>切换候选</dt><dd>' + (f.switch_candidate ? tag('是：位置不高 + 连续两日在前十 + 量能扩张 + 主线正在退', 'blue') : '否') + '</dd>' +
+            '<dt>原因硬度</dt><dd>' + miCausalCell(f) + '</dd>' +
+            '<dt>修正影响</dt><dd>' + (f.causal_adjustment == null ? '<span class="dim">未参与修正</span>'
+              : '<span class="' + (f.causal_adjustment > 0 ? 'ok-t' : 'bad-t') + '">' + (f.causal_adjustment > 0 ? '+' : '') + (f.causal_adjustment * 100).toFixed(0) +
+                ' 延续分</span> <span class="dim">技术面 ' + Math.round((f.evidence.technical_continuation_prob || 0) * 100) + '% → ' + Math.round((f.continuation_prob || 0) * 100) + '%</span>') + '</dd>' +
+            '<dt>反证状态</dt><dd>' + (f.falsified ? tag('已触发：延续标签已撤销', 'red') : '未触发') + (f.emotion_only ? ' · ' + tag('情绪票：只做当日', 'gold') : '') + '</dd></dl>'
+          : '<div class="empty-list"><strong>这个板块今天不在涨幅前十</strong>没有前瞻分数，只有历史榜位。下面明细仍可核对。</div>') + '</div>' +
+      (launch ? miLaunchCard(i, launch, state.miChainMode === 'time' ? 'time' : 'chain', fcs) : '') +
+      '<div class="card"><div class="card-title"><h3>近 10 个交易日榜位与量价</h3><span class="hint">行数窗口，不是严格交易日窗口</span></div>' +
+        '<div class="table-wrap"><table><thead><tr><th>日期</th><th>名次</th><th>涨幅</th><th>量比</th><th>上涨家数</th><th>60日箱位</th><th>榜位</th></tr></thead>' +
+        '<tbody>' + (rows || '<tr><td colspan="7" class="dim">没有历史快照</td></tr>') + '</tbody></table></div>' +
+        '<dl class="kv mi-kv"><dt>箱位轨迹</dt><dd class="mono">' + esc(boxSeries) + '</dd></dl></div>' +
+      '<div class="card"><div class="card-title"><h3>这个板块的下游入口</h3></div>' +
+        '<div class="row mi-actions">' +
+          '<button class="btn sm" data-nav="#/candidates">' + icon('search', 'sm') + '在候选池按板块筛个股</button>' +
+          '<button class="btn sm" data-nav="#/holdings">' + icon('home', 'sm') + '看持仓里有没有它</button>' +
+        '</div>' +
+        '<div class="cap-note">' + icon('info') + '<div>正式页面会把板块名作为筛选条件带到候选池与持仓页。这里不列个股，个股结论只在候选池与持仓页出现。</div></div></div>' +
+    '</div>';
+}
+
+/* ----- 交互 ----- */
+function miPushLog(text, step) { miLog(miI(), step || 'op', text); }
+function miRequireSnap(i) {
+  if (miDay(i).partial) {
+    toast('这一天的快照只剩前五名单', '正式库里每个交易日都有 90 个板块。原型只为最近 14 个交易日保留了完整十行，补跑出来的结论只能演示，别当历史回填。', 'warn');
+  }
+  return true;
+}
+function handleMarketIntelAction(action, el) {
+  const i = miI();
+  if (action === 'mi-board') { state.miBoard = el.dataset.b; renderView(); syncMarketIntelHash(); return; }
+  if (action === 'mi-date') { state.miDate = el.dataset.date; state.miSector = null; closeDrawer(); renderView(); syncMarketIntelHash(); return; }
+  if (action === 'mi-step') {
+    const n = Math.max(0, Math.min(miDates().length - 1, i + Number(el.dataset.d)));
+    state.miDate = miDates()[n];
+    renderView(); syncMarketIntelHash(); return;
+  }
+  if (action === 'mi-horizon') { state.miHorizon = el.dataset.h; renderView(); syncMarketIntelHash(); return; }
+  if (action === 'mi-refresh') { renderView(); syncMarketIntelHash(); toast('已按页面数据重算', '结构、前瞻、后验都是现算的，没有调后端。', 'info'); return; }
+  if (action === 'mi-clear-log') { state.miLog = []; renderView(); return; }
+  if (action === 'mi-chain-mode') { state.miChainMode = el.dataset.m; renderView(); return; }
+  if (action === 'mi-expand') {
+    const k = el.dataset.k;
+    state.miExpand[k] = !state.miExpand[k];
+    renderView();
+    return;
+  }
+  if (action === 'mi-sector') {
+    const s = el.dataset.s;
+    state.miSector = s;
+    openDrawer('mi-sector', s);
+    syncMarketIntelHash();
+    return;
+  }
+  if (action === 'mi-run-regime') {
+    miRequireSnap(i);
+    const r = miRun(i);
+    if (r.regime) { toast('这天已经有结构判定', '要看回填后的准确率，用「回填验证」。', 'info'); return; }
+    r.regime = true; r.forward = true;
+    miPushLog('补跑行情结构 + 板块前瞻：' + MI_REGIME_LABEL[miRegime(i).current_regime] + ' · ' + MI_STAGE_LABEL[miRegime(i).regime_stage], 'regime');
+    renderView(); syncMarketIntelHash();
+    const rg = miRegime(i);
+    toast('结构判定完成', miDates()[i] + '：' + MI_REGIME_LABEL[rg.current_regime] + ' · 阶段「' + MI_STAGE_LABEL[rg.regime_stage] + '」，' +
+      '前十板块三窗口前瞻已写入。正式系统需要后端补一个手动跑结构的接口，现在的按钮只能跑板块前瞻。', 'ok');
+    return;
+  }
+  if (action === 'mi-run-verify') {
+    let n = 0;
+    miDates().forEach((d, k) => { if (miRun(k).regime) { miRun(k).verify = true; n += 1; } });
+    miPushLog('回填验证：已把 ' + n + ' 个判定日的后验窗口重新算了一遍', 'verify');
+    renderView(); syncMarketIntelHash();
+    toast('后验已回填', '未到期窗口仍然显示「还差 N 天」，不计入命中率也不伪造。', 'ok');
+    return;
+  }
+  if (action === 'mi-run-intel') {
+    const r = miRun(i);
+    if (r.intel) { toast('这天的 AI 研判已存在', '原型里的研判文字是固定的，重新生成不会给出不同措辞。', 'info'); return; }
+    if (!r.regime) { toast('先跑行情结构', 'AI 研判要读结构判定和板块前瞻的结果，这一天两者都没有。', 'warn'); return; }
+    if (state.miIntelBusy) return;
+    state.miIntelBusy = miDates()[i];
+    renderView();
+    miPushLog('提交 AI 研判后台任务（16:20 那段）', 'intel');
+    setTimeout(() => {
+      state.miIntelBusy = null;
+      miRun(miIdx(miDates()[i])).intel = true;
+      miPushLog('AI 研判完成（本页用模板按同一批数字拼出文字，正式系统由大模型撰写）', 'intel');
+      renderView(); syncMarketIntelHash();
+      toast('研判完成', miDates()[i] + ' 的判定依据、核心矛盾、操作含义、次日盯盘点已补上，并标注为模板生成。', 'ok');
+    }, 900);
+    return;
+  }
+  if (action === 'mi-run-rotation') {
+    const r = miRun(i);
+    if (r.rotation) { toast('轮动归因已回填', 'AI 版归因每条约 5 分钟，正式系统里它跑在独立批里，可能晚于 16:20 研判。', 'info'); return; }
+    r.rotation = true;
+    miPushLog('生成轮动归因（AI 版）', 'rotation');
+    renderView(); syncMarketIntelHash();
+    toast('轮动归因完成', '板块启动理由与 AI 评估已补上；文字只作解释，不进前瞻分数。', 'ok');
+    return;
+  }
+}
+function syncMarketIntelHash() {
+  if (state.route !== '#/market-intel') return;
+  let next = '#/market-intel?date=' + miDate() + '&board=' + state.miBoard + '&h=' + state.miHorizon;
+  if (state.miSector) next += '&sector=' + encodeURIComponent(state.miSector);
+  if (location.hash !== next) history.replaceState(null, '', next);
+}
+
+
 function renderView() {
   const route = state.route;
   let html = '';
@@ -7470,6 +9300,7 @@ function renderView() {
   else if (route === '#/paper') html = renderPaper();
   else if (route === '#/reviews') html = renderReviews();
   else if (route === '#/experience') html = renderExperience();
+  else if (route === '#/market-intel') html = renderMarketIntel();
   else if (route.startsWith('#/system/')) {
     const key = govTabKey();
     if (key === 'overview') html = renderOverview();
@@ -7479,11 +9310,15 @@ function renderView() {
     else html = renderOverview();
   } else {
     const info = PLACEHOLDERS[route];
-    html = info ? renderPlaceholder(info) : renderOverview();
+    html = info ? renderPlaceholder(info) : renderWorkspaceOverview();
   }
   $('#view').innerHTML = html;
   hydrateIcons($('#view'));
   bindPage();
+  if (state.miDrawerPending && state.miSector) {
+    state.miDrawerPending = false;
+    openDrawer('mi-sector', state.miSector);
+  }
 }
 
 function refreshAll() {
@@ -7517,6 +9352,14 @@ function bindPage() {
   if (cSearch) cSearch.addEventListener('input', (e) => { state.candQuery = e.target.value; refreshCandList(); });
   const cTier = $('#cand-tier');
   if (cTier) cTier.addEventListener('change', (e) => { state.candTier = e.target.value; refreshCandList(); });
+  const miSel = $('#mi-date');
+  if (miSel) miSel.addEventListener('change', (e) => {
+    state.miDate = e.target.value;
+    state.miSector = null;
+    closeDrawer();
+    renderView();
+    syncMarketIntelHash();
+  });
 }
 
 function renderFactorsTableOnly() {
@@ -7551,7 +9394,7 @@ function openDrawer(kind, payload) {
     title = '导航与交互设计说明';
     sub = '原型所依据的判断，供你验收时对照';
     body = '<ol class="note-list">' +
-      '<li><b>按交易节奏分组：</b>今日 → 研究 → 计划 → 复盘 → 系统。左侧从 17 项压到 14 项，先解决「每天先看什么」。</li>' +
+      '<li><b>按交易节奏分组：</b>今日 → 研究 → 计划 → 复盘 → 系统。左侧从 17 项压到 12 项，先解决「每天先看什么」；行业消息雷达、游资追踪、交易知识库按实际使用反馈移出导航。</li>' +
       '<li><b>工作台总览改行动卡：</b>九张数据卡平铺回答不了「现在该干嘛」。四张行动卡直接把待办条目摆出来（决策 / 可建仓 / 风控 / 复盘），卡内每条都能直达处理现场；市况与持仓压成摘要行，后台任务与留痕收进底部。</li>' +
       '<li><b>治理页收进一个工作区：</b>治理总览、规则审计、因子回测、能力地图合并为「系统与治理」下的四个 Tab，低频页面不再占满侧边栏。</li>' +
       '<li><b>规则审计从看板改为队列：</b>五列拖拽很难回答「我现在该处理什么」，还容易误操作。现在按状态分队列，右边就地决策。</li>' +
@@ -7637,6 +9480,10 @@ function openDrawer(kind, payload) {
       :
       '<div class="empty-list"><strong>没有运行中的任务</strong>提交增量 AI 审核或重新审核后，任务进度会显示在这里。</div>' +
       '<div class="cap-note" style="margin-top:14px">' + icon('clock') + '<div>正式接入后，规则 AI 审核、因子回测、建仓方案生成等后台任务会在这里显示进度，并在完成时通知当前页面刷新。</div></div>');
+  } else if (kind === 'mi-sector') {
+    title = payload + ' · 板块判定链路';
+    sub = miDate() + ' 快照 → 结构 → 前瞻 → 归因 → 后验';
+    body = miSectorDrawerHtml(payload);
   }
   root.innerHTML = '<div class="drawer-mask" data-drawer-mask><div class="drawer" role="dialog" aria-modal="true">' +
     '<div class="drawer-head"><div><div class="drawer-title">' + esc(title) + '</div><div class="drawer-sub">' + esc(sub) + '</div></div>' +
@@ -7970,6 +9817,7 @@ document.addEventListener('click', (e) => {
   if (action === 'sgs-audit-now') { auditSugNow(el.dataset.sgs); return; }
   if (action === 'sgs-audit-all') { auditAllSugs(); return; }
   if (action === 'sgs-rollback') { rollbackSug(el.dataset.sgs); return; }
+  if (action.indexOf('mi-') === 0) { handleMarketIntelAction(action, el); return; }
   if (action.indexOf('pp-') === 0) { handlePaperAction(action, el); return; }
   if (action.indexOf('hd-') === 0) { handleHdAction(action, el); return; }
   /* 就地裁决：列表行上直接处理，处理完自动跳下一条 */
