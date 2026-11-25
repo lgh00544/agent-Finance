@@ -421,6 +421,13 @@ const state = {
   factorCategory: '',
   factorQuery: '',
   factorConfirm: null,
+  scDate: '2026-11-16',
+  scGrade: '',
+  scSig: '',
+  scSrc: '',
+  scSort: 'score',
+  scFocus: '',
+  scBusy: {},
   candId: '603501',
   candQuery: '',
   candTier: '',
@@ -711,7 +718,6 @@ const GOV_TABS = [
 
 const PLACEHOLDERS = {
   '#/alerts': { title: '告警日志', desc: '下一批设计：按严重度分组，支持一键进入对应持仓或规则。', scope: ['严重度分组与已读状态', '告警 → 持仓 / 规则 / 复盘 的深链', '保留原始 payload 折叠查看'] },
-  '#/scores': { title: '评分报告', desc: '下一批设计：评分表 + 详情抽屉，采纳状态更清晰。', scope: ['A/B/C 分级筛选', '六因子解释与风险计数', '一键去建仓计划'] },
   '#/agent-chat': { title: 'Agent 对话', desc: '下一批设计：保留看板化对话，接入治理留痕。', scope: ['任务型对话与普通问答分流', '任务状态与结果卡片', '留痕与治理深链'] }
 };
 
@@ -744,6 +750,16 @@ function parseRoute() {
       const row = PLANS.find((q) => String(q.id) === x);
       if (row) state.plExpand[row.id] = true;
     });
+  }
+  if (path === '#/scores') {
+    const sp = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
+    const sd = sp.get('date');
+    if (sd && scDates().indexOf(sd) >= 0) state.scDate = sd;
+    const sc = sp.get('code');
+    if (sc) state.scFocus = sc;
+    const sg = sp.get('grade');
+    if (sg && ['A', 'B', 'C'].indexOf(sg) >= 0) state.scGrade = sg;
+    if (sp.get('filter') === 'potential') state.scSig = 'pot';
   }
   if (path === '#/candidates') {
     const params = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
@@ -1734,7 +1750,7 @@ const WO_TASK_RULES = [
 /* 今天动作与发现：上面没列出来的产出（重复标题会自动隐藏，处理完一件这条就消失） */
 const WO_FEED_SEED = [
   { t: '16:35', who: 'ai', title: '模拟盘今天平仓 1 笔', body: '宁德时代 +1,304.96（已扣费用）。这是模拟仓，不是你账户里的持仓。', nav: '#/paper?acc=901&tab=executions' },
-  { t: '16:10', who: 'ai', title: '挖掘选出 8 只候选，3 只可建仓', body: '韦尔股份 88 分、紫光国微 84 分、航发动力 81 分；另外 3 只「建议关注」、2 只「观察」。', nav: '#/candidates?mode=today' },
+  { t: '16:10', who: 'ai', title: '挖掘选出 8 只候选，3 只可建仓', body: '韦尔股份 88 分、紫光国微 84 分、航发动力 81 分；另外 3 只「建议关注」；2 只打分没跑完，未评级只能观察。', nav: '#/candidates?mode=today' },
   { t: '15:40', who: 'ai', title: '行情结构进入主线确认段', body: 'CPO光模块连续 4 日领涨，60 日箱位中位 70%；但算力租赁只是跟随，独立证据缺失。', nav: '#/market-intel?date=' + WO_TODAY },
   { t: '15:02', who: 'sys', title: '模拟盘放到今天第 3 轮', body: '09:35 那一轮成交后模拟总资产 306,727.96 元（+2.24%），下一轮 2026-11-17 09:33。', nav: '#/paper?acc=901' },
   { t: '10:20', who: 'ai', title: '2 个因子连续 3 个月失效', body: '动量 20 日、换手突增：|IC| < 0.02，样本 n=1820，建议退出每日打分。要你点头才会从打分里摘掉。', nav: '#/system/factors' }
@@ -2392,7 +2408,7 @@ const CANDIDATE_POOL = [
     ],
     traces: [
       { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：板块动量 + 量价突破，初筛通过。' },
-      { source: 'Score', time: '11-16 11:20', summary: '评分 88（技术 30/题材 28/资金 30）。' },
+      { source: 'Score', time: '11-16 16:52', summary: '六因子评分 88 分（加权 84 + 微调 4）：动量 9、催化 9、主线 9、资金 9、基本面 8、估值 6 → A 档。' },
       { source: 'MarketAudit', time: '11-16 14:05', summary: '审计有效档 A，通过率 6/7。' }
     ]
   },
@@ -2412,12 +2428,12 @@ const CANDIDATE_POOL = [
     ],
     traces: [
       { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：题材动量 + 基本面共振。' },
-      { source: 'Score', time: '11-16 11:20', summary: '评分 84（技术 28/题材 30/资金 26）。' }
+      { source: 'Score', time: '11-16 16:53', summary: '六因子评分 84 分（加权 79.5 + 微调 4.5）：催化与动量各 9，估值 5 偏弱 → A 档。' }
     ]
   },
   {
     stock_code: '600893', stock_name: '航发动力', trade_date: '2026-11-16', rank: 3,
-    score: 81, tier: 'B', label: '可建仓', price_zone: '41 - 43',
+    score: 81, tier: 'A', label: '可建仓', price_zone: '41 - 43',
     snapshot: { chg: 1.38, amount: '19.8 亿', turnover: '2.1%' },
     trend: [38.9, 39.4, 39.1, 40.0, 40.6, 41.2, 41.0, 41.8],
     conclusion: '军工景气延续，合同负债环比 +12% 指示在手订单充足；81 分可建仓，弹性中等偏稳。',
@@ -2431,15 +2447,16 @@ const CANDIDATE_POOL = [
     ],
     traces: [
       { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：基本面动量。' },
-      { source: 'Score', time: '11-16 11:20', summary: '评分 81（技术 26/题材 27/资金 28）。' }
+      { source: 'Score', time: '11-16 16:55', summary: '六因子评分 81 分（加权 77 + 微调 4）：五项看多、无看空 → A 档；估值 6 是唯一短板。' }
     ]
   },
   {
     stock_code: '002371', stock_name: '北方华创', trade_date: '2026-11-16', rank: 4,
-    score: 79, tier: 'B', label: '建议关注', price_zone: '318 - 326',
+    score: 79, tier: 'A', label: '建议关注', price_zone: '310 - 318',
+    gate: '买点未到：现价 323.00 已越过首档买入区 310 - 318，等回踩',
     snapshot: { chg: 3.41, amount: '35.4 亿', turnover: '3.9%' },
     trend: [298, 301, 306, 310, 308, 314, 319, 323],
-    conclusion: '设备招标放量直接受益，但当日涨幅偏大、量能未完全跟上，先观察回踩确认。',
+    conclusion: '评分 79 分 A 档，但现价已越过首档买入区，买点未验证 → 先观察回踩确认。',
     horizon: { bias: '偏多', clarity: '中' },
     reasons: ['半导体设备招标放量，中标 12 亿元', '板块主线核心标'],
     risk: '单日涨幅 3.4% 追高风险，等待回踩 5 日线。',
@@ -2450,13 +2467,14 @@ const CANDIDATE_POOL = [
     ],
     traces: [
       { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：事件驱动。' },
-      { source: 'Score', time: '11-16 11:20', summary: '评分 79（技术 27/题材 29/资金 23）。' }
+      { source: 'Score', time: '11-16 16:56', summary: '六因子评分 79 分（加权 74 + 微调 5，用满上限）：五项看多 → A 档，但现价已高出首档买入区。' }
     ]
   },
   {
     stock_code: '300399', stock_name: '天孚通信', trade_date: '2026-11-16', rank: 5,
-    score: 77, tier: 'B', label: '建议关注', price_zone: '—',
+    score: 77, tier: 'A', label: '建议关注', price_zone: '—',
     blocked: '当日涨幅超 9%，触发追高拦截',
+    gate: '买点未到：现价 66.20 高于买入区 61 - 63，且当日已触发追高拦截',
     snapshot: { chg: 9.18, amount: '28.9 亿', turnover: '7.2%' },
     trend: [58.2, 59.8, 61.0, 60.4, 62.2, 63.5, 64.8, 66.2],
     conclusion: '光模块景气度高，但当日大涨触发追高拦截；进入观察，回踩不破 5 日线再评估。',
@@ -2470,15 +2488,17 @@ const CANDIDATE_POOL = [
     ],
     traces: [
       { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：业绩动量。' },
+      { source: 'Score', time: '11-16 16:57', summary: '六因子评分 77 分（加权 72.5 + 微调 4.5）：主线契合 8、资金面 7（换手 5.4% 偏高）→ A 档。' },
       { source: 'Monitor', time: '11-16 14:32', summary: '追高拦截：涨幅超阈值，转入观察。' }
     ]
   },
   {
     stock_code: '601012', stock_name: '隆基绿能', trade_date: '2026-11-16', rank: 6,
-    score: 76, tier: 'B', label: '建议关注', price_zone: '19.2 - 19.8',
+    score: 76, tier: 'A', label: '建议关注', price_zone: '18.6 - 19.2',
+    gate: '买点未到：现价 19.30 高于首档买入区 18.6 - 19.2',
     snapshot: { chg: 0.86, amount: '17.3 亿', turnover: '1.8%' },
     trend: [18.1, 18.4, 18.2, 18.7, 18.9, 19.0, 19.1, 19.3],
-    conclusion: '硅料价格企稳 + 出口回暖，行业左侧信号；评分未达可建仓线，先关注量能持续性。',
+    conclusion: '评分 76 分 A 档，但现价在买入区上方，买点未到；左侧信号仍在，等回踩确认量能。',
     horizon: { bias: '中性', clarity: '低' },
     reasons: ['光伏组件出口数据超预期', '硅料价格企稳'],
     risk: '行业产能出清未完成，反弹持续性存疑。',
@@ -2489,15 +2509,16 @@ const CANDIDATE_POOL = [
     ],
     traces: [
       { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：行业反转信号。' },
-      { source: 'Score', time: '11-16 11:20', summary: '评分 76（技术 24/题材 26/资金 26）。' }
+      { source: 'Score', time: '11-16 16:59', summary: '六因子评分 76 分（加权 72 + 微调 4）：估值 8 是本轮唯一看多的估值项，主线契合 6 拖累共振。' }
     ]
   },
   {
     stock_code: '688981', stock_name: '中芯国际', trade_date: '2026-11-16', rank: 7,
-    score: 74, tier: 'C', label: '观察', price_zone: '—',
+    score: null, tier: null, label: '观察', price_zone: '—',
+    unscored: '今天没跑完打分：17:00 送评后行情接口超时，评分表里没有这条记录 → 未评级',
     snapshot: { chg: -0.62, amount: '12.1 亿', turnover: '1.2%' },
     trend: [88.4, 87.6, 88.0, 87.2, 86.8, 87.5, 86.9, 86.4],
-    conclusion: '代工价格仍在底部，左侧信号但右侧未确认；观察池跟踪，不入建仓队列。',
+    conclusion: '打分没跑完，没有权威评级；按口径无评分不得标可建仓，观察池跟踪。',
     horizon: { bias: '中性', clarity: '低' },
     reasons: ['国产替代长逻辑', '产能利用率缓慢回升'],
     risk: '代工价格尚未反转，右侧信号缺失。',
@@ -2505,15 +2526,17 @@ const CANDIDATE_POOL = [
     volume: '缩量整理。',
     news: [],
     traces: [
-      { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：长逻辑观察。' }
+      { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：长逻辑观察。' },
+      { source: 'Score', time: '11-16 17:00', summary: '打分失败：行情批量接口 6 秒未返回（DataSourceError），未写入评分表 → 未评级。' }
     ]
   },
   {
     stock_code: '000725', stock_name: '京东方A', trade_date: '2026-11-16', rank: 8,
-    score: 71, tier: 'C', label: '观察', price_zone: '—',
+    score: null, tier: null, label: '观察', price_zone: '—',
+    unscored: '今天没跑完打分：17:01 送评后行情接口超时，评分表里没有这条记录 → 未评级',
     snapshot: { chg: -1.85, amount: '9.8 亿', turnover: '1.5%' },
     trend: [4.32, 4.28, 4.30, 4.24, 4.21, 4.18, 4.15, 4.12],
-    conclusion: '面板价格环比回落，利空落地但右侧未起；观察池继续跟踪价格拐点。',
+    conclusion: '打分没跑完，没有权威评级；面板价格回落只是背景，进观察池等拐点。',
     horizon: { bias: '偏空', clarity: '中' },
     reasons: ['面板价格弱反弹后回落'],
     risk: '三季度面板价格环比回落 3%，短期承压。',
@@ -2523,7 +2546,8 @@ const CANDIDATE_POOL = [
       { time: '14:18', source: '公司公告', title: '京东方A：三季度面板价格环比回落 3%', sentiment: 'neg' }
     ],
     traces: [
-      { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：行业周期观察。' }
+      { source: 'Discover', time: '11-16 09:12', summary: '候选挖掘：行业周期观察。' },
+      { source: 'Score', time: '11-16 17:01', summary: '打分失败：同一次行情接口超时，未写入评分表 → 未评级。' }
     ]
   }
 ];
@@ -2550,9 +2574,9 @@ const CAND_LEVEL_NUM = {
   '603501': { sup: 100.2, res: 106.5, buy: [102, 104] },
   '002049': { sup: 75.8, res: 82, buy: [78, 80] },
   '600893': { sup: 39.5, res: 43.5, buy: [41, 43] },
-  '002371': { sup: 310, res: 330, buy: [318, 326] },
+  '002371': { sup: 310, res: 330, buy: [310, 318] },
   '300399': { sup: 61, res: 68, buy: [61, 63] },
-  '601012': { sup: 18.4, res: 20.5, buy: [19.2, 19.8] },
+  '601012': { sup: 18.4, res: 20.5, buy: [18.6, 19.2] },
   '688981': { sup: 85, res: 92, buy: null },
   '000725': { sup: 4.05, res: 4.35, buy: null }
 };
@@ -2679,7 +2703,7 @@ function candDetailHtml(c) {
       '<div class="cp-conclusion">' + esc(c.conclusion) + '</div>' +
       '<dl class="kv">' +
         '<dt>评分</dt><dd>' + (c.score == null
-          ? '<span class="cp-manual">人工加入 · 未评分</span>'
+          ? '<span class="cp-manual">' + esc(c.unscored || '人工加入 · 未评分') + '</span>'
           : '<b class="cp-score-lg">' + c.score + '</b><span class="hint">· ' + esc(c.tier) + ' 档 · ' + esc(c.label) + '</span>') + '</dd>' +
         '<dt>前瞻</dt><dd>' + tag('前瞻·' + c.horizon.bias, c.horizon.bias === '偏多' ? 'blue' : 'outline') + ' <span class="hint">清晰度 ' + esc(c.horizon.clarity) + '</span></dd>' +
         '<dt>量价资金</dt><dd>' + esc(c.volume) + '</dd>' +
@@ -2690,7 +2714,12 @@ function candDetailHtml(c) {
       '<ul class="cp-bullets">' + (c.reasons || []).map((r) => '<li>' + esc(r) + '</li>').join('') + '</ul>' +
       '<div class="cp-list-title">风险点</div>' +
       '<div class="cp-risk">' + icon('alert') + '<div>' + esc(c.risk) + '</div></div>' +
-      (c.blocked ? '<div class="cp-risk">' + icon('ban') + '<div>' + esc(c.blocked) + '（系统拦截，转观察池）</div></div>' : '');
+      (c.blocked ? '<div class="cp-risk">' + icon('ban') + '<div>' + esc(c.blocked) + '（系统拦截，转观察池）</div></div>' : '') +
+      (c.gate ? '<div class="cp-risk">' + icon('compass') + '<div>' + esc(c.gate) + '</div></div>' : '') +
+      (c.score != null ? '<div class="cap-note">' + icon('info') + '<div>档位是评分口径，能不能建仓是另一道判定：' +
+        '要同时满足评级达门槛、现价进入建仓方案首档区间、没有重大利空。' +
+        (c.label === '可建仓' ? '这只三条都满足。' : '这只没全满足，所以档位够也先进关注。') +
+        '</div></div>' : '');
   } else if (state.candTab === 'news') {
     tabBody = (c.news || []).length
       ? '<div class="cp-news-list">' + c.news.map(candNewsItem).join('') + '</div>' +
@@ -2717,6 +2746,7 @@ function candDetailHtml(c) {
       '<div class="spacer"></div>' +
       '<div class="cp-acts">' +
         '<button class="btn sm" data-action="cand-kline" data-cand="' + c.stock_code + '">' + icon('chart', 'sm') + '看K线</button>' +
+        '<button class="btn sm" data-nav="#/scores?code=' + esc(c.stock_code) + '">' + icon('review', 'sm') + (c.score == null ? '看打分记录' : '看评分依据') + '</button>' +
         '<div class="cp-ext">' + quoteUrls(c.stock_code).map((q) =>
           '<a class="btn link xs" href="' + q.url + '" target="_blank" rel="noopener noreferrer">' + esc(q.name) + ' ' + icon('external', 'sm') + '</a>').join('') + '</div>' +
         '<button class="btn primary sm" data-action="cand-gen" data-cand="' + c.stock_code + '">' + icon('plan', 'sm') + '生成建仓方案</button>' +
@@ -2728,6 +2758,567 @@ function candDetailHtml(c) {
     ).join('') + '</div>' +
     '<div class="cp-tab-body">' + tabBody + '</div>' +
   '</div>';
+}
+
+/* ================= 评分报告（#/scores） =================
+   生产对应 stock_score 表：唯一键 stock_code + trade_date，一天一条，重打分覆盖旧记录。
+   分数是模型输出（ScoreOutput v4.0 六因子），不是代码算出来的：
+     score ≈ Σ(因子分 × 权重) × 10，允许 ±5 分微调，微调方向须与各因子信号一致（score_prompt.py:68-70）。
+   分级：A ≥ 75 且 ≥4 因子看多、无看空 / B 55-74 / C < 55（score_prompt.py:72-76）。
+   缓存键 code:date:v4:f{因子指纹}:h{游资指纹}，24 小时有效（score.py:313/330）——
+   当天重跑通常命中缓存拿到同一个分，只有因子状态/权重被人工改过，指纹变了才会真的重算。 */
+const SC_W = [
+  { key: '动量', w: 20, note: '均线排列、MACD/RSI、量价配合、5/20 日涨跌、距高低点。5 日涨幅超 30% 算已拉升期，须给低分。' },
+  { key: '催化', w: 20, note: '新闻与公告里的事件催化：政策、业绩预告、订单、重组、技术突破。' },
+  { key: '估值', w: 15, note: 'PE/PB/PS 相对行业的位置、PEG、市值与成长是否匹配。' },
+  { key: '主线契合', w: 15, note: '所属板块是不是当前主线、板块相对大盘强弱、资金关注度。' },
+  { key: '资金面', w: 15, note: '主力资金净流入与占比、换手是否活跃。' },
+  { key: '基本面质量', w: 15, note: 'ROE、毛利率、净利同比、负债率、现金流质量。' }
+];
+const SC_TODAY = '2026-11-16';
+const SC_BATCH = {
+  '2026-11-16': '今天 16:50 信号扫描批量送评：候选池 8 只 + 你人工加送 3 只',
+  '2026-11-13': '上周五 16:50 批次（对照用）：当时大盘进入缩量段，分数整体偏低'
+};
+
+/* f 的顺序固定同 SC_W：动量 / 催化 / 估值 / 主线契合 / 资金面 / 基本面质量（0-10 整数）
+   why 为该因子的打分依据（生产要求引用具体数据，30-80 字）；adj 为模型微调，须 |adj| ≤ 5 */
+const SCORES = [
+  { code: '603501', name: '韦尔股份', date: SC_TODAY, src: '候选池', rank: 1, at: '16:52:41', dur: '2 分 18 秒', rounds: 7,
+    f: [9, 9, 6, 9, 9, 8], adj: 4, score: 88, potential: false,
+    why: ['MA5>MA10>MA20 多头排列，MACD 零轴上金叉，5 日 +6.4%、20 日 +14.2%，量价配合，未到已拉升期',
+          '半导体设备招标放量 + CIS 四季度出货指引上调，两条都是本周新出现的产业证据',
+          'PE(TTM) 38 倍处近 3 年 78 分位，PEG 1.3；不便宜但也没到极端，不给看空',
+          '半导体是当前主线，板块 5 日跑赢沪深 300 约 4.1%，资金关注度在主线内部靠前',
+          '近 5 日主力净流入 3.1 亿、占成交额 4.1%，换手 4.1% 属活跃但不过热',
+          'ROE 18.4%、毛利率 32.1%，净利同比 +21%，负债率 27%，经营现金流为正'],
+    verdict: '可低吸建仓，首仓不超过单股上限的一半',
+    risks: ['板块拥挤度偏高，短线追高后回撤空间大', '估值分位 78%，安全边际一般'],
+    cross: 'Discover 以「半导体主线放量 + 量价突破」选中，Score 六因子验证：动量、催化、主线、资金四项共振，与选股逻辑一致。',
+    think: ['先看日线结构：站上 MA20 且 5 日涨幅 6.4%，仍在可介入段，动量给 9。',
+            '催化只认本周新增证据（招标 + 出货指引），旧研报重复引用不计分。',
+            '估值是唯一中性项：78 分位不便宜，但主线资金未撤，不按看空处理。'] },
+  { code: '002049', name: '紫光国微', date: SC_TODAY, src: '候选池', rank: 2, at: '16:54:02', dur: '1 分 52 秒', rounds: 6,
+    f: [9, 9, 5, 8, 8, 8], adj: 4.5, score: 84, potential: false,
+    why: ['回踩 MA10 未破，MACD 缩口后重新开口，5 日 +4.8%，量价健康',
+          '特种芯片招标落地，国产化率目标上调，属政策 + 订单双重催化',
+          'PE 45 倍、PB 6.1，处行业偏高位置；成长兑现依赖订单节奏',
+          '军工电子 + 国产替代都在主线范围内，板块相对强度中等偏上',
+          '主力 5 日净流入 1.9 亿、占比 3.3%，换手 3.3%',
+          'ROE 16.2%、毛利率 41%，净利同比 +18%，负债率 22%，现金流充沛'],
+    verdict: '可建仓，但估值分位高，建议分三档慢慢加',
+    risks: ['估值分位偏高，业绩不及预期时杀估值空间大', '特种芯片订单确认周期长，季度间波动大'],
+    cross: 'Discover 以「国产替代订单落地」选中，Score 六因子验证：动量与催化一致，估值偏弱，建议关注但谨慎加仓。',
+    think: ['回踩不破 MA10 + 缩口再开口，动量给 9 而不是 10（未创阶段新高）。',
+            '订单类催化兑现慢，分数记 9 但在风险里写明确认周期。',
+            '估值给 5：PE 45 倍偏高，靠 41% 毛利率与 ROE 撑住，不看空。'] },
+  { code: '600893', name: '航发动力', date: SC_TODAY, src: '候选池', rank: 3, at: '16:55:20', dur: '1 分 41 秒', rounds: 6,
+    f: [8, 8, 6, 8, 8, 8], adj: 4, score: 81, potential: false,
+    why: ['MA20 上方整理 6 日，缩量不破位，5 日 +2.6%，属稳健推进而非拉升',
+          '航发列装节奏与维修后市场放量，公告口径变化不大，催化中等偏强',
+          'PE 62 倍、PB 4.3，长期看贵，但订单可见度给了估值容忍',
+          '军工主机厂属主线外围，板块 5 日相对强度 +1.8%',
+          '主力 5 日净流入 1.2 亿、占比 2.7%，换手 2.1%',
+          'ROE 8.1% 偏低但改善中，毛利率 15%，净利同比 +16%，负债率 58%'],
+    verdict: '可建仓，波动小、周期长，按周而不是按天看',
+    risks: ['ROE 偏低，靠订单兑现驱动，节奏慢', '负债率 58%，高于其余候选'],
+    cross: 'Discover 以「军工主机厂订单可见度」选中，Score 因子验证：资金与主线一致，动量偏温和，结论一致。',
+    think: ['缩量不破位算健康的动量 8，不给 9 是因为没有放量确认。',
+            '负债率 58% 与 ROE 8.1% 拉低基本面质量，但仍在看多线上。',
+            '催化来自长期列装节奏，不是本周事件，权重给 8。'] },
+  { code: '002371', name: '北方华创', date: SC_TODAY, src: '候选池', rank: 4, at: '16:56:38', dur: '1 分 58 秒', rounds: 7,
+    f: [8, 8, 5, 8, 8, 7], adj: 5, score: 79, potential: false,
+    why: ['站上 MA20 后连续 3 日小阳，5 日 +5.1%，距 60 日高点 4.2%',
+          '设备招标持续放量 + 国产化率目标上调，与韦尔共用同一条产业证据',
+          'PE 41 倍处近 3 年 71 分位，合同负债增长部分对冲了估值',
+          '半导体设备是主线内最强分支之一，板块资金关注度靠前',
+          '主力 5 日净流入 2.4 亿、占比 3.8%，换手 3.0%',
+          'ROE 15.8%、毛利率 40%，净利同比 +34%，负债率 44%，现金流为正'],
+    verdict: '建议关注：买点未验证，且与韦尔共用同一条产业逻辑，注意合并板块暴露',
+    risks: ['与韦尔股份同板块，同时持有会让单板块暴露超过 30%', '估值分位 71%，主线退潮时回撤会放大'],
+    cross: 'Discover 以「设备招标放量」选中，Score 六因子验证：与选股逻辑一致，但需与韦尔合并看板块暴露。',
+    think: ['和韦尔共用同一批产业证据，催化同分但边际新鲜度略低。',
+            '净利 +34% 让估值分位 71% 变得可接受，估值仍只给 5。',
+            '微调 +5 用满：因子高度共振（5 项看多、0 项看空）。'] },
+  { code: '300399', name: '天孚通信', date: SC_TODAY, src: '候选池', rank: 5, at: '16:57:55', dur: '1 分 33 秒', rounds: 6,
+    f: [8, 8, 6, 8, 7, 6], adj: 4.5, score: 77, potential: false,
+    why: ['MA5 上穿 MA20，5 日 +7.2%，量增价升但已接近前高压力',
+          'CPO 光模块主线确认段，800G 订单指引上修，催化明确',
+          'PE 33 倍处行业中位，估值不贵但业绩预期已打满',
+          'CPO 是本周主线核心，板块连续 4 日领涨',
+          '主力 5 日净流入 1.1 亿、占比 2.2%，换手 5.4% 偏高',
+          'ROE 22%，毛利率 45%，净利同比 +28%，负债率低，现金流好'],
+    verdict: '建议关注：等回踩 5 日线再动手，不追前高',
+    risks: ['换手 5.4% 偏高，短线分歧加大', '60 日箱位已到 90 分位，追高风险与延续概率同时抬高'],
+    cross: 'Discover 以「CPO 主线放量」选中，Score 因子验证：方向一致，但箱位与换手提示不宜追高。',
+    think: ['前高压力 + 换手 5.4% 让资金面只给 7，不给 8。',
+            '估值行业中位给 6：不贵，但 800G 预期已计入价格。',
+            '主线契合给 8 而非 9：连续 4 日领涨意味着进入加速段，风险同步上升。'] },
+  { code: '601012', name: '隆基绿能', date: SC_TODAY, src: '候选池', rank: 6, at: '16:59:10', dur: '2 分 06 秒', rounds: 7,
+    f: [7, 8, 8, 6, 7, 7], adj: 4, score: 76, potential: false,
+    why: ['底部放量突破 MA60 后回踩确认，5 日 +3.4%，弹性仍在修复期',
+          '组件价格止跌 + 行业限产口径，光伏链出现拐点信号',
+          'PB 1.9 处近 5 年 12 分位，是本轮候选里最便宜的一只',
+          '光伏还不是当前主线，属于主线外围的轮动候选',
+          '主力 5 日净流入 0.9 亿、占比 1.6%，换手 2.8%',
+          'ROE 9.4%，毛利率 14%（仍承压），净利同比 +9%，负债率 56%'],
+    verdict: '建议关注：估值与催化到位，主线尚未确认',
+    risks: ['板块未进入主线，独立走强的证据不足', '毛利率仍在承压，拐点要靠下一份财报确认'],
+    cross: 'Discover 以「光伏拐点信号」选中，但 Score 因子发现主线契合与资金面偏弱，建议关注但谨慎。',
+    think: ['PB 12 分位给估值 8，这是本轮唯一估值看多的候选。',
+            '毛利率 14% 压制基本面质量到 7，不看空但也不看多。',
+            '板块相对强度不足：主线契合 6，构成与 Discover 的偏差项。'] },
+  { code: '688981', name: '中芯国际', date: SC_TODAY, src: '候选池', rank: 7, at: '17:00:26', dur: '1 分 47 秒', rounds: 6,
+    status: 'failed', error: '行情批量接口 6 秒没返回（DataSourceError）——与 15:07 起红线扫描、15:58 全量持仓监控是同一个故障',
+    f: [8, 8, 5, 7, 7, 7], adj: 2.5, score: 74, potential: false,
+    why: ['沿 MA10 上行，5 日 +4.2%，量能温和放大未过热',
+          '先进制程产能利用率回升 + 国产替代订单，催化持续但没有新增事件',
+          'PB 3.4 处行业偏高，重资产口径下 PE 参考意义有限',
+          '半导体主线内的代工环节，板块强于大盘但弹性低于设备',
+          '主力 5 日净流入 1.4 亿、占比 1.9%，换手 1.6%',
+          'ROE 4.2% 偏低，毛利率 21%，净利同比 +11%，资本开支重'],
+    verdict: '建议关注：74 分差 1 分到 A 档线，本周没有新增催化',
+    risks: ['ROE 4.2%，重资产模式下盈利弹性有限', '催化为存量逻辑，缺少本周新证据'],
+    cross: 'Discover 以「产能利用率回升」选中，Score 因子验证：方向一致但强度不足，降级为关注。',
+    think: ['存量催化给 8，不给 9：没有本周新事件。',
+            'PB 高 + PE 失真，估值只给 5。',
+            '微调只加 2.5：六因子里没有一项看多满配，不支撑大改。'] },
+  { code: '000725', name: '京东方A', date: SC_TODAY, src: '候选池', rank: 8, at: '17:01:44', dur: '1 分 29 秒', rounds: 5,
+    status: 'failed', error: '行情批量接口 6 秒没返回（DataSourceError）——同一次故障连带的第二条，未写入评分表',
+    f: [8, 6, 7, 6, 7, 6], adj: 4, score: 71, potential: false,
+    why: ['突破半年线后连续 2 日站稳，5 日 +3.8%，但上方套牢盘密集',
+          '面板价格连续 3 周持平，没有明确向上催化，只算企稳',
+          'PB 1.3 处近 5 年 28 分位，估值安全边际较厚',
+          '消费电子面板不在本周主线内，板块相对强度 +0.4%',
+          '主力 5 日净流入 1.0 亿、占比 1.2%，换手 1.9%',
+          'ROE 5.6%，毛利率 16%，净利同比 +7%，负债率 52%'],
+    verdict: '建议关注：估值便宜但不是主线，等催化出现再说',
+    risks: ['缺少新增催化，靠估值驱动的修复容易半途熄火', '上方套牢盘密集，突破后回抽概率高'],
+    cross: 'Discover 以「面板价格企稳 + 低估值」选中，Score 因子发现催化不足，建议维持关注而不是建仓。',
+    think: ['面板价格持平只是企稳，催化给 6 而非 8。',
+            'PB 28 分位给估值 7，是本周第二便宜的标的。',
+            '不在主线内，主线契合 6，与 Discover 的分歧点就在这里。'] },
+  { code: '601138', name: '工业富联', date: SC_TODAY, src: '人工', rank: null, at: '15:12:36', dur: '2 分 02 秒', rounds: 8,
+    f: [6, 7, 7, 5, 6, 7], adj: 4.5, score: 68, potential: false,
+    why: ['横盘 11 日，MA20 上下反复穿越，5 日 +0.6%，方向不明',
+          'AI 服务器出货预期在，但本周没有新公告或订单证据',
+          'PE 22 倍处近 3 年 44 分位，估值合理',
+          '算力代工环节，本周资金在外围题材打游击，主线契合度下降',
+          '主力 5 日净流出 0.4 亿，换手 1.1%，量能清淡',
+          'ROE 18%，毛利率 8.6%（代工口径），净利同比 +13%，现金流稳'],
+    verdict: '关注：方向不明 + 资金清淡，不给建仓档',
+    risks: ['主力近 5 日净流出，缺少资金支撑', '毛利率 8.6%，业绩弹性主要靠量而不靠价'],
+    cross: '',
+    crossNote: '你手动送评的标的，不在今天的候选池里，没有 Discover 选股理由可比 → 生产这条字段输出空串（score_prompt.py:86）。',
+    think: ['横盘 11 日、5 日只涨 0.6%，动量给中性 6。',
+            'AI 服务器是存量预期，本周无新证据，催化 7。',
+            '主力净流出是这条结论的主要压制项。'] },
+  { code: '002230', name: '科大讯飞', date: SC_TODAY, src: '人工', rank: null, at: '14:26:18', dur: '2 分 44 秒', rounds: 8,
+    f: [4, 9, 5, 7, 6, 6], adj: 0, score: 62, potential: true,
+    why: ['跌破 MA20 后连续 4 日未能收复，5 日 -3.7%，处缩量阴跌段',
+          '教育大模型中标 + 国产算力合作两条新公告，催化强',
+          'PE 58 倍处近 3 年 63 分位，估值不便宜',
+          'AI 应用属主线范围内，但资金集中在算力硬件，应用端未被定价',
+          '主力 5 日净流出 0.6 亿，换手 2.4%，承接不足',
+          'ROE 6.8%，毛利率 40%，净利同比 +5%，回款周期长'],
+    verdict: '关注：催化强但价格没走，属于"尚未被定价"那一类',
+    risks: ['主力净流出 + 未收复 MA20，左侧接飞刀风险', '净利同比只有 +5%，估值 63 分位缺兑现支撑'],
+    cross: '',
+    crossNote: '人工送评，不在候选池内，无交叉验证结论。',
+    potentialNote: '催化 9 分、动量只有 4 分：模型判断事件催化尚未被价格反映，标为潜力。',
+    think: ['动量给 4：跌破 MA20 未收复，5 日 -3.7%。',
+            '催化给 9：两条公告都是本周新增、可验证的产业证据。',
+            '强催化 + 弱动量 → 潜力标识，但不改分，只提示重点关注。'] },
+  { code: '688521', name: '芯原股份', date: SC_TODAY, src: '人工', rank: null, at: '15:41:07', status: 'failed',
+    error: '行情批量接口 6 秒没返回（DataSourceError）—— 与 15:07 起红线扫描、15:58 全量持仓监控是同一个故障',
+    dur: '1 分 55 秒', rounds: 8, f: [7, 8, 4, 7, 6, 5], adj: 3, score: 66, potential: false,
+    why: ['MA20 上方整理，5 日 +2.9%，量能一般', '芯片 IP 授权 + Chiplet 生态公告，本周新事件',
+          '未盈利口径下 PE 失真，PS 9.2 处近 3 年 66 分位', '在半导体主线内，但资金偏好设备与制造，设计环节靠后',
+          '主力 5 日净流入 0.6 亿、占比 1.4%', 'ROE 3.1%、毛利率 34%、净利同比 -8%，研发投入占比高'],
+    verdict: '关注：题材与主线都在，盈利还没跟上',
+    risks: ['净利同比转负，估值只能用 PS 口径', '设计环节资金靠后，弹性兑现慢'],
+    cross: '', crossNote: '人工送评，不在候选池里，没有选股理由可比对。',
+    think: ['行情取不到就中止：宁可报失败，也不用隔夜价凑一个分数。',
+            '失败记录不落进评分表，所以当天这条不会污染历史对比。',
+            '行情恢复后单独重跑这只，其它标的的分数不受影响。'] },
+  { code: '603501', name: '韦尔股份', date: '2026-11-13', src: '候选池', rank: 1, at: '16:52:10', dur: '2 分 05 秒', rounds: 7,
+    f: [8, 9, 6, 9, 8, 8], adj: 3.5, score: 84, potential: false,
+    why: ['沿 MA10 上行，5 日 +3.9%，量能未放大',
+          'CIS 出货指引预期，当时还没有本周这份正式公告',
+          'PE 35 倍、近 3 年 72 分位',
+          '半导体已是主线，板块相对强度 +3.1%',
+          '主力 5 日净流入 2.2 亿、占比 3.2%',
+          'ROE 18.4%、毛利率 32%，净利同比 +21%'],
+    verdict: '可建仓（上周五口径）',
+    risks: ['主线拥挤度已在抬升'],
+    cross: 'Discover 以「半导体主线延续」选中，与六因子一致。',
+    think: ['上周五量未放大，动量给 8 而不是 9。',
+            '催化当时只有预期、没有公告，仍给 9 是看重产业方向。',
+            '对照今天：同一只票 84 → 88，差异来自公告落地与放量确认。'] },
+  { code: '002371', name: '北方华创', date: '2026-11-13', src: '候选池', rank: 2, at: '16:53:28', dur: '1 分 51 秒', rounds: 6,
+    f: [8, 8, 5, 7, 8, 7], adj: 4.5, score: 77, potential: false,
+    why: ['站上 MA20，5 日 +4.1%', '设备招标预期，公告未落地', 'PE 39 倍、71 分位',
+          '半导体设备在主线内，板块强度 +2.4%', '主力净流入 2.0 亿、占比 3.4%', 'ROE 15.8%、净利 +34%'],
+    verdict: '可建仓，与韦尔同板块注意合并上限',
+    risks: ['板块暴露与韦尔重叠'],
+    cross: 'Discover 以「设备国产化」选中，因子方向一致。',
+    think: ['催化当时只有预期未落地，给 8。', '主线契合 7：板块强度弱于韦尔所在分支。', '与今天差 2 分，差异来自公告落地。'] },
+  { code: '601012', name: '隆基绿能', date: '2026-11-13', src: '候选池', rank: 3, at: '16:54:40', dur: '1 分 44 秒', rounds: 6,
+    f: [5, 6, 8, 4, 5, 7], adj: 0, score: 58, potential: false,
+    why: ['仍在 MA60 下方，5 日 -1.2%', '面板/组件价格仍处下跌尾部，没有拐点信号',
+          'PB 1.8、近 5 年 15 分位，估值很便宜', '光伏不在主线，板块相对强度 -2.3%',
+          '主力 5 日净流出 1.1 亿', 'ROE 9.4%、毛利率 14%、净利 +9%'],
+    verdict: '观察：估值便宜但没有任何一项确认',
+    risks: ['资金净流出，板块无主线地位，便宜可以更长'],
+    cross: 'Discover 以「低估值 + 超跌」选中，Score 因子发现动量与资金双弱，建议只做观察。',
+    think: ['估值 8 是六因子里唯一看多的项。', '动量 5：还在 MA60 下方，没有底部结构。', '与今天 76 分的差在催化与资金：本周价格止跌、限产口径出现。'] },
+  { code: '002261', name: '拓维信息', date: '2026-11-13', src: '候选池', rank: 4, at: '16:55:59', dur: '1 分 38 秒', rounds: 6,
+    f: [3, 7, 4, 6, 5, 4], adj: 3.5, score: 52, potential: true,
+    potentialNote: '催化 7、动量 3 同样命中潜力口径，但它总分只有 52、C 档：' +
+      '潜力说明事件还没走完，不代表这只现在能买——两个字段各说各的。',
+    why: ['5 日 -6.8%，跌破 MA20 与 MA60，处放量下跌段', '算力一体机合作消息，但缺乏订单金额',
+          'PE 74 倍、近 3 年 88 分位，估值透支', '算力题材内弹性高但持续性差',
+          '主力净流出 0.8 亿，游资参与度高', 'ROE 5.1%、毛利率 19%、净利同比 -12%'],
+    verdict: '暂不参与（C 级）',
+    risks: ['净利同比转负', '游资主导，题材熄火后流动性风险', '估值 88 分位无兑现支撑'],
+    cross: 'Discover 以「算力题材活跃」选中，但 Score 因子显示动量看空、基本面转弱，建议剔除。',
+    think: ['动量 3 = 看空：放量跌破两条均线。', '净利 -12% 直接把基本面质量压到 4。', '微调 +3.5 仍救不回 55 分线，维持 C。'] },
+  { code: '300502', name: '新易盛', date: '2026-11-13', src: '人工', rank: null, at: '16:57:12', dur: '2 分 12 秒', rounds: 7,
+    f: [3, 9, 7, 9, 8, 8], adj: 4, score: 76, potential: true,
+    potentialNote: '催化 9、动量 3，命中「催化 ≥7 且 动量 ≤4」的潜力口径。但这里的低动量是「已经拉升过」，' +
+      '不是「还没被定价」——所以潜力标识只提示关注，不改档位，也不构成买入理由。',
+    why: ['5 日 +34%，已越过 30% 拉升线，MA5 偏离 12% → 按口径算已拉升期，给低分',
+          '1.6T 光模块订单指引上修 + 北美云厂商资本开支上调，本周两条可验证公告',
+          'PE 31 倍处近 3 年 58 分位，绝对值不便宜，但 PEG 0.8 撑得住',
+          'CPO 是当周主线核心分支，板块连续 4 日领涨、资金关注度第一',
+          '主力 5 日净流入 6.1 亿、占比 4.2%，换手 11.3% 偏高但承接真实',
+          'ROE 26%、毛利率 42%，净利同比 +165%，负债率 28%，现金流为正'],
+    verdict: '不追高：分过了 A 档线但动量看空，等回踩 10 日线再看',
+    risks: ['5 日 +34% 之后回撤空间大，追进去就是接最后一棒', '换手 11.3%，短线分歧已经在放大'],
+    cross: '',
+    crossNote: '人工送评，不在候选池里，没有 Discover 选股理由可比对。',
+    think: ['动量只能给 3：涨幅超 30% 属已拉升期，这条是硬口径，不因为产业逻辑强就豁免。',
+            '五项看多但有一项看空 → A 档要求「没有一项看空」，被这一项破坏，落 B。',
+            '微调 +4 补的是订单兑现，不去补已经涨过头的价格风险。'] }
+];
+
+const SC_GRADE_NOTE = { A: '≥ 75 分，且至少 4 项因子看多、没有一项看空', B: '55 - 74 分：部分因子看多，方向成立但强度或共振不够', C: '< 55 分：多数因子中性或看空，暂不进入建仓清单' };
+const SC_SIG_RULE = '单项因子 0-10 分：≥7 记看多，4-6 记中性，≤3 记看空（生产由模型直接输出 signal，这里按同一口径显示）。';
+
+function scSig(v) { return v >= 7 ? '看多' : v <= 3 ? '看空' : '中性'; }
+/* stock_score.grade 是模型直接输出的字段，代码不重算；这里按生产阈值复算一遍，
+   用来显示与解释（score_prompt.py:66-70：A ≥75 且 ≥4 因子看多且无看空，B 55-74，C <55）。
+   75 分以上但共振不够 → B，所以不能只看分数发档。 */
+function scGrade(r) {
+  if (r.score >= 75 && scBull(r) >= 4 && scBear(r) === 0) return 'A';
+  return r.score >= 55 ? 'B' : 'C';
+}
+/* 过线未共振：值得单独提示，用户看分数会以为够 A 了 */
+function scGradeGap(r) {
+  if (!scOk(r) || r.score < 75 || scGrade(r) === 'A') return '';
+  return scBear(r) ? '有 ' + scBear(r) + ' 项因子看空' : '看多因子只有 ' + scBull(r) + ' 项（A 档要 ≥4）';
+}
+function scRaw(r) { return Math.round(SC_W.reduce(function (a, w, i) { return a + w.w * r.f[i]; }, 0)) / 10; }
+function scBull(r) { return r.f.filter(function (v) { return v >= 7; }).length; }
+function scBear(r) { return r.f.filter(function (v) { return v <= 3; }).length; }
+function scOk(r) { return r.status !== 'failed'; }
+function scDates() {
+  const set = [];
+  SCORES.forEach(function (r) { if (set.indexOf(r.date) < 0) set.push(r.date); });
+  return set.sort().reverse();
+}
+function scByCode(code, date) {
+  return SCORES.filter(function (r) { return r.code === code && (!date || r.date === date); })[0] || null;
+}
+function scAdvice(r) {
+  return '综合评估：' + scBull(r) + '/6 因子看多，总分 ' + r.score + ' 分（' + scGrade(r) + ' 级），' +
+    r.verdict + '，止损-8%，主要风险：' + (r.risks[0] || '无') +
+    (r.potential ? '。⚠️ 潜力标识：催化强但动量弱，可能尚未被定价' : '');
+}
+/* A 级不只是看分：还得 ≥4 项看多且没有看空，缺一条就只能落 B */
+function scGradeWhy(r) {
+  const g = scGrade(r);
+  const mix = scBull(r) + ' 项看多、' + scBear(r) + ' 项看空';
+  if (g === 'A') return SC_GRADE_NOTE.A + '（实际 ' + mix + '）';
+  if (r.score >= 75) return '总分 ' + r.score + ' 已过 75 线，但' + scGradeGap(r) + '，共振不够 → 只能落 B';
+  if (g === 'B') return SC_GRADE_NOTE.B + '（' + mix + '）';
+  return SC_GRADE_NOTE.C + '（' + mix + '）';
+}
+function scFiltered() {
+  let rows = SCORES.filter(function (r) { return r.date === state.scDate; });
+  if (state.scSrc) rows = rows.filter(function (r) { return r.src === state.scSrc; });
+  if (state.scGrade) rows = rows.filter(function (r) { return scOk(r) && scGrade(r) === state.scGrade; });
+  if (state.scSig === 'bull4') rows = rows.filter(function (r) { return scOk(r) && scBull(r) >= 4; });
+  else if (state.scSig === 'bear') rows = rows.filter(function (r) { return scOk(r) && scBear(r) > 0; });
+  else if (state.scSig === 'pot') rows = rows.filter(function (r) { return r.potential; });
+  else if (state.scSig === 'risk') rows = rows.filter(function (r) { return scOk(r) && r.risks.length; });
+  const sorters = {
+    score: function (a, b) { return (b.score || 0) - (a.score || 0); },
+    at: function (a, b) { return a.at < b.at ? 1 : -1; },
+    bull: function (a, b) { return scBull(b) - scBull(a) || (b.score || 0) - (a.score || 0); },
+    risk: function (a, b) { return a.risks.length - b.risks.length || (b.score || 0) - (a.score || 0); }
+  };
+  return rows.slice().sort(function (a, b) {
+    return (scOk(a) ? 0 : 1) - (scOk(b) ? 0 : 1) || (sorters[state.scSort] || sorters.score)(a, b);
+  });
+}
+function scBarHtml(r) {
+  if (!scOk(r)) return '<span class="dim">没有因子明细</span>';
+  return '<div class="sc-bar" aria-hidden="true">' + SC_W.map(function (w, i) {
+    const v = r.f[i], sg = scSig(v);
+    return '<i class="sc-cell ' + (sg === '看多' ? 'up' : sg === '看空' ? 'down' : '') + '" title="' +
+      esc(w.key + ' ' + v + '/10 · ' + sg + ' · 权重 ' + w.w + '%') + '"><b>' + v + '</b><span>' + esc(w.key) + '</span></i>';
+  }).join('') + '</div>';
+}
+function scRowHtml(r) {
+  const busy = state.scBusy[r.code];
+  const cand = CANDIDATE_POOL.filter(function (c) { return c.stock_code === r.code && c.trade_date === r.date; })[0];
+  if (!scOk(r)) {
+    return '<div class="sc-row fail"><div class="sc-main">' +
+      '<div class="sc-name">' + esc(r.name) + ' <span class="mono dim">' + esc(r.code) + '</span> ' +
+        tag(r.src === '人工' ? '人工送评' : '候选池', r.src === '人工' ? 'gold' : 'outline') + '</div>' +
+      '<div class="sc-err">' + esc(r.error) + '</div>' +
+      '<div class="hint">' + esc(r.at) + ' 提交 · 这一条没有写入评分表，页面上不会留下半条结果</div>' +
+      '</div><div class="sc-acts">' +
+      (busy ? '<span class="cp-tier ' + (busy === 'running' ? 'run' : 'wait') + '">' +
+        (busy === 'running' ? '打分中' : '排队中') + '</span>'
+        : '<button class="btn sm" data-action="sc-rescore" data-code="' + esc(r.code) + '">' + icon('rotate', 'sm') + '重跑这只</button>') +
+      '<button class="btn link sm" data-action="sc-open" data-code="' + esc(r.code) + '">看失败详情</button>' +
+      '</div></div>';
+  }
+  const g = scGrade(r);
+  return '<div class="sc-row">' +
+    '<div class="sc-main">' +
+      '<div class="sc-name">' +
+        '<button class="btn link" data-action="sc-open" data-code="' + esc(r.code) + '">' + esc(r.name) + '</button>' +
+        ' <span class="mono dim">' + esc(r.code) + '</span>' +
+        (r.src === '候选池'
+          ? ' <span class="hint">候选第 ' + r.rank + ' 名' + (cand ? ' · 今天也在池里：' + esc(cand.label) : ' · ' + esc(r.date) + ' 那批') + '</span>'
+          : ' ' + tag('人工送评', 'gold')) +
+        (r.potential ? ' ' + tag('潜力', 'blue') : '') +
+      '</div>' +
+      scBarHtml(r) +
+      '<div class="sc-meta">' +
+        '<span>' + scBull(r) + '/6 看多</span>' +
+        (scGradeGap(r) ? '<span class="sc-warn">过 75 线但' + esc(scGradeGap(r)) + ' → ' + g + ' 档</span>' : '') +
+        '<span>风险 ' + r.risks.length + ' 条</span>' +
+        '<span>微调 ' + (r.adj >= 0 ? '+' : '') + r.adj + '（上限 ±5）</span>' +
+        '<span>' + esc(r.at) + ' 出分 · 模型跑了 ' + esc(r.dur) + '，' + r.rounds + ' 轮</span>' +
+        (r.cross ? '' : '<span class="dim">无 Discover 交叉验证</span>') +
+      '</div>' +
+    '</div>' +
+    '<div class="sc-score"><b class="mono sc-g' + g + '">' + r.score + '</b><span>' + g + ' 档</span></div>' +
+    '<div class="sc-acts">' +
+      (busy ? '<span class="cp-tier ' + (busy === 'running' ? 'run' : 'wait') + '">' +
+        (busy === 'running' ? '打分中' : '排队中') + '</span>'
+        : '<button class="btn sm" data-action="sc-rescore" data-code="' + esc(r.code) + '">' + icon('rotate', 'sm') + '重新打分</button>') +
+      '<button class="btn link sm" data-action="sc-open" data-code="' + esc(r.code) + '">看依据</button>' +
+      (cand
+        ? '<button class="btn link sm" data-nav="#/candidates?id=' + esc(r.code) + '">候选池</button>'
+        : '<button class="btn link sm" data-nav="#/candidates?date=' + esc(r.date) + '">那天的候选</button>') +
+      (cand && cand.label === '可建仓' ? '<button class="btn link sm" data-nav="#/plans?gen=' + esc(r.code) + '">去建仓</button>' : '') +
+    '</div>' +
+  '</div>';
+}
+function scStat(label, value, sub, tone) {
+  return '<div class="sc-stat' + (tone ? ' ' + tone : '') + '"><b>' + value + '</b><span>' + esc(label) + '</span>' +
+    '<em>' + esc(sub) + '</em></div>';
+}
+/* 重打分：生产是 POST /score/{code} 立刻返回任务号，后台串行执行；
+   同类任务未跑完再提交返回 HTTP 409；当天结果有 24 小时缓存（键里带因子指纹），
+   所以正常情况跑完分数不变——只有因子状态/权重改过才会真的重算。 */
+function scRescore(code) {
+  const r = scByCode(code, state.scDate) || scByCode(code, SC_TODAY);
+  if (!r) return;
+  const busy = state.scBusy[code];
+  if (busy) {
+    toast('这只已经在队列里', '同一只票重复点不会排两次队：现在处于' + (busy === 'running' ? '执行中' : '排队中') + '。', 'info');
+    return;
+  }
+  const others = Object.keys(state.scBusy);
+  if (others.length) {
+    toast('已有同类任务在跑', '打分任务在后台是排队串行执行的（' + others.length + ' 个还没结束），这次提交会被拒——' +
+      '生产这里返回 409，不会两个一起跑。', 'warn');
+    return;
+  }
+  state.scBusy[code] = 'running';
+  if (state.route === '#/scores') renderView();
+  toast('已提交打分', r.name + ' 进了后台队列，一次只跑 1 个，跑完这页自动更新。', 'info');
+  setTimeout(function () {
+    delete state.scBusy[code];
+    const wasFailed = r.status === 'failed';
+    let poolLabel = '';
+    if (wasFailed) {
+      r.status = 'done';
+      r.at = '17:26:40';
+      r.crossNote = '人工送评，不在候选池里，没有选股理由可比对。';
+      const pc = CANDIDATE_POOL.filter(function (c) { return c.stock_code === r.code && c.trade_date === r.date; })[0];
+      if (pc) {
+        poolLabel = pc.label + ' → 建议关注';
+        pc.score = r.score; pc.tier = scGrade(r); pc.label = '建议关注';
+        pc.unscored = '';
+        pc.gate = '刚补跑出来的 ' + r.score + ' 分 ' + pc.tier + ' 档：评级过了门槛，但还没有建仓方案，首档区间无从判断 → 只能进关注。';
+      }
+      const ps = PL_SCORES[r.code];
+      if (ps) {
+        ps.grade = scGrade(r); ps.score = r.score; ps.score_date = r.date; ps.age = 0;
+        ps.risk = ['这条是补跑出来的新评分：已存的建仓方案不会自动重算，要重新生成才会读到'];
+      }
+    }
+    if (state.route === '#/scores') renderView();
+    if (wasFailed) {
+      toast('打分完成', r.name + ' 补上了评分：' + r.score + ' 分（' + scGrade(r) + ' 档）。' +
+        '行情已恢复，这一版用的是当天的真实输入' +
+        (poolLabel ? '。候选池的决策档跟着变了（' + poolLabel + '）；建仓方案要重新生成才会读到新评级。' : '。这只不在今天的候选池里，池子不受影响。'), 'success');
+    } else {
+      toast('打分完成，分数没变', r.name + ' 还是 ' + r.score + ' 分：当天结果命中 24 小时缓存。' +
+        '要拿到不一样的结论，得等因子状态或权重变化——缓存键里带因子指纹。', 'info');
+    }
+  }, 6200);
+}
+
+function renderScores() {
+  const rows = scFiltered();
+  const all = SCORES.filter(function (r) { return r.date === state.scDate; });
+  const done = all.filter(scOk);
+  const failed = all.length - done.length;
+  const chips = function (name, opts, cur) {
+    return '<div class="cp-chips">' + opts.map(function (o) {
+      return '<button class="cp-chip ' + (cur === o[0] ? 'active' : '') + '" data-action="sc-filter" data-k="' +
+        name + '" data-v="' + o[0] + '">' + esc(o[1]) + '</button>';
+    }).join('') + '</div>';
+  };
+  const stats =
+    '<div class="sc-stats">' +
+      scStat('本批送评', all.length,
+        '候选池 ' + all.filter(function (r) { return r.src === '候选池'; }).length +
+        ' · 人工 ' + all.filter(function (r) { return r.src !== '候选池'; }).length, '') +
+      scStat('已出分', done.length, failed ? failed + ' 只没出分' : '全部返回', failed ? 'warn' : 'ok') +
+      scStat('A 档', done.filter(function (r) { return scGrade(r) === 'A'; }).length, '≥75 且 ≥4 看多、无看空', 'ok') +
+      scStat('潜力标识', done.filter(function (r) { return r.potential; }).length, '催化强、动量弱，尚未定价', 'info') +
+      scStat('风险条数', done.reduce(function (a, r) { return a + r.risks.length; }, 0), '模型提示，不等于持仓红线', '') +
+    '</div>';
+  const filters =
+    '<div class="sc-filters">' +
+      '<div class="sc-fl-row">' +
+        '<span class="sc-fl-label">评分日</span>' +
+        chips('scDate', scDates().map(function (d) { return [d, d === SC_TODAY ? d + '（今天）' : d]; }), state.scDate) +
+      '</div>' +
+      '<div class="sc-fl-row">' +
+        '<span class="sc-fl-label">档位</span>' +
+        chips('scGrade', [['', '全部'], ['A', 'A'], ['B', 'B'], ['C', 'C']], state.scGrade) +
+        '<span class="sc-fl-label">因子</span>' +
+        chips('scSig', [['', '全部'], ['bull4', '≥4 项看多'], ['bear', '有看空'], ['pot', '潜力标识'], ['risk', '带风险条']], state.scSig) +
+      '</div>' +
+      '<div class="sc-fl-row">' +
+        '<span class="sc-fl-label">来源</span>' +
+        chips('scSrc', [['', '全部'], ['候选池', '候选池批量'], ['人工', '人工送评']], state.scSrc) +
+        '<span class="sc-fl-label">排序</span>' +
+        chips('scSort', [['score', '总分'], ['at', '出分时刻'], ['bull', '看多因子数'], ['risk', '风险条数']], state.scSort) +
+      '</div>' +
+      (state.scGrade || state.scSig || state.scSrc || state.scSort !== 'score'
+        ? '<div class="sc-fl-row"><span class="hint">筛完剩 ' + rows.length + ' / ' + all.length + ' 条，排序按' +
+            (({ score: '总分', at: '出分时刻', bull: '看多因子数', risk: '风险条数' })[state.scSort] || state.scSort) +
+            '；没出分的那几条已经沉到末尾。</span>' +
+          '<button class="btn link sm" data-action="sc-clear">清掉筛选，看整批</button></div>'
+        : '') +
+    '</div>';
+  const caliber =
+    '<div class="card sc-caliber">' +
+      '<div class="sc-cal-head"><h3>分是怎么来的</h3><span class="hint">' + esc(SC_BATCH[state.scDate] || '') + '</span></div>' +
+      '<div class="sc-cells">' + SC_W.map(function (w) {
+        return '<div class="sc-cell-def"><b>' + esc(w.key) + ' ' + w.w + '%</b><span>' + esc(w.note) + '</span></div>';
+      }).join('') + '</div>' +
+      '<div class="cap-note">' + icon('info') + '<div>分数和档位都是模型输出的字段，代码不重算；页面上这列是按同一口径复算出来的，' +
+        '用来发现「分够了、档没够」的降级。综合分先按权重加权，模型可在 ±5 分内微调，但微调方向必须和因子信号一致；' +
+        esc(SC_SIG_RULE) + '</div></div>' +
+      '<div class="cap-note">' + icon('clock') + '<div>当天重跑一般拿到的是<b>同一个分</b>：结果有 24 小时缓存，' +
+        '缓存键里带了因子状态的指纹。只有在因子页改过启停或权重，指纹变了才会真的重算。</div></div>' +
+      '<div class="cap-note">' + icon('link') + '<div>建仓方案上写的评级是<b>方案生成当时</b>读到的那一条，' +
+        '本页是<b>当日最新记录</b>，两者可以不同一天。落地时两处都读同一张评分表，但页面要标清楚各取哪一条，' +
+        '否则会出现「方案说过期、报告说今天刚出分」。</div></div>' +
+    '</div>';
+  const list = rows.length
+    ? '<div class="sc-list">' + rows.map(scRowHtml).join('') + '</div>'
+    : '<div class="wo-empty" style="margin:18px 0">这一批里没有符合当前筛选的评分。<br>' +
+      '<button class="btn sm" data-action="sc-clear" style="margin-top:10px">清掉筛选</button></div>';
+  return '<div class="page">' +
+    '<div class="page-head"><div>' +
+      '<h2>评分报告</h2>' +
+      '<div class="hint">每只票每个交易日一条评分记录，重跑会覆盖当天那条；分数是模型给的，不是行情算出来的。</div>' +
+    '</div><div class="spacer"></div>' +
+      '<div class="cp-acts"><button class="btn sm" data-nav="#/system/factors">因子启停与权重</button>' +
+      '<button class="btn sm" data-nav="#/candidates?mode=today">看候选池</button></div>' +
+    '</div>' + stats + filters + list + caliber + '</div>';
+}
+function scDrawerHtml(code) {
+  const r = scByCode(code, state.scDate) || scByCode(code, SC_TODAY);
+  if (!r) return '<div class="wo-empty">找不到这条评分记录。</div>';
+  if (!scOk(r)) {
+    return '<dl class="kv">' +
+      '<dt>状态</dt><dd>' + tag('打分失败', 'red') + ' 这一条没有写进评分表</dd>' +
+      '<dt>失败原因</dt><dd>' + esc(r.error) + '</dd>' +
+      '<dt>提交时刻</dt><dd class="mono">' + esc(r.date) + ' ' + esc(r.at) + '</dd>' +
+      '</dl>' +
+      '<div class="cap-note">' + icon('alert') + '<div>行情取不到就不会给分：模型缺输入时宁可报错，也不会编一个分数出来。' +
+      '行情恢复后可以重跑这一只，其它标的的分数不受影响。</div></div>' +
+      '<div class="drawer-acts"><button class="btn primary" data-action="sc-rescore" data-code="' + esc(r.code) + '">重跑这只</button>' +
+      '<button class="btn ghost" data-nav="#/holdings?view=all">看持仓红线为什么也在失败</button></div>';
+  }
+  const cand = CANDIDATE_POOL.filter(function (c) { return c.stock_code === r.code && c.trade_date === r.date; })[0];
+  const calc = SC_W.map(function (w, i) {
+    return '<span>' + esc(w.key) + ' ' + r.f[i] + '×' + w.w + '%</span>';
+  }).join(' + ');
+  return '<dl class="kv">' +
+      '<dt>综合评估</dt><dd>' + esc(scAdvice(r)) + '</dd>' +
+      '<dt>档位判定</dt><dd>' + tag(scGrade(r) + ' 档', scGrade(r) === 'A' ? 'blue' : scGrade(r) === 'B' ? 'gold' : 'mute') +
+        ' ' + esc(scGradeWhy(r)) + '</dd>' +
+      '<dt>来源</dt><dd>' + (r.src === '候选池'
+        ? '候选池批量（' + esc(r.date) + ' 那批第 ' + r.rank + ' 名' + (cand ? '，今天的决策档 ' + esc(cand.label) : '') + '）'
+        : tag('人工送评', 'gold') + ' 你手动发起的单只打分') +
+        ' <span class="hint">评分日 ' + esc(r.date) + '</span></dd>' +
+    '</dl>' +
+    '<div class="sc-sec-title">加权算式</div>' +
+    '<div class="sc-calc">' + calc + '</div>' +
+    '<div class="sc-calc-sum">加权 <b class="mono">' + scRaw(r).toFixed(1) + '</b>，模型微调 ' +
+      '<b class="mono">' + (r.adj >= 0 ? '+' : '') + r.adj + '</b>（上限 ±5，方向须与因子信号一致），最终 ' +
+      '<b class="mono">' + r.score + '</b> 分。</div>' +
+    '<div class="sc-sec-title">六个因子逐项</div>' +
+    '<table class="tbl sc-factors"><thead><tr><th>因子</th><th>权重</th><th>得分</th><th>信号</th><th>打分依据</th></tr></thead><tbody>' +
+      SC_W.map(function (w, i) {
+        const v = r.f[i], sg = scSig(v);
+        return '<tr><td>' + esc(w.key) + '</td><td class="mono">' + w.w + '%</td>' +
+          '<td class="mono"><b>' + v + '</b>/10</td>' +
+          '<td>' + tag(sg, sg === '看多' ? 'blue' : sg === '看空' ? 'gold' : 'mute') + '</td>' +
+          '<td class="wrap small">' + esc(r.why[i] || '—') + '<div class="dim" style="margin-top:2px">口径：' + esc(w.note) + '</div></td></tr>';
+      }).join('') + '</tbody></table>' +
+    (r.potential ? '<div class="cap-note">' + icon('star') + '<div><b>潜力标识</b>：' + esc(r.potentialNote || '') +
+      ' 这是提示重点关注，不额外加分也不改档位。</div></div>' : '') +
+    '<div class="sc-sec-title">与选股逻辑的交叉验证</div>' +
+    '<div class="sc-cross">' + esc(r.cross || '') + (r.cross ? '' : '<span class="dim">' + esc(r.crossNote || '没有交叉验证内容。') + '</span>') + '</div>' +
+    '<div class="sc-sec-title">风险清单（' + r.risks.length + ' 条）</div>' +
+    (r.risks.length ? '<ul class="cp-bullets">' + r.risks.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>'
+      : '<div class="wo-empty">模型这一轮没有给出风险提示——不等于没有风险。</div>') +
+    '<div class="cap-note">' + icon('shield') + '<div>这些是打分时列出的风险，<b>不是持仓的红线</b>；' +
+      '红线是另一条确定性通道按成本与现价算的，在持仓页看。</div></div>' +
+    '<div class="sc-sec-title">推理留痕</div>' +
+    '<div class="sc-meta"><span>模型跑了 ' + esc(r.dur) + '</span><span>工具调用 ' + r.rounds + '/8 轮（上限 8）</span>' +
+      '<span>取过行情 / 日线 / 新闻 / 财务 / 资金 / 板块结构 / 因子校准</span></div>' +
+    '<ul class="cp-bullets">' + (r.think || []).map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>' +
+    '<div class="cap-note">' + icon('info') + '<div>模型的思考过程只写进推理留痕表，不会混进评分明细；' +
+      '页面上这条是从留痕里取出的摘要，原文要按留痕记录单独取。</div></div>' +
+    '<div class="sc-sec-title">这条记录本身</div>' +
+    '<dl class="kv">' +
+      '<dt>覆盖规则</dt><dd>同一只票同一交易日只留一条，重跑会盖掉当天旧记录（要留版本得另建历史表）</dd>' +
+      '<dt>重跑会不会变</dt><dd>24 小时内重跑通常命中缓存得到<b>同一个分</b>；因子启停或权重改过之后才会真的重算 → ' +
+        '<button class="btn link sm" data-nav="#/system/factors">看因子状态</button></dd>' +
+      '<dt>出分时刻</dt><dd class="mono">' + esc(r.date) + ' ' + esc(r.at) + '</dd>' +
+    '</dl>' +
+    '<div class="drawer-acts">' +
+      '<button class="btn primary" data-action="sc-rescore" data-code="' + esc(r.code) + '">重新打分</button>' +
+      (cand && cand.label === '可建仓' ? '<button class="btn" data-nav="#/plans?gen=' + esc(r.code) + '">生成建仓方案</button>' : '') +
+      (cand ? '<button class="btn ghost" data-nav="#/candidates?id=' + esc(r.code) + '">回候选池</button>' : '') +
+    '</div>';
 }
 
 function renderCandidates() {
@@ -9898,8 +10489,8 @@ const PL_SCORES = {
   '002415': { grade: 'B', score: 78, score_date: '2026-11-10', age: 6, risk: ['海外收入占比高，汇率敏感'] },
   '300750': { grade: 'B', score: 80, score_date: '2026-11-13', age: 3, risk: ['排产下修传闻待确认'] },
   '600519': { grade: 'A', score: 86, score_date: '2026-11-12', age: 4, risk: ['单价 1392 元，一手金额超单票上限'] },
-  '688981': { grade: 'C', score: 74, score_date: '2026-11-16', age: 0, risk: ['评级不足，禁止生成建仓计划'] },
-  '000725': { grade: 'C', score: 71, score_date: '2026-11-16', age: 0, risk: ['评级不足'] }
+  '688981': { grade: '未评级', score: null, score_date: null, age: 0, risk: ['当天打分失败，评分表里没有记录 → 未评级，不得生成建仓计划'] },
+  '000725': { grade: '未评级', score: null, score_date: null, age: 0, risk: ['当天打分失败，无权威评分 → 未评级'] }
 };
 
 /* LLM 只负责区间/配比/止损止盈/市场强弱（position.py llm_plan），数值全部由量化层重算 */
@@ -10738,11 +11329,11 @@ function handlePlansAction(action, el) {
         PL_SCORES[c] = PL_SCORES[c] || { grade: s.grade, score: s.score, score_date: PL_TODAY, age: 0, risk: [] };
         const g = plGradeOf(c);
         if (g === 'A' || g === 'B') made.push(plUpsert(c, (CANDIDATE_POOL.find((x) => x.stock_code === c) || {}).stock_name || c, 'candidate'));
-        else refused.push(c + '（' + g + '）');
+        else refused.push(c + '（' + (g === '未评级' ? '无评分' : g + ' 级') + '）');
       });
       renderView(); syncPlansHash();
       toast('今日联动完成', '候选池 B 级以上 ' + made.length + ' 只已出计划' +
-        (refused.length ? '；' + refused.join('、') + ' 评级不足被拒绝' : '') +
+        (refused.length ? '；' + refused.join('、') + ' 没有权威评分，被拒绝（无评分一律不建仓）' : '') +
         '。可用资金仍是 0 元，所以金额还是被压成 0。', made.length ? 'ok' : 'warn');
     }, 1300);
     return;
@@ -10828,6 +11419,7 @@ function renderView() {
   let html = '';
   if (route === '#/overview') html = renderWorkspaceOverview();
   else if (route === '#/candidates') html = renderCandidates();
+  else if (route === '#/scores') html = renderScores();
   else if (route === '#/holdings') html = renderHoldings();
   else if (route === '#/paper') html = renderPaper();
   else if (route === '#/reviews') html = renderReviews();
@@ -10849,6 +11441,11 @@ function renderView() {
   hydrateIcons($('#view'));
   bindPage();
   if (route === '#/overview') woEnsureTicker();
+  if (route === '#/scores' && state.scFocus) {
+    const scFocus = state.scFocus;
+    state.scFocus = '';
+    if (scByCode(scFocus, state.scDate) || scByCode(scFocus, SC_TODAY)) openDrawer('score', scFocus);
+  }
   if (state.miDrawerPending && state.miSector) {
     state.miDrawerPending = false;
     openDrawer('mi-sector', state.miSector);
@@ -11025,6 +11622,11 @@ function openDrawer(kind, payload) {
     title = payload + ' · 板块判定链路';
     sub = miDate() + ' 快照 → 结构 → 前瞻 → 归因 → 后验';
     body = miSectorDrawerHtml(payload);
+  } else if (kind === 'score') {
+    const row = scByCode(payload, state.scDate) || scByCode(payload, SC_TODAY);
+    title = row ? row.name + ' · ' + row.code + ' 的评分依据' : '评分依据';
+    sub = row ? row.date + ' 批次 · ' + (row.src === '人工' ? '人工送评' : '候选池批量') : '';
+    body = scDrawerHtml(payload);
   }
   root.innerHTML = '<div class="drawer-mask" data-drawer-mask><div class="drawer" role="dialog" aria-modal="true">' +
     '<div class="drawer-head"><div><div class="drawer-title">' + esc(title) + '</div><div class="drawer-sub">' + esc(sub) + '</div></div>' +
@@ -11377,6 +11979,21 @@ document.addEventListener('click', (e) => {
     return;
   }
 
+  if (action === 'sc-filter') {
+    const k = el.dataset.k;
+    if (k === 'scDate' || k === 'scGrade' || k === 'scSig' || k === 'scSrc' || k === 'scSort') state[k] = el.dataset.v;
+    if (k === 'scDate') state.scFocus = '';
+    renderView();
+    return;
+  }
+  if (action === 'sc-clear') {
+    state.scGrade = ''; state.scSig = ''; state.scSrc = ''; state.scSort = 'score';
+    renderView();
+    toast('筛选已清掉', '评分日不变，仍看 ' + state.scDate + ' 这一批。', 'info');
+    return;
+  }
+  if (action === 'sc-open') { openDrawer('score', el.dataset.code); return; }
+  if (action === 'sc-rescore') { scRescore(el.dataset.code); return; }
   if (action === 'task-center') { openDrawer('tasks'); return; }
   if (action === 'open-palette') { openPalette(); return; }
   if (action === 'select-rule') { selectRule(id); return; }
